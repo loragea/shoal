@@ -1,6 +1,7 @@
 # Layer A — distributed object store
 
-Status: design proposal, not ratified, nothing implemented.
+Status: **ratified 2026-08-24** (decisions.md D8). Nothing is
+implemented yet; this is the contract M1–M4 build against.
 
 Scope: the object model, the per-disk storage server's 9P export,
 the cluster map, the placement function, the write/read path, epoch
@@ -2820,8 +2821,11 @@ regression outright and by pinning `monid` (§6.3).
 
 ### 8.7 Forward compatibility with a replicated monitor
 
-The v1 monitor is one process. Everything above is chosen so that
-replication is additive, never a format break:
+The v1 monitor is one process. A replicated monitor (or another
+mechanism with the same availability effect) is the **committed
+design target**, not a maybe (D9): v1 ships single only because
+M1–M4 do not depend on replication and everything below makes it
+additive, never a format break:
 
 - Readers MUST ignore unknown map attributes and unknown record
   kinds (§3.1), so a `mon=` record kind and a `term=`/`leader=`
@@ -2886,8 +2890,7 @@ available with no new code.
   an attribute that already exists and is already checked — not a
   change of format shape.
 
-This settles D6's open half and should be ratified as a new
-decisions.md row. This document does not edit `docs/decisions.md`.
+This settles D6's open half; ratified as decisions.md **D7**.
 
 ## 10. Conflicts, deviations, and open questions
 
@@ -3052,81 +3055,36 @@ owner should see:
 - BLAKE2s vs SHA-256 throughput on the fleet, to confirm §9's
   premise with numbers rather than a general claim.
 
-### 10.3 (b) Product and design calls for the project owner
+### 10.3 (b) Product calls — all answered 2026-08-24
 
-The first five are unchanged in substance; their framing is updated
-where the redesign moved the trade-off. The sixth is new from this
-round.
+All six were put to the project owner and answered; the decisions
+live in `../decisions.md` (D8–D10), and the full trade-off framings
+that accompanied each question remain in this file's git history.
+In brief:
 
-1. **Monitor availability.** Monitor loss stops the cluster within
-   `leasems`. The redesign adds two further reasons to care, and the
-   second is stronger than the previous revision let on: the monitor
-   holds the stale ledger, so (i) it is on the degraded-write path —
-   a write that would leave a placement member behind fails
-   `degraded` if the mark cannot be registered within `replms` — and
-   (ii) because the ledger travels in the map and every currency
-   check reads it, the monitor is on the **read** path too, in the
-   ordinary sense that a stale or unavailable map makes an instance
-   fence itself and a scoped unresolved mark makes `1/|V|` of objects
-   answer `not ready`. Its loss also degrades the heal gate (§8.6).
-   Acceptable for v1 with a fast-restart story, or does v1 need a
-   replicated monitor?
-2. **`mincopies` default.** Default 1 accepts a write onto a single
-   surviving disk (available, but a second failure loses it).
-   Default 2 refuses writes to affected objects during any
-   single-disk outage (durable, but less available than one node).
-   The redesign changes the consequence of losing that single disk:
-   the loss is now *surfaced* — the peer that missed the writes is
-   either held at `up=heal` by the heal gate or, if it stayed
-   `up=yes`, refused by the currency check, so the affected objects
-   answer `not ready` rather than serving a rollback (§5.7) — until
-   an operator runs `forcesync` or retires the dead reporter. That
-   makes `mincopies=1` more defensible and less comfortable at the
-   same time. Note that the wedged-link residual (§8.4) is a
-   pair-share read/write outage at *either* setting — `mincopies`
-   does not soften it. Which is the product?
-3. **Failure-detection and handoff windows.** Affected objects are
-   unavailable-and-retrying for up to `deadms` (10 s) on a node
-   death, and for `leasems` plus a currency check (plus a background
-   pull, if the winning copy moved) on a rebalance or an operator
-   `disable`. Individual requests no longer block for the whole
-   window (§5.4's summed bound caps them at ≤ 3·`replms` plus local
-   I/O), so the question is now about client-visible retry latency,
-   not wedged processes. Shrink `deadms` at the cost of flappier
-   `up=no` transitions?
-4. **`promote force`.** Should the operator override that serves
-   possibly-stale data exist at all in v1, given it knowingly breaks
-   D2's contract? Note it now has four siblings with the same
-   character (`forcesync`, `commit force`, `forceepoch`, and
-   `retire` of a reporter) — the question is really whether the whole
-   family is wanted, or whether v1 should simply stay unavailable and
-   make the operator restore from elsewhere. With report-based
-   demotion removed (§10.4), the operator verbs are also now the
-   *only* way out of a wedged-link partial partition, which raises
-   the price of removing them.
-5. **Authentication.** Is Layer A a trusted-network service in v1
-   (no auth on attach), or must attaches authenticate via
-   factotum/p9any? This is not admin convenience: with an
-   unauthenticated `role=repl` attach, any host on the LAN can write
-   `/repl` with an attacker-chosen `(wepoch, ver)` high enough to
-   win arbitration everywhere, or `op=full force=1` a target object
-   to arbitrary content, or register itself as an instance. It is a
-   data-integrity boundary, and `role=admin` additionally reaches
-   `forcesync`, `promote force` and `forceepoch`. Deciding "trusted
-   network" is deciding that the storage LAN is a security domain.
-   Removing client reports (§10.4, D-a) closed one unauthenticated
-   influence channel — any host could previously help demote a
-   healthy instance — but it closed one hole in a wall, not the wall.
-6. **NEW — how coarse may durable staleness be, and what happens
-   when its reporter never comes back?** The ledger is per pair of
-   instances (§7.1), so one stale object blocks a whole disk's
-   return to `up=yes`, and a reporter that is permanently lost
-   leaves its subject unpromotable until an operator accepts the
-   loss with `forcesync`. The alternatives are a finer ledger
-   (per-object, unbounded, monitor in the write path — rejected
-   here) or an automatic timeout that promotes the subject after
-   some interval, which is `forcesync` without a human. Should v1
-   ever discard acked writes without an operator saying so?
+1. **Monitor availability** — single monitor accepted for v1 with a
+   fast-restart story; a replicated monitor (or equivalent) is the
+   **committed design target**, not an option (D9). §8.7's
+   additive-forward-compatibility rules are normative for exactly
+   that reason.
+2. **`mincopies`** — default 1, and it stays a mutable map attribute
+   (it always was); the surfaced-not-silent loss semantics of §5.7
+   are the accepted contract (D8).
+3. **Failure windows** — `deadms` default 10 s accepted; a mutable
+   map attribute like every timer (D8).
+4. **The override family** — kept, understood as post-mortem
+   recovery tooling, not operator UI: any end-user product MUST
+   separate it from the regular operator surface (D10).
+5. **Authentication** — production assumption is threat actors on
+   the network; auth is required before any non-isolated deployment.
+   v1 runs unauthenticated on an isolated network only, because auth
+   bolts on: 9P's Tauth/afid carries factotum/p9any without protocol
+   change, and `role` then derives from the authenticated identity
+   (§2.1 anticipates this). Committed target per D9.
+6. **Staleness granularity** — per-pair ledger accepted for v1;
+   acked writes are NEVER discarded without an operator; a finer
+   ledger is the recorded refinement path if per-pair blocking hurts
+   in practice (additive record kinds; D9).
 
 ### 10.4 Alternatives considered and rejected
 

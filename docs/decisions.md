@@ -92,3 +92,80 @@ content-addressed mode use a modern hash; the specific algorithm
 heritage, not a spec to inherit.
 **Normative:** the eventual algorithm choice, once fixed in the wire
 and map formats.
+
+## D7 — BLAKE2s everywhere (2026-08-24)
+
+**Decision:** Object checksums are BLAKE2s-128 per block and
+BLAKE2s-256 over the block digests; transfer digests are BLAKE2s-128;
+the placement hash is the first 8 bytes of BLAKE2s-256. Exact
+definitions: `design/layer-a.md` §1.4, §4.2, §5.5. Closes D6's open
+half.
+**Rationale:** Present in stock 9front libsec (verified on the
+fleet); faster than SHA-256 on hardware without SHA extensions;
+digest length is a BLAKE2 parameter, not a truncation; one primitive
+to implement and test. Cheap non-crypto placement hashes rejected —
+the cost they save is sub-microsecond against a LAN RTT; `placehash=`
+stays reserved for a swap.
+**Normative:** algorithms, digest lengths, encodings.
+
+## D8 — Layer A protocol design ratified (2026-08-24)
+
+**Decision:** `design/layer-a.md` is the ratified Layer A contract
+that M1–M4 build against, with its own per-section
+normative/implementation-policy markings governing. Ratified by the
+owner after an adversarial design round (draft → two reviews →
+redesign → two delta reviews → verification; the git log of that file
+is the record). Defaults `mincopies=1` and `deadms=10000` stand;
+like every timer they are mutable map attributes, configurable per
+cluster.
+**Normative:** per the document's own markings.
+
+## D9 — Cheap-now requires a recorded good-later (2026-08-24, Victor)
+
+**Decision:** v1 may ship the cheap variant of a mechanism only when
+the good variant is recorded as the committed target and the upgrade
+is additive (no format or wire break). Instances bound by this row:
+(a) **monitor** — v1 single-process with a fast-restart story; a
+replicated monitor (or equivalent availability) is the committed
+design, and layer-a §8.7's additivity rules are normative to keep it
+so; (b) **authentication** — v1 unauthenticated, permitted ONLY on an
+isolated network; production assumes threat actors on the network, so
+factotum/p9any auth (role derived from authenticated identity) is
+committed and REQUIRED before any non-isolated deployment; (c)
+**staleness ledger** — per-pair in v1; a finer ledger is the recorded
+refinement if per-pair promotion-blocking hurts in practice
+(additive record kinds). Acked writes are never discarded without an
+operator, in v1 or later.
+**Why:** Victor 2026-08-24: "the good solution is the target… begin
+cheap… as long as it is properly noted and intended to be replaced."
+**How to apply:** any future cheap-variant shipping decision cites
+this row and records its target the same way.
+
+## D10 — Recovery overrides are not operator UI (2026-08-24, Victor)
+
+**Decision:** The override family (`promote force`, `forcesync`,
+`commit force`, `forceepoch`, `retire` of a mark's reporter,
+`newmonid`) is post-mortem/data-recovery tooling. It exists, is
+always logged as a data-loss event, and in any end-user product MUST
+be separated from the regular operator surface (separate tool, role,
+or gating). v1 may co-locate it on the ctl surfaces. This is a
+general principle for all future data-loss-capable tooling, not a
+list frozen to these six verbs.
+**Normative:** the logging requirement; the separation requirement is
+a product obligation, not a v1 wire property.
+
+## D11 — Zone failure domain reserved (2026-08-24)
+
+**Decision:** The map format carries `zone=` per instance and a
+`placerule=` header attribute (v1 defines and accepts only `nodes`);
+zone-aware three-level placement — replicas on distinct zones via a
+domain-separated HRW round — is reserved with exact byte strings in
+`design/layer-a.md` §4.5, not implemented. Enabling it later is a
+staged placement-rule change that moves data, not a redesign.
+**Rationale:** Owner requirement for future datacenter deployments
+(buildings, power feeds as failure domains); map-format changes are
+the expensive kind, so the hook lands now — same treatment as device
+class (D5) and weights.
+**Normative:** the attributes and the reserved rule's byte strings.
+**Open at enable time:** the scarce-zone spill question (layer-a
+§4.5).

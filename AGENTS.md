@@ -34,6 +34,7 @@ implemented yet; see `docs/target.md` for the ratified target.
 |---|---|
 | `docs/target.md` | The ratified deliverable target: layers, semantics contract, milestones, design envelope. |
 | `docs/decisions.md` | Design decisions with rationale; each row marked normative vs implementation policy. |
+| `docs/design/layer-a.md` | The ratified Layer A contract: object model, storage-server 9P export, cluster map, placement, write/read path, epoch/fencing, heal, monitor. Wire truth lives here. |
 
 ## Test tiers
 
