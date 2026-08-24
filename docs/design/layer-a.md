@@ -790,6 +790,7 @@ pretend otherwise:
 | `tombdays` | yes | tombstone retention and absence bound (§1.5) |
 | `mincopies` | yes | refuse a write that would land on fewer than this many copies (§5.4) |
 | `retain` | yes | number of past maps the monitor keeps (§8.2) |
+| `placerule` | yes, staged | placement rule selector. v1 defines and accepts only `nodes` (§4.3); `zones` is reserved (§4.5) and a v1 monitor MUST reject it. Changing it is a placement change: staged, committed, and it moves data. |
 
 `retain` is denominated in **epochs**, and epochs are now bumped by
 `up` flaps, by placement changes, and by the `tombdays`/2 heartbeat
@@ -819,6 +820,12 @@ disjoint (§4.2).
   label, the uuid is the disk.
 - `class=` — device class tag (D5). Present from day one; v1
   placement MUST ignore it.
+- `zone=` — failure-domain tag one level above the node: a building,
+  a power feed, a rack row. Present from day one; v1 placement MUST
+  ignore it. Zone names share the node-name grammar (§3.3, no `.`).
+  Every instance of one node MUST carry the same `zone` (the monitor
+  validates at `commit`); an absent `zone=` means the zone named
+  `default`. Consumed only by §4.5's reservation.
 - `weight=` — capacity weight. Present from day one; v1 placement
   MUST ignore it, and a v1 monitor MUST reject any value other than
   `100` (§4.4) so that no operator can believe weighting works.
@@ -1006,6 +1013,38 @@ Consequence to state plainly: v1 fills disks in proportion to
 *count*, not capacity. A cluster with a 1 TB and an 8 TB disk on
 one node will fill the small one first. The envelope assumes
 roughly homogeneous disks.
+
+### 4.5 Zones: reserved, not implemented
+
+Same treatment as weights: the attributes are in the format
+(`zone=` per instance, `placerule=` in the header, §3.2–3.3), v1
+ignores one and rejects the other's non-default value, and the rule
+that will consume them is fixed now so that enabling zone redundancy
+later is a *placement-rule change* — staged, committed, data moves —
+not a redesign. The hazard zones answer is environmental: two nodes
+in one building, on one power feed, are not independent failures.
+
+When `placerule=zones` is enabled, placement SHALL become
+three-level, one more HRW round on top of §4.3:
+
+- Let `Z` = the set of zone names carried by members of `I`.
+  **Zone round:** for each `z ∈ Z` compute
+  `Sz = H( oid || 0x00 || 'Z' || z )`, sort descending, §4.3's
+  tie-break on the candidate byte string; take the first
+  `min(R, |Z|)` zones, in order.
+- **Node round** as §4.3 step 2, restricted to each chosen zone's
+  nodes; **disk round** unchanged.
+- Replicas land on distinct zones by construction. `|Z| < R` is
+  structural under-replication, reported and served exactly as
+  `|V| < R` is today.
+
+Weighted zones compose with §4.4's virtual copies (a zone's `K` is
+the sum over its nodes). **Open at enable time, deliberately not
+reserved:** whether scarce zones should *spill* (place two replicas
+in one zone rather than under-replicate) — the strict rule above is
+the reservation, and a spill rule would be a widening, decided when
+someone actually has two zones and R=3. Until then, `zone=` costs
+one ignored attribute per instance.
 
 ## 5. Write and read path
 
