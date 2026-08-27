@@ -525,10 +525,10 @@ extent-map slot writes nothing: the bytes of the previous owner's map
 survive in the region, and they still pass their own `csum128`. What
 makes that safe is the other half of the rule — the commit that
 *allocates* a slot zeroes the whole entry before setting the blocks
-it names, and MUST name every non-hole block below `nblk` (§2.7). So
-no reader ever reaches a byte of a released entry through a live
-object, and `shoalck` treats an entry whose `emapslot` no live index
-entry claims as free space rather than as a fault.
+it names, and MUST name every block below `nblk`, holes included
+(§2.7). So no reader ever reaches a byte of a released entry through
+a live object, and `shoalck` treats an entry whose `emapslot` no live
+index entry claims as free space rather than as a fault.
 
 **No live grain number above `nblk`.** `nblk` is a derived value:
 it is `blkcount(len)` and nothing else, and a reader that has both
@@ -605,12 +605,21 @@ carried by any bitmap page that passes **its own checksum** — a page
 that fails its checksum has an arbitrary `ckseq` and contributes
 nothing. Then:
 
-> After replay the store MUST have applied a valid record whose
-> `seq` is ≥ `Pmax`. If it has not, the log no longer covers state
-> that is already on disk, and the store MUST NOT start.
+> After replay, `max(superblock.ckseq, the highest seq replay
+> applied)` MUST be ≥ `Pmax`. If it is not, the log no longer covers
+> state that is already on disk, and the store MUST NOT start.
+
+The superblock's term is not slack. A page whose `ckseq` is at or
+below `superblock.ckseq` is *settled*: the superblock names a
+checkpoint that included it, so nothing has to be replayed behind it.
+Only a page ahead of the superblock — `Pmax > superblock.ckseq` —
+obliges replay to reach `Pmax`. Stated as "replay MUST have applied a
+record" instead, the rule would refuse to start whenever replay
+applies no record, which is every restart of a store that was idle
+when it stopped.
 
 §5 applies it in that order, after replay and not before. The test
-discriminates the two cases that are byte-indistinguishable without
+discriminates the three cases that are byte-indistinguishable without
 it:
 
 - *benign* — a crash during checkpoint *N*. The superblock is
@@ -622,9 +631,18 @@ it:
   space was reclaimed, and that copy was later lost to a media fault,
   so start falls back to *N−1*'s copy over a log that has been
   overwritten. Replay stops at the first overwritten sector, short of
-  `Pmax`, and the store refuses. Replaying from a stale mark over
+  `Pmax`, and `superblock.ckseq` is `ckseq(N−1)` — also short of it —
+  so the store refuses. Replaying from a stale mark over
   already-materialised state is how grains that live objects
   reference get handed out again.
+- *quiescent* — checkpoint *N* completes, nothing is dirtied
+  afterwards, so §2.8's timer starts no further checkpoint, and the
+  power goes at some later hour. Restart finds `superblock.ckseq =
+  ckseq(N) = Pmax` and a log that begins at `cklogoff(N)` in unwritten
+  space, so replay applies **no record at all**. The superblock's term
+  satisfies the rule and the store starts. This is the commonest
+  restart there is, and refusing it would be the same false refusal
+  the generation comparison was replaced to remove.
 
 ### 2.6 Dirty-record region
 
@@ -755,6 +773,10 @@ eighth of the log region.
     u32  nfree
     nfree × u32 grain
 
+`oflags` bit0 is **`Oslot`**: this commit changes `emapslot`, in
+either direction (the slot rule below). Bits 1..7 are reserved and
+MUST be zero.
+
 `nmap` names the blocks this commit changes; every other block below
 `nblk` is unchanged, except under the slot rule below. `nfree` names
 the grains this commit releases — the old grains of the blocks it
@@ -764,31 +786,53 @@ Applying an `Eobj` sets absolute values, and it MUST, in this order:
 
 1. set the four-tuple and `len` in the index entry, and derive
    `nblk = blkcount(len)` from that `len`;
-2. if `emapslot` differs from the entry's current value, allocate or
-   release the extent-map slot **and zero the whole target map** —
-   all `emapsz` bytes of a newly allocated extent-map entry, or
+2. if the record carries `Oslot`, allocate or release the extent-map
+   slot `emapslot` names **and zero the whole target map** — all
+   `emapsz` bytes of a newly allocated extent-map entry, or
    `grain0`/`dig0` when `emapslot` becomes 0;
 3. set `grain[b]`/`dig[b]` for every block named by `nmap`;
-4. make every block in `[old nblk, nblk)` that `nmap` does not name
-   a hole: `grain = 0` and the digest of the zero bytes it reads as
-   (§2.4) — the precomputed full-block zero digest, or the short
-   final block's, computed from `len`;
+4. for every block below `nblk` that `nmap` does not name and whose
+   `grain[i]` is 0, set `dig[i]` to the digest of the zero bytes that
+   block reads as (§2.4) — the precomputed full-block zero digest, or
+   the short final block's, computed from `len`;
 5. **clear `grain[i]` and `dig[i]` for every `i ≥ nblk`**;
 6. free every grain in `nfree`.
 
 Clause 5 is §2.4's invariant on the shrinking side, and it is what
 makes a truncate that names no blocks correct rather than merely
-cheap. Clause 4 is the same invariant on the growing side: a sparse
-extend across many blocks stays a metadata-only commit, and the write
-path and replay agree on what the new blocks hash as, so `csum` (§4)
+cheap. Clause 4 is the same invariant over the holes: a sparse extend
+across many blocks stays a metadata-only commit, and the write path
+and replay agree on what the new blocks hash as, so `csum` (§4)
 matches the digest array without the commit having to name 65535
 holes. Where they disagreed, the object would fail its next scrub and
-be routed to a whole-object repair it does not need.
+be routed to a whole-object repair it does not need. It is stated as
+a walk of the digest array wherever `grain[i]` is 0, rather than over
+the range a growth covers, because the range is a function of what
+the entry held before and the walk is not — and the short final
+block's zero digest changes with `len` whether or not `nblk` moved.
+
+**Every clause is a function of the record and of `nblk` alone.**
+None of them reads the entry's live state: clauses 1, 3, 5 and 6 set
+absolute values, clause 2 branches on a bit the record carries, and
+clause 4 is recomputed unconditionally over the map the others leave.
+So applying a record twice — once live, once again in replay over a
+checkpoint that already materialised part of its effect — gives the
+same entry both times. That is the property §5 asserts when it calls
+replay idempotent and the one §3.4's damage ⊆ repair argument rests
+on. A clause that compared against the entry instead — zeroing the
+target map only "if `emapslot` differs from the current value", or
+making holes only of `[old nblk, nblk)` — is a clause a half-written
+checkpoint disarms silently: the index page carrying the new
+`emapslot` and `len` lands, the extent-map entry does not, and the
+re-replay skips exactly the zeroing and the hole-filling that stood
+between the object and the previous owner's grains.
 
 **The extent-map slot rule.** A commit that changes `emapslot` in
-either direction MUST name in `nmap` **every block below `nblk` that
-is not a hole**, and applying it zeroes the target map first (clause
-2). Both halves are load-bearing and neither is sufficient alone:
+either direction MUST set `Oslot`, MUST name in `nmap` **every block
+below `nblk`** — holes included, a hole named as `grain = 0` with the
+zero digest §2.4 requires for its length — and is applied by zeroing
+the target map first (clause 2). Both halves are load-bearing and
+neither is sufficient alone:
 
 - Without the zeroing, a slot released by a deleted object still
   holds that object's map — §2.4 zeroes nothing on release — so a
@@ -802,12 +846,22 @@ is not a hole**, and applying it zeroes the target map first (clause
   zeros, and a shrink to one block would leave `grain0`/`dig0` empty
   rather than carrying block 0 out of the entry being released.
 
+Naming the holes too is what makes a slot-changing record complete on
+its own terms: the whole map below `nblk` is in the record, so the
+entry the apply leaves does not depend on clause 4 having recomputed
+what the zeroing erased. Exempt them, and a hole below `nblk` is
+described by neither the record nor the map being replaced — the
+zeroing leaves its `dig[i]` sixteen zero bytes, which is not the
+digest of the zero bytes the block reads as, and only clause 4 stands
+between the object and `hash(dig[]) != csum` the instant the
+transition commits.
+
 So the rule covers all three transitions: inline→slot (block 0 is
 named even when the write did not touch it), slot→inline including
-truncate (block 0 is named unless it is a hole), and the reuse of a
-slot by a different object. When `emapslot` is 0 the map being set is
-the index entry's inline `grain0`/`dig0`, and `nmap` names at most
-block 0.
+truncate (block 0 is named whether or not it is a hole), and the
+reuse of a slot by a different object. When `emapslot` is 0 the map
+being set is the index entry's inline `grain0`/`dig0`, and `nmap`
+names at most block 0.
 
 The cost is bounded and rare: a slot-changing commit carries at most
 `nblkmax` map triples — the same 28.2 KiB the whole-object `op=full`
@@ -1113,7 +1167,11 @@ there is nothing to replay. §2.8's rule that the checkpoint
 materialises committed allocation state only — reservations live in
 the staged set, not in the bitmap — is what keeps the "iff" true
 there, and §2.5's coverage rule is what catches the one case where
-replay's range is not the checkpoint's.
+replay's range is not the checkpoint's. The dirty region is the one
+structure the step does not hold for: a torn page there loses
+fine-grained marks below `ckseq` that no record replays. Nothing in
+this proof covers them; §5 step 6 drops such a page, and the restart
+`fullsync` (§2.6) is what makes the loss harmless.
 
 ### 3.5 The deferred-reuse rule
 
@@ -1252,7 +1310,10 @@ lose arbitration against everything including absence.
    the operator reaches for.
 3. Check `secsz` against the device, and `vers` against the build.
    Refuse a mismatch. Check the geometry for self-consistency: every
-   region inside the partition, no overlaps, `ngrains` < 2^32.
+   region inside the partition, no overlaps, `ngrains` < 2^32, and
+   `cklogoff` sector-aligned inside the log region — step 7 addresses
+   from it, and an unchecked offset out of the region is the same
+   fault an unchecked `nsec` would be (§2.7).
 4. Read the index region in 64 KiB requests and build the in-memory
    index (§9) **tolerantly**: verify every entry's checksum and
    range-check `oidlen` (1..128), `state` (0..2) and `emapslot`
@@ -1280,23 +1341,30 @@ lose arbitration against everything including absence.
    or out of sequence. Applying an entry means setting absolute
    values — this slot's four-tuple becomes these bytes, block *i*
    becomes grain *g* with digest *d*, blocks at or beyond `nblk`
-   become holes, this grain becomes allocated, this extent-map slot
-   becomes this object's and is zeroed before its blocks are set,
+   become holes, this grain becomes allocated, a record carrying
+   `Oslot` zeroes the target map before its blocks are set,
    this dirty record exists or is gone — so replay is idempotent and
    a partially checkpointed region is corrected by it. Replay uses
    the apply function the commit path uses (§3.2).
-8. Check replay coverage. The highest `seq` replay applied MUST be
-   ≥ `Pmax` from step 5; if it is not, the log no longer covers state
-   the bitmap has already materialised and the store MUST NOT start
-   (§2.5). A store with no valid bitmap page has no `Pmax` and this
-   step passes vacuously — the rebuild in step 11 is what covers it.
+8. Check replay coverage. The greater of the superblock's `ckseq`
+   (step 2) and the highest `seq` replay applied MUST be ≥ `Pmax`
+   from step 5; if it is not, the log no longer covers state the
+   bitmap has already materialised and the store MUST NOT start
+   (§2.5). Replay applying no record is not itself a failure: after a
+   quiescent restart the superblock's term carries the test. A store
+   with no valid bitmap page has no `Pmax` and this step passes
+   vacuously — the rebuild in step 11 is what covers it.
 9. Read the extent-map entry of each replayed slot that has one, and
    apply its deltas. `nblk` is recomputed from the replayed `len`,
    never trusted from the entry's header sector. **A failing
-   `csum128` on a replayed entry is not fatal**: the bytes replay
-   does not name are byte-identical old-or-new and therefore intact,
-   so applying the deltas and recomputing the checksum restores the
-   entry. Every grain number read out of such an entry is
+   `csum128` on a replayed entry is not fatal**: a record carrying
+   `Oslot` zeroes the entry and then names every block below `nblk`
+   (§2.7), so none of the previous owner's map survives the apply and
+   the entry is rebuilt whole; a record that leaves `emapslot` alone
+   names blocks of the same object, and the bytes it does not name
+   are that object's, byte-identical old-or-new and therefore intact.
+   Either way, applying the deltas and recomputing the checksum
+   restores the entry. Every grain number read out of such an entry is
    bounds-checked against `ngrains`; one out of range is damage
    replay did not cover, and the slot goes to `/lost`. A failing
    `csum128` on an entry replay did *not* touch is fatal for that
@@ -1313,7 +1381,9 @@ lose arbitration against everything including absence.
     replay applied, minus nothing — there are no reservations at
     start (§3.6). If step 5 set the rebuild flag, rebuild it instead
     by scanning every live object's map (§2.5), log the event, and
-    report `bmaprebuild=yes`.
+    report `bmaprebuild=yes`. Build the two slot free lists (§6)
+    here as well: the extent-map list is read from the `emapslot`
+    fields, which step 7 may have changed.
 12. Set `fullsync` for every peer (§2.6). Clear `cur` for every
     object — which costs nothing, because `cur` is never on disk
     (§14(1)).
@@ -1340,13 +1410,13 @@ degraded mode it did not name. A corrupt index entry is a running
 store with an object in `/lost`. A bitmap page that fails its
 checksum is a slow start, not a refusal. A bitmap page ahead of the
 superblock is *not* a refusal either — it is the ordinary
-mid-checkpoint crash — but a replay that cannot reach `Pmax` is,
-because the log no longer describes what the disk already holds; the
-tools for it are `shoalck` and, if the log is genuinely gone, refill
-from peers. Two invalid superblocks is a store that will not start,
-and there the honest answer is `shoalfmt -r` plus refill from peers,
-since the disk's identity is gone, which by layer-a §1.5 makes it a
-reformat-before-rejoin case anyway.
+mid-checkpoint crash — but a `Pmax` that neither the superblock nor
+replay reaches is, because the log no longer describes what the disk
+already holds; the tools for it are `shoalck` and, if the log is
+genuinely gone, refill from peers. Two invalid superblocks is a store
+that will not start, and there the honest answer is `shoalfmt -r`
+plus refill from peers, since the disk's identity is gone, which by
+layer-a §1.5 makes it a reformat-before-rejoin case anyway.
 
 ## 6. Space management
 
@@ -1376,9 +1446,10 @@ one grain (16 KiB), and every object statically reserves 256 bytes of
 index. At the recommended sizing that is 0.13% of the partition for
 metadata plus up to `blksz-1` per object's final block.
 
-**Slots.** Two free lists in memory, rebuilt at start: index slots
-from the index region, extent-map slots from the `emapslot` fields of
-live entries. A slot of either kind is reused only after the commit
+**Slots.** Two free lists in memory, rebuilt at start (§5 step 11,
+which is after replay has settled every `emapslot`): index slots from
+the index region, extent-map slots from the `emapslot` fields of live
+entries. A slot of either kind is reused only after the commit
 that freed it is durable (§3.5).
 
 **Reclaim of tombstones.** A tombstone's content is released at
@@ -1524,7 +1595,7 @@ does not touch:
 | Lock | Covers | Taken by |
 |---|---|---|
 | `qlstate` | the index array, the oid arena and hash table (§9), the index-slot and extent-map-slot free lists, the free-grain bitmap and its cursor, the staged set (§6), and the dirty set | every queue proc (stage, apply), the committer applying a batch, the checkpointer, the scrubber's commits, and the service loop taking an enumeration snapshot |
-| `qlemap` | the extent-map cache and its LRU (§9) | every queue proc, on a map read |
+| `qlemap` | the extent-map cache: which entries are present, their loading state and pin counts, and the LRU (§9) — not a pinned entry's contents, which its pin covers | every queue proc, on a map read, a pin and an unpin |
 | `qllog` | the log tail and free space, the pending-commit queue, batch numbering and the durable watermark | every committer |
 | `qlsuper` | the five publishable superblock fields and the publish itself (§2.2) | the checkpointer, a `qidnext` batch advance, the first `monid` pin, an `epochhigh` advance |
 
@@ -1534,7 +1605,8 @@ Two rules make that discipline checkable rather than aspirational:
    order to get wrong, and no deadlock to reason about. The commit
    path is the one that looks like it needs nesting and does not: it
    takes `qllog` to join a batch, releases it, does its I/O, then
-   takes `qlstate` to apply.
+   takes `qlstate` to apply — and the extent maps the apply mutates
+   are pinned, not held under `qlemap` (below).
 2. **None is held across a device I/O, a flush wait or a `Rendez`
    sleep**, with exactly one exception: `qlsuper` *is* held across
    the superblock write and its flush, because serialising that write
@@ -1551,6 +1623,25 @@ releases it; the missing proc reads the 41 sectors through an I/O
 proc; it then fills the entry and wakes any other proc that found it
 loading. So one read serves concurrent readers of the same map and no
 lock spans it.
+
+**A staged map is pinned from the stage that read it to the apply
+that changes it.** The queue proc that reads an object's map at
+§3.1's staging step pins the cache entry, and the pin is dropped when
+the batch carrying that object's commit has been applied — up to
+3·`replms` later, which is the whole reason the entry cannot be left
+to the LRU: the cache is a few thousand entries and the apply comes
+long after the read. A pinned entry is not in the eviction set, so
+the apply always finds the map in memory. It therefore never faults,
+never reads the device under a lock, and mutates the map **under the
+pin** rather than under `qlemap` — which is what lets the committer
+apply its whole batch under `qlstate` alone and keeps rule 1 true as
+stated. Without the pin the apply would have to take `qlemap` inside
+`qlstate` and might read 41 sectors there: a lock order to get wrong
+and a device read under the lock the service loop needs for
+`/status`, which is both rules broken at once. The pins cost nothing
+to bound: one object operation holds at most one, and the queue
+pool's size is the ceiling on operations in flight, so at 64 queues
+at most 64 of a few thousand entries are pinned.
 
 **Group commit: the committer writes its own batch.** A worker
 reaching layer-a §5.4 step 6 becomes the committer of a batch or a
@@ -1570,7 +1661,8 @@ member of one, and there is no separate assigner or writer proc:
    not about correctness, and §3.2's argument is indifferent to how
    many requests a record takes.
 3. When its post-flush returns and every lower-numbered batch has
-   been applied, it applies its whole batch under `qlstate` (§3.2),
+   been applied, it applies its whole batch under `qlstate` (§3.2) —
+   over pinned extent maps, so no part of the apply faults —
    advances the watermark, and wakes its members, which answer
    `Rwrite`.
 
@@ -1731,6 +1823,18 @@ finds every block matching, clears the `corrupt` flag with a
 key-preserving `Eobj`, and the object leaves `/lost`. If the corrupt
 copy is the only copy, nothing repairs it and layer-a §7.5's `object
 lost` is the honest outcome.
+
+**One repair this store cannot accept yet.** A corrupt holder whose
+own stored key is *greater* than the winner's — it committed
+`(E, ver+1)` and the content then went bad while the primary kept
+`(E, ver)` — contributes no key, so the primary wins arbitration at
+the lower key and its `op=full force=1` arrives as neither greater
+nor equal. Layer-a §5.5's receiver comparison refuses it, this store
+implements that comparison as ratified, and the copy stays in `/lost`
+and goes on blocking the tombstone discard. Closing it is the second
+half of §14(11)'s proposal — a copy that fails local verification
+behaves as absent for the receiver's comparison too — and that is a
+wire change, so it waits for ratification with the rest.
 
 A commit that does not advance the key is a first-class case in this
 store, and there are three of them: block repair, whole-object
@@ -1918,7 +2022,9 @@ them to the wrong place.
 a twentyfold margin and a whole number of 16 KiB units. With
 `retain=8` the store needs 2 header sectors + 10 slots ≈ 640 KiB;
 `shoalmonfmt` defaults the partition to 4 MiB and refuses less than
-1 MiB.
+1 MiB. `retain` MUST be at least 2 — layer-a §5.2 clause 2 reads
+epoch `E−1`, so one history slot is a floor rather than a preference
+— and `shoalmonfmt -R` refuses less.
 
 **Cost.** One 16 KiB write plus one flush per slot written: **8.6 ms**
 for the current-map slot, and the same again for the history slot
@@ -1940,7 +2046,8 @@ index entry, 265 µs per 16 KiB block).
 Per commit, unconditionally: **one flush + one write + one flush =
 8.75 ms**, shared across everything in the batch. A record whose body
 exceeds one sector adds one `Wunit` write per 16 KiB of body; a
-commit that wraps the log adds one 512-byte write and one flush.
+commit that wraps the log adds one 512-byte write and no extra
+flush — the wrap record rides before the batch's post-flush (§2.7).
 
 | Operation | Reads | Data writes | Commit | Total |
 |---|---|---|---|---|
@@ -2017,11 +2124,14 @@ is expensive to undo once the engine has grown roots in a command.
     shoalfmt [-r] [-b blksz] [-o objmax] [-n nslots] [-e nemap]
              [-d ndirty] [-L logbytes] [-u uuid] /dev/sdXX/name
 
-Writes both superblocks, zeroes the log, index, extent-map, dirty and
-bitmap regions, sets bit 0 of the bitmap (grain 0 is never
-allocatable), and prints the geometry it chose — including how many
-multi-block objects `nemap` supports, which is the number an operator
-needs to size a workload that is not Layer B's. It generates a random
+Writes both superblocks, zeroes the log, index, extent-map and dirty
+regions, writes every bitmap page with a valid header at `ckseq = 0`
+— a zeroed page fails its own checksum, so a formatted store would
+otherwise start with `bmaprebuild=yes` (§5 step 5) — sets bit 0 of
+the bitmap (grain 0 is never allocatable), and prints the geometry it
+chose — including how many multi-block objects `nemap` supports,
+which is the number an operator needs to size a workload that is not
+Layer B's. It generates a random
 `uuid` unless given one, and **refuses a partition that already
 carries a valid superblock unless `-r`** — reaming a disk destroys an
 instance's identity, and layer-a §1.5 makes that a
@@ -2137,17 +2247,14 @@ flush — the two copies are written in sequence only by `shoalfmt`),
 `publish` (force an `epochhigh` publish at the current point, so it
 can be combined with `ckpt:n`), `batch:n` (hold batch *n*'s write and
 let *n+1* complete). Each T1 test names the requirement it
-discriminates and the mutation that must break it; each mutation is
-run.
+discriminates and the mutation that must break it; **each mutation is
+run**, per `AGENTS.md`.
 
 T1 formats a **small geometry** — a partition image of a few MiB with
 `-n` and `-e` in the hundreds — so that `mk test` stays within
 `AGENTS.md`'s seconds. The sweeps that are exhaustive are exhaustive
 over one header sector, not over the whole store, and the cases that
 need `nslots = 2^20` are T2's.
-
-Each test names the requirement it discriminates and the mutation
-that must break it; **each mutation is run**, per `AGENTS.md`.
 
 - **T1.1 crash matrix (R1–R4).** Every point above × {create,
   whole-block write, partial write, truncate, delete, 16 MiB
@@ -2250,20 +2357,39 @@ that must break it; **each mutation is run**, per `AGENTS.md`.
   map matches a full scan. Then the media-fault variant: let the
   checkpoint complete and reclaim, damage the newer superblock copy so
   start falls back to the older one over a log that has been
-  overwritten, and assert the store **refuses**. *Mutations:* refuse
-  when a page's `ckseq` exceeds the superblock's, which fails the
-  first case; drop the coverage test, which fails the second; read a
-  torn page's `ckseq` into `Pmax` without checking its checksum
-  first.
+  overwritten, and assert the store **refuses**. Then the quiescent
+  variant: let a checkpoint complete, write nothing after it, crash,
+  restart, and assert the store **starts** with replay applying no
+  record at all. *Mutations:* refuse when a page's `ckseq` exceeds the
+  superblock's, which fails the first case; drop the coverage test,
+  which fails the second; drop the `superblock.ckseq` term and require
+  a replayed record, which fails the third; read a torn page's `ckseq`
+  into `Pmax` without checking its checksum first.
 - **T1.19 extent-map slot transitions (R2, R13).** Give a
-  multi-block object a slot, delete it, then grow a one-block object
-  past `blksz` so it allocates the same slot, with a write that does
-  not touch block 0; crash at `commit:0`; restart. Block 0 must read
-  its own bytes and every unwritten block must read zeros. Then the
-  mirror: truncate a multi-block object to one block and assert
-  block 0 survives the release of the slot. *Mutations:* name only
-  the blocks the write changed; skip the zeroing of the newly
-  allocated entry; leave `grain0`/`dig0` unset on the shrink.
+  multi-block object a slot with content in every block, delete it,
+  then grow a one-block object past `blksz` so it allocates the same
+  slot, with a write that does not touch block 0. Run it twice over:
+  once with block 0 holding its own bytes, and once with **block 0 a
+  hole** — create, truncate to `blksz`, then write past it — which is
+  the case a rule that exempts holes from `nmap` gets wrong with no
+  crash at all. Crash at `commit:0`; restart. Block 0 must read what
+  it held — its own bytes in the first variant, zeros in the second —
+  every unwritten block must read zeros, and `verify` must pass,
+  which is what catches a hole left with sixteen zero bytes for a
+  digest. Then the re-replay
+  schedule: with the hole variant, crash at `ckpt:n` with the
+  object's index page written and its extent-map entry not, restart,
+  and assert the same — replay must zero the map it inherits even
+  though the entry it is applying to already carries the record's
+  `emapslot`. Then the mirror: truncate a multi-block object to one
+  block and assert block 0 survives the release of the slot.
+  *Mutations:* name only the blocks the write changed; exempt holes
+  from `nmap`; key the zeroing off `emapslot` differing from the
+  entry's current value rather than off the record's `Oslot`, which
+  fails only the re-replay schedule; make holes of `[old nblk, nblk)`
+  rather than of every unnamed block whose grain is 0; skip the
+  zeroing of the newly allocated entry; leave `grain0`/`dig0` unset
+  on the shrink.
 - **T1.20 dirty records across a restart (R7).** Commit writes that
   create fine-grained dirty records for several peers, crash at
   `preack`, restart, and assert every record whose write is visible is
@@ -2487,7 +2613,19 @@ rather than amendments, because they touch the wire.
     serving primary — which the completed check is what elects — to
     push `op=full force=1` at an equal key to the reporting holder,
     layer-a §1.3's key-preserving repair and the only way to repair a
-    holder whose key already equals the sender's. A response form
+    holder whose key already equals the sender's. Symmetrically, a
+    copy that fails local verification MUST behave as **absent** for
+    the receiver's own layer-a §5.5 comparison: an instance that
+    answers `corrupt=1` for `<oid>` MUST accept an `op=full` for it
+    at any key — greater, equal or lower, `force=1` or not — because
+    a line that contributes no key has no key to defend. Without that
+    half the set has a hole exactly where it is needed: a holder that
+    committed `(E, ver+1)` and then lost the content to a media fault
+    contributes no key, so the primary wins arbitration at the lower
+    `(E, ver)` and its repair push arrives as neither greater nor
+    equal and is refused as `stale version` — by the very copy that
+    asked for it, which is then unrepairable for the life of the disk
+    and blocks the tombstone discard for as long. A response form
     rather than an error, because `op=meta` is answered whatever the
     instance's `up`/`status` (layer-a §6.4 F3) and a caller must be
     able to tell a corrupt holder from an unreachable one. §8 says
@@ -2505,7 +2643,9 @@ rather than amendments, because they touch the wire.
     Nothing said when an abandoned stage is released, so a sender that
     died mid-transfer left the receiver holding staged space forever.
     *Made:* layer-a §5.5 now requires an owner, a lifetime and a
-    bound, matching §3.6 clause for clause.
+    bound, matching §3.6's owner, lifetime and per-fid bound. The
+    process-wide `stagetot` §3.6 argues for is this store's own and
+    is not required of layer-a.
 
 14. **layer-a §5.4.1 forbade the reply order every 9P server
     actually produces, and prescribed a mechanism this store does not
@@ -2519,11 +2659,9 @@ rather than amendments, because they touch the wire.
     *Made:* §5.4.1 now requires `Rflush` and the whole of step 7,
     permits the flushed request to have been answered first (the
     client discards that reply), and states the ordering as a property
-    of the queue rather than of a lock. What is *not* changed is
-    layer-a §5.4 step 2, which still spells the ordering point as
-    "take the per-object lock"; §5.4.1 governs the mechanism and
-    admits any that gives the total order, so step 2's wording is a
-    residual to align, not a second rule.
+    of the queue rather than of a lock. §5.4 step 2 now enters "the
+    object's ordering point" rather than taking a per-object lock, so
+    the contract names no mechanism it also says is optional.
 
 15. **`/lost` names a condemned slot without an `oid=`.** Layer-a
     §2.2 fixes `oid=` as a field of every `/lost` line, and layer-a
@@ -2751,10 +2889,11 @@ rather than amendments, because they touch the wire.
    automatically (it is derived state, and a 3 a.m. operator
    procedure for a derivable structure is a bad trade), serve with
    the object in `/lost` on a bad index entry that replay did not
-   restore, and refuse to start on two bad superblocks or on a replay
-   that cannot reach the state the bitmap has already materialised
-   (§2.5) — but *not* on a bitmap page merely stamped ahead of the
-   superblock, which is the ordinary mid-checkpoint crash. The
+   restore, and refuse to start on two bad superblocks or on state
+   the bitmap has already materialised that neither the superblock
+   nor replay covers (§2.5) — but *not* on a bitmap page merely
+   stamped ahead of the superblock, which is the ordinary
+   mid-checkpoint crash. The
    alternative, starting anyway and letting the cluster arbitrate, is
    tempting because layer-a can in fact heal it; it is rejected
    because a store that starts in a mode it did not name is how an
