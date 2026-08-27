@@ -186,9 +186,10 @@ geometry(Super *s, Fmtcfg *c, vlong partbytes)
 }
 
 /*
- * Write a formatted store.  Regions first, superblocks last: a crash
- * part way through then leaves no valid superblock rather than a
- * valid one naming regions that were never written.
+ * Write a formatted store.  Both superblocks invalidated first,
+ * regions next, superblocks last: a crash part way through then
+ * leaves no valid superblock rather than a valid one naming regions
+ * that were never written or were half overwritten.
  *
  * A zeroed index entry, dirty record or bitmap page fails its own
  * checksum, so each is written as a valid *free* record: otherwise a
@@ -212,9 +213,25 @@ fmtstore(Dev *d, Super *s)
 	if((buf = mallocz(s->blksz, 1)) == nil)
 		return -1;
 
+	/*
+	 * Invalidate both superblock copies first, and flush, so that
+	 * a format or a ream cut short leaves no valid superblock.
+	 * Writing the regions first and the superblocks last is only
+	 * half of that property, and the missing half is the one -r
+	 * needs: without this a ream interrupted before its superblock
+	 * writes leaves the *previous* instance's superblocks valid
+	 * over regions that have just been overwritten — its uuid, its
+	 * checkpoint mark and its qidnext, over a zeroed log.
+	 */
+	if(devwrite(d, buf, s->secsz, 0) < 0)
+		goto bad;
+	if(devwrite(d, buf, s->secsz, super1off(d)) < 0)
+		goto bad;
+	if(devflush(d) < 0)
+		goto bad;
+
 	/* the reserved alignment run, and the log */
-	if(devzero(d, (vlong)s->secsz, (vlong)(s->logoff - 1)*s->secsz,
-		s->blksz) < 0)
+	if(devzero(d, 0, (vlong)s->logoff*s->secsz, s->blksz) < 0)
 		goto bad;
 	if(devzero(d, (vlong)s->logoff*s->secsz,
 		(vlong)s->logsecs*s->secsz, s->blksz) < 0)

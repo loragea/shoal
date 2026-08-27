@@ -2191,27 +2191,37 @@ vtable is the only thing either of them calls.
              [-e nemap] [-d ndirty] [-L logbytes] [-u uuid]
              [-z size] /dev/sdXX/name
 
-Zeroes the log and the extent-map region; writes every index entry
-and every dirty record as a valid **free** record, and every bitmap
-page with a valid header at `ckseq = 0` — sixteen zero bytes are not
-the checksum of a zeroed record, so a region merely zeroed would make
-§5 step 10 condemn every slot and §5 step 5 report
-`bmaprebuild=yes`; sets bit 0 of the bitmap (grain 0 is never
-allocatable); and writes both superblocks **last**, copy 0 at
-`gen = 0` and copy 1 at `gen = 1`, so that a crash part way through a
-format leaves no valid superblock rather than a valid one naming
-regions that were never written. It prints the geometry it chose —
-including how many multi-block objects `nemap` supports, which is the
-number an operator needs to size a workload that is not Layer B's. It
+Zeroes **both superblock sectors and flushes before it writes
+anything else**, so that a format or a ream cut short leaves no valid
+superblock rather than a valid one naming regions that were never
+written or have just been half overwritten. That invalidation is the
+half of the ordering `-r` needs: writing the superblocks last makes a
+*first* format safe, but a ream interrupted before them would
+otherwise leave the **previous** instance's superblocks valid — its
+`uuid`, its `ckseq`/`cklogoff` over a log that has just been zeroed,
+its `qidnext` and its `epochhigh` — which defeats the very thing `-r`
+exists to make loud, and which `shoalck` would report as a healthy
+store.
+
+It then zeroes the log and the extent-map region; writes every index
+entry and every dirty record as a valid **free** record, and every bitmap page with a valid
+header at `ckseq = 0` — sixteen zero bytes are not the checksum of a
+zeroed record, so a region merely zeroed would make §5 step 10
+condemn every slot and §5 step 5 report `bmaprebuild=yes`; sets bit 0
+of the bitmap (grain 0 is never allocatable); and writes both
+superblocks **last**, copy 0 at `gen = 0` and copy 1 at `gen = 1`.
+
+It prints the geometry it chose — including how many multi-block
+objects `nemap` supports, which is the number an operator needs to
+size a workload that is not Layer B's. It
 generates a random `uuid` unless given one, and **refuses a partition
 that already carries a valid superblock unless `-r`** — reaming a
 disk destroys an instance's identity, and layer-a §1.5 makes that a
 reformat-before-rejoin event, so it should take a flag. It refuses a
 geometry whose maximal `Eobj` record exceeds an eighth of the log
 region, refuses one whose `ngrains` reaches 2^32, and warns when
-`nslots` implies more than 1% of the partition in metadata. `-w` is
-§3.2's operator assertion, which is what lets it format a unit whose
-raw channel it cannot open.
+`nslots` implies more than 1% of the partition in metadata. `-w` is §3.2's operator assertion, which is what lets it
+format a unit whose raw channel it cannot open.
 
 **`shoalck`** — inspect and check. It reads and never writes, and
 opens the device read-only so the kernel enforces that rather than

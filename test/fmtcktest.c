@@ -234,6 +234,55 @@ treformat(void)
 	devclose(d);
 }
 
+/*
+ * §12: a format or a ream cut short leaves no valid superblock.  The
+ * ream is the case that matters — without the invalidation that
+ * begins a format, a ream interrupted before its superblock writes
+ * leaves the previous instance's superblocks valid over regions that
+ * have just been overwritten, so the disk comes back empty wearing
+ * the identity its peers still believe in (layer-a §3.4), naming a
+ * checkpoint over a log that has been zeroed, and shoalck sees
+ * nothing wrong with it.
+ */
+static void
+tcutream(void)
+{
+	Dev *d;
+	Super s;
+	Fmtcfg c;
+	Sbsel sel;
+	uchar uuid[16];
+
+	if((d = simopen(Secsz, Nsec, Seed)) == nil)
+		sysfatal("simopen: %r");
+	smallcfg(&c);
+	if(geometry(&s, &c, d->size) < 0 || fmtstore(d, &s) < 0)
+		sysfatal("format: %r");
+	memmove(uuid, s.uuid, 16);
+	checks++;
+	if(superselect(d, &sel) != 0 || memcmp(sel.sb[sel.start].uuid, uuid, 16) != 0)
+		fail("the first format left no superblock to ream over");
+
+	/* the ream dies on its first index write, and the power goes */
+	if(geometry(&s, &c, d->size) < 0)
+		sysfatal("geometry: %r");
+	simfaultat(d, Sfeio, 1, idxentoff(&s, 0), Idxentsz);
+	checks++;
+	if(fmtstore(d, &s) == 0)
+		fail("a format whose region write failed reported success");
+	simfault(d, Sfnone, 0);
+	simcrash(d);
+
+	checks++;
+	if(superselect(d, &sel) == 0)
+		fail("a ream cut short left copy %d valid, gen %llud",
+			sel.start, sel.sb[sel.start].gen);
+	checks++;
+	if(check(d) == 0)
+		fail("shoalck passed a store left by a ream cut short");
+	devclose(d);
+}
+
 void
 main(int, char**)
 {
@@ -265,6 +314,7 @@ main(int, char**)
 
 	tdamage();
 	treformat();
+	tcutream();
 	if(fails > 0)
 		exits("failed");
 	print("fmtcktest: %d checks ok\n", checks);
