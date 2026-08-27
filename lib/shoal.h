@@ -22,7 +22,7 @@ enum
 	Blkdlen		= BLAKE2S_128dlen,	/* per-block digest, 16 */
 	Csumlen		= BLAKE2S_256dlen,	/* object checksum, 32 */
 	Csumhexlen	= 2*Csumlen + 1,	/* rendered csum + NUL */
-	Blkszdflt	= 65536,		/* map default blksz */
+	Blkszdflt	= 16384,		/* map default blksz */
 };
 
 /*

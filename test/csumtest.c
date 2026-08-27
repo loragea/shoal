@@ -33,7 +33,7 @@ static Vec vec[] =
 	  "2d114776ebea2fce47617501bf552fb56cf3de3921e0ed00caeb577a39edbb45" },
 	{ "threepartial", 64,	199,
 	  "56de5a1f458c4c8c00a7a45c26b099bf03ad88acb107e9e07413d3718b27bfe4" },
-	{ "dfltblksz",	65536,	2*65536 + 1234,
+	{ "blksz64k",	65536,	2*65536 + 1234,
 	  "2b03f34254f29e65d28dcd03b79511d15d42dd440cec48d69c568d5f1b952aba" },
 };
 
