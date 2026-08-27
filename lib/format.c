@@ -183,6 +183,28 @@ geometry(Super *s, Fmtcfg *c, vlong partbytes)
 			return -1;
 		}
 	}
+	/*
+	 * That loop steps 1 -> need(1) and stops at the first page
+	 * count that covers itself, which is not always the smallest
+	 * one that does: a page taken costs one grain, so need falls
+	 * by at most one page for each page added, and the jump lands
+	 * up to ceil((need(1)-1)/bpp) pages high — four pages at
+	 * blksz 512 on a 20 GiB partition.  Walking down reaches the
+	 * smallest, and one page at a time suffices because the valid
+	 * counts are upward closed: a bigger bitmap leaves fewer
+	 * grains to cover.  That is what makes §2.1's bound — the
+	 * ceiling, or the single page above it where the ceiling has
+	 * no fixed point — a property of this arithmetic rather than
+	 * a hope about small partitions.
+	 */
+	while(nbm > 1){
+		s->datasecs = avail - (nbm - 1)*pagesecs;
+		s->ngrains = s->datasecs / pagesecs;
+		need = (s->ngrains + bpp - 1) / bpp;
+		if(need > nbm - 1)
+			break;
+		nbm--;
+	}
 	s->bmapsecs = nbm*pagesecs;
 	s->dataoff = s->bmapoff + s->bmapsecs;
 	s->datasecs = lastsec - s->dataoff;

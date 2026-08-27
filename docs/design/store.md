@@ -287,12 +287,21 @@ recomputes them from assumptions:
 that are left once it has taken its own pages. That is a fixed point
 rather than a formula — a page taken shrinks the data region, which
 shrinks `ngrains`, which can shrink the number of pages needed — and
-it lands on `ceil(ngrains / (8 * (blksz - 48)))` where a fixed point
-exists there and **one page above it** where none does, which happens
-when `n-1` pages need `n` and `n` pages need `n-1`. So a reader MUST
+`shoalfmt` MUST take the **smallest** page count that covers itself.
+The valid counts are upward closed, since a bigger bitmap leaves
+fewer grains to cover, so the smallest is well defined; and because
+one more page costs exactly one grain, the smallest lands on
+`ceil(ngrains / (8 * (blksz - 48)))` where a fixed point exists there
+and **one page above it** where none does, which happens when `n-1`
+pages need `n` and `n` pages need `n-1`. Both cases occur. So a
+reader MUST
 take `nbmpage` from the recorded `bmapsecs` rather than recomputing
 it, and MUST NOT read a surplus page as a fault: its bits cover grain
-numbers at or above `ngrains`, which nothing ever allocates.
+numbers at or above `ngrains`, which nothing ever allocates. A sizing
+that stopped at the first fixed point it found rather than the
+smallest would not hold this bound: at `blksz` 512 it overshoots by
+up to four pages on a 20 GiB partition, which is harmless on the disk
+and false in this paragraph.
 
 Every region start is rounded up to a `blksz` boundary. The reserved
 run above requires that of `logoff`, and it costs at most
@@ -2436,7 +2445,8 @@ known-answer vectors, a flipped byte caught in every structure,
 §2.7's `Eobj` at its extremes, and §0's verify rule under two procs
 sharing one record), `geomtest` (§2.1's arithmetic at the 4 TiB
 worked example and at the small geometry above, every refusal §2.1
-and §12 make a MUST, the bitmap sizing swept over 300 partitions, and
+and §12 make a MUST, the bitmap sizing swept at `blksz` 512 and 1024
+over partitions from 1 MiB to 24 GiB of simulated size, and
 the maximal-record bound the log sizing rests on), `devtest` (the
 simulated disk's own semantics — the volatile cache, torn and subset
 writes, short counts, the error classes wrapped as a caller wraps

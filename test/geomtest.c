@@ -296,31 +296,40 @@ tmaxrec(void)
 
 /*
  * §2.1: the bitmap covers the grains that are left once it has taken
- * its own pages, which is a fixed point rather than a formula.  It
- * lands on the ceiling wherever a fixed point exists there and one
- * page above it where none does, so the property to hold the sizing
- * to is the bound and the coverage, not an equality — and a reader
- * takes nbmpage from the recorded bmapsecs either way.
+ * its own pages, which is a fixed point rather than a formula.  The
+ * sizing takes the *smallest* such page count, so it lands on
+ * ceil(ngrains / bmbits(blksz)) wherever a fixed point exists there
+ * and exactly one page above it where none does — which happens when
+ * n-1 pages need n and n pages need n-1.  A reader takes nbmpage
+ * from the recorded bmapsecs either way, and MUST NOT read a surplus
+ * page as a fault.
+ *
+ * The bound is swept where it can fail rather than where it is easy.
+ * At the default blksz a page holds 130688 bits, so a bitmap of more
+ * than one page would need ngrains past 2^32 and every partition
+ * agrees with every plausible formula; at blksz 512 a page holds
+ * 3712, a 6 GiB image needs more than a page's worth of pages, and a
+ * sizing that stops at the first fixed point it finds rather than the
+ * smallest overshoots by as much as four pages.  Nothing here needs
+ * an image to exist: it is the arithmetic that is being pinned.
  */
-static void
-tbitmap(void)
+static uvlong
+bmsweep(ulong blksz, vlong lo, vlong hi, vlong step)
 {
 	Fmtcfg c;
 	Super s;
 	vlong part;
 	uvlong bpp, ceil, over;
-	int i;
 
 	over = 0;
-	for(i = 1; i <= 300; i++){
+	for(part = lo; part <= hi; part += step){
 		dflt(&c);
-		c.blksz = 512;
+		c.blksz = blksz;
 		c.objmax = 65536;
 		c.nslots = 512;
 		c.nemap = 256;
 		c.ndirty = 256;
 		c.logbytes = 256*1024;
-		part = (vlong)i*1024*1024 + 512*(i%7);
 		if(geometry(&s, &c, part) < 0)
 			continue;
 		bpp = bmbits(s.blksz);
@@ -329,22 +338,49 @@ tbitmap(void)
 			over++;
 		checks++;
 		if(nbmpage(&s) < ceil || nbmpage(&s) > ceil + 1)
-			fail("a %lld-byte partition took %llud bitmap pages "
-				"for %llud grains, ceiling %llud", part,
-				nbmpage(&s), s.ngrains, ceil);
+			fail("a %lld-byte partition at blksz %lud took %llud "
+				"bitmap pages for %llud grains, ceiling %llud",
+				part, blksz, nbmpage(&s), s.ngrains, ceil);
 		checks++;
 		if(nbmpage(&s)*bpp < s.ngrains)
-			fail("a %lld-byte partition's bitmap does not cover "
-				"its %llud grains", part, s.ngrains);
+			fail("a %lld-byte partition at blksz %lud leaves "
+				"%llud grains uncovered by its bitmap", part,
+				blksz, s.ngrains - nbmpage(&s)*bpp);
 		checks++;
 		if(s.dataoff != s.bmapoff + s.bmapsecs)
 			fail("a %lld-byte partition's data does not follow "
 				"its bitmap", part);
 	}
+	return over;
+}
+
+static void
+tbitmap(void)
+{
+	uvlong over;
+
+	/* the few-hundred-MiB partitions the sizing was first written for */
+	bmsweep(512, 1024*1024, 300LL*1024*1024, 1024*1024 + 512);
+
 	/*
-	 * And the surplus is real rather than hypothetical: at least
-	 * one of those partitions has no fixed point at the ceiling.
+	 * And past 6 GiB, where the bitmap itself is more than one
+	 * page's worth of pages and a fixed point found by jumping is
+	 * no longer within a page of the ceiling.  Simulated size
+	 * only: geometry() is arithmetic over a byte count.
 	 */
+	bmsweep(512, 6LL*1024*1024*1024, 22LL*1024*1024*1024,
+		64LL*1024*1024);
+	bmsweep(1024, 6LL*1024*1024*1024, 24LL*1024*1024*1024,
+		64LL*1024*1024);
+
+	/*
+	 * The surplus page is real rather than hypothetical.  It
+	 * appears where avail is exactly bpp*(n-1) + n sectors, so
+	 * consecutive cases are bpp partitions apart at blksz 512 and
+	 * a sweep of more than bpp partitions in sector steps must
+	 * contain one.
+	 */
+	over = bmsweep(512, 16LL*1024*1024, 16LL*1024*1024 + 4000*512, 512);
 	checks++;
 	if(over == 0)
 		fail("no swept geometry needed a page above the ceiling");
