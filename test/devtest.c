@@ -874,6 +874,43 @@ tcrash(void)
 }
 
 /*
+ * §13: the named crash set and the crash mode are set by two calls,
+ * and neither order may lose the set.  simcrashkeep selects Scnamed
+ * itself, so the reverse order is the one that can go wrong.
+ */
+static void
+tkeeporder(void)
+{
+	Dev *d;
+	uchar w[Secsz], r[Secsz];
+
+	d = sim();
+	pat(w, Secsz, 13);
+	if(devwrite(d, w, Secsz, 8*Secsz) < 0)
+		fail("write: %r");
+	simcrashkeep(d, 8*Secsz, Secsz);
+	simcrashmode(d, Scnamed);
+	simcrash(d);
+	simpeek(d, 8*Secsz, r, Secsz);
+	checks++;
+	if(memcmp(r, w, Secsz) != 0)
+		fail("simcrashmode(Scnamed) after simcrashkeep lost the "
+			"named set");
+
+	/* and every other mode does discard it */
+	if(devwrite(d, w, Secsz, 9*Secsz) < 0)
+		fail("write: %r");
+	simcrashkeep(d, 9*Secsz, Secsz);
+	simcrashmode(d, Scdrop);
+	simcrash(d);
+	simpeek(d, 9*Secsz, r, Secsz);
+	checks++;
+	if(memcmp(r, w, Secsz) == 0)
+		fail("a crash kept a sector no policy named");
+	devclose(d);
+}
+
+/*
  * §7 puts the queue procs, the I/O procs, the flusher and the
  * checkpointer on one Dev, all of them proccreate'd and genuinely
  * parallel.  Every operation of every proc must reach the trace, or a
@@ -1019,6 +1056,7 @@ main(int, char**)
 	tcrash();
 	ttrace();
 	tpoint();
+	tkeeporder();
 	tprocs();
 	tfile();
 	tclassify();

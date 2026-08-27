@@ -516,7 +516,13 @@ simcrash(Dev *d)
 	qunlock(&s->lk);
 }
 
-/* what the next crash does with the sectors written since the last flush */
+/*
+ * What the next crash does with the sectors written since the last
+ * flush.  Selecting Scnamed leaves the named set alone, so the two
+ * calls may come in either order; every other mode discards it,
+ * since a set named for a crash that did not use it is not a set to
+ * inherit.
+ */
 void
 simcrashmode(Dev *d, int mode)
 {
@@ -525,7 +531,7 @@ simcrashmode(Dev *d, int mode)
 	s = d->aux;
 	qlock(&s->lk);
 	s->crashmode = mode;
-	if(s->keep != nil)
+	if(mode != Scnamed && s->keep != nil)
 		memset(s->keep, 0, s->nsec);
 	qunlock(&s->lk);
 }
