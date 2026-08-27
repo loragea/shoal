@@ -195,9 +195,10 @@ instance, and on the primary, before the primary answers `Rwrite`.
 
 Object content is divided into fixed-size **checksum blocks** of
 `blksz` bytes (map header, immutable, power of two, default
-16384 — the target platform's device write unit, §10.2). Block *i* covers bytes `[i*blksz, min((i+1)*blksz, len))`.
-The final partial block is hashed over its actual length. A hole
-(§2.4) hashes as the zero bytes it reads as.
+16384 — the target platform's device write unit, §10.2). Block *i*
+covers bytes `[i*blksz, min((i+1)*blksz, len))`. The final partial
+block is hashed over its actual length. A hole (§2.4) hashes as the
+zero bytes it reads as.
 
 - Block digest: BLAKE2s with a **16-byte** digest, unkeyed, over
   the block's bytes.
@@ -542,13 +543,14 @@ produced an error.
   exists. The counter's durable high-water MUST be recorded, and
   that record MUST be durable, **before any path value it covers is
   issued**; an implementation MAY advance it in batches, which is
-  what keeps a create from costing a durable write. (The first draft suggested a 64-bit hash, which contradicts
-  its own MUST.) Discarding a tombstone (§1.5) destroys the record,
-  so a later create of the same id on that instance allocates a fresh
-  path — the id's `qid.path` is stable for the lifetime of the
-  *record*, not for all time. That is harmless: nothing outside a
-  single fid's lifetime compares paths, and the counter is
-  monotonic, so the two values can never be confused.
+  what keeps a create from costing a durable write. (The first draft
+  suggested a 64-bit hash, which contradicts its own MUST.)
+  Discarding a tombstone (§1.5) destroys the record, so a later
+  create of the same id on that instance allocates a fresh path —
+  the id's `qid.path` is stable for the lifetime of the *record*,
+  not for all time. That is harmless: nothing outside a single fid's
+  lifetime compares paths, and the counter is monotonic, so the two
+  values can never be confused.
 - `qid.vers` MUST be the low 32 bits of `ver`.
 - `stat` reports `length = len`, `mtime`, `uid`/`gid`/`muid` of the
   server's choosing, `mode` `0666`.
@@ -588,7 +590,7 @@ produced an error.
   object (wrapped here typographically only):
 
         oid=f3a91c.7 len=1048576 ver=42 wepoch=17 csum=9f...c1
-        state=live mtime=1755990000 blksz=65536 cur=44
+        state=live mtime=1755990000 blksz=16384 cur=44
         placement=n2.1,n5.0 primary=n2.1 ready=yes
 
   `placement`, `primary` and `ready` are computed from the
@@ -729,7 +731,7 @@ this is what keeps a later replicated monitor (§8.7) additive.
     # shoal cluster map
     map=cluster0 epoch=41
         monid=8c1d0f5a9b2e47c3a6d180fe37b45219
-        objmax=16777216 blksz=65536 replicas=2
+        objmax=16777216 blksz=16384 replicas=2
         csumalg=blake2s256 placehash=blake2s256-64
         pollms=1000 leasems=3000 replms=1000 deadms=10000
         outmins=60 tombdays=7 mincopies=1 retain=8
@@ -1354,10 +1356,11 @@ A `role=client` write, create, truncate or remove on the primary:
    not say `up=no`/`status=out` for this instance (F3). Check that
    this instance is the serving primary for `o`; else `not primary`.
    Check the handoff grace and currency (§5.2); else `not ready`.
-2. **Order.** Take the per-object lock. All concurrent operations on
-   one object are totally ordered here; this is where D1's
-   "primary-ordered" is realised. The lock covers one object only:
-   operations on other objects MUST proceed concurrently (§5.4.1).
+2. **Order.** Enter the object's ordering point (§5.4.1). All
+   concurrent operations on one object are totally ordered here; this
+   is where D1's "primary-ordered" is realised. The ordering covers
+   one object only: operations on other objects MUST proceed
+   concurrently.
 3. **Prepare.** Compute the new key and the resulting `csum`, and
    **stage** the update durably in local storage. The new key is
    `(E, ver+1)` where `ver` is the object's current version; for a
@@ -1476,12 +1479,13 @@ D13 raw store they are tens of milliseconds each, and a commit that
 has to wait for the local store to reclaim its own log space is
 bounded by that store's checkpoint cost rather than by `replms`
 (`docs/design/store.md` §6, §11). Whoever tunes `replms` down toward
-a sub-millisecond LAN needs those numbers in front of them. Every term is named and bounded, and the only
-unbounded work in the write path — the currency check's pull of a
-winning copy from elsewhere, up to `objmax` — is explicitly *not*
-inside a client request: the request answers `not ready` and the pull
-runs in the background (§5.2). With defaults that is a 3 s worst case
-against a 1 ms LAN, and the common case is one `replms` term at most.
+a sub-millisecond LAN needs those numbers in front of them. Every
+term is named and bounded, and the only unbounded work in the write
+path — the currency check's pull of a winning copy from elsewhere, up
+to `objmax` — is explicitly *not* inside a client request: the
+request answers `not ready` and the pull runs in the background
+(§5.2). With defaults that is a 3 s worst case against a 1 ms LAN,
+and the common case is one `replms` term at most.
 The multi-second *exposure* of a dead peer is a retry window the
 client library manages, not a wedged 9P request: by `deadms` the
 monitor has published `up=no`, `C(o)` shrinks, and the retry proceeds
