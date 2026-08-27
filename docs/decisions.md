@@ -169,3 +169,30 @@ class (D5) and weights.
 **Normative:** the attributes and the reserved rule's byte strings.
 **Open at enable time:** the scarce-zone spill question (layer-a
 §4.5).
+
+## D12 — 9front native C toolchain; lib9p for 9P (2026-08-27)
+
+**Decision:** shoal is implemented in 9front's native C — the Plan 9
+C dialect, built with `6c`/`6l` under `mk` — and builds and tests run
+on 9front itself; a Linux host, if any, is git hosting only. The 9P
+server side uses stock `lib9p` (9p(2)) with `srv` in multi-proc mode
+and an implemented `Srv.flush`, as `design/layer-a.md` §5.4.1
+requires. Hashing uses libsec's BLAKE2s (D7).
+**Rationale:** Native C is the only toolchain 9front ships and
+maintains, so it is the only one whose breakage is anyone's problem
+but ours. `lib9p` is what every 9front file server is written
+against; its idioms — `Srv`, `srv`, `respond`, per-request procs —
+are the ones a 9front reviewer expects, and §5.4.1's concurrency and
+`Tflush` requirements are stated in its terms. Building on the
+target means every test exercises the real kernel: `devmnt`'s
+`Tflush`-on-interrupt behaviour, real `msize` negotiation, real
+`ERRMAX` truncation.
+**Considered and rejected:** Go's plan9 port — a secondary-tier port
+with no maintained 9P *server* library, so the 9P surface would be
+ours to write and maintain anyway. plan9port or a Linux cross-build
+— exercises a userspace 9P client, not the kernel's `devmnt`, which
+is exactly the component §5.4.1 and §2.1 are written against.
+**Implementation policy — the whole row.** A reimplementation may
+use any language, library and build system it likes; what a
+conforming implementation must match is the wire and the formats
+(`design/layer-a.md`), not this.
