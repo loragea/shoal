@@ -1,8 +1,9 @@
 # shoal — target contract
 
 **Status: ratified target, 2026-08-23.** This doc is the contract
-the design rounds and milestones build toward; `decisions.md` holds the rationale and the
-normative/implementation-policy split for each decision.
+the design rounds and milestones build toward; `decisions.md` holds
+the rationale and the normative/implementation-policy split for each
+decision.
 
 ## Target, in one sentence
 
