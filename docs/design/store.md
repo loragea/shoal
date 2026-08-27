@@ -2414,8 +2414,15 @@ models what the real one is allowed to do:
   outcome;
 - **one lock over all of it**, so that the procs §7 puts on one
   device do not lose each other's operations out of the trace or
-  race the seeded generator: a run stays reproducible from its seed
-  and an order assertion stays an assertion.
+  race the seeded generator: each operation reaches the trace whole,
+  and a single-proc run stays reproducible from its seed. The lock
+  makes each operation atomic; it does not order them, so under
+  §7's procs the draw sequence from the shared generator still
+  varies run to run and a concurrent schedule is not reproducible.
+  The lock is itself testable: `simslow` yields inside the two
+  critical sections that carry shared counters, so removing the lock
+  fails the many-procs case on every run rather than on some of
+  them.
 
 Points: `stage` (after the last staged grain write), `precommit`
 (after the pre-flush, before the body write), `body:n` (after *n*

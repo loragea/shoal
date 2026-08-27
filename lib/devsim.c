@@ -80,6 +80,8 @@ struct Sim
 	char	point[64];	/* armed crash point, empty if none */
 	int	pointn;
 
+	int	slow;		/* simslow: yield inside the critical section */
+
 	Simop	*trace;
 	long	ntrace;
 	long	atrace;
@@ -96,22 +98,33 @@ simrand(Sim *s)
  * The trace grows without bound and a test program is what runs out
  * of memory if it does; there is nothing this library could return
  * a failure to.
+ *
+ * The read of ntrace and the store back to it are separated, and
+ * simslow puts a yield between them, so that a build whose lock has
+ * been removed loses a record every run rather than three runs in
+ * ten.  Under the lock the yield costs a reschedule and changes
+ * nothing (§13).
  */
 static void
 record(Sim *s, int op, vlong off, long n)
 {
 	Simop *t;
+	long i;
 
-	if(s->ntrace >= s->atrace){
+	i = s->ntrace;
+	if(s->slow)
+		sleep(0);
+	if(i >= s->atrace){
 		s->atrace = s->atrace ? 2*s->atrace : 64;
 		if((t = realloc(s->trace, s->atrace*sizeof *t)) == nil)
 			sysfatal("simdisk: trace: %r");
 		s->trace = t;
 	}
-	t = &s->trace[s->ntrace++];
+	t = &s->trace[i];
 	t->op = op;
 	t->off = off;
 	t->n = n;
+	s->ntrace = i + 1;
 }
 
 /* which operations a fault of this kind can be taken by */
@@ -166,6 +179,7 @@ static void
 land(Sim *s, uvlong sec, uchar *src, int mix)
 {
 	uchar *dst;
+	uvlong nd;
 	ulong i;
 
 	dst = s->live + sec*s->secsz;
@@ -177,7 +191,10 @@ land(Sim *s, uvlong sec, uchar *src, int mix)
 		memmove(dst, src, s->secsz);
 	if(!s->dirty[sec]){
 		s->dirty[sec] = 1;
-		s->ndirty++;
+		nd = s->ndirty;
+		if(s->slow)
+			sleep(0);	/* see record() */
+		s->ndirty = nd + 1;
 	}
 }
 
@@ -533,6 +550,23 @@ simcrashkeep(Dev *d, vlong off, vlong len)
 		hi = s->nsec;
 	for(i = off/s->secsz; i < hi; i++)
 		s->keep[i] = 1;
+	qunlock(&s->lk);
+}
+
+/*
+ * Yield inside the critical sections that count, so that §13's
+ * many-procs case discriminates the sim's own lock every run instead
+ * of when the scheduler obliges.  It is a probe of the lock and
+ * nothing else: with the lock held the yields are invisible.
+ */
+void
+simslow(Dev *d, int on)
+{
+	Sim *s;
+
+	s = d->aux;
+	qlock(&s->lk);
+	s->slow = on;
 	qunlock(&s->lk);
 }
 

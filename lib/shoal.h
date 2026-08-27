@@ -221,6 +221,7 @@ void	simcrash(Dev*);
 void	simcrashmode(Dev*, int mode);
 void	simcrashkeep(Dev*, vlong off, vlong len);
 void	simarm(Dev*, char *point, int n);
+void	simslow(Dev*, int on);		/* yield under the lock; see §13 */
 void	simpoke(Dev*, vlong off, void *buf, long n);	/* to durable storage */
 void	simpeek(Dev*, vlong off, void *buf, long n);	/* from durable storage */
 uvlong	simdirty(Dev*);				/* sectors written but not flushed */

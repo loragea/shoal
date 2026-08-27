@@ -863,6 +863,19 @@ tcrash(void)
  * parallel.  Every operation of every proc must reach the trace, or a
  * crash test asserting an order asserts it of a record with holes in
  * it.
+ *
+ * simslow is what makes this discriminating rather than lucky.  The
+ * sim's two shared counters — the trace index and the dirty count —
+ * are each read, then yielded across, then stored; with the lock
+ * held that is invisible, and with it removed eight procs lose
+ * records on every run.  Without the yields the same mutation ships
+ * green most of the time, which is a test that has caught nothing.
+ *
+ * The trace array is grown past what the procs will need before the
+ * first one is forked, so that the trace is not reallocated under
+ * them.  A build without the lock then fails on the counters, which
+ * is the property being tested, rather than inside the allocator,
+ * which would leave a broken proc and a parent in waitpid.
  */
 static void
 tprocs(void)
@@ -870,11 +883,20 @@ tprocs(void)
 	Dev *d;
 	Simop *t;
 	uchar *buf, *seen;
+	uchar pre[Secsz];
 	long i, n;
 	int j;
 
 	if((d = simopen(Secsz, Nproc*Npwrite + 8, Seed)) == nil)
 		sysfatal("simopen: %r");
+	pat(pre, Secsz, 1);
+	for(i = 0; i < 2*Nproc*Npwrite; i++)
+		if(devwrite(d, pre, Secsz, (vlong)(Nproc*Npwrite)*Secsz) < 0)
+			fail("prefill: %r");
+	if(devflush(d) < 0)
+		fail("prefill flush: %r");
+	eqv("the dirty set is empty before the procs start", simdirty(d), 0);
+	simslow(d, 1);
 	simtracereset(d);
 	for(j = 0; j < Nproc; j++){
 		switch(rfork(RFPROC|RFMEM)){
@@ -910,6 +932,7 @@ tprocs(void)
 			j++;
 	eqv("sectors written other than once", j, 0);
 	free(seen);
+	simslow(d, 0);
 	devclose(d);
 }
 
