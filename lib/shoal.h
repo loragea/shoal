@@ -435,3 +435,26 @@ int	dirtyrecunpack(Dirtyrec *d, uchar *p, long n);
 
 long	slotrecpack(uchar *p, long max, ulong slot);
 int	slotrecunpack(ulong *slot, uchar *p, long n);
+
+/*
+ * Geometry and format, §2.1 and §12.
+ */
+typedef struct Fmtcfg Fmtcfg;
+struct Fmtcfg
+{
+	ulong	secsz;
+	ulong	blksz;
+	uvlong	objmax;
+	ulong	nslots;		/* 0: the §2.1 default */
+	ulong	nemap;		/* 0: the §2.1 default */
+	ulong	ndirty;		/* 0: the §2.1 default */
+	uvlong	logbytes;	/* 0: the §2.1 default */
+	ulong	csumalg;
+	uchar	uuid[16];
+	int	uuidset;
+};
+
+int	geometry(Super *s, Fmtcfg *c, vlong partbytes);
+int	fmtstore(Dev *d, Super *s);
+char*	csumalgname(ulong alg);
+ulong	csumalgno(char *name);

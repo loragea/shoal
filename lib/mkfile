@@ -8,6 +8,7 @@ OFILES=\
 	devfile.$O\
 	devsd.$O\
 	devsim.$O\
+	format.$O\
 	log.$O\
 	ondisk.$O\
 	super.$O\
