@@ -2397,25 +2397,31 @@ T1 formats a **small geometry** — a partition image of a few MiB with
 over one header sector, not over the whole store, and the cases that
 need `nslots = 2^20` are T2's.
 
-**What T1 covers today.** Five programs, all of them against the
+**What T1 covers today.** Six programs, all of them against the
 simulated disk except where a file-backed device is the point:
-`structtest` (§2's byte layouts against known-answer vectors, and a
-flipped byte caught in every structure), `geomtest` (§2.1's
-arithmetic at the 4 TiB worked example and at the small geometry
-above, and every refusal §2.1 and §12 make a MUST), `devtest` (the
+`csumtest` (layer-a §1.4's block digests and object checksums against
+known-answer vectors), `structtest` (§2's byte layouts against
+known-answer vectors, a flipped byte caught in every structure,
+§2.7's `Eobj` at its extremes, and §0's verify rule under two procs
+sharing one record), `geomtest` (§2.1's arithmetic at the 4 TiB
+worked example and at the small geometry above, every refusal §2.1
+and §12 make a MUST, the bitmap sizing swept over 300 partitions, and
+the maximal-record bound the log sizing rests on), `devtest` (the
 simulated disk's own semantics — the volatile cache, torn and subset
 writes, short counts, the error classes wrapped as a caller wraps
 them, aimed and multiple faults, the crash victim policies, the
 recorded trace and eight procs sharing one device — and the
 file-backed device, including the read-only open and the `Wunit`
-cap), `supertest` (§2.2's three clauses under torn
-superblock writes and under the `super` crash point, which is T1.9's
-first half), and `fmtcktest` (`shoalfmt` to `shoalck` over both a
-simulated disk and a file image, and the checker finding what a
-poked-in fault leaves behind). The short-count case is T1.3. Every
-case above the format — the crash matrix, replay, the log, group
-commit, stages, enumeration and the rest of the list — waits on the
-write path it exercises.
+cap), `supertest` (§2.2's three clauses under torn superblock writes
+and under the `super` crash point, which is T1.9's first half), and
+`fmtcktest` (`shoalfmt` to `shoalck` over both a simulated disk and a
+file image; a store with a live one-block object and a live
+three-block one, built through the codecs, with each fault §2 and §5
+name poked into it in turn and the checker's own words read back; and
+a ream cut short, which must leave no valid superblock). The
+short-count case is T1.3. Every case above the format — the crash
+matrix, replay, the log, group commit, stages, enumeration and the
+rest of the list — waits on the write path it exercises.
 
 - **T1.1 crash matrix (R1–R4).** Every point above × {create,
   whole-block write, partial write, truncate, delete, 16 MiB
