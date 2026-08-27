@@ -175,15 +175,21 @@ class (D5) and weights.
 **Decision:** shoal is implemented in 9front's native C — the Plan 9
 C dialect, built with `6c`/`6l` under `mk` — and builds and tests run
 on 9front itself; a Linux host, if any, is git hosting only. The 9P
-server side uses stock `lib9p` (9p(2)): its `srv` loop is
-single-threaded, and slow requests get their own proc through
-`srvrelease`/`srvacquire`, with an implemented `Srv.flush`, as
-`design/layer-a.md` §5.4.1 requires. Hashing uses libsec's BLAKE2s (D7).
+server side uses stock `lib9p` (9p(2)). Its `srv` loop is
+single-threaded, so object operations are pushed to a pool of
+`9pqueue`(2) `Reqqueue`s hashed by oid — which makes the server a
+libthread program started with `threadpostmountsrv` — and
+`Srv.flush` is `reqqueueflush`, as `design/layer-a.md` §5.4.1
+requires. One queue per oid hash and one proc per queue give that
+section's per-object total order and cross-object concurrency by
+construction; `srvrelease`/`srvacquire` with explicit per-object
+locks is the plain-libc alternative and was not taken
+(`design/store.md` §7). Hashing uses libsec's BLAKE2s (D7).
 **Rationale:** Native C is the only toolchain 9front ships and
 maintains, so it is the only one whose breakage is anyone's problem
 but ours. `lib9p` is what every 9front file server is written
-against; its idioms — `Srv`, `srv`, `respond`, per-request procs —
-are the ones a 9front reviewer expects, and §5.4.1's concurrency and
+against; its idioms — `Srv`, `srv`, `respond`, `Reqqueue` — are the
+ones a 9front reviewer expects, and §5.4.1's concurrency and
 `Tflush` requirements are stated in its terms. Building on the
 target means every test exercises the real kernel: `devmnt`'s
 `Tflush`-on-interrupt behaviour, real `msize` negotiation, real
