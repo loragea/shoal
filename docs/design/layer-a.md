@@ -1402,9 +1402,10 @@ A `role=client` write, create, truncate or remove on the primary:
 
 **Durability.** "Commit" means durable against power loss on that
 instance before it is reported — on every acker in step 4 and on the
-primary in step 6. What the underlying 9front file system must be
-asked for to make that true is §10.2 evidence work; that it must be
-asked for is normative here.
+primary in step 6. That it must be obtained is normative here; how it
+is obtained is decisions.md **D13** — a raw partition the instance
+manages itself, on the evidence in `docs/platform/9front-storage.md`
+— and is implementation policy.
 
 **What a failed write means.** The first draft applied the write
 locally in step 6 and then refused to ack, so a failed write mutated
@@ -3036,21 +3037,20 @@ owner should see:
 - Whether a directory read of `/obj` at ~2.6·10^5 entries is
   comfortable on 9front with the snapshot-at-open requirement, and
   what the snapshot costs in memory.
-- Local object-store layout: file per object vs packed store; where
-  block digests and staged updates live; how `(content, ver,
-  wepoch, csum)` atomicity (§1.3) and durability-before-ack (§5.4)
-  are actually obtained on 9front, and what they cost per write.
-  This is the single largest unknown in the design.
-- **How the monitor makes a map durable before acknowledging a
-  commit or a `stale` registration (§8.2).** 9front has no
-  `fsync(2)`; cwfs and hjfs commit on their own schedule. The
-  candidates are a raw partition the monitor manages itself, a file
-  server `ctl` sync where one exists, or a small dedicated log
-  device — with the cost per commit measured, because §5.4 step 5a
-  puts one such acknowledgement inside a client write on the
-  degraded path. This is the **second-largest unknown**, and it is
-  the same question as the item above asked of a different process;
-  neither may be answered by assumption.
+- **Settled:** how `(content, ver, wepoch, csum)` atomicity (§1.3)
+  and durability-before-ack (§5.4) are obtained on 9front, and what
+  they cost. The platform evidence is
+  `docs/platform/9front-storage.md`; the choice it feeds is
+  decisions.md **D13** — each storage-server instance owns a raw
+  partition and implements its own on-disk store with write-ahead
+  commit, at 8.4 ms per commit. That store's own design (layout,
+  where block digests and staged updates live, allocation and
+  reclaim) is documented separately once it exists.
+- **Settled:** how the monitor makes a map durable before
+  acknowledging a commit or a `stale` registration (§8.2) — same
+  evidence, same row. The monitor owns a small raw partition holding
+  the map, and a commit costs one device write, inside the bound
+  §5.4 step 5a puts on it.
 - Whether partial-block repair (§7.5 step 3) is worth implementing.
 - BLAKE2s vs SHA-256 throughput on the fleet, to confirm §9's
   premise with numbers rather than a general claim.
