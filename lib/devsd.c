@@ -139,6 +139,12 @@ sdclose(Dev *d)
 	free(s);
 }
 
+/*
+ * No point function: §13's named crash points are the simulated
+ * disk's, and on a real partition devpoint is a no-op.  A crash at a
+ * point on real hardware is the server killing itself there (§13's
+ * -X), not the device doing anything.
+ */
 static Devops sdops =
 {
 	sdrd,

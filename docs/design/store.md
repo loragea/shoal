@@ -121,7 +121,19 @@ it has one.
   terms for that reason, and both say so.
 - A record's checksum is computed over the record's whole byte range
   **with the checksum field itself zeroed**, and verified the same
-  way.
+  way. Verifying is a *read*: it MUST NOT write to the record, even
+  transiently, because §7 has several procs reading one page at once
+  and a reader that caught the zeroed field would report a checksum
+  failure over a record that is perfectly good.
+- **Reserved bytes are written zero and ignored on read.** Every
+  header below has them; a reader MUST NOT reject a structure because
+  a reserved byte is not zero, because there is no in-place format
+  upgrade — a new field takes a `vers` bump, which is a reformat — so
+  rejecting buys nothing and two decoders differing about it is a
+  bug. The one exception is a *flags* field, whose undefined bits are
+  a MUST-be-zero the reader checks: §2.7's `Eobj` `oflags` is the
+  only one so far, and it is checked because an unknown flag means
+  the record asks for something this build does not know how to do.
 - Every header begins `magic` then `vers`. A store MUST refuse to
   open a structure whose `vers` it does not implement, and MUST say
   so rather than guessing. There is no in-place format upgrade in
@@ -412,7 +424,10 @@ clauses, and the order matters:
 3. If neither is valid, the store MUST NOT write and MUST NOT serve.
 
 In every case the new `gen` is `max(valid gen) + 1`, and the write is
-followed by a flush. On start the store reads both copies and takes
+followed by a flush. `gen` is a `u64` and is not treated as wrapping:
+at one publish per checkpoint interval it is unreachable by many
+orders of magnitude, so no reader compares generations modulo
+anything. On start the store reads both copies and takes
 the valid one with the greater `gen`. Clause 1 is the whole point of
 keeping two copies: without it, a copy torn at a high `gen` steers
 the next write onto the only good copy, and a second fault then

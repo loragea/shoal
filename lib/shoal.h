@@ -53,9 +53,9 @@ char*	csumfmt(char *buf, uchar csum[Csumlen]);
 
 /*
  * The rest of this header is the local object store,
- * docs/design/store.md.  Includers of it must also include <fcall.h>
- * before this file: every on-disk integer is packed and unpacked with
- * the GBIT/PBIT macros 9front exports from there (store.md §0), and
+ * docs/design/store.md.  Anything that packs or unpacks an on-disk
+ * integer must also include <fcall.h> before this file: that is where
+ * 9front exports the GBIT/PBIT macros store.md §0 requires, and
  * nothing here redefines them.
  */
 
