@@ -384,6 +384,25 @@ tfile(void)
 }
 
 /*
+ * §0: the two error strings that are not media errors are recognised
+ * inside whatever the caller wrapped them in.  devsd reports which of
+ * the flush's three system calls failed, so this is the form deverr
+ * actually sees from a real device.
+ */
+static void
+twrapped(void)
+{
+	werrstr("/dev/sdF0/shoal: flush: interrupted");
+	eqv("a wrapped interrupt is not a media error", deverr(), Deintr);
+	werrstr("/dev/sdF0/shoal: flush status: media or partition has changed");
+	eqv("a wrapped Echange", deverr(), Dechange);
+	werrstr("/dev/sdF0/shoal: flush: i/o error");
+	eqv("a wrapped media error is one", deverr(), Deio);
+	werrstr("");
+	eqv("no error string is no error class", deverr(), Denone);
+}
+
+/*
  * §0: the store MUST NOT issue a single pwrite larger than Wunit, and
  * the device layer is where that is enforced rather than at each call
  * site.  A read has the opposite rule and is not capped.
@@ -842,6 +861,7 @@ main(int, char**)
 	ttear();
 	tshort();
 	terrors();
+	twrapped();
 	tlimits();
 	trdonly();
 	tfaults();

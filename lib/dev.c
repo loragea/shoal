@@ -17,13 +17,23 @@
  * were re-declared under an open fid.
  */
 
+/*
+ * Classify the current error string.  Both strings are matched inside
+ * whatever the caller has wrapped them in: a device call reports which
+ * of its three syscalls failed and on which device, so by the time an
+ * error reaches a classifier it is `%s: flush: interrupted' rather
+ * than the kernel's bare word, and an exact match would read an
+ * ordinary client interrupt as media damage (§0).
+ */
 int
 deverr(void)
 {
 	char err[ERRMAX];
 
 	rerrstr(err, sizeof err);
-	if(strcmp(err, "interrupted") == 0)
+	if(err[0] == '\0')
+		return Denone;
+	if(strstr(err, "interrupted") != nil)
 		return Deintr;
 	/* the kernel's Echange is "media or partition has changed" */
 	if(strstr(err, "has changed") != nil)
