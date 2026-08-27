@@ -2362,8 +2362,11 @@ flipped byte caught in every structure), `geomtest` (§2.1's
 arithmetic at the 4 TiB worked example and at the small geometry
 above, and every refusal §2.1 and §12 make a MUST), `devtest` (the
 simulated disk's own semantics — the volatile cache, torn and subset
-writes, short counts, the error classes and the recorded trace — and
-the file-backed device), `supertest` (§2.2's three clauses under torn
+writes, short counts, the error classes wrapped as a caller wraps
+them, aimed and multiple faults, the crash victim policies, the
+recorded trace and eight procs sharing one device — and the
+file-backed device, including the read-only open and the `Wunit`
+cap), `supertest` (§2.2's three clauses under torn
 superblock writes and under the `super` crash point, which is T1.9's
 first half), and `fmtcktest` (`shoalfmt` to `shoalck` over both a
 simulated disk and a file image, and the checker finding what a

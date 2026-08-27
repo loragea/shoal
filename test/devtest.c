@@ -380,6 +380,24 @@ tfile(void)
 	if(memcmp(w, r, Secsz) != 0)
 		fail("a file-backed write did not survive a close and reopen");
 	devclose(d);
+
+	/*
+	 * Growing an image that is already there: shoalfmt -z over an
+	 * existing file is exactly this path, and the bytes below the
+	 * old end must survive it.
+	 */
+	if((d = fileopen(path, Secsz, 64*Secsz, 0)) == nil){
+		fail("grow: %r");
+		remove(path);
+		return;
+	}
+	eqv("a grown image is the size asked for", d->size, 64*Secsz);
+	if(devread(d, r, Secsz, 8*Secsz) < 0)
+		fail("read: %r");
+	checks++;
+	if(memcmp(w, r, Secsz) != 0)
+		fail("growing an image lost what was below the old end");
+	devclose(d);
 	remove(path);
 }
 
@@ -508,6 +526,59 @@ trdonly(void)
 	else
 		devclose(d);
 	remove(path);
+}
+
+/*
+ * devzero is what fmtstore zeroes the log with, in pieces of one
+ * Wunit, from an offset that need not be a Wunit boundary.  A devzero
+ * that stopped after its first piece would leave a store starting on
+ * whatever the disk held.
+ */
+static void
+tzero(void)
+{
+	Dev *d;
+	Simop *t;
+	uchar buf[Secsz], r[Secsz];
+	vlong off, len;
+	long i, n, nw;
+	int bad;
+
+	d = sim();
+	pat(buf, Secsz, 5);
+	for(i = 0; i < Nsec; i++)
+		if(devwrite(d, buf, Secsz, (vlong)i*Secsz) < 0)
+			fail("fill: %r");
+	off = Secsz;			/* as fmtstore zeroes the reserved run */
+	len = 5*4096 + 2*Secsz;
+	simtracereset(d);
+	if(devzero(d, off, len, 4096) < 0)
+		fail("devzero: %r");
+	bad = 0;
+	for(i = 1; i*Secsz < off + len; i++){
+		if(devread(d, r, Secsz, (vlong)i*Secsz) < 0)
+			fail("read: %r");
+		for(n = 0; n < Secsz; n++)
+			if(r[n] != 0)
+				bad++;
+	}
+	eqv("bytes left unzeroed inside the range", bad, 0);
+	if(devread(d, r, Secsz, 0) < 0)
+		fail("read: %r");
+	checks++;
+	if(memcmp(r, buf, Secsz) != 0)
+		fail("devzero wrote below the range it was given");
+	if(devread(d, r, Secsz, off + len) < 0)
+		fail("read: %r");
+	checks++;
+	if(memcmp(r, buf, Secsz) != 0)
+		fail("devzero wrote past the range it was given");
+	nw = 0;
+	for(i = 0; i < simtrace(d, &t); i++)
+		if(t[i].op == Sopwrite)
+			nw++;
+	eqv("devzero requests", nw, len/4096 + 1);
+	devclose(d);
 }
 
 /*
@@ -864,6 +935,7 @@ main(int, char**)
 	twrapped();
 	tlimits();
 	trdonly();
+	tzero();
 	tfaults();
 	tcrash();
 	ttrace();
