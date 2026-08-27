@@ -4,6 +4,10 @@ LIB=libshoal.a$O
 
 OFILES=\
 	csum.$O\
+	dev.$O\
+	devfile.$O\
+	devsd.$O\
+	devsim.$O\
 
 HFILES=\
 	shoal.h\
