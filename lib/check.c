@@ -25,6 +25,23 @@ enum
 	Rdunit	= 65536,	/* §0's bulk-read request size */
 };
 
+/*
+ * One bit per grain, not one byte: the cross-check below wants two
+ * arrays over ngrains, which is 2.7e8 at the envelope of §2.1's
+ * worked example.
+ */
+static int
+getbit(uchar *p, uvlong i)
+{
+	return (p[i/8] >> (i%8)) & 1;
+}
+
+static void
+setbit(uchar *p, uvlong i)
+{
+	p[i/8] |= 1 << (i%8);
+}
+
 typedef struct Ck Ck;
 struct Ck
 {
@@ -32,8 +49,8 @@ struct Ck
 	Ckcfg	*c;
 	Super	*s;
 	int	bad;		/* problems found */
-	uchar	*used;		/* grain -> referenced by a live map */
-	uchar	*alloc;		/* grain -> set in the bitmap */
+	uchar	*used;		/* bit per grain: referenced by a live map */
+	uchar	*alloc;		/* bit per grain: set in the bitmap */
 	uvlong	nlive, ntomb, nfree, nbadent, ncorrupt;
 	uvlong	nemapused, nbademap;
 	uvlong	ndirtyused, nbaddirty;
@@ -162,10 +179,10 @@ refgrain(Ck *k, ulong g, ulong slot, ulong blk)
 			"is %llud", slot, blk, g, k->s->ngrains);
 		return;
 	}
-	if(k->used[g])
+	if(getbit(k->used, g))
 		problem(k, "grain %lud is referenced twice (slot %lud "
 			"block %lud)", g, slot, blk);
-	k->used[g] = 1;
+	setbit(k->used, g);
 }
 
 static void
@@ -320,7 +337,7 @@ ckbitmap(Ck *k)
 		base = i*bpp;
 		for(g = 0; g < bpp && base + g < s->ngrains; g++)
 			if(bmget(buf, g))
-				k->alloc[base + g] = 1;
+				setbit(k->alloc, base + g);
 	}
 	free(buf);
 }
@@ -493,24 +510,27 @@ static void
 ckcross(Ck *k)
 {
 	uvlong g, nref, nmark, phantom, leaked, nfree;
+	int u, a;
 
 	nref = nmark = phantom = leaked = nfree = 0;
 	for(g = 0; g < k->s->ngrains; g++){
-		if(k->used[g])
+		u = getbit(k->used, g);
+		a = getbit(k->alloc, g);
+		if(u)
 			nref++;
-		if(k->alloc[g])
+		if(a)
 			nmark++;
-		if(k->used[g] && !k->alloc[g]){
+		else
+			nfree++;
+		if(u && !a){
 			if(phantom++ == 0)
 				problem(k, "grain %llud is referenced by a "
 					"live map and clear in the bitmap", g);
-		}else if(!k->used[g] && k->alloc[g] && g != 0){
+		}else if(!u && a && g != 0){
 			if(leaked++ == 0)
 				problem(k, "grain %llud is set in the bitmap "
 					"and referenced by nothing", g);
 		}
-		if(!k->alloc[g])
-			nfree++;
 	}
 	if(phantom > 1)
 		problem(k, "%llud grains in all are referenced and unmarked",
@@ -585,6 +605,7 @@ ckstore(Dev *d, Ckcfg *c)
 	Sbsel sel;
 	Super *s;
 	char hb[33];
+	uvlong nbit;
 	int i;
 
 	memset(&k, 0, sizeof k);
@@ -651,10 +672,11 @@ ckstore(Dev *d, Ckcfg *c)
 		return k.bad;
 	}
 
-	if((k.used = mallocz(s->ngrains, 1)) == nil)
-		sysfatal("malloc %llud: %r", s->ngrains);
-	if((k.alloc = mallocz(s->ngrains, 1)) == nil)
-		sysfatal("malloc %llud: %r", s->ngrains);
+	nbit = (s->ngrains + 7)/8;
+	if((k.used = mallocz(nbit, 1)) == nil)
+		sysfatal("malloc %llud: %r", nbit);
+	if((k.alloc = mallocz(nbit, 1)) == nil)
+		sysfatal("malloc %llud: %r", nbit);
 	ckindex(&k);
 	ckbitmap(&k);
 	ckdirty(&k);
