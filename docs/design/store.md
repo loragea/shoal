@@ -82,6 +82,15 @@ it has one.
   write whose length is not a sector multiple silently becomes a
   read-modify-write of every sector it touches
   (`docs/platform/9front-storage.md` §5).
+- **`interrupted` is not an I/O error.** `reqqueueflush` interrupts
+  the proc running a flushed request — 9pqueue(2) says so, and the
+  note it posts aborts whatever system call that proc is in — so any
+  device call in the store can return `interrupted`. The wrappers
+  MUST distinguish it from a media error: it is neither a short
+  count to retry nor damage to report, it means this request has
+  been flushed, and it unwinds into §3.3's step-7 exit. Treating it
+  as an `Eio` would turn an ordinary client interrupt into §5's
+  condemnation paths.
 - **`Echange` is recognised specifically.** Every I/O on an open
   partition fid fails that way once anything re-declares the unit's
   partitions — an operator re-running `diskparts` is enough
@@ -226,6 +235,13 @@ Copy 1 sits at the last sector of the partition so that no single
 device request, and no plausible localised media fault, can reach
 both copies.
 
+The reserved run between copy 0 and the log is alignment, not spare
+room: the log is the region every commit writes, so `shoalfmt` rounds
+`logoff` up to a `Wunit` boundary (32 sectors at the defaults) and
+zeroes what is left over. Nothing reads it, and nothing may start
+using it without a `vers` bump, since a store built before the change
+would not know it was occupied.
+
 Derived quantities, all recorded in the superblock so no reader
 recomputes them from assumptions:
 
@@ -268,8 +284,15 @@ a disk filled with two-block objects needs one extent-map slot per
 empty. `/status` reports `emapfree=` beside `slotfree=` and
 `grainfree=` so the cause of a `disk full` is never ambiguous,
 `shoalfmt` prints how many multi-block objects the geometry it chose
-supports, and §14 records the residual and the format change that
-would remove it.
+supports, and the exhaustion is a distinct, named `disk full` (§6).
+Splitting the two slot spaces is what keeps the extent-map region at
+5.1 GiB while quadrupling block resolution, and the inline one-block
+map (§2.3) is what keeps small objects out of it entirely; what
+remains is that an object of two to `nblkmax` blocks consumes a full
+`emapsz` slot. `nemap` is a format parameter, so an operator who
+knows the workload can size it; the fix if a real workload defeats it
+is §15's size-classed or grain-backed extent map, which is a format
+change and therefore a `vers` bump and a reformat.
 
 **One shoal process per `sd` unit.** The device flush (§3.2) is
 issued through `/dev/sdXX/raw`. That file is **not** exclusive: the
@@ -283,6 +306,15 @@ issue raw commands**, and third parties that open the raw file —
 `scuzz`(8), `disk/smart`, `nusb` — are a hazard on a running store's
 unit for the same reason. Inside the process the same hazard is
 handled by construction: §3.2 gives the raw channel a single owner.
+
+The third party an operator is most likely to create is shoal's own
+monitor. `cmd/shoalmon` commits its map through the same kind of raw
+flush (§10), so **the monitor's map partition MUST be on an `sd` unit
+that no object-store instance is serving**, and `shoalmonfmt` warns
+when the unit it is given already carries a shoal superblock. A
+monitor co-located with an object server on a node is the ordinary
+deployment; a monitor co-located with one on a *unit* is two
+processes writing each other's cdbs, with nothing detecting it.
 
 ### 2.2 Superblock
 
@@ -353,15 +385,19 @@ discarded and refilled from peers. At format, copy 0 is written
 first with `gen = 0` and copy 1 second with `gen = 1`, so `shoalck`
 has a deterministic expectation on a fresh disk.
 
-**Exactly one writer.** Every superblock write carries *all* fields,
-so a writer that builds its image from a stale snapshot regresses
-whatever another writer advanced. The store therefore has **one
-superblock owner** — a single proc; every other proc asks it to
-publish. The owner builds the image under its own lock from live
-in-memory state, issues one write at a time, and does not overlap
-two writes. Five things trigger a publish: format, each checkpoint
-(`ckseq`, `cklogoff`), a `qidnext` batch advance, the first `monid`
-pin, and an `epochhigh` advance. Without the single owner a
+**Exactly one publisher.** Every superblock write carries *all*
+fields, so a writer that builds its image from a stale snapshot
+regresses whatever another writer advanced. The store therefore
+publishes the superblock through **one function under one `QLock`**
+(`publish()`, §7): it takes the lock, builds the whole image from
+live in-memory state, issues one write and one flush, and releases.
+The lock is what serialises publishes and what makes "built from
+live state" mean something; no separate owner proc, no request
+channel and no wake-up are needed for five events per checkpoint
+interval, and the caller pays the write in its own proc. Five things
+trigger a publish: format, each checkpoint (`ckseq`, `cklogoff`), a
+`qidnext` batch advance, the first `monid` pin, and an `epochhigh`
+advance. Without the single publisher a
 checkpoint publishing a stale `qidnext` at a higher `gen` re-issues
 `qid.path` values that layer-a §2.3 forbids reusing, a stale
 `epochhigh` makes layer-a §8.6's rebuild republish an epoch that
@@ -387,6 +423,18 @@ field mean anything:
   1023 paths out of 2^64.
 - `monid` MUST be durable before the instance acts on the map that
   pinned it, for the same reason as `epochhigh`.
+
+**The checkpoint mark enters the image only when it is earned.**
+Because any of the five triggers can publish at any moment, and every
+publish carries `ckseq`/`cklogoff` along with everything else, the
+checkpointer's new mark MUST NOT become part of the live image until
+§2.8 step 2's flush has returned. Until then every publish carries
+the *previous* mark. Otherwise an `epochhigh` publish landing between
+§2.8's step 1 and step 2 writes the new `ckseq` with the pages it
+describes still in a volatile device cache — and, worse, §2.8's
+reclaim rule then licenses overwriting the log records that would
+have rebuilt them. That is the stale-`ckseq` loss above, arriving
+through a publish that was not the checkpoint's.
 
 `epochhigh` changes only when the instance adopts a higher epoch;
 epoch bumps are bounded by map changes and the `tombdays`/2
@@ -467,9 +515,20 @@ Two parallel arrays rather than an array of 20-byte structs, so the
 digest array is a contiguous byte range that can be fed to
 `csumdigests` in one call.
 
-At the defaults an entry is 20504 bytes in 20992 bytes of space — 41
-sectors, one 64 KiB read. Array entries beyond `nblk` MUST be zero,
-and take no part in the object's `csum`.
+At the defaults an entry is 20504 bytes in 20992 bytes of space —
+41 sectors, and one read of the 64 KiB class rather than 41 separate
+requests (§0). Array entries beyond `nblk` MUST be zero, and take no
+part in the object's `csum`.
+
+**A released entry's bytes are not to be trusted.** Freeing an
+extent-map slot writes nothing: the bytes of the previous owner's map
+survive in the region, and they still pass their own `csum128`. What
+makes that safe is the other half of the rule — the commit that
+*allocates* a slot zeroes the whole entry before setting the blocks
+it names, and MUST name every non-hole block below `nblk` (§2.7). So
+no reader ever reaches a byte of a released entry through a live
+object, and `shoalck` treats an entry whose `emapslot` no live index
+entry claims as free space rather than as a fault.
 
 **No live grain number above `nblk`.** `nblk` is a derived value:
 it is `blkcount(len)` and nothing else, and a reader that has both
@@ -533,12 +592,39 @@ and nothing at all on a disk of one-block objects. That is a slow
 start; it is not an operator procedure at three in the morning, and
 `shoalck -R` remains for the offline case.
 
-A page's `ckseq` MUST be ≤ the superblock's `ckseq`. A page carrying
-a **higher** `ckseq` proves the superblock the store chose is stale —
-a media fault on the newer copy, or a lost superblock write — and the
-store MUST NOT start, because replaying from a stale mark over
-already-materialised state is how grains that live objects reference
-get handed out again.
+**The replay-coverage rule.** A page's `ckseq` is the checkpoint
+generation whose effects the page materialises, so a page *ahead* of
+the superblock is the ordinary state after a crash between §2.8's
+step 1 and step 3: the pages landed and the superblock naming them
+never did. A generation comparison therefore cannot be the test —
+it would refuse to start after the commonest checkpoint crash there
+is, which is exactly the one §3.4 calls benign. What has to be
+checked is not the generation but whether the log still covers the
+state already materialised. Let **`Pmax`** be the greatest `ckseq`
+carried by any bitmap page that passes **its own checksum** — a page
+that fails its checksum has an arbitrary `ckseq` and contributes
+nothing. Then:
+
+> After replay the store MUST have applied a valid record whose
+> `seq` is ≥ `Pmax`. If it has not, the log no longer covers state
+> that is already on disk, and the store MUST NOT start.
+
+§5 applies it in that order, after replay and not before. The test
+discriminates the two cases that are byte-indistinguishable without
+it:
+
+- *benign* — a crash during checkpoint *N*. The superblock is
+  *N−1*'s. Step 3 never returned, so §2.8's reclaim never happened
+  and the log from `cklogoff(N−1)` is intact; replay covers
+  `(ckseq(N−1), ckseq(N)]`, reaches `seq ≥ Pmax`, and the store
+  starts and rewrites the pages at the next checkpoint.
+- *malign* — checkpoint *N*'s superblock write returned and its log
+  space was reclaimed, and that copy was later lost to a media fault,
+  so start falls back to *N−1*'s copy over a log that has been
+  overwritten. Replay stops at the first overwritten sector, short of
+  `Pmax`, and the store refuses. Replaying from a stale mark over
+  already-materialised state is how grains that live objects
+  reference get handed out again.
 
 ### 2.6 Dirty-record region
 
@@ -567,6 +653,15 @@ more than the field holds; the store MUST reject `peerlen > 72` and
 When it is exhausted the store discards every fine-grained record for
 the peer with the most records and marks that peer `fullsync`, which
 layer-a §7.1 explicitly permits.
+
+The region is read at start (§5) and the in-memory set is built from
+it before replay, whose `Edirty` entries then add to and remove from
+it. That is what makes the records worth their 16 MiB even though the
+next paragraph re-syncs everything anyway: the coarse `fullsync` flag
+says *this peer is behind on something*, and layer-a §7.1's
+fine-grained records are what let the reconcile pass name the objects
+instead of walking the disk. R7 is a durability requirement, and it is
+met by these records surviving the crash, not by the restart flag.
 
 **`fullsync` flags are not persisted.** On start the store sets
 `fullsync` for every peer, because that is the safe default and a
@@ -609,14 +704,30 @@ a torn header can carry a garbage length, and hashing an unbounded
 range on the strength of an unverified field is how a replay turns a
 crash into a fault.
 
-A record MUST NOT straddle the end of the region. If the next record
-does not fit before the end, the writer emits a one-sector record
-with `nent=0` and `Fwrap` set, and places the real record at the
-region start. The wrap record carries a sequence number like any
-other, so sequence contiguity is unbroken; a reader that has applied
-a record with `Fwrap` set continues at the region start rather than
-at `+nsec`. A wrapping commit is therefore two device writes and not
-one, which is the one exception to §11's per-commit cost.
+A record MUST NOT straddle the end of the region, and the
+continuation rule is **modular**: a reader that has applied a record
+continues at `+nsec`, and at the region start when `+nsec` reaches
+the region end. A record that ends flush with the region end
+therefore wraps by arithmetic and needs no marker. That case is not a
+corner: a workload of one-sector records — the common commit —
+counts the free tail down 3, 2, 1, 0 and reaches the end exactly, and
+a rule that demanded a marker there would demand a sector that does
+not exist. `Fwrap` covers the other case, where sectors remain before
+the end but too few for the next record: the writer emits a one-sector
+record with `nent=0` and `Fwrap` set and places the real record at the
+region start, and a reader that has applied a record with `Fwrap` set
+continues at the region start whatever `+nsec` says. The wrap record
+carries a sequence number like any other, so sequence contiguity is
+unbroken in both cases.
+
+A wrapping commit is therefore two device writes and not one, which
+is the one exception to §11's per-commit cost. The wrap record
+belongs to the batch it precedes and is written **before** that
+batch's post-flush, so one flush makes both durable. Written after
+it, the wrap record would be a link in the log's own continuity that
+a crash can drop — replay would apply the last record before the end
+and continue at `+nsec` into the index region, discarding every
+commit written after the wrap.
 
 Entries are `{u8 kind, u8 flags, u16 pad, u32 len}` — `len` counting
 the whole entry including this eight-byte header — followed by the
@@ -644,19 +755,64 @@ eighth of the log region.
     u32  nfree
     nfree × u32 grain
 
-`nmap` names only the blocks this commit changes; every other block
-below `nblk` is unchanged. `nfree` names the grains this commit
-releases — the old grains of the blocks it replaced, and every grain
-beyond a new shorter `len`. Applying an `Eobj` sets absolute values,
-and it MUST, in this order: set the four-tuple and `len` in the index
-entry; derive `nblk = blkcount(len)`; set `grain[b]`/`dig[b]` for
-each named block; **clear `grain[i]` and `dig[i]` for every
-`i ≥ nblk`**; free every grain in `nfree`; and, if `emapslot` differs
-from the entry's current value, allocate or release the extent-map
-slot accordingly. The clearing clause is §2.4's invariant, and it is
-what makes a truncate that names no blocks correct rather than
-merely cheap. When `emapslot` is 0 the map being set is the index
-entry's inline `grain0`/`dig0`, and `nmap` names at most block 0.
+`nmap` names the blocks this commit changes; every other block below
+`nblk` is unchanged, except under the slot rule below. `nfree` names
+the grains this commit releases — the old grains of the blocks it
+replaced, and every grain beyond a new shorter `len`.
+
+Applying an `Eobj` sets absolute values, and it MUST, in this order:
+
+1. set the four-tuple and `len` in the index entry, and derive
+   `nblk = blkcount(len)` from that `len`;
+2. if `emapslot` differs from the entry's current value, allocate or
+   release the extent-map slot **and zero the whole target map** —
+   all `emapsz` bytes of a newly allocated extent-map entry, or
+   `grain0`/`dig0` when `emapslot` becomes 0;
+3. set `grain[b]`/`dig[b]` for every block named by `nmap`;
+4. make every block in `[old nblk, nblk)` that `nmap` does not name
+   a hole: `grain = 0` and the digest of the zero bytes it reads as
+   (§2.4) — the precomputed full-block zero digest, or the short
+   final block's, computed from `len`;
+5. **clear `grain[i]` and `dig[i]` for every `i ≥ nblk`**;
+6. free every grain in `nfree`.
+
+Clause 5 is §2.4's invariant on the shrinking side, and it is what
+makes a truncate that names no blocks correct rather than merely
+cheap. Clause 4 is the same invariant on the growing side: a sparse
+extend across many blocks stays a metadata-only commit, and the write
+path and replay agree on what the new blocks hash as, so `csum` (§4)
+matches the digest array without the commit having to name 65535
+holes. Where they disagreed, the object would fail its next scrub and
+be routed to a whole-object repair it does not need.
+
+**The extent-map slot rule.** A commit that changes `emapslot` in
+either direction MUST name in `nmap` **every block below `nblk` that
+is not a hole**, and applying it zeroes the target map first (clause
+2). Both halves are load-bearing and neither is sufficient alone:
+
+- Without the zeroing, a slot released by a deleted object still
+  holds that object's map — §2.4 zeroes nothing on release — so a
+  commit that allocates that slot and does not name every block
+  inherits live grain numbers the allocator has since handed to other
+  objects, and a read of the object serves another object's bytes.
+  That is §2.4's invariant broken one slot-space over, and it is
+  reachable without any crash.
+- Without the naming, the zeroing turns those same blocks into holes:
+  an object that grew past one block would read its own block 0 as
+  zeros, and a shrink to one block would leave `grain0`/`dig0` empty
+  rather than carrying block 0 out of the entry being released.
+
+So the rule covers all three transitions: inline→slot (block 0 is
+named even when the write did not touch it), slot→inline including
+truncate (block 0 is named unless it is a hole), and the reuse of a
+slot by a different object. When `emapslot` is 0 the map being set is
+the index entry's inline `grain0`/`dig0`, and `nmap` names at most
+block 0.
+
+The cost is bounded and rare: a slot-changing commit carries at most
+`nblkmax` map triples — the same 28.2 KiB the whole-object `op=full`
+record already costs — and only on a transition, not on the writes
+either side of it.
 
 **`Edirty` (kind 2)** — `{u8 op (0 remove, 1 add), u8 peerlen,
 u8 oidlen, u8 pad, u64 epoch, peer[], oid[]}`.
@@ -694,15 +850,38 @@ A checkpoint:
 3. writes the superblock with the new `ckseq` and `cklogoff`, and
    flushes.
 
+**A checkpoint materialises committed state only.** The bitmap pages
+it writes carry the *committed* allocation state — the bits set by
+records at or below `ckseq` — and never a staged reservation. Staged
+grains (§3.1, §3.6) are held in a side reservation set that the
+allocator consults and the checkpointer ignores (§6). Without that
+split a checkpoint taken while a stage is live would write a durable
+bit for a grain no record ever allocates: the stage's owner dies, the
+grains go back to the in-memory free map, a crash follows, and replay
+— which knows nothing of stages — leaves them marked allocated and
+referenced by nothing until `shoalck -R`. It also breaks §3.4's
+proof, which needs a page to be dirty at checkpoint *N* **iff** a
+record in `(ckseq(N−1), ckseq(N)]` changed it; a stage that dirties a
+page with no record behind it is damage replay cannot repair.
+
+The new `ckseq`/`cklogoff` become publishable only after step 2's
+flush has returned (§2.2), so a publish triggered by anything else
+mid-checkpoint carries the old mark.
+
 Its cost is therefore proportional to the state dirtied since the
 last checkpoint and to nothing else, which is what lets §6 put a
 number on how long a commit may wait for log space.
 
-`ckseq` MUST NOT exceed the log writer's **durable watermark** (§7).
-Materialising in-memory state whose backing batch has not reached
-the watermark, and then publishing a `ckseq` past a record that never
-became durable, would leave the checkpoint describing a write that
-does not exist.
+`ckseq` MUST NOT exceed the commit path's **durable watermark**
+(§7), which is reached only when a batch is durable *and* has been
+applied to in-memory state. Materialising in-memory state whose
+backing batch has not reached the watermark, and then publishing a
+`ckseq` past a record that never became durable, would leave the
+checkpoint describing a write that does not exist; publishing a
+`ckseq` past a record that is durable but whose effects the
+checkpointer has not yet seen in memory is the same fault from the
+other side — replay would start above the record, and the bits and
+map entries it would have set are in neither place.
 
 Log space before the *newly published* `cklogoff` is reclaimed only
 after step 3 has returned. Reclaiming earlier would let a crash leave
@@ -730,13 +909,20 @@ Serialised against every other operation on the same object by §7's
 queue:
 
 1. Read the extent-map entry if the object has one and it is not in
-   the cache (one 64 KiB read, 41 sectors at the defaults); a
-   one-block object's map is already in the in-memory index entry.
-2. For each block the operation touches, allocate a **fresh** grain
+   the cache (41 sectors at the defaults, one read of the 64 KiB
+   class); a one-block object's map is already in the in-memory index
+   entry.
+2. For each block the operation touches, reserve a **fresh** grain
    from the in-memory free map. The allocator never returns a grain
-   that any committed map references, and never returns one released
-   by a commit that is not yet durable (§3.5). This is what makes a
-   stage invisible: it writes only where nothing is published.
+   that any committed map references, one released by a commit that
+   is not yet durable (§3.5), or one another stage has reserved. A
+   reservation goes into the **staged set** (§6), not into the
+   bitmap: the checkpoint materialises committed allocation state
+   only (§2.8), so a stage cannot leave a durable bit behind it. The
+   grain becomes allocated in the free map when the commit that names
+   it is applied (§3.2), and the reservation is dropped either way.
+   This is what makes a stage invisible: it writes only where nothing
+   is published, and it records nothing.
 3. Compose each touched block's new content. A write covering a whole
    block needs no read. A partial write reads the old grain (or takes
    zeros for a hole), merges the new bytes, and re-hashes the block —
@@ -757,8 +943,8 @@ Nothing in this step is published. Nothing in it is a commit.
 
 ### 3.2 Commit — step 6
 
-The staged entries are handed to the log writer, which batches them
-with any other commits pending at that instant (§7) and performs:
+The committing proc takes the staged entries, batches them with any
+other commits pending at that instant (§7), and performs:
 
     write the record's body sectors  — every sector but the first
     one device flush                 — covers the batch's grain
@@ -819,11 +1005,11 @@ write-cdb / read-data / read-status triple, 4.2 µs per round trip on
 a held fd against 462 µs if the file is opened and closed around each
 command. The triple is per-unit kernel state, so it MUST NOT be
 interleaved: within the store, **one flusher proc owns the raw fd**
-and every flush — the log writers', the checkpointer's, the
-superblock owner's — is a request to it. The flusher coalesces:
+and every flush — the committers', the checkpointer's, the
+superblock publisher's — is a request to it. The flusher coalesces:
 a caller asks for "a flush that began after time *t*", and one
 device flush satisfies every caller waiting at the moment it is
-issued, which is what keeps `logdepth` concurrent log writers from
+issued, which is what keeps `logdepth` concurrent committers from
 costing `logdepth` flushes. Outside the store the same exclusion is
 the operator's (§2.1).
 
@@ -843,14 +1029,30 @@ IDE unit the flush is silently faked by the driver, so `-w` is also
 the honest flag there, together with disabling the drive's write
 cache; `cat /dev/sdctl` names the driver and `/status` reports it.
 
-After the commit returns, the in-memory index entry, extent map, free
-map and dirty set are updated, the grains the commit released are put
-on the batch's deferred-free list (§3.5), and the operation leaves
-its queue.
+What `-w` changes is the sequence: with no raw channel there is no
+flush to issue, so the commit above becomes body write, header write,
+and the ordering argument rests entirely on the operator's assertion
+that the unit is write-through — issue order is platter order only if
+nothing is cached. Everything else is unchanged, and T1.13, which
+asserts flush *placement*, does not apply to a `-w` store: there are
+no flushes to place.
+
+**One apply function, two callers.** When the post-flush returns, the
+committing proc applies **the whole batch's entries** — its own and
+its batch-mates' — to in-memory state through the same apply function
+§5's replay uses: the index entry, the extent map, the free map (both
+the allocations the record names and the frees, which is where §3.5's
+deferral is discharged), the staged set, and the dirty set. Applies
+run in `seq` order, sequenced by the watermark (§7); only then are the
+waiters woken and the operations released from their queues. Using one
+function for the live path and for replay is not tidiness: the two
+disagreeing about an unnamed block or an inherited grain number is a
+bug that appears only after a crash, which is the most expensive place
+for one to be.
 
 ### 3.3 Discard — step 7, `Tflush` and failure
 
-Return the staged grains to the in-memory free map, drop the composed
+Release the stage's grain reservations (§3.1), drop the composed
 entries, leave the queue. **No durable write.** The bytes written
 into those grains in §3.1(4) are simply not referenced by anything
 and are overwritten by whoever allocates them next.
@@ -878,14 +1080,14 @@ new one. Taking the points in order:
 | Point | What is on disk | Outcome |
 |---|---|---|
 | P0 before any grain write | nothing changed | old |
-| P1 during or after grain writes, before enqueue | new bytes in grains nothing references; the checkpointed bitmap does not mark them allocated and no log record allocates them | old |
+| P1 during or after grain writes, before enqueue | new bytes in grains nothing references; they are reserved in memory (§3.1), and the checkpoint materialises committed allocation state only (§2.8), so nothing durable marks them allocated and no log record allocates them | old |
 | P2 after enqueue, before the pre-flush | as P1 | old |
 | P3 during the body write, or during the header write | no valid header, or a header that fails its checksum or its sequence test | old |
 | P4 after the header write returns, before the post-flush | the record is durable or it is not; if not, P3 | old or new, and nothing acked either way |
 | P5 after the post-flush, before `Rwrite` | new | new; layer-a §5.4's "may or may not have been applied" covers exactly this |
 | P6 after `Rwrite` | new | new, guaranteed — R1 |
-| checkpoint, mid-way | half-written index/extent-map/bitmap pages; the superblock still names the *old* `ckseq` | replay re-applies from the old mark over the half-written pages; entries carry absolute values, so replay is idempotent |
-| superblock write | the other copy is valid and one generation older | replay from its (older) mark, which the reclaim rule guarantees the log still covers |
+| checkpoint, mid-way | half-written index/extent-map/bitmap pages, some stamped with the new `ckseq`; the superblock still names the *old* one | replay re-applies from the old mark over the half-written pages; entries carry absolute values, so replay is idempotent. Pages ahead of the superblock are expected here, and §2.5's replay-coverage rule is what tells this case from a lost superblock |
+| superblock write | the other copy is valid and one generation older | replay from its (older) mark. The reclaim rule guarantees the log still covers it when the newer write simply did not land; when the newer copy landed and was *later* lost to a media fault, its log space may already be reclaimed, and §2.5's replay-coverage rule is what detects that and refuses to start |
 
 A batch carrying several objects' commits is one record, so the whole
 batch is at the same point at every instant. §7 explains why a batch
@@ -904,6 +1106,15 @@ Entries in a written page that did *not* change are rewritten with
 byte-identical content, so any mixture of old and new bytes in their
 sectors is still their correct image.
 
+The proof needs the dirty-iff-a-record-touched-it step in both
+directions, and the bitmap is where it could fail: a page dirtied by
+something no record names is damage replay cannot repair, because
+there is nothing to replay. §2.8's rule that the checkpoint
+materialises committed allocation state only — reservations live in
+the staged set, not in the bitmap — is what keeps the "iff" true
+there, and §2.5's coverage rule is what catches the one case where
+replay's range is not the checkpoint's.
+
 ### 3.5 The deferred-reuse rule
 
 **A grain, an index slot or an extent-map slot released by a commit
@@ -916,10 +1127,12 @@ commit was lost too. Replay restores A's old extent map, which still
 points at *g* — whose bytes are now B's. A four-tuple that verifies
 against nothing, produced by two writes that both correctly failed.
 
-The implementation is a per-batch deferred-free list drained when the
-batch's flush returns. It costs one pointer per batch and it is the
-only ordering rule in the write path that is not obvious from the
-log.
+The implementation is §3.2's apply order and nothing else: a commit's
+frees are part of applying its record, and a batch is applied when
+its post-flush has returned. There is no separate deferred-free
+structure to keep in step, and the rule holds for all three kinds of
+release — grains, index slots and extent-map slots — because the
+apply function handles all three.
 
 ### 3.6 Multi-request stages — `op=full`
 
@@ -935,28 +1148,38 @@ an object on a `/repl` fid, and holds: the oid, the declared final
 `len`, `force`, the grains staged so far with their digests, and the
 time of the last chunk. It is owned by the fid.
 
-- Each chunk allocates fresh grains from the in-memory free map and
-  writes them (§3.1 steps 2–4). Nothing is published and no log
-  record is written.
+- Each chunk reserves fresh grains (§3.1 steps 2–4) and writes them.
+  Nothing is published and no log record is written.
 - **`final=1`** takes the object's queue (§7), re-reads the
   receiver's current key, applies layer-a §5.5's comparison against
   it — greater, or equal with `force=1` — and, if it passes, commits
   one `Eobj` naming every staged block and freeing every grain the
   object held before. If it fails, the stage is discarded exactly as
   below and the error is layer-a §5.5's.
-- **Lifetime.** A stage is discarded, and its grains returned to the
-  free map, on `Tclunk` of the fid, on a `Tflush` of any of its
-  chunks, when no chunk for it has arrived for `stagems` (policy,
-  default 30·`replms`), and at restart — which is free, because a
-  stage is memory-only: its grains are allocated from the in-memory
-  free map and named by no record, so no restart path can resurrect
-  them and none can leak across one.
-- **Bound.** At most `stagemax` grains may be staged on one `/repl`
-  fid (policy, default 2048, i.e. two maximal objects). A chunk that
-  would exceed it fails `disk full`, and `/status` reports
-  `staged=<grains>`. Without a bound, a sender that dies mid-transfer
-  leaves grains held by nothing until the fid is clunked, and a heal
-  of a whole disk can answer `disk full` with the disk nearly empty.
+- **Lifetime.** A stage is discarded, and its reservations released,
+  on `Tclunk` of the fid, on a `Tflush` of any of its chunks, when no
+  chunk for it has arrived for `stagems` (policy, default
+  30·`replms`), and at restart — which is free, because a stage is
+  memory-only: its grains are *reserved* (§3.1) rather than
+  allocated, no record names them, and §2.8 keeps reservations out of
+  the checkpointed bitmap, so no restart path can resurrect them and
+  none can leak across one.
+  Were reservations written into the bitmap, a checkpoint taken while
+  a stage was live would leak 32 MiB per abandoned maximal transfer
+  across every subsequent restart.
+- **Bound, per fid and per process.** At most `stagemax` grains may
+  be staged on one `/repl` fid (policy, default 2048, i.e. two
+  maximal objects), and at most `stagetot` grains across the whole
+  process (policy, default 16384, one eighth of a 4 TB disk's
+  reservation capacity being far more than any heal needs at once).
+  A chunk that would exceed either fails `disk full`, and `/status`
+  reports `staged=<grains>`. The per-fid bound alone is not a bound:
+  the number of `/repl` fids is not limited, so a hundred senders
+  each below `stagemax` still reserve the disk. Without a bound, a
+  sender that dies mid-transfer leaves grains held by nothing until
+  the fid is clunked, and a heal of a whole disk can answer
+  `disk full` with the disk nearly empty. Both counters are one
+  integer each.
 
 ## 4. Read path, holes and re-hashing
 
@@ -970,7 +1193,10 @@ or, when `grain[i]` is 0, deliver zeros. The map is the index
 entry's inline map for a one-block object and the extent-map entry
 otherwise. Serialising the read against commits on the same object
 is what stops a grain being freed under the reader; §3.5 makes that
-sufficient.
+sufficient. Every reader of an object's grains depends on that
+serialisation, which is why the scrubber reads through the object's
+queue like anything else (§8) rather than walking the disk beside
+the write path.
 
 **Write of a whole block.** No read. Compose, hash, allocate, write.
 
@@ -992,10 +1218,14 @@ whole digest array, which is why the array is stored contiguously.
   or beyond the new `nblk` (§2.4).
 
 A truncate that lands on a block boundary therefore costs no data
-read and no data write: it is an `Eobj` with `nmap` empty, `nfree`
-naming the released grains, and the apply rule doing the clearing.
-So is a delete. What it is not is a commit that leaves the map
-alone — that is the bug §2.4 exists to forbid.
+read and no data write: it is an `Eobj` with `nfree` naming the
+released grains and the apply rule doing the clearing, and `nmap`
+empty — unless it takes the object to one block or fewer, where it
+releases the extent-map slot and so must name block 0 unless block 0
+is a hole (§2.7's slot rule), which costs one map triple and still no
+device read. A delete is the same shape with `len = 0`. What neither
+is, is a commit that leaves the map alone — that is the bug §2.4
+exists to forbid.
 
 **The digest array is consistent with content by construction.** The
 new grain and the new digest for block *i* are published by the same
@@ -1028,25 +1258,39 @@ lose arbitration against everything including absence.
    range-check `oidlen` (1..128), `state` (0..2) and `emapslot`
    (< `nemap`), and record which slots failed — but condemn nothing
    yet.
-5. Read the bitmap. A page whose `ckseq` exceeds the superblock's
-   means the superblock is stale and the store MUST NOT start (§2.5).
-   A page that fails its checksum sets the rebuild flag; it is not a
-   refusal.
-6. Replay. Start at `cklogoff` with the expected sequence seeded at
+5. Read the bitmap. A page that fails its checksum sets the rebuild
+   flag; it is not a refusal, and it contributes no `ckseq`. Record
+   `Pmax`, the greatest `ckseq` over the pages that pass their own
+   checksum (§2.5); nothing is judged by it yet.
+6. Read the dirty region in 64 KiB requests and build the in-memory
+   dirty set: verify each record's `csum128`, range-check `oidlen`
+   (1..128) and `peerlen` (1..72), and take the `state=used` records
+   that pass. A record that fails its checksum is dropped and counted
+   in `/status`; it is at worst one peer's fine-grained mark, and the
+   restart's `fullsync` (step 12) covers it. This is the region's
+   only reader, and R7 is what it is for (§2.6).
+7. Replay. Start at `cklogoff` with the expected sequence seeded at
    **`ckseq + 1`** — the seed is what makes an earlier lap's record
    unacceptable however plausible its bytes — and, for each record:
    bounds-check `nsec` against the region before using it, verify the
    checksum over `nsec*secsz`, check `seq` against the expectation,
    apply the entries, then continue at the region start if `Fwrap` is
-   set and at `+nsec` otherwise. Stop at the first record that is
-   invalid or out of sequence. Applying an entry means setting
-   absolute values — this slot's four-tuple becomes these bytes,
-   block *i* becomes grain *g* with digest *d*, blocks at or beyond
-   `nblk` become holes, this grain becomes allocated, this
-   extent-map slot becomes this object's, this dirty record exists —
-   so replay is idempotent and a partially checkpointed region is
-   corrected by it.
-7. Read the extent-map entry of each replayed slot that has one, and
+   set, at the region start if `+nsec` reaches the region end, and at
+   `+nsec` otherwise (§2.7). Stop at the first record that is invalid
+   or out of sequence. Applying an entry means setting absolute
+   values — this slot's four-tuple becomes these bytes, block *i*
+   becomes grain *g* with digest *d*, blocks at or beyond `nblk`
+   become holes, this grain becomes allocated, this extent-map slot
+   becomes this object's and is zeroed before its blocks are set,
+   this dirty record exists or is gone — so replay is idempotent and
+   a partially checkpointed region is corrected by it. Replay uses
+   the apply function the commit path uses (§3.2).
+8. Check replay coverage. The highest `seq` replay applied MUST be
+   ≥ `Pmax` from step 5; if it is not, the log no longer covers state
+   the bitmap has already materialised and the store MUST NOT start
+   (§2.5). A store with no valid bitmap page has no `Pmax` and this
+   step passes vacuously — the rebuild in step 11 is what covers it.
+9. Read the extent-map entry of each replayed slot that has one, and
    apply its deltas. `nblk` is recomputed from the replayed `len`,
    never trusted from the entry's header sector. **A failing
    `csum128` on a replayed entry is not fatal**: the bytes replay
@@ -1057,45 +1301,52 @@ lose arbitration against everything including absence.
    replay did not cover, and the slot goes to `/lost`. A failing
    `csum128` on an entry replay did *not* touch is fatal for that
    slot in the same way.
-8. Condemn what is left. An index entry that still fails its checksum
-   after replay, or fails a range check, is genuine media damage: it
-   is listed in `/lost` with `kind=corrupt`, its slot is not reused,
-   and it is not served. `/lost` requires an `oid=` field, which a
-   damaged entry cannot supply honestly — the store reports the slot
-   number as the `oid=` value prefixed `slot:` and says so in the
-   line, rather than printing 128 bytes it does not trust.
-9. Complete the free map: the bitmap, plus every allocation and free
-   replay applied. If step 5 set the rebuild flag, rebuild
-   it instead by scanning every live object's map (§2.5), log the
-   event, and report `bmaprebuild=yes`.
-10. Set `fullsync` for every peer (§2.6). Clear `cur` for every
+10. Condemn what is left. An index entry that still fails its
+    checksum after replay, or fails a range check, is genuine media
+    damage: it is listed in `/lost` with `kind=corrupt`, its slot is
+    not reused, and it is not served. The line carries `slot=<n>`
+    and **omits `oid=`**, rather than printing 128 bytes the store
+    does not trust or inventing an oid layer-a §1.2's grammar would
+    not admit; §14(15) records the deviation from layer-a §2.2's
+    field list.
+11. Complete the free map: the bitmap, plus every allocation and free
+    replay applied, minus nothing — there are no reservations at
+    start (§3.6). If step 5 set the rebuild flag, rebuild it instead
+    by scanning every live object's map (§2.5), log the event, and
+    report `bmaprebuild=yes`.
+12. Set `fullsync` for every peer (§2.6). Clear `cur` for every
     object — which costs nothing, because `cur` is never on disk
     (§14(1)).
-11. Set the log tail after the last valid record, take `qidnext` from
+13. Set the log tail after the last valid record, take `qidnext` from
     the superblock, and start serving.
 
-**Cost bound (R17).** Steps 4–7 read the index region, the bitmap and
-at most the log, and hash everything they read. At the defaults and
-`nslots = 2^20` that is 256 MiB + 32 MiB + ≤ 64 MiB in 64 KiB
-requests — 4.4 s at the measured 80 MB/s — plus the hashing, which is
-the larger term: 2^20 index entries at 4.86 µs each is 5.1 s of CPU.
-Call it ten seconds at the recommended sizing, half of it hashing.
-Step 7 adds one extent-map read per multi-block object touched since
-the last checkpoint. The bound is a function of format constants and
-of nothing else — in particular not of the number of objects that
-were being written when the crash happened, and not of their sizes.
-The rebuild path of step 9 is the exception and says so.
+**Cost bound (R17).** Steps 4–9 read the index region, the bitmap,
+the dirty region and at most the log, and hash everything they read.
+At the defaults and `nslots = 2^20` that is 256 MiB + 32 MiB + 16 MiB
++ ≤ 64 MiB in 64 KiB requests — 4.6 s at the measured 80 MB/s — plus
+the hashing, which is the larger term: 2^20 index entries at 4.86 µs
+each is 5.1 s of CPU, and the other regions add ~2 s. Call it ten to
+twelve seconds at the recommended sizing, half of it hashing. Step 9
+adds one extent-map read per multi-block object touched since the
+last checkpoint. The bound is a function of format constants and of
+nothing else — in particular not of the number of objects that were
+being written when the crash happened, and not of their sizes. The
+rebuild path of step 11 is the exception and says so.
 
 **What an operator sees when it fails.** Every refusal above prints
 one line naming the structure, the offset, and the tool that
 addresses it, and exits non-zero — the store never starts in a
 degraded mode it did not name. A corrupt index entry is a running
 store with an object in `/lost`. A bitmap page that fails its
-checksum is a slow start, not a refusal. A bitmap page from a future
-checkpoint, or two invalid superblocks, is a store that will not
-start: for the latter the honest answer is `shoalfmt -r` plus refill
-from peers, since the disk's identity is gone, which by layer-a §1.5
-makes it a reformat-before-rejoin case anyway.
+checksum is a slow start, not a refusal. A bitmap page ahead of the
+superblock is *not* a refusal either — it is the ordinary
+mid-checkpoint crash — but a replay that cannot reach `Pmax` is,
+because the log no longer describes what the disk already holds; the
+tools for it are `shoalck` and, if the log is genuinely gone, refill
+from peers. Two invalid superblocks is a store that will not start,
+and there the honest answer is `shoalfmt -r` plus refill from peers,
+since the disk's identity is gone, which by layer-a §1.5 makes it a
+reformat-before-rejoin case anyway.
 
 ## 6. Space management
 
@@ -1106,9 +1357,19 @@ allocation is "find a clear bit". The in-memory free map is a bitmap
 plus a rotating cursor and a free count; allocation is O(1)
 amortised and there is **no external fragmentation and no
 coalescing**, because there is nothing of a different size to
-coalesce. That is the whole payoff of tying the grain to `blksz`:
-one number per block locates the bytes and indexes the digest, one
-bit per grain manages space, and the allocator is thirty lines.
+coalesce.
+
+Beside it is the **staged set**: the grains stages have reserved and
+no record has yet named (§3.1, §3.6). The allocator skips them; the
+checkpointer does not see them (§2.8); a grain leaves the set for the
+bitmap when the commit naming it is applied, or leaves it for nothing
+when the stage is discarded. It is a small hash of grain numbers,
+bounded by `stagetot` plus the writes in flight, rather than a second
+32 MiB bit array, because that is what it holds.
+
+Fixed grains are the whole payoff of tying the grain to `blksz`: one
+number per block locates the bytes and indexes the digest, one bit
+per grain manages space, and the allocator is thirty lines.
 
 The cost is internal fragmentation: an object of one byte occupies
 one grain (16 KiB), and every object statically reserves 256 bytes of
@@ -1150,7 +1411,13 @@ the entry's `mtime`, which is why the tombstone keeps one.
 **The log's reserved tail.** The last `logresv` sectors of free log
 space (policy, default one sixteenth of `logsecs`) are usable only by
 commits that free space: an `Eobj` that releases grains without
-allocating any — delete, truncate, tombstone — and an `Eslot`. So
+allocating any — delete, truncate, tombstone — and an `Eslot`. The
+reservation is a property of a *record*, and §7 batches many commits
+into one record, so the rule is on the batch: a batch that draws on
+the reserve MUST contain only space-freeing commits, and an ordinary
+commit that would take the log into the reserve waits instead of
+joining. Otherwise the reserve is spent by exactly the traffic it
+exists to exclude. So
 "delete always works" is true rather than nearly true: without the
 reservation, log exhaustion blocks the delete and the tombstone
 discard that would have relieved the slot exhaustion, and the two
@@ -1206,66 +1473,165 @@ sitting in its queue instead. Short, non-object work — `/status`,
 `/map`, `/ctl` reads — is answered on the service loop itself and
 never queued.
 
-The pool size is the one trade: a read of object *A* waits behind a
-write to object *B* that hashes to the same queue. At 64 queues and
-the write path's ≤ 3·`replms` bound that is rare and bounded, and
-`/status` reports the queues' depth so it is visible rather than
-folklore. Bucket collisions are why the number is a policy tunable.
+**The pool size is a ceiling, not just a collision parameter.** A
+queue proc runs one pushed request at a time, and a client write
+occupies its queue from layer-a §5.4 step 2 to step 6 or 7 — across
+the replication round trip, up to 3·`replms`, three seconds at the
+default. So the pool size is the maximum number of client object
+operations that can be in flight at once, full stop; the 65th waits
+even if it hashes to an idle queue's neighbour. The collision case —
+a read of object *A* waiting behind a write to object *B* with the
+same hash — is the milder half of the same number. The sizing rule
+is therefore **queues ≥ expected concurrent object operations**, not
+≥ expected objects, and `/status` reports the queues' depth so
+saturation is visible rather than folklore. Nothing else in the store
+inherits the ceiling: the eight-way concurrency §11's `op=full` row
+depends on is grain writes issued by the I/O procs below, which one
+queue proc can have in flight at once.
 
-**`Tflush`.** `Srv.flush` calls `reqqueueflush`. A request still
-queued is removed and answered `Rflush` without ever having run. A
-request already running is marked abandoned; the worker notices at
-its next check point and performs the whole of step 7 (§3.3), then
-answers `Rflush` with no `Rwrite` and no `Rerror`. A worker already
-inside the log writer's batch cannot be pulled out of it: it
-completes the commit, then still performs the invalidate half of step
-7, and answers `Rflush` without answering the write — the "MAY have
-been applied" case layer-a §5.4.1 contemplates.
+**`Tflush`.** `Srv.flush` calls `reqqueueflush` on the queue the
+flushed request was pushed to; the handler is given the *flush*
+request, so the store keeps the `Reqqueue*` in `r->aux` at push time
+to find it, and answers `respond(r, nil)` — `lib9p` then parks the
+`Rflush` until the flushed request itself responds.
 
-**Group commit.** Three kinds of proc, and the split matters:
+What `reqqueueflush` does is worth stating plainly, because two of
+its properties are load-bearing:
 
-1. **The tail assigner.** One `QLock` held for microseconds. A worker
-   reaching step 6 appends its entries to the pending queue and
-   sleeps on a `Rendez`. The assigner takes as much of the queue as
-   fits one `Wunit` of record body as a **batch**, stamps it with the
-   next `seq` and the next log offset, and hands it to a free writer
-   proc. A single commit whose record exceeds `Wunit` forms a batch
-   of one and is written in `ceil(nsec*secsz/Wunit)` pieces; the
-   batch rule is about latency, not about correctness, and §3.2's
-   argument is indifferent to how many requests a record takes.
-2. **A pool of `logdepth` writer procs** (default 4, maximum 8). Each
-   writes its batch's body, asks the flusher for a flush, writes its
-   header sector, asks for another flush. They run concurrently:
-   that is what puts `logdepth` writes in flight, and it is the whole
-   reason the design can claim more than the 114 durable writes/s a
-   single serial writer gets. The measured 409/s came from eight
-   independent writers; one proc executing a serial loop is depth 1
-   and gets 114/s no matter how cleverly the queue is drained.
-3. **The flusher** (§3.2), which owns the raw channel and coalesces:
-   `logdepth` writers asking for a flush at the same instant cost one
-   device flush, not `logdepth`.
+- A request still **queued** is removed and answered `interrupted`,
+  then the parked `Rflush` follows. That is an `Rerror` before the
+  `Rflush`; it is legal 9P — the client discards the reply to a
+  request it flushed — and layer-a §5.4.1 as amended says so (§14(14)).
+- A request already **running** is interrupted with a note, which
+  aborts the system call its proc is in. So the check point is a test
+  of the queue's public `flush` flag *and* an `interrupted` return
+  from a device call (§0), and either one unwinds into the whole of
+  step 7 (§3.3) before the request responds.
+- A worker already inside a commit batch cannot be pulled out of it,
+  and this is by construction rather than by care: the batch's device
+  writes are issued by procs the note does not reach, and libc's
+  `QLock`/`Rendez` wait loops resume across an interrupted rendezvous
+  (`qlock`(2)). It completes the commit, then still performs the
+  invalidate half of step 7, and answers without answering the write
+  — the "MAY have been applied" case layer-a §5.4.1 contemplates.
 
-**The durable watermark.** A batch's waiters are woken only when that
-batch's post-flush has returned **and every lower-numbered batch's
-has**. Without it a crash after batch *n+1* landed and batch *n* did
-not would leave replay stopping at *n* and discarding *n+1* — an
-acked write lost. With it, *n+1* was never acked. Batch membership is
-fixed by the assigner before any of its writes are issued, so no
-member's grain writes escape the pre-flush.
+**Shared in-memory state, and the locks over it.** Deleting the
+per-object lock does not delete the need to protect the structures
+every proc touches. Four `QLock`s cover all of it — beside the ones
+`Reqqueue` and `Ioproc` keep for their own queues, which the store
+does not touch:
+
+| Lock | Covers | Taken by |
+|---|---|---|
+| `qlstate` | the index array, the oid arena and hash table (§9), the index-slot and extent-map-slot free lists, the free-grain bitmap and its cursor, the staged set (§6), and the dirty set | every queue proc (stage, apply), the committer applying a batch, the checkpointer, the scrubber's commits, and the service loop taking an enumeration snapshot |
+| `qlemap` | the extent-map cache and its LRU (§9) | every queue proc, on a map read |
+| `qllog` | the log tail and free space, the pending-commit queue, batch numbering and the durable watermark | every committer |
+| `qlsuper` | the five publishable superblock fields and the publish itself (§2.2) | the checkpointer, a `qidnext` batch advance, the first `monid` pin, an `epochhigh` advance |
+
+Two rules make that discipline checkable rather than aspirational:
+
+1. **No proc holds two of them at once.** There is therefore no lock
+   order to get wrong, and no deadlock to reason about. The commit
+   path is the one that looks like it needs nesting and does not: it
+   takes `qllog` to join a batch, releases it, does its I/O, then
+   takes `qlstate` to apply.
+2. **None is held across a device I/O, a flush wait or a `Rendez`
+   sleep**, with exactly one exception: `qlsuper` *is* held across
+   the superblock write and its flush, because serialising that write
+   is the lock's whole purpose (§2.2). Nothing in the client path
+   waits behind it except a `qidnext` batch advance, once per 1024
+   creates. The rule matters most for `qlstate`: the service loop
+   takes it to snapshot `/obj` and to render `/status`, so a
+   `qlstate` held across an 8.4 ms write would block `/status`,
+   `/ctl` and `Tflush` — the failure layer-a §5.4.1 forbids.
+
+The extent-map cache is where rule 2 needs a mechanism rather than a
+promise. A miss inserts an entry marked *loading* under `qlemap` and
+releases it; the missing proc reads the 41 sectors through an I/O
+proc; it then fills the entry and wakes any other proc that found it
+loading. So one read serves concurrent readers of the same map and no
+lock spans it.
+
+**Group commit: the committer writes its own batch.** A worker
+reaching layer-a §5.4 step 6 becomes the committer of a batch or a
+member of one, and there is no separate assigner or writer proc:
+
+1. It takes `qllog`. If a batch is forming, it appends its entries to
+   the pending queue, sleeps on a `Rendez`, and is now a member. If
+   not, it becomes the committer: it absorbs whatever is already
+   pending into its batch — as much as fits one `Wunit` of record
+   body — stamps the batch with the next `seq` and the next log
+   offset, and releases the lock. The lock is held for microseconds
+   and never across I/O.
+2. It writes the batch's body sectors, asks the flusher for a flush,
+   writes the header sector, and asks for another (§3.2). A record
+   larger than `Wunit` is a batch of one, written in
+   `ceil(nsec*secsz/Wunit)` pieces; the batch rule is about latency,
+   not about correctness, and §3.2's argument is indifferent to how
+   many requests a record takes.
+3. When its post-flush returns and every lower-numbered batch has
+   been applied, it applies its whole batch under `qlstate` (§3.2),
+   advances the watermark, and wakes its members, which answer
+   `Rwrite`.
+
+Concurrency comes from the committers themselves: at 64 queues there
+can be 64 of them, and `logdepth` (policy, default 4, maximum 8) is a
+semaphore under `qllog` capping how many batches are in flight at
+once. That is what puts several writes in flight, and it is the whole
+reason the design can claim more than the 114 durable writes/s a
+single serial writer gets — the measured 409/s came from eight
+independent writers, and one proc executing a serial loop is depth 1
+and gets 114/s no matter how cleverly the queue is drained. What the
+shape removes, against a dedicated assigner plus a writer pool, is a
+proc, a message type, a handoff and a free-writer allocation in the
+most crash-critical loop in the store; what it keeps is every
+property the §3.2 and watermark arguments rest on.
+
+The flusher (§3.2) owns the raw channel and coalesces: `logdepth`
+committers asking for a flush at the same instant cost one device
+flush, not `logdepth`.
+
+**The durable watermark.** A batch's members are woken only when that
+batch's post-flush has returned, **every lower-numbered batch's has**,
+and the batch has been applied to in-memory state. Without the
+ordering, a crash after batch *n+1* landed and batch *n* did not would
+leave replay stopping at *n* and discarding *n+1* — an acked write
+lost. With it, *n+1* was never acked. Including the apply in the
+watermark is what lets §2.8 bind `ckseq` to it: a checkpoint may
+materialise state for record *n* only if record *n*'s effects are in
+the memory it is materialising from. Batch membership is fixed before
+any of its writes are issued, so no member's grain writes escape the
+pre-flush.
 
 There is no timer and no artificial delay, so **a lone writer pays
-exactly one flush, one write and one flush** — the queue is empty
-when it arrives. Batching happens only among commits that coincide
-with a write already in flight, which is precisely the coincidence
-worth exploiting.
+exactly one flush, one write and one flush** — the pending queue is
+empty when it arrives. Batching happens only among commits that
+coincide with a write already in flight, which is precisely the
+coincidence worth exploiting.
 
-**The I/O pool.** Grain writes for one operation, and the pieces of a
-record body larger than `Wunit`, are issued by a bounded pool of I/O
-procs (policy; default 8) sharing the partition fd — `pwrite` carries
-its own offset, so `rfork(RFPROC|RFMEM)` procs sharing one fd are
-safe. The pool exists because the sustained-throughput figures in §11
-are measured with several requests in flight; without it every one of
-them is a single-writer figure.
+**The I/O procs.** Grain writes, extent-map reads, and the pieces of a
+record body larger than `Wunit` are issued through a bounded pool of
+`ioproc`(2) slaves (policy; default 8) sharing the partition fd —
+`pwrite` carries its own offset, so concurrent requests on one fd are
+safe. `Ioproc`s are libthread's own bounded pool of slave I/O procs:
+`iocall` carries `pread`/`pwrite`, for which there is no wrapper, and
+`iointerrupt`/`ioflush` are the cancellation path a flushed request
+needs. A proc made with a bare `rfork` would be the wrong tool here —
+libthread keeps its `Proc` in per-process private storage, so a proc
+forked outside it can use neither a channel nor a `qlock` nor
+`threadsleep`, which is exactly what handing a result back to a
+waiting worker requires. The pool exists because the sustained
+throughput figures in §11 are measured with several requests in
+flight; without it every one of them is a single-writer figure.
+
+**How many procs, and how big.** The service loop, 64 queue procs,
+8 I/O procs, the flusher, the checkpointer and the scrubber: about 76,
+which is unremarkable on 9front but is a number worth having written
+down, since the queue count is a tunable and each queue is a proc.
+Every one of them is created by `proccreate` — `reqqueuecreate`
+included — so the program sets `mainstacksize` explicitly: a queue
+proc composes a `blksz` block and builds a record on its stack, and
+the default is not sized for that.
 
 Throughput follows: one batch holds a hundred-odd small commits in one
 `Wunit` of body, so the commit path's ceiling is thousands of commits
@@ -1307,29 +1673,64 @@ already there:
   block.
 - Both consistent: the object verifies.
 
-**Scrub.** A background proc walks slots in order, verifies each, and
-rate-limits itself to the configured KiB/s so a full pass takes about
-`scrubdays`. At layer-a §7.5's ~4 MiB/s on a 4 TB disk that is ~7% of
-one CPU spent hashing, continuously, which is worth knowing on a
-two-vCPU node that also runs the write path. On mismatch it sets the
-index entry's `corrupt` flag — durably, via an `Eobj` that changes
-nothing else, so a restart does not forget — lists the object in
-`/lost`, and fails client access with `checksum mismatch`. A corrupt
+**Scrub runs inside the queues.** A background proc walks slots in
+order, but it does not read grains itself: for each object it pushes
+one verify request onto that object's `Reqqueue` and waits for the
+answer, exactly as a client read would, and the repair commits below
+go the same way. The queue is the store's only object-level
+serialisation, and §3.5 defers a freed grain's reuse only until the
+freeing commit's flush returns — which says nothing about a reader
+that started earlier. A scrubber reading outside the queue would
+therefore hit grains freed, reallocated and staged into under it, and
+would durably flag a live, correct object `corrupt`: a background
+consistency checker that manufactures corruption is worse than none.
+One object per push keeps the pause it imposes on a client to one
+object's verify, and it rate-limits itself to the configured KiB/s so
+a full pass takes about `scrubdays`. At layer-a §7.5's ~4 MiB/s on a
+4 TB disk that is ~7% of one CPU spent hashing, continuously, which
+is worth knowing on a two-vCPU node that also runs the write path.
+On mismatch it sets the index entry's `corrupt` flag — durably, via
+an `Eobj` that changes nothing else, so a restart does not forget —
+lists the object in `/lost`, and fails client access with
+`checksum mismatch`. A corrupt
 copy loses arbitration against everything including absence (layer-a
 §1.3), which the server enforces by refusing to advertise it.
 
-**What a corrupt object answers to `op=meta`.** Neither available
-answer is right: reporting the key claims an arbitration position
-layer-a §1.3 forbids a failing copy, and `absent=1` is a lie that
-layer-a §1.5 counts as a positive confirmation for tombstone discard.
-Until the wire has a third answer, this store fails the request with
-`checksum mismatch` — a defined error string (layer-a §2.6), though
-layer-a §5.6's table does not list it for `op=meta`. §14(11) records
-the deviation and proposes the grammar that would remove it.
+**What a corrupt object answers to `op=meta`.** No available answer
+is right: reporting the key claims an arbitration position layer-a
+§1.3 forbids a failing copy, `absent=1` is a lie that layer-a §1.5
+counts as a positive confirmation for tombstone discard, and an
+error is not a response at all. The third of those is the one that
+cannot be shipped: layer-a §5.2's currency check requires an
+`op=meta` **response** from every witness that is `up=yes` or
+`up=heal`, and a corrupt holder is neither `up=no` nor absent, so an
+error leaves the check permanently incompletable — every client read
+and write of the object answers `not ready`, cluster-wide, forever,
+on one media fault, with a good copy on the primary and a repairable
+one on the holder. So this store answers, and the answer is the
+ordinary `meta` line for the key it holds with **`corrupt=1`
+appended**, which is the grammar §14(11) proposes. shoal's own
+callers honour that rule: the response satisfies the currency check
+and contributes no key, so it loses arbitration against everything
+including absence.
 
-When every block verifies again, the `corrupt` flag is cleared by
-another key-preserving `Eobj` and the object leaves `/lost`. When no
-peer has a good copy, it stays there and reads fail `object lost`.
+Against a reader that does not know the attribute the line degrades
+to an ordinary `meta` line, which is a real deviation and is why
+§14(11) exists — but a bounded one: the corrupt holder refuses
+`op=get` (`checksum mismatch`), so a caller that arbitrated for it
+gets a failed pull and retries elsewhere rather than adopting
+unreadable content. `absent=1` has no such floor, and an error has
+none either.
+
+**The repair path.** Because the check completes, the object has a
+serving primary again, and that primary does what layer-a §1.3
+prescribes for a holder whose key already equals its own: it pushes
+`op=full force=1` at an equal key to the corrupt holder, replacing
+the whole object without bumping the key. The holder's next verify
+finds every block matching, clears the `corrupt` flag with a
+key-preserving `Eobj`, and the object leaves `/lost`. If the corrupt
+copy is the only copy, nothing repairs it and layer-a §7.5's `object
+lost` is the honest outcome.
 
 A commit that does not advance the key is a first-class case in this
 store, and there are three of them: block repair, whole-object
@@ -1369,16 +1770,18 @@ The extent maps of multi-block objects are deliberately **not** in
 memory — 21 KiB × 2.6·10^5 is 5.5 GB — so the write path reads one
 41-sector extent map per multi-block object touched, backed by an LRU
 of a few thousand entries (4096 entries is 86 MB) which makes
-repeated writes to one object free. One 64 KiB-request read is ~300 µs
-against an 8.75 ms commit, 3% overhead; §16a asks for it to be
-measured under the striping workload.
+repeated writes to one object free; §7's `qlemap` is the lock over
+it, and a miss is served once for every proc that wants the same map.
+One read of the 64 KiB class is ~300 µs against an 8.75 ms commit,
+3% overhead; §16a asks for it to be measured under the striping
+workload.
 
 **Snapshot-at-open (R12).** Layer-a §2.2 makes snapshot-at-open a
 MUST for `/status`, `/map`, `/dirty`, `/stale`, `/lost` and `/jobs`
 and a SHOULD for `/obj` and `/tombs`. The six MUSTs are small — a
 few hundred lines at the envelope — and are rendered into a buffer
 at open, which is the one-line implementation. For `/obj`, `/tombs`
-and `/advert` the store takes, under the index lock, a vector of
+and `/advert` the store takes, under `qlstate` (§7), a vector of
 `{u32 slot, u64 qidpath}` — 12 bytes an entry, **3.1 MB at 2.6·10^5
 objects and 12 MB at `nslots = 2^20`**. Each `Tread` renders entries
 from the *live* index, skipping any whose `qidpath` no longer matches
@@ -1435,7 +1838,13 @@ no way to rewrite a header. That is deliberate: a header rewrite has
 no safe torn-write story, because a torn header makes every slot
 unlocatable and the whole store unreadable. Two copies, at the first
 and last sector, cover the media-fault case; nothing ever writes
-either after format.
+either after format, so they are identical and the start-time rule is
+"take either valid copy, refuse if neither" — there is no generation
+to compare and nothing to choose between.
+
+The monitor's partition is committed with the same raw flush the
+object store uses, so §2.1's deployment rule applies to it: it MUST
+be on an `sd` unit no object-store instance is serving.
 
 Slot, `slotsz` bytes, first sector the header:
 
@@ -1460,25 +1869,43 @@ map commit is then one device request for any map under 16 KiB.
 
 **Commit.** In this order:
 
-1. Write the history ring slot for the new epoch, and flush. The ring
-   is not optional and this is not last: the slot the ring is writing
-   is the *newest* entry, and at the next publish that entry is the
-   `E−1` layer-a §8.2 requires the monitor to keep and layer-a §5.2
-   clause 2 depends on. Writing it first means a torn ring write
-   damages only the map being published, which fails the commit,
-   rather than the previous map, which nothing else can supply. If it
-   cannot be written, the commit fails.
+1. Write the history ring slot for the new epoch, **stamped with the
+   `seq` step 2 is about to carry**, and flush. The ring is not
+   optional and this is not last: the slot the ring is writing is the
+   *newest* entry, and at the next publish that entry is the `E−1`
+   layer-a §8.2 requires the monitor to keep and layer-a §5.2 clause
+   2 depends on. Writing it first means a torn ring write damages
+   only the map being published, which fails the commit, rather than
+   the previous map, which nothing else can supply. If it cannot be
+   written, the commit fails. The slot it overwrites is any invalid
+   slot, and failing that the valid slot with the lowest `seq` — one
+   `seq` space for the whole store is what makes "oldest" and
+   "newer than the current map" both well defined.
 2. Write the current-map slot, choosing by the same three-clause rule
    as §2.2: if exactly one slot is valid, write the invalid one; if
    both are valid, write the one with the lower `seq`; if neither is
-   valid, refuse. `seq` is `max(valid seq) + 1`. Flush.
+   valid, refuse. `seq` is `max(valid seq) + 1` over both slots and
+   the ring. Flush.
 
-**Choose on start:** read both, take the valid one with the greater
-`seq`. A torn write to the slot being written fails its checksum and
-the other slot is untouched, so the previous map survives; that is
-the entire crash argument, and it is §2.2's rule again — including
-the clause that keeps a torn slot from steering the next write onto
-the only good one.
+**Choose on start:** read both current-map slots, take the valid one
+with the greater `seq`. A torn write to the slot being written fails
+its checksum and the other slot is untouched, so the previous map
+survives; that is the entire crash argument, and it is §2.2's rule
+again — including the clause that keeps a torn slot from steering the
+next write onto the only good one.
+
+**Then erase the phantom.** A crash between the two steps leaves a
+history entry for an epoch that was never published: the current map
+is still `E−1`, so the monitor's next publish is epoch `E` again with
+different content — recomputed `up` marks, different stale records —
+and a ring holding two entries claiming `E`, one of which never
+existed. Served the phantom, an instance computing `W(o)` from
+`/maps/<E−1>` (layer-a §5.2 clause 2) would complete a currency check
+against a placement that never existed. The `seq` stamp is what makes
+this decidable without a durable ring cursor: at start the monitor
+**ignores, and marks reusable, every history slot whose `seq` exceeds
+the chosen current slot's**. Exactly the entries written by publishes
+that did not complete are erased, and no committed history is.
 
 **A map that does not fit.** If `secsz + len` exceeds `slotsz` the
 commit fails with `disk full` (layer-a §2.6: any operation that must
@@ -1518,7 +1945,7 @@ commit that wraps the log adds one 512-byte write and one flush.
 | Operation | Reads | Data writes | Commit | Total |
 |---|---|---|---|---|
 | create, delete, truncate to a block boundary | map: 0 inline, 0.3 ms out-of-line, 0 cached | none | 1 | **~9 ms** |
-| 16 KiB write, block-aligned | 1 map | 1 grain: 8.4 ms | 1 | **~17.5 ms** |
+| 16 KiB write, block-aligned | 1 map | 1 grain: 8.4 ms + 0.27 ms hash | 1 | **~17.5 ms** |
 | 4 KiB write into a populated block | 1 map + 1 grain (0.24 ms) + 0.27 ms hash | 1 grain | 1 | **~18 ms** |
 | 4 KiB write into a hole | 1 map | 1 grain | 1 | **~17.5 ms** |
 | 16 MiB `op=full` | 1 map | 1024 grains | 1 (3 writes) | **8.6 s serial, ~2.5 s at 8-way (409/s)** |
@@ -1572,6 +1999,19 @@ only the constant, and the hashing terms stop being negligible.
 *Policy.* Three new commands under `cmd/`, each an `mkone`
 directory listed in `cmd/mkfile`'s `DIRS`.
 
+**Where the code lives, and why the test tier decides it.** Every
+T1 case in §13 drives format, commit, replay, checkpoint, allocation
+and enumeration against the simulated disk, and `AGENTS.md` requires
+a T1 test to be a C program in `test/` linking `libshoal`. So the
+store engine — the device vtable (§0), the on-disk structures, the
+write path, the log and its apply function, replay, the index, the
+allocator and the enumeration snapshot — lives in `lib/libshoal.a`
+behind `lib/shoal.h`. What is left in `cmd/shoalsrv` is argument
+parsing, the `Srv` glue, the queue pool and the procs of §7; the
+three tools below are thin front ends over the same library. This is
+a real constraint on the code layout rather than a preference, and it
+is expensive to undo once the engine has grown roots in a command.
+
 **`shoalfmt`** — format or ream an object-store partition.
 
     shoalfmt [-r] [-b blksz] [-o objmax] [-n nslots] [-e nemap]
@@ -1603,7 +2043,7 @@ non-zero on any inconsistency. `-l` dumps the log records. `-o` dumps
 one object's index entry and extent map. `-v` verifies every object's
 content against its digests — an offline scrub. `-R` rebuilds the
 free-grain bitmap from the live maps and rewrites the checkpoint,
-which is the offline form of §5 step 9's automatic rebuild.
+which is the offline form of §5 step 11's automatic rebuild.
 
 **`shoalmonfmt`** — format a monitor map partition.
 
@@ -1640,8 +2080,17 @@ flush caveat depends on: `virtio` and `ahci` issue a real flush,
 `ata` (the legacy IDE driver) fakes it silently.
 
 The servers themselves — the object server and the monitor — are
-layer-a's subject, not this document's; where they need names,
-`cmd/shoalsrv` and `cmd/shoalmon`.
+layer-a's subject, not this document's, but two of `shoalsrv`'s flags
+carry behaviour this document defines, so it gets a synopsis here:
+
+    shoalsrv [-w] [-X point[,n]] [-q queues] [-s srvname]
+             /dev/sdXX/name
+
+`-w` is §3.2's operator assertion that the unit is write-through and
+is reported in `/status`; `-X` is §13's fault-injection point,
+present in every build and inert without the flag; `-q` sets the
+queue-pool size, whose sizing rule is §7's. The monitor is
+`cmd/shoalmon`.
 
 ## 13. Test plan
 
@@ -1683,10 +2132,19 @@ body sectors), `commit:n` (after *n* header bytes — the torn-header
 sweep), `postwrite` (after the header write returns, before the
 post-flush), `preack`, `ckpt:n` (after *n* checkpoint page writes),
 `reclaim` (reclaim log space before the checkpoint's superblock
-write), `super` (between the two superblock copies), `batch:n` (hold
-batch *n*'s write and let *n+1* complete). Each T1 test names the
-requirement it discriminates and the mutation that must break it;
-each mutation is run.
+write), `super` (after a superblock write returns, before its
+flush — the two copies are written in sequence only by `shoalfmt`),
+`publish` (force an `epochhigh` publish at the current point, so it
+can be combined with `ckpt:n`), `batch:n` (hold batch *n*'s write and
+let *n+1* complete). Each T1 test names the requirement it
+discriminates and the mutation that must break it; each mutation is
+run.
+
+T1 formats a **small geometry** — a partition image of a few MiB with
+`-n` and `-e` in the hundreds — so that `mk test` stays within
+`AGENTS.md`'s seconds. The sweeps that are exhaustive are exhaustive
+over one header sector, not over the whole store, and the cases that
+need `nslots = 2^20` are T2's.
 
 Each test names the requirement it discriminates and the mutation
 that must break it; **each mutation is run**, per `AGENTS.md`.
@@ -1735,20 +2193,32 @@ that must break it; **each mutation is run**, per `AGENTS.md`.
   in the log. *Mutation:* reclaim before the checkpoint's superblock
   write returns — the one way §2.8 says this format can lose data.
 - **T1.11 log wrap (R2).** Drive the log several times around the
-  ring, crashing on and around the wrap record. *Mutation:* let a
-  record straddle the region end instead of emitting `Fwrap`.
+  ring, crashing on and around the wrap record, with a record mix
+  that includes one ending **flush with the region end**: the record
+  after it is at the region start, carries the next `seq`, and is
+  applied by replay. *Mutations:* continue at `+nsec` unconditionally
+  — which walks replay into the index region and discards every
+  commit since the wrap; let a record straddle the region end
+  instead of emitting `Fwrap`; write the wrap record after the
+  batch's post-flush rather than before it.
 - **T1.12 stage lifetime (R3, R4).** Abandon an `op=full` part way
   through and end it by clunk, by `Tflush` and by timeout in turn;
   the free-grain count returns to its pre-transfer value each time,
-  and `stagemax` is enforced. *Mutation:* keep a stage alive past its
-  fid.
+  and `stagemax` and `stagetot` are both enforced. Then the restart
+  case: force a checkpoint while the stage is live, abandon it, crash,
+  restart, and assert the free-grain count is the pre-transfer one —
+  a stage leaves nothing durable behind. *Mutations:* keep a stage
+  alive past its fid; allocate staged grains in the bitmap the
+  checkpointer writes rather than in the staged set, which leaks them
+  across the restart; bound stages per fid only.
 - **T1.13 flush sequence (R1).** From the recorded device trace,
   assert that a flush precedes the header write and another follows
   it, for every commit shape including a wrapping one and one whose
   body spans several `Wunit`s. *Mutation:* either flush removed, or
   the two reordered. This is the test that makes T1.1's flush
   mutations detectable as a sequence even where they are not
-  detectable as a loss.
+  detectable as a loss. It does not apply to a `-w` store, which has
+  no flushes to place (§3.2).
 - **T1.14 exhaustion (R8).** Grains, index slots, extent-map slots
   and the log: `disk full` in the first three, a bounded wait then
   `disk full` in the fourth, with delete and tombstone discard
@@ -1762,13 +2232,82 @@ that must break it; **each mutation is run**, per `AGENTS.md`.
   read the hole as zeros, and check `csum` against `shoalcsum` over
   the same byte image; truncate within a block; partial-write one
   block of a many-block object and assert only that block's digest
-  changed. *Mutations:* hash the final partial block over `blksz`
-  rather than its actual length; hash a hole as absent rather than as
-  the zero bytes it reads as.
+  changed. Include the **sparse extend across many blocks**, both
+  live and after a crash-and-replay at `commit:0`: the blocks the
+  commit does not name carry the zero-block digest, so `csum`
+  verifies and the object does not fail its next scrub. *Mutations:*
+  hash the final partial block over `blksz` rather than its actual
+  length; hash a hole as absent rather than as the zero bytes it
+  reads as; leave newly covered blocks' digests at sixteen zero bytes
+  when applying the commit.
 - **T1.17 corrupt digest array (§8).** Damage an extent-map entry so
   that `hash(dig[]) != csum`, and assert the repair takes the
   whole-object path. *Mutation:* accept a peer's block against the
   stored `dig[i]` when the array itself fails.
+- **T1.18 start after a mid-checkpoint crash (§2.5, R17).** Crash at
+  `ckpt:n` with bitmap pages stamped ahead of the superblock, restart,
+  and assert the store **starts**, replay reaches `Pmax`, and the free
+  map matches a full scan. Then the media-fault variant: let the
+  checkpoint complete and reclaim, damage the newer superblock copy so
+  start falls back to the older one over a log that has been
+  overwritten, and assert the store **refuses**. *Mutations:* refuse
+  when a page's `ckseq` exceeds the superblock's, which fails the
+  first case; drop the coverage test, which fails the second; read a
+  torn page's `ckseq` into `Pmax` without checking its checksum
+  first.
+- **T1.19 extent-map slot transitions (R2, R13).** Give a
+  multi-block object a slot, delete it, then grow a one-block object
+  past `blksz` so it allocates the same slot, with a write that does
+  not touch block 0; crash at `commit:0`; restart. Block 0 must read
+  its own bytes and every unwritten block must read zeros. Then the
+  mirror: truncate a multi-block object to one block and assert
+  block 0 survives the release of the slot. *Mutations:* name only
+  the blocks the write changed; skip the zeroing of the newly
+  allocated entry; leave `grain0`/`dig0` unset on the shrink.
+- **T1.20 dirty records across a restart (R7).** Commit writes that
+  create fine-grained dirty records for several peers, crash at
+  `preack`, restart, and assert every record whose write is visible is
+  in `/dirty` — and that the reconcile pass can name those objects
+  rather than walking the disk. *Mutation:* skip the dirty region at
+  start and build the set from replay alone.
+- **T1.21 the superblock publisher (§2.2).** Drive `qidnext`,
+  `epochhigh`, `monid` and a checkpoint publish concurrently from
+  several procs, crash at `super`, restart, and assert no field
+  regressed. *Mutation:* build the image from a snapshot taken when
+  the publish was requested rather than from live state — which
+  re-issues `qid.path` values, un-pins `monid`, or lowers `ckseq`
+  depending on the interleaving.
+- **T1.22 the checkpoint mark and a concurrent publish (§2.2, §2.8).**
+  `ckpt:n` combined with `publish`: an `epochhigh` publish between the
+  checkpoint's page writes and its flush must carry the *old*
+  `ckseq`/`cklogoff`, and a crash straight after it must still replay
+  the records those pages materialise. *Mutation:* let the checkpoint
+  advance the publishable mark before its flush returns.
+- **T1.23 durable before issue (R15, R16).** Hand out `qid.path`
+  values until a batch advance is due, crash at `super`, restart, and
+  assert no path is ever re-issued; the same shape for `epochhigh`
+  and `monid`, which must be durable before the instance acts under
+  them. *Mutations:* advance the in-memory counter past the recorded
+  high-water; act on an adopted epoch before its publish returns.
+- **T1.24 bitmap rebuild (§2.5).** Corrupt a bitmap page, restart,
+  and assert the store starts, `bmaprebuild=yes` is reported, and the
+  rebuilt free map equals a full scan of every live object's map.
+  *Mutation:* trust the page that failed its checksum.
+- **T1.25 deferred reuse of slots (§3.5).** T1.7's schedule for index
+  slots and extent-map slots: free one by a commit, crash at
+  `commit:0` before its post-flush, restart, and assert the slot is
+  still the old object's and its extent map intact. *Mutation:*
+  return freed slots to their free lists at commit time.
+- **T1.26 the flush channel (§3.2).** With the simulated raw channel
+  refused, the store MUST NOT start; with `-w` it starts and
+  `/status` reports `flush=asserted-writethrough`; with the channel
+  present it reports `flush=raw`. *Mutation:* start anyway and report
+  `flush=unavailable`.
+- **T1.27 scrub inside the queue (§8).** Hold a scrub read of one
+  object while a commit on the same object frees that grain and
+  another object stages into it; the scrub must not flag the object
+  `corrupt`. *Mutation:* have the scrubber read grains directly
+  instead of pushing through the object's `Reqqueue`.
 
 T1 stays diskless and is `mk test` at the repo root, as `AGENTS.md`
 requires: the simulated disk is a T1 program's own memory.
@@ -1809,7 +2348,10 @@ property of the platform rather than of the store:
 - **T2.7 monitor slots (§10)** under `-X` at each point, restarting
   and asserting the monitor comes up at the newer map or the older
   one, never a torn one, and that the `E−1` history entry survives a
-  torn publish.
+  torn publish. Including the phantom case: crash between the history
+  write and the current-map write, restart, and assert no history
+  entry survives with a `seq` above the current map's, so `/maps/<E>`
+  can never serve a placement that was never published.
 - **T2.8 sustained throughput**, to confirm or refute §11's 6.7 MB/s
   extrapolation and the eight-way `op=full` figure.
 
@@ -1825,213 +2367,172 @@ would be a wire change.
 *Policy, but read it before implementing anything.*
 
 Fifteen places where layer-a is silent, self-defeating, or
-contradicted by the measurements. Items 1–5, 8, 9, 12 and 13 are
-amendments made to `docs/design/layer-a.md`; items 6, 7, 10, 11, 14
-and 15 are recorded here and not made there — two of them (10 and
-11) as proposals, because they touch the wire.
+contradicted by the measurements. Each entry states the tension, its
+resolution, and where the argument for it lives; nothing here repeats
+an argument made in a section above. Items 1–5, 8, 9, 12, 13 and 14
+are amendments **made** to `docs/design/layer-a.md`; items 6, 7 and 15
+are recorded here and not made there; items 10 and 11 are **proposals**
+rather than amendments, because they touch the wire.
 
-1. **`cur` cannot usefully be durable (layer-a §5.2).** Layer-a §5.2
-   required the instance to record currency "durably as `cur=<epoch>`"
-   and, two lines later, to invalidate `cur` for every object **on
-   process start, after a clean exit as much as after a crash**. The
-   only moment a durable value could be read is the moment it must be
-   discarded. This store keeps `cur` in memory only; layer-a §5.2 no
-   longer says "durably", and keeps both invalidation MUSTs and
-   `cur=` in `/meta` as an in-memory value.
+1. **`cur` cannot usefully be durable (layer-a §5.2).** Layer-a
+   required currency recorded "durably as `cur=<epoch>`" and, two
+   lines later, invalidated for every object on every process start:
+   the only moment a durable value could be read is the moment it
+   must be discarded. *Made:* "durably" is gone; both invalidation
+   MUSTs and `cur=` in `/meta` stay, as an in-memory value (§5, R5).
 
 2. **Step 5b's dirty record is committed *with* the update, not
-   before it (layer-a §5.4).** This store puts the `Edirty` entries
-   in the same log record as the `Eobj`, so either both are durable
-   or neither is. That is **not** strictly stronger, which is the
-   easy mistake: layer-a's stated order covers one window this order
-   does not — a crash after an acker committed and before the
-   primary did leaves layer-a's ordering with a durable dirty record
-   naming the peer that fell behind, and leaves this one with
-   nothing, so the primary could later report `synced` for a subject
-   that missed an acked write. It is *equivalent* only because §2.6
-   sets `fullsync` for every peer at restart, which covers exactly
-   that window. Layer-a §5.4 step 5b now reads "durable no later than
-   the update", and the restart obligation is written into layer-a
-   §7.1 so that a different conforming implementation cannot take the
-   licence without the rescue.
+   before it (layer-a §5.4).** The `Edirty` entries ride in the same
+   record as the `Eobj`, so either both are durable or neither.
+   That is not strictly stronger — layer-a's stated order covers one
+   window this order does not — and §2.6 is where the window and the
+   restart `fullsync` that closes it are argued. *Made:* step 5b
+   reads "durable no later than the update", and the restart
+   obligation is written into layer-a §7.1 so the licence cannot be
+   taken without the rescue.
 
 3. **Layer-a assigned no home to state the store must hold (layer-a
-   §2.3, §6.3, §8.6).** Three per-instance facts must survive a
-   restart: the pinned `monid`, whose whole purpose as a tripwire
-   evaporates if a restart forgets it; the highest adopted epoch,
-   which layer-a §8.6 step (b) has the rebuilding monitor read out of
-   `/status`; and layer-a §2.3's monotonic `qid.path` counter. All
-   three are in the superblock (§2.2), and layer-a now states the two
-   ordering rules that make them mean anything: the epoch durable
-   before the instance acts under it, and the `qid.path` high-water
-   durable before any value in its batch is issued. Layer-a §2.3 also
-   states that the counter is monotonic *and* that discarding a
-   tombstone frees the path for reallocation — those only compose if
-   the counter is a stored high-water rather than a maximum over live
-   records, which is what §2.2 does.
+   §2.3, §6.3, §8.6).** The pinned `monid`, the highest adopted epoch
+   and the monotonic `qid.path` counter must all survive a restart,
+   and layer-a named no place for them. *Made:* they live in the
+   superblock, and layer-a now states the two orderings that make
+   them mean anything — the epoch durable before the instance acts
+   under it, the `qid.path` high-water durable before any value in
+   its batch is issued. §2.2 argues both, including why the counter
+   must be a stored high-water rather than a maximum over live
+   records.
 
-4. **Layer-a §5.5's resync arithmetic omits the disk (§11).** 185–545
-   ms is wire time; the receiving disk costs seconds. Layer-a §5.5
-   now says so qualitatively and points here. It does **not** carry
-   this document's 2.5 s figure, because that figure rests on
-   eight-way concurrency read off a table of independent writers
-   (§16a): a number in the ratified contract should be one somebody
-   measured for the case it describes.
+4. **Layer-a §5.5's resync arithmetic omits the disk.** 185–545 ms is
+   wire time; the receiving disk costs seconds (§11). *Made:*
+   qualitatively, pointing here. It does not carry this document's
+   2.5 s figure, because that figure rests on eight-way concurrency
+   read off a table of independent writers (§16a(1)), and a number in
+   the ratified contract should be one somebody measured for the case
+   it describes.
 
 5. **Layer-a §5.4's "plus local I/O" is the dominant term, not a
-   rounding error.** The honest sum for one client write is
-   3·`replms` plus 9–18 ms of local I/O in the ordinary case, plus
-   whatever the object's queue holds — and, in the rare case where
-   the log is full, plus a wait bounded by `ckwaitms` (§6) rather
-   than by `replms`. At the default `replms` of 1 s the ordinary case
-   is invisible; at a `replms` tuned down toward the sub-millisecond
-   LAN it is the whole cost. Layer-a §5.4 now names the checkpoint
-   wait as part of that term.
+   rounding error.** The honest sum is 3·`replms` plus 9–18 ms
+   ordinarily, plus the object's queue, plus — when the log is full —
+   a wait bounded by `ckwaitms` rather than by `replms` (§6). At a
+   `replms` tuned toward the sub-millisecond LAN the local term is
+   the whole cost. *Made:* layer-a §5.4 names the checkpoint wait.
 
 6. **`disk full` stays definitive, and no retryable error is added.**
-   A commit that finds no log space waits and then answers
-   `disk full` (§6). Adding a retryable `busy` to layer-a §2.6 would
-   be a wire change made to paper over a store that cannot bound its
-   own checkpoint; the cause is fixed instead — incremental
-   checkpointing (§2.8), a reserved log tail so space-freeing commits
-   never block (§6), and a wait bound derived from the real
-   checkpoint cost. What is left is genuine exhaustion, for which a
-   definitive answer is the correct one.
+   Adding a retryable `busy` to layer-a §2.6 would be a wire change
+   made to paper over a store that cannot bound its own checkpoint;
+   §6 fixes the cause instead and bounds the wait. *Not made,* and
+   §16b(2) records the product call.
 
 7. **The flush channel is not exclusive, and the store requires it
-   anyway.** `/dev/sdXX/raw` admits any number of openers; the
-   kernel's interlock is unreachable and the cdb→data→status state is
-   per unit, so concurrent users corrupt each other's commands rather
-   than being excluded (`docs/platform/9front-storage.md` §5). Two
-   consequences, both in §2.1 and §3.2: the deployment rule is that
-   one process per `sd` unit issues raw commands, and inside the
-   process one flusher proc owns the channel. The store does not
-   start without the channel unless the operator asserts
-   write-through with `-w`, because the property being given up is
-   layer-a §1.3's normative four-tuple atomicity, not a nicety, and
-   the platform's write-through behaviour is inference rather than
-   confirmation. D4 says "one instance per disk" and layer-a never
-   mentions the unit; that gap is why the rule is written down here.
+   anyway.** `/dev/sdXX/raw` admits any number of openers and the
+   cdb→data→status state is per unit, so concurrent users corrupt
+   each other's commands rather than being excluded. *Not made:*
+   layer-a never mentions the `sd` unit and D4 says only "one
+   instance per disk", so the deployment rule (§2.1) and the
+   single-owner flusher (§3.2) are written down here, together with
+   the refusal to start without the channel and `-w` as the only way
+   past it.
 
 8. **Formatting precedes the map that defines the format (layer-a
-   §3.4).** Step 1 there has the operator start a server on an
-   unformatted disk, which generates a uuid and writes a superblock —
-   before it registers, so before it has a map, so before it knows
-   `blksz` and `objmax`, which this store's geometry depends on.
-   Resolution: `shoalfmt` takes them from the operator, defaulting to
-   the map defaults, and the server MUST refuse to serve if the
-   adopted map's `blksz`, `objmax` **or `csumalg`** differs from what
-   the disk was formatted with — `csumalg` because layer-a §8.5 makes
-   it immutable for exactly this reason and a mismatch invalidates
-   every stored digest. Layer-a §3.4 now says the format step needs
-   them.
+   §3.4).** Step 1 there has a server generate its identity before it
+   has a map, so before it knows `blksz` and `objmax`, which this
+   store's geometry depends on. *Made:* layer-a §3.4 says the format
+   step needs them, and the server MUST refuse to serve if the
+   adopted map's `blksz`, `objmax` or `csumalg` differs from what the
+   disk was formatted with — `csumalg` because a mismatch invalidates
+   every stored digest.
 
 9. **Layer-a §10.2's evidence items: two answered, one settled, one
-   not.** Answered: the local layout question and the monitor's
-   durability question are this document. Settled by measurement:
-   `blksz` sits at `Wunit`, which makes a block one device request
-   and a partial write cost four times its size rather than sixteen —
-   layer-a §10.2 records that item as settled and layer-a §1.4's
-   default is 16384. Not settled: whether a full `/obj` snapshot is
-   affordable. It costs 3.1 MB at 2.6·10^5 objects and 12 MB per open
-   fid at the `nslots = 2^20` this document itself recommends for a
-   4 TB disk, so `objsnap=partial` is unnecessary at the Layer B
-   envelope and not demonstrated unnecessary at this design's own
-   maximum. §9 bounds the number of open enumeration fids for that
-   reason.
+   not.** The local layout and monitor durability questions are this
+   document. `blksz` at `Wunit` is settled by measurement and layer-a
+   §1.4's default is 16384. Not settled: whether a full `/obj`
+   snapshot is affordable — 3.1 MB at 2.6·10^5 objects but 12 MB per
+   open fid at `nslots = 2^20`, so `objsnap=partial` is unnecessary at
+   the Layer B envelope and not demonstrated unnecessary at this
+   design's own maximum (§9).
 
 10. **A `Tflush` after the commit still owes the cleanup half of step
-    7.** Layer-a §5.4.1 requires a flushed request to perform "the
-    whole of step 7", and its "the replication attempt MAY complete"
-    clause is about the attempt in flight, not about the local
-    commit. Once the commit is durable the discard half is vacuous
-    but the invalidate half is not: the primary holds `(E, ver+1)`
-    with sync state and a `cur` derived from an operation whose
-    outcome the client never learned. §3.3 and §7 do the whole of it.
-    Layer-a §5.4.1 would read better if it split the obligation
-    explicitly into a discard half (pre-commit only) and an
-    invalidate half (always); that is a clarification of an existing
-    MUST rather than a new rule, and is proposed rather than made.
+    7.** Once the commit is durable the discard half is vacuous but
+    the invalidate half is not (§3.3). *Proposed, not made:* layer-a
+    §5.4.1 would read better if it split the obligation explicitly
+    into a discard half (pre-commit only) and an invalidate half
+    (always). That is a clarification of an existing MUST, and it sits
+    beside the amendment item 14 did make.
 
 11. **`op=meta` has no way to say "I hold a copy that fails
-    verification".** A corrupt holder must either claim a key that
-    layer-a §1.3 forbids a failing copy from claiming, or answer
-    `absent=1`, which layer-a §1.5 counts as a positive confirmation
-    licensing a tombstone discard it cannot vouch for. This is a wire
-    change, so it is proposed here and not made. The exact grammar
-    proposed, as a third form of the `meta` response in layer-a §5.6:
+    verification".** A corrupt holder must either claim a key layer-a
+    §1.3 forbids a failing copy from claiming, or answer `absent=1`,
+    which layer-a §1.5 counts as a positive confirmation licensing a
+    tombstone discard it cannot vouch for. This is a wire change, so
+    it is *proposed* here and not made. The grammar, as a third form
+    of the `meta` response in layer-a §5.6:
 
-        meta oid=<oid> corrupt=1
+        meta oid=<oid> ver=<u64> wepoch=<u64> csum=<hex64> len=<u64>
+             state=live|tomb cur=<u64> corrupt=1
 
-    with these rules: an instance whose copy of `<oid>` fails local
-    verification (layer-a §7.5) MUST answer `corrupt=1` and MUST NOT
-    answer with a key or with `absent=1`; a `corrupt=1` response is
-    neither a key nor an absence, so it MUST NOT be used in
-    arbitration, MUST NOT count as either kind of layer-a §1.5
-    confirmation — so it blocks a tombstone discard exactly as an
-    unreachable instance does — and MUST NOT satisfy a layer-a §5.2
-    currency check; and it licenses the serving primary to push
-    `op=full force=1` at an equal key to the reporting holder, which
-    is layer-a §1.3's repair path and the only way to repair a holder
-    whose key already equals the sender's. A response form is
-    proposed rather than an error because `op=meta` is answered
-    whatever the instance's `up`/`status` (layer-a §6.4 F3), and a
-    caller must be able to tell a corrupt holder from an unreachable
-    one. Until it is ratified, §8 says what this store answers.
+    with these rules. An instance whose copy of `<oid>` fails local
+    verification (layer-a §7.5) MUST set `corrupt=1` and MUST NOT
+    answer `absent=1`. A `corrupt=1` response **contributes no key**:
+    it MUST lose arbitration against everything including absence
+    (layer-a §1.3), whatever key the line carries, and it MUST NOT
+    count as either kind of layer-a §1.5 confirmation — so it blocks
+    a tombstone discard exactly as an unreachable instance does. It
+    **does satisfy** a layer-a §5.2 currency check as a *response*:
+    the check needs an `op=meta` response from every witness that is
+    `up=yes` or `up=heal`, and a corrupt holder is neither absent nor
+    unreachable, so a rule that withheld the answer would leave the
+    check permanently incompletable and darken the object
+    cluster-wide on one media fault — with a good copy on the primary
+    and a repairable one on the holder. Finally it licenses the
+    serving primary — which the completed check is what elects — to
+    push `op=full force=1` at an equal key to the reporting holder,
+    layer-a §1.3's key-preserving repair and the only way to repair a
+    holder whose key already equals the sender's. A response form
+    rather than an error, because `op=meta` is answered whatever the
+    instance's `up`/`status` (layer-a §6.4 F3) and a caller must be
+    able to tell a corrupt holder from an unreachable one. §8 says
+    what this store answers until the grammar is ratified, and what
+    that costs against a reader that does not know the attribute.
 
 12. **A tombstone's cost.** Layer-a §1.5 said a tombstone "occupies a
-    metadata record and nothing else". That is true here — 256 bytes,
-    because a tombstone has no blocks and so holds no extent-map slot
-    (§2.3) — but it is true by design rather than by nature, and a
-    store that reserved a fully-sized block map per object would pay
-    21 KiB. Layer-a §1.5 now says the cost is implementation-
-    dependent and may include a reserved per-object metadata extent.
+    metadata record and nothing else". True here — 256 bytes, because
+    a tombstone holds no extent-map slot (§2.3) — but true by design
+    rather than by nature. *Made:* layer-a §1.5 now says the cost is
+    implementation-dependent and may include a reserved per-object
+    metadata extent.
 
 13. **Layer-a §5.5's multi-request `op=full` stage had no lifetime.**
-    The receiver stages chunks across many `Twrite`s and commits at
-    `final=1`; nothing said when an abandoned stage is released, so a
-    sender that dies mid-transfer left the receiver holding staged
-    space forever and a heal of a whole disk could answer `disk full`
-    with the disk nearly empty. §3.6 gives the stage an owner, a
-    lifetime and a bound, and layer-a §5.5 now requires one.
+    Nothing said when an abandoned stage is released, so a sender that
+    died mid-transfer left the receiver holding staged space forever.
+    *Made:* layer-a §5.5 now requires an owner, a lifetime and a
+    bound, matching §3.6 clause for clause.
 
-14. **`nemap` is the sizing a workload can defeat.** Splitting the
-    extent-map slot space from the index slot space (§2.1) is what
-    keeps the extent-map region at 5.1 GiB while quadrupling block
-    resolution, and the inline one-block map is what keeps small
-    objects out of it entirely. What remains is that an object of two
-    to `nblkmax` blocks consumes a full `emapsz` slot, so a disk
-    filled with 32 KiB objects exhausts `nemap` with the data region
-    almost empty. Mitigations in place: `nemap` is a format
-    parameter, `shoalfmt` prints what it supports, `/status` reports
-    `emapfree=`, and the exhaustion is a distinct, named `disk full`.
-    The recorded fix, if a real workload hits it, is a size-classed or
-    grain-backed extent map (§15) — a format change, so a `vers` bump
-    and a reformat.
+14. **layer-a §5.4.1 forbade the reply order every 9P server
+    actually produces, and prescribed a mechanism this store does not
+    use.** It required "no `Rwrite`, no `Rerror`" before the
+    `Rflush`, which `lib9p` cannot do — a parked `Rflush` is sent from
+    inside the flushed request's own `respond`, after that request's
+    reply is already on the wire, and `reqqueueflush` answers a
+    still-queued request `interrupted` first. It also described
+    `srvrelease`/`srvacquire` and "the per-object lock", which D12 and
+    §7 replaced with a `Reqqueue` pool and no per-object lock at all.
+    *Made:* §5.4.1 now requires `Rflush` and the whole of step 7,
+    permits the flushed request to have been answered first (the
+    client discards that reply), and states the ordering as a property
+    of the queue rather than of a lock. What is *not* changed is
+    layer-a §5.4 step 2, which still spells the ordering point as
+    "take the per-object lock"; §5.4.1 governs the mechanism and
+    admits any that gives the total order, so step 2's wording is a
+    residual to align, not a second rule.
 
-15. **Two defensible answers, and the ones taken.** Three questions
-    in this design had a good argument on each side; the choices are
-    recorded so they are not re-opened by accident.
-    - *The bitmap.* Incremental per-page checkpointing keeps the
-      bitmap cheap; dropping the persistent bitmap entirely and
-      rebuilding at every start makes the format smaller but every
-      start slow. Taken: both halves of the cheap answer — one
-      paged, incrementally checkpointed copy (§2.5), rebuilt
-      automatically when a page fails, with `shoalck -R` kept for the
-      offline case. A second copy was dropped because it is not
-      redundancy: the older copy belongs to a checkpoint whose log
-      may already be reclaimed.
-    - *The flush channel.* Since the raw file is not exclusive, the
-      "another process holds it" degraded start had no referent at
-      all; but a genuine open failure can still happen. Taken:
-      refuse, with an explicit operator assertion (`-w`) as the only
-      way past it, rather than a permissive default (§3.2).
-    - *The entry length field.* A `u16` length with `shoalfmt`
-      refusing configurations it cannot encode would have been
-      smaller. Taken: `u32`, because the bound a `u16` imposes
-      (~2300 blocks per object) is invisible at the point where an
-      operator chooses `blksz`, and this format has already spent
-      more than two bytes on being explicit.
+15. **`/lost` names a condemned slot without an `oid=`.** Layer-a
+    §2.2 fixes `oid=` as a field of every `/lost` line, and layer-a
+    §1.2 constrains what an oid may be; an index entry damaged badly
+    enough to be condemned can supply neither. *Not made:* the line
+    carries `slot=<n>` and omits `oid=` (§5 step 10), which is a
+    deviation from a named field rather than an invented oid. Format
+    beyond `oid=` and `kind=` is implementation policy there, so the
+    omission is the smaller of the two departures.
 
 ## 15. Alternatives considered
 
@@ -2095,7 +2596,7 @@ and 15 are recorded here and not made there — two of them (10 and
 
 - **A size-classed or grain-backed extent map** — extent-map entries
   sized to the object rather than to `objmax`, or held in ordinary
-  grains allocated on demand. This is the recorded fix for §14(14)'s
+  grains allocated on demand. This is the recorded fix for §2.1's
   `nemap` residual, and the reason it is not taken now is that a
   grain-backed map has to be published by the same commit as the
   content it describes, which puts map-grain allocation into the
@@ -2139,6 +2640,20 @@ and 15 are recorded here and not made there — two of them (10 and
   the writer reclaim, so it can never be rolled forward. Keeping it
   would cost 32 MiB and an operator procedure for no recoverable
   state.
+
+- **A superblock-owner proc, and a tail assigner feeding a writer
+  pool** — the shape of the previous draft: one proc owning the
+  superblock image and answering publish requests, and one proc
+  assigning `seq` and log offsets to batches that a pool of writer
+  procs then wrote. Rejected as procs that buy nothing a lock does
+  not: a `QLock` plus a publish function gives "one write at a time,
+  built from live state" exactly (§2.2), and the classic group-commit
+  shape — the arriving committer absorbs the queue and writes its own
+  batch — gives the microsecond lock hold, the fixed batch
+  membership, the watermark and the lone writer's one-flush-one-write-
+  one-flush, with `logdepth` as a semaphore rather than a proc count
+  (§7). Two procs, a message type and a handoff removed from the most
+  crash-critical loop in the store.
 
 - **A per-object reader-writer lock** — the obvious way to spell
   layer-a §5.4.1's per-object ordering, held from step 2 to step 6 or
@@ -2195,7 +2710,7 @@ and 15 are recorded here and not made there — two of them (10 and
    configuration, only that removing them is unsafe on any
    configuration that does have a volatile cache.
 9. **The real object-size mix** Layer C produces, against `nemap`
-   (§14(14)). The parameter is cheap to change at format time and
+   (§2.1). The parameter is cheap to change at format time and
    expensive to change afterwards.
 10. **BLAKE2s throughput on the fleet**, to confirm the 50–59 MB/s
     measured here — every hashing term in §5, §8 and §11 scales with
@@ -2211,7 +2726,7 @@ and 15 are recorded here and not made there — two of them (10 and
    slots only for objects too big to carry their map inline. The
    alternative is a tighter default plus an operator who has to
    think; the cost of thinking wrongly is a disk that reports
-   `disk full` with terabytes free, which is also §14(14)'s residual.
+   `disk full` with terabytes free, which is also §2.1's residual.
 2. **Behaviour when the log is full.** *Recommend* a bounded wait
    then `disk full`, as §6 specifies, with no new wire error. The
    alternatives are failing immediately (turns a checkpoint hiccup
@@ -2236,11 +2751,14 @@ and 15 are recorded here and not made there — two of them (10 and
    automatically (it is derived state, and a 3 a.m. operator
    procedure for a derivable structure is a bad trade), serve with
    the object in `/lost` on a bad index entry that replay did not
-   restore, and refuse to start on two bad superblocks or a bitmap
-   page from a future checkpoint. The alternative, starting anyway
-   and letting the cluster arbitrate, is tempting because layer-a can
-   in fact heal it; it is rejected because a store that starts in a
-   mode it did not name is how an operator loses a day.
+   restore, and refuse to start on two bad superblocks or on a replay
+   that cannot reach the state the bitmap has already materialised
+   (§2.5) — but *not* on a bitmap page merely stamped ahead of the
+   superblock, which is the ordinary mid-checkpoint crash. The
+   alternative, starting anyway and letting the cluster arbitrate, is
+   tempting because layer-a can in fact heal it; it is rejected
+   because a store that starts in a mode it did not name is how an
+   operator loses a day.
 7. **libthread.** *Recommend* the `Reqqueue` pool (§7), which makes
    the whole server a libthread program using `threadpostmountsrv`.
    The alternative is `srvrelease`/`srvacquire` with explicit

@@ -79,4 +79,5 @@ computed outside this codebase, and the test source says how they
 were computed.
 
 **T2 — single-node integration** and **T3 — multi-node grid** are
-not yet defined.
+not yet defined. `docs/design/store.md` §13 proposes T2's shape for
+the local store, which is a proposal and not a ratified tier.
