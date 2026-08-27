@@ -523,6 +523,27 @@ sbpoke32(Dev *d, Super *s, ulong off, ulong v)
 	free(sb);
 }
 
+/* the same for a u64 field */
+static void
+sbpoke64(Dev *d, Super *s, ulong off, uvlong v)
+{
+	uchar *sb;
+	int i;
+
+	if((sb = malloc(s->secsz)) == nil)
+		sysfatal("malloc: %r");
+	for(i = 0; i < 2; i++){
+		vlong o;
+
+		o = i == 0 ? 0 : super1off(d);
+		simpeek(d, o, sb, s->secsz);
+		PBIT64(sb + off, v);
+		reccsumset(sb, s->secsz, 16);
+		simpoke(d, o, sb, s->secsz);
+	}
+	free(sb);
+}
+
 /*
  * A store with two live objects in it: a one-block object whose map
  * is inline (§2.3), and a three-block one with an extent map (§2.4).
@@ -704,6 +725,23 @@ tlive(void)
 	if(report(d, nil) == 0)
 		fail("the checker passed a misaligned region start");
 	said("a misaligned region", "not a 4096-byte boundary");
+
+	/*
+	 * §2.4: emapsz must cover 24 + 20*nblkmax, and nblkmax is a
+	 * u32 the superblock supplies, so the sum reaches 2^36 and a
+	 * ulong comparison wraps it.  A superblock naming 2^30 blocks
+	 * with the 512-byte emapsz this geometry formatted must be
+	 * caught here and by name: past this check ckindex allocates
+	 * emapsz bytes and ckemap walks nblkmax entries of it, which
+	 * is 4 GiB beyond the buffer.
+	 */
+	live(d, &s, &c);
+	sbpoke64(d, &s, 72, 1ULL<<42);		/* objmax */
+	sbpoke32(d, &s, 80, 1UL<<30);		/* nblkmax */
+	checks++;
+	if(report(d, nil) == 0)
+		fail("the checker passed an emapsz too small for nblkmax");
+	said("an emapsz too small for its nblkmax", "is too small for");
 
 	/*
 	 * A checker is the one tool run against hostile bytes: a

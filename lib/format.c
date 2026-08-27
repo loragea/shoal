@@ -48,7 +48,7 @@ int
 geometry(Super *s, Fmtcfg *c, vlong partbytes)
 {
 	uvlong nsec, lastsec, pagesecs, avail, nbm, bpp, need, nobj;
-	uvlong logbytes;
+	uvlong logbytes, emapsz;
 
 	memset(s, 0, sizeof *s);
 	if(!pow2(c->secsz)){
@@ -102,7 +102,20 @@ geometry(Super *s, Fmtcfg *c, vlong partbytes)
 	s->objmax = c->objmax;
 	s->csumalg = c->csumalg;
 	s->nblkmax = c->objmax / c->blksz;
-	s->emapsz = roundup(Emaphdrsz + 20*(uvlong)s->nblkmax, c->secsz);
+	emapsz = roundup(Emaphdrsz + 20*(uvlong)s->nblkmax, c->secsz);
+	if(emapsz >= (1ULL<<32)){
+		/*
+		 * emapsz is u32 in the superblock (§2.2), and every
+		 * reader sizes a buffer from it.  20*nblkmax reaches
+		 * 2^36 at a legal nblkmax, so this is a refusal beside
+		 * the nblkmax and logbytes ones and not a coincidence
+		 * of the defaults.
+		 */
+		werrstr("extent-map entry of %llud bytes for %lud blocks "
+			"reaches 2^32", emapsz, s->nblkmax);
+		return -1;
+	}
+	s->emapsz = emapsz;
 
 	/*
 	 * The defaults need no u32 range check of their own: nslots is

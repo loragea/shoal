@@ -176,7 +176,14 @@ ckgeom(Ck *k)
 	if(s->objmax % s->blksz != 0 || s->nblkmax != s->objmax/s->blksz)
 		problem(k, "nblkmax %lud does not match objmax %llud / blksz %lud",
 			s->nblkmax, s->objmax, s->blksz);
-	if(s->emapsz < Emaphdrsz + 20*s->nblkmax)
+	/*
+	 * In uvlong: nblkmax is a u32 the superblock supplies, so
+	 * 20*nblkmax reaches 2^36 and the ulong sum wraps.  A
+	 * checksum-valid superblock naming 2^30 blocks with a
+	 * 512-byte emapsz would otherwise pass this and send ckemap's
+	 * walk 4 GiB past the buffer ckindex allocates for it.
+	 */
+	if((uvlong)s->emapsz < Emaphdrsz + 20*(uvlong)s->nblkmax)
 		problem(k, "emapsz %lud is too small for %lud blocks",
 			s->emapsz, s->nblkmax);
 	if(s->ngrains >= (1ULL<<32))

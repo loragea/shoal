@@ -2293,7 +2293,8 @@ reformat-before-rejoin event, so it should take a flag. It refuses a
 geometry whose maximal `Eobj` record exceeds an eighth of the log
 region, one whose `ngrains` reaches 2^32, one whose `nblkmax`
 (`objmax`/`blksz`) reaches 2^32, one whose `blksz` is not a power of
-two between `secsz` and §2.1's 1 MiB ceiling, and one whose
+two between `secsz` and §2.1's 1 MiB ceiling, one whose `emapsz`
+(`24 + 20*nblkmax`, §2.4) reaches 2^32, and one whose
 log region does not fit the `u32` a record length is computed in
 (§2.7); and it warns
 when the metadata it has sized comes to more than 1% of the

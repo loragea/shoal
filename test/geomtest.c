@@ -153,6 +153,7 @@ trefuse(void)
 {
 	Fmtcfg c;
 	Super s;
+	char err[ERRMAX];
 
 	dflt(&c);
 	c.blksz = 12288;			/* not a power of two */
@@ -248,6 +249,28 @@ trefuse(void)
 	checks++;
 	if(geometry(&s, &c, 64LL*1024*1024*1024) == 0)
 		fail("an objmax whose nblkmax reaches 2^32 was accepted");
+
+	/*
+	 * §2.2: emapsz is u32, so 24 + 20*nblkmax must fit one.  No
+	 * geometry reaches this refusal without meeting another
+	 * first — the maximal record is 28 bytes per block against
+	 * emapsz's 20, and the log that would have to hold it does
+	 * not fit a u32 — so the refusal is asserted by the reason it
+	 * gives.  It is there because nothing but the arithmetic
+	 * stands between a u32 field and a wrapped assignment.
+	 */
+	dflt(&c);
+	c.objmax = 1ULL<<42;			/* 2^28 blocks at blksz 2^14 */
+	checks++;
+	if(geometry(&s, &c, 64LL*1024*1024*1024) == 0)
+		fail("an emapsz that reaches 2^32 was accepted");
+	else{
+		rerrstr(err, sizeof err);
+		checks++;
+		if(strstr(err, "extent-map entry") == nil)
+			fail("an emapsz reaching 2^32 was refused for some "
+				"other reason: %s", err);
+	}
 
 	/* §2.7: a record's length is u32, so the log region must fit one */
 	dflt(&c);
