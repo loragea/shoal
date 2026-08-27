@@ -277,14 +277,20 @@ ttruncextend(void)
 	d = newdisk();
 	if((s = mustopen(d, "truncate then extend")) == nil)
 		return;
-	a = mkbuf(3*Blk, 19);
+	a = mkbuf(5*Blk, 19);
 	b = mkbuf(2*Blk, 23);
-	if((got = mallocz(3*Blk, 1)) == nil)
+	if((got = mallocz(5*Blk, 1)) == nil)
 		sysfatal("malloc: %r");
 
+	/*
+	 * Five blocks down to three and back to five, so the object
+	 * keeps its extent-map slot across the shrink: that is where
+	 * clause 5 does its work, because a shrink that releases the
+	 * slot has the whole entry zeroed by clause 2 instead.
+	 */
 	mk(s, "a");
-	mustwr(s, "a", a, 3*Blk, 0);
-	if(trunc(s, "a", Blk, 3) < 0)
+	mustwr(s, "a", a, 5*Blk, 0);
+	if(trunc(s, "a", 3*Blk, 3) < 0)
 		fail("objtrunc: %r");
 
 	/* the freed grains go to another object, which writes over them */
@@ -292,13 +298,13 @@ ttruncextend(void)
 	mustwr(s, "b", b, 2*Blk, 0);
 
 	/* extend a again: the blocks it grows across must read as zero */
-	if(trunc(s, "a", 3*Blk, 4) < 0)
+	if(trunc(s, "a", 5*Blk, 4) < 0)
 		fail("objtrunc extend: %r");
-	rd(s, "a", got, 3*Blk, 0, "truncate then extend");
+	rd(s, "a", got, 5*Blk, 0, "truncate then extend");
 	checks++;
-	if(memcmp(got, a, Blk) != 0)
-		fail("truncate then extend: block 0 changed");
-	zeroes("the blocks a truncate released", got + Blk, 2*Blk);
+	if(memcmp(got, a, 3*Blk) != 0)
+		fail("truncate then extend: the surviving blocks changed");
+	zeroes("the blocks a truncate released", got + 3*Blk, 2*Blk);
 	mustverify(s, "a", "truncate then extend");
 	mustverify(s, "b", "the other object");
 
@@ -307,8 +313,8 @@ ttruncextend(void)
 		devclose(d);
 		return;
 	}
-	rd(s, "a", got, 3*Blk, 0, "replayed");
-	zeroes("the blocks a truncate released, after replay", got + Blk,
+	rd(s, "a", got, 5*Blk, 0, "replayed");
+	zeroes("the blocks a truncate released, after replay", got + 3*Blk,
 		2*Blk);
 	mustverify(s, "a", "replayed");
 	storeclose(s);
