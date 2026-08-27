@@ -344,6 +344,41 @@ tpoint(void)
 	devclose(d);
 }
 
+/*
+ * A crash is the end of a run, so a test may ask for it to stop the
+ * device: every read, write and flush then fails until the machine
+ * comes back.  Without it the writes a §13 schedule places after its
+ * crash point would still land.
+ */
+static void
+tdead(void)
+{
+	Dev *d;
+	uchar w[Secsz], r[Secsz];
+
+	d = sim();
+	pat(w, Secsz, 23);
+	simcrashdead(d, 1);
+	simarm(d, "commit", 0);
+	if(devwrite(d, w, Secsz, 5*Secsz) < 0)
+		fail("write: %r");
+	devpoint(d, "commit", 0);
+	checks++;
+	if(devwrite(d, w, Secsz, 6*Secsz) >= 0)
+		fail("a write after the crash still landed");
+	checks++;
+	if(devread(d, r, Secsz, 0) >= 0)
+		fail("a read after the crash still worked");
+	checks++;
+	if(devflush(d) >= 0)
+		fail("a flush after the crash still worked");
+	simrevive(d);
+	checks++;
+	if(devread(d, r, Secsz, 0) < 0)
+		fail("the machine did not come back: %r");
+	devclose(d);
+}
+
 /* the file-backed device: §12's tools work on an image, so T1 can too */
 static void
 tfile(void)
@@ -940,6 +975,7 @@ main(int, char**)
 	tcrash();
 	ttrace();
 	tpoint();
+	tdead();
 	tprocs();
 	tfile();
 	tclassify();

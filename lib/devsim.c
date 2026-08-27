@@ -75,6 +75,8 @@ struct Sim
 	Fault	fault[Nfault];
 
 	int	crashmode;
+	int	dieoncrash;	/* a crash stops the device until simrevive */
+	int	dead;
 	uchar	*keep;		/* per sector, under Scnamed: survives */
 
 	char	point[64];	/* armed crash point, empty if none */
@@ -188,6 +190,12 @@ simrd(Dev *d, void *a, long n, vlong off)
 
 	s = d->aux;
 	qlock(&s->lk);
+	if(s->dead){
+		record(s, Sopread, off, -1);
+		qunlock(&s->lk);
+		werrstr("i/o error");
+		return -1;
+	}
 	switch(takefault(s, Oread, off, n)){
 	case Sfeio:
 		record(s, Sopread, off, -1);
@@ -226,6 +234,12 @@ simwr(Dev *d, void *a, long n, vlong off)
 
 	s = d->aux;
 	qlock(&s->lk);
+	if(s->dead){
+		record(s, Sopwrite, off, -1);
+		qunlock(&s->lk);
+		werrstr("i/o error");
+		return -1;
+	}
 	f = takefault(s, Owrite, off, n);
 	switch(f){
 	case Sfeio:
@@ -275,6 +289,12 @@ simflush(Dev *d)
 
 	s = d->aux;
 	qlock(&s->lk);
+	if(s->dead){
+		record(s, Sopflush, 0, -1);
+		qunlock(&s->lk);
+		werrstr("i/o error");
+		return -1;
+	}
 	e = nil;
 	switch(takefault(s, Oflush, 0, 0)){
 	case Sfeio:
@@ -351,6 +371,8 @@ crash(Sim *s)
 	s->ndirty = 0;
 	memset(s->fault, 0, sizeof s->fault);
 	s->crashmode = Scdrop;
+	if(s->dieoncrash)
+		s->dead = 1;
 	if(s->keep != nil)
 		memset(s->keep, 0, s->nsec);
 }
@@ -533,6 +555,41 @@ simcrashkeep(Dev *d, vlong off, vlong len)
 		hi = s->nsec;
 	for(i = off/s->secsz; i < hi; i++)
 		s->keep[i] = 1;
+	qunlock(&s->lk);
+}
+
+/*
+ * A crash is the end of a run.  Where a test needs that — every §13
+ * schedule inside the commit path does, because the writes after the
+ * crash point would otherwise still land — simcrashdead makes the
+ * crash stop the device: every read, write and flush then fails until
+ * simrevive brings the machine back.  It is opt-in because the
+ * schedules that examine what a *partly* completed sequence left
+ * behind, like §2.2's two superblock writes, need the run to carry
+ * on.
+ */
+void
+simcrashdead(Dev *d, int on)
+{
+	Sim *s;
+
+	s = d->aux;
+	qlock(&s->lk);
+	s->dieoncrash = on;
+	if(!on)
+		s->dead = 0;
+	qunlock(&s->lk);
+}
+
+void
+simrevive(Dev *d)
+{
+	Sim *s;
+
+	s = d->aux;
+	qlock(&s->lk);
+	s->dead = 0;
+	s->dieoncrash = 0;
 	qunlock(&s->lk);
 }
 

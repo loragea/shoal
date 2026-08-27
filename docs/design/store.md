@@ -2391,6 +2391,16 @@ let *n+1* complete). Each T1 test names the requirement it
 discriminates and the mutation that must break it; **each mutation is
 run**, per `AGENTS.md`.
 
+A crash at a point is the end of a run, so the simulated disk can be
+told to **stop the device** at the crash: every subsequent read, write
+and flush fails until the test brings the machine back. Without that
+the writes a schedule places *after* its crash point would still
+land, and a crash before the commit record's header write would still
+leave a committed record. The schedules that examine what a partly
+completed sequence left behind — §2.2's two superblock writes — need
+the run to carry on instead, so stopping is a choice the test makes
+rather than what a crash always does.
+
 T1 formats a **small geometry** — a partition image of a few MiB with
 `-n` and `-e` in the hundreds — so that `mk test` stays within
 `AGENTS.md`'s seconds. The sweeps that are exhaustive are exhaustive

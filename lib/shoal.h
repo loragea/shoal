@@ -215,6 +215,8 @@ struct Simop
 void	simfault(Dev*, int kind, int n);
 void	simfaultat(Dev*, int kind, int n, vlong off, vlong len);
 void	simcrash(Dev*);
+void	simcrashdead(Dev*, int on);	/* a crash stops the device */
+void	simrevive(Dev*);		/* ... until the machine comes back */
 void	simcrashmode(Dev*, int mode);
 void	simcrashkeep(Dev*, vlong off, vlong len);
 void	simarm(Dev*, char *point, int n);
