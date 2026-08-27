@@ -124,10 +124,20 @@ static void
 ckgeom(Ck *k)
 {
 	Super *s;
-	uvlong nsec, o[7], n[7], i;
+	uvlong nsec, o[7], n[7], i, pagesecs;
 	char *nm[7];
 
 	s = k->s;
+	if(s->secsz == 0 || s->blksz == 0 || s->blksz % s->secsz != 0){
+		/*
+		 * Everything below divides by these two.  A checker is
+		 * the one tool that is run against hostile bytes, so it
+		 * says so and stops rather than trapping.
+		 */
+		problem(k, "secsz %lud and blksz %lud are not a geometry",
+			s->secsz, s->blksz);
+		return;
+	}
 	nsec = k->d->size / k->d->secsz;
 	nm[0] = "log";		o[0] = s->logoff;	n[0] = s->logsecs;
 	nm[1] = "index";	o[1] = s->idxoff;	n[1] = s->idxsecs;
@@ -137,6 +147,7 @@ ckgeom(Ck *k)
 	nm[5] = "data";		o[5] = s->dataoff;	n[5] = s->datasecs;
 	nm[6] = nil;
 
+	pagesecs = s->blksz / s->secsz;
 	for(i = 0; nm[i] != nil; i++){
 		if(o[i] < 1 || o[i] + n[i] > nsec - 1)
 			problem(k, "%s region %llud+%llud outside the "
@@ -145,10 +156,23 @@ ckgeom(Ck *k)
 		if(i > 0 && o[i] < o[i-1] + n[i-1])
 			problem(k, "%s region %llud overlaps %s %llud+%llud",
 				nm[i], o[i], nm[i-1], o[i-1], n[i-1]);
+		/* §2.1: every region start is a Wunit boundary */
+		if(o[i] % pagesecs != 0)
+			problem(k, "%s region starts at sector %llud, which is "
+				"not a %lud-byte boundary", nm[i], o[i],
+				s->blksz);
 	}
-	if(s->blksz % s->secsz != 0)
-		problem(k, "blksz %lud is not a multiple of secsz %lud",
-			s->blksz, s->secsz);
+	/*
+	 * §14(8) makes refusing a csumalg mismatch a MUST, and a digest
+	 * is meaningless until the algorithm behind it is known.
+	 */
+	if(s->csumalg != Csumblake2s)
+		problem(k, "csumalg %lud is not one this build implements",
+			s->csumalg);
+	if(s->logsecs*(uvlong)s->secsz >= (1ULL<<32))
+		problem(k, "log region of %llud bytes exceeds the u32 a "
+			"record length is computed in",
+			s->logsecs*(uvlong)s->secsz);
 	if(s->objmax % s->blksz != 0 || s->nblkmax != s->objmax/s->blksz)
 		problem(k, "nblkmax %lud does not match objmax %llud / blksz %lud",
 			s->nblkmax, s->objmax, s->blksz);
@@ -532,6 +556,15 @@ ckcross(Ck *k)
 					"and referenced by nothing", g);
 		}
 	}
+	/*
+	 * §2.1: grain 0 is reserved to mean `no grain', and shoalfmt
+	 * MUST mark it allocated.  A store whose bit 0 was cleared
+	 * would check clean and then hand grain 0 out as a real grain,
+	 * aliasing dataoff under every hole.
+	 */
+	if(k->s->ngrains > 0 && !getbit(k->alloc, 0))
+		problem(k, "grain 0 is not marked allocated, and §2.1 "
+			"reserves it");
 	if(phantom > 1)
 		problem(k, "%llud grains in all are referenced and unmarked",
 			phantom);
@@ -614,7 +647,15 @@ ckstore(Dev *d, Ckcfg *c)
 	say(&k, "device: %s, %lud-byte sectors, %lld bytes, flush=%s",
 		d->name, d->secsz, d->size, flushname(d->flushmode));
 
-	superselect(d, &sel);
+	if(superselect(d, &sel) < 0 && sel.clause != 3){
+		/*
+		 * Not clause 3: superselect could not get far enough to
+		 * apply the rule at all, and saying "neither copy is
+		 * valid" would be a different diagnosis from the truth.
+		 */
+		problem(&k, "reading the superblocks: %r");
+		return k.bad;
+	}
 	for(i = 0; i < 2; i++){
 		if(sel.valid[i])
 			say(&k, "superblock %d: valid, gen %llud, ckseq %llud, "

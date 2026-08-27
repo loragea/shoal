@@ -430,6 +430,27 @@ putlog(Dev *d, Super *s, uvlong seq)
 	free(p);
 }
 
+/* patch a u32 field in both superblock copies and re-seal them */
+static void
+sbpoke32(Dev *d, Super *s, ulong off, ulong v)
+{
+	uchar *sb;
+	int i;
+
+	if((sb = malloc(s->secsz)) == nil)
+		sysfatal("malloc: %r");
+	for(i = 0; i < 2; i++){
+		vlong o;
+
+		o = i == 0 ? 0 : super1off(d);
+		simpeek(d, o, sb, s->secsz);
+		PBIT32(sb + off, v);
+		reccsumset(sb, s->secsz, 16);
+		simpoke(d, o, sb, s->secsz);
+	}
+	free(sb);
+}
+
 /*
  * A store with two live objects in it: a one-block object whose map
  * is inline (§2.3), and a three-block one with an extent map (§2.4).
@@ -584,6 +605,45 @@ tlive(void)
 		fail("the checker passed a multi-block entry with no map");
 	said("a multi-block entry with no map", "no extent-map slot");
 
+	/* §2.1: grain 0 is reserved and MUST be marked allocated */
+	live(d, &s, &c);
+	markgrain(d, &s, 0, 0);
+	checks++;
+	if(report(d, nil) == 0)
+		fail("the checker passed a store with grain 0 free");
+	said("grain 0 free", "grain 0 is not marked allocated");
+
+	/*
+	 * §14(8): a digest is meaningless without the algorithm behind
+	 * it, so the checker says so rather than believing every digest
+	 * it then verifies.
+	 */
+	live(d, &s, &c);
+	sbpoke32(d, &s, 260, 99);		/* csumalg */
+	checks++;
+	if(report(d, nil) == 0)
+		fail("the checker passed an unknown csumalg");
+	said("an unknown csumalg", "csumalg 99");
+
+	/* §2.1: every region start is a Wunit boundary */
+	live(d, &s, &c);
+	sbpoke32(d, &s, 112, s.logoff + 1);	/* logoff */
+	checks++;
+	if(report(d, nil) == 0)
+		fail("the checker passed a misaligned region start");
+	said("a misaligned region", "not a 4096-byte boundary");
+
+	/*
+	 * A checker is the one tool run against hostile bytes: a
+	 * checksum-valid superblock with a zero blksz must be reported,
+	 * not divided by.
+	 */
+	live(d, &s, &c);
+	sbpoke32(d, &s, 68, 0);			/* blksz */
+	checks++;
+	if(report(d, nil) == 0)
+		fail("the checker passed a zero blksz");
+	said("a zero blksz", "are not a geometry");
 	devclose(d);
 }
 
