@@ -2252,7 +2252,12 @@ file is silent and expensive — the sector size falls back to the
 default, so every write becomes a read-modify-write of the sectors
 it touches (§0), and there is no flush channel to refuse to open —
 so the question is settled by what is there. Both tools take either
-kind. A file image is not a deployment target — D13 makes that a raw
+kind, and the classification is not a preference: a path the
+directory says is a partition is opened as one, and a failure there
+— no `ctl`, no permission, a raw channel that will not open — is
+reported and the tool exits rather than retrying it as a file, since
+falling back would be the silent misreading the question exists to
+prevent. A file image is not a deployment target — D13 makes that a raw
 partition — but it is what lets an operator inspect a copy, and it
 is what lets the T1 cases of §13 drive format and check with no disk
 at all. `shoalfmt -z` sizes such an image; nothing else in either
