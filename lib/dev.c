@@ -25,7 +25,8 @@ deverr(void)
 	rerrstr(err, sizeof err);
 	if(strcmp(err, "interrupted") == 0)
 		return Deintr;
-	if(strstr(err, "partitions have changed") != nil)
+	/* the kernel's Echange is "media or partition has changed" */
+	if(strstr(err, "has changed") != nil)
 		return Dechange;
 	return Deio;
 }
