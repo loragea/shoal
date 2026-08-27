@@ -92,7 +92,7 @@ enum
 
 /*
  * What the device can say about durability, which is what shoalck
- * prints and what /status reports (§3.2, §12).  The three states are
+ * prints and what /status reports (§3.2, §12).  The four states are
  * not two: a tool that never opened the raw channel has not observed
  * write-through, and must not claim the operator asserted it.
  */
@@ -131,8 +131,11 @@ struct Dev
  * Loop-until-complete wrappers (store.md §0).  devsd truncates a
  * request rather than splitting or failing, so a short count is
  * normal; these loop, and fail only on a real error or on no
- * progress.  They return 0 or -1 with the error string set; deverr
- * classifies that string.
+ * progress.  devwrite also splits: §0 forbids a single pwrite larger
+ * than the device's wunit, so a longer write is issued as wunit
+ * pieces rather than refused, which is what lets a blksz above the
+ * device's write unit be formatted at all (§2.1).  They return 0 or
+ * -1 with the error string set; deverr classifies that string.
  */
 int	devread(Dev*, void*, long, vlong);
 int	devwrite(Dev*, void*, long, vlong);
@@ -164,9 +167,16 @@ Dev*	simopen(ulong secsz, uvlong nsec, ulong seed);
  * write cache: a written sector is visible to reads at once but is
  * durable only after a flush, and a crash decides sector by sector
  * which of the two a dirty sector keeps.  Faults are armed for the
- * next n operations (n <= 0 arms them until disarmed); several may be
- * armed at once, and simfaultat aims one at a byte range.  Arming
- * Sfnone disarms every one of them, and so does a crash.
+ * next n operations (n <= 0 arms them until disarmed); at most eight
+ * may be armed at once — a ninth is a sysfatal — and simfaultat aims
+ * one at a byte range.  Arming Sfnone disarms every one of them, and
+ * so does a crash.
+ *
+ * One device operation takes at most one fault: the first armed one
+ * it can take, which is then consumed unless it is sticky.  A short
+ * count and a tear therefore apply to one devwrite rather than to one
+ * request — the wrapper loops, and the next iteration takes the next
+ * fault.
  */
 enum
 {
@@ -220,6 +230,7 @@ void	simrevive(Dev*);		/* ... until the machine comes back */
 void	simcrashmode(Dev*, int mode);
 void	simcrashkeep(Dev*, vlong off, vlong len);
 void	simarm(Dev*, char *point, int n);
+void	simslow(Dev*, int on);		/* yield under the lock; see §13 */
 void	simpoke(Dev*, vlong off, void *buf, long n);	/* to durable storage */
 void	simpeek(Dev*, vlong off, void *buf, long n);	/* from durable storage */
 uvlong	simdirty(Dev*);				/* sectors written but not flushed */
@@ -239,7 +250,9 @@ enum
 	Recsumlen	= Blkdlen,	/* 16, a record checksum */
 
 	Secszdflt	= 512,
-	Blkszstore	= 16384,	/* §0: blksz = Wunit = the grain */
+	Blkszstore	= 16384,	/* §2.1: the default blksz, layer-a's */
+	Blkszmax	= 1024*1024,	/* §2.1: the format's blksz ceiling */
+	Wunitdflt	= 16384,	/* §0's Wunit on the reference unit */
 	Objmaxdflt	= 16*1024*1024,
 	Ndirtydflt	= 65536,
 	Logbytesdflt	= 64*1024*1024,

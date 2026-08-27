@@ -185,7 +185,7 @@ formbatch(Store *s, int *full)
 	for(it = s->pend; it != nil; it = next){
 		next = it->next;
 		if(b->items != nil && bytes + it->nbyte > s->sb.blksz)
-			break;			/* one Wunit of record body */
+			break;			/* one blksz of record body */
 		nsec = (bytes + it->nbyte + s->sb.secsz - 1)/s->sb.secsz;
 		room = s->sb.logsecs - s->logtail;
 		consume = nsec <= room ? nsec : room + nsec;
@@ -276,7 +276,7 @@ packbatch(Store *s, Batch *b, uchar *p, long max, ulong *nent)
 	return n;
 }
 
-/* one Wunit-bounded write per piece (§0); sec is relative to logoff */
+/* blksz-bounded pieces, which devwrite splits again if need be (§0) */
 static int
 logwrite(Store *s, uchar *p, ulong n, uvlong sec)
 {

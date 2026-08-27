@@ -153,6 +153,78 @@ tround(Dev *d, char *what)
 	free(p);
 }
 
+/*
+ * §2.1: blksz is layer-a's, bounded by the format and not by the
+ * device's write unit, so a store formatted at a grain above that
+ * unit must format and check like any other — every region, bitmap
+ * page and grain write goes out in Wunit pieces (§0).
+ */
+static void
+tbigblk(void)
+{
+	Dev *d;
+	Super s;
+	Fmtcfg c;
+	Simop *t;
+	Bmpage bh;
+	uchar *p;
+	long i, n, nw, big;
+	int nbad;
+
+	if((d = simopen(Secsz, Nsec, Seed)) == nil)
+		sysfatal("simopen: %r");
+	memset(&c, 0, sizeof c);
+	c.secsz = Secsz;
+	c.blksz = 4*Wunitdflt;			/* 64 KiB: four write units */
+	c.objmax = 1024*1024;
+	c.nslots = 512;
+	c.nemap = 256;
+	c.ndirty = 256;
+	c.logbytes = 256*1024;
+	c.csumalg = Csumblake2s;
+	if(geometry(&s, &c, d->size) < 0){
+		fail("a geometry at a blksz above the write unit: %r");
+		devclose(d);
+		return;
+	}
+	eqv("a grain above the device write unit", s.blksz,
+		4*(uvlong)Wunitdflt);
+	simtracereset(d);
+	if(fmtstore(d, &s) < 0){
+		fail("a format at a blksz above the write unit: %r");
+		devclose(d);
+		return;
+	}
+	nw = big = 0;
+	n = simtrace(d, &t);
+	for(i = 0; i < n; i++)
+		if(t[i].op == Sopwrite){
+			nw++;
+			if(t[i].n > (long)d->wunit)
+				big++;
+		}
+	eqv("format requests above the device write unit", big, 0);
+	checks++;
+	if(nw < (long)(s.blksz/d->wunit))
+		fail("a format at a 64 KiB blksz took %ld requests", nw);
+	checks++;
+	if((nbad = check(d)) != 0)
+		fail("a store formatted at a 64 KiB blksz reported %d "
+			"problem(s)", nbad);
+	if((p = malloc(s.blksz)) == nil)
+		sysfatal("malloc: %r");
+	if(devread(d, p, s.blksz, (vlong)s.bmapoff*s.secsz) < 0)
+		fail("bitmap read: %r");
+	checks++;
+	if(bmunpack(&bh, p, s.blksz, 0) < 0)
+		fail("bitmap page 0 at a 64 KiB blksz: %r");
+	else
+		eqv("grain 0 is marked allocated at a 64 KiB blksz",
+			bmget(p, 0), 1);
+	free(p);
+	devclose(d);
+}
+
 /* the checker earns its keep: it must find what a fault leaves behind */
 static void
 tdamage(void)
@@ -451,6 +523,27 @@ sbpoke32(Dev *d, Super *s, ulong off, ulong v)
 	free(sb);
 }
 
+/* the same for a u64 field */
+static void
+sbpoke64(Dev *d, Super *s, ulong off, uvlong v)
+{
+	uchar *sb;
+	int i;
+
+	if((sb = malloc(s->secsz)) == nil)
+		sysfatal("malloc: %r");
+	for(i = 0; i < 2; i++){
+		vlong o;
+
+		o = i == 0 ? 0 : super1off(d);
+		simpeek(d, o, sb, s->secsz);
+		PBIT64(sb + off, v);
+		reccsumset(sb, s->secsz, 16);
+		simpoke(d, o, sb, s->secsz);
+	}
+	free(sb);
+}
+
 /*
  * A store with two live objects in it: a one-block object whose map
  * is inline (§2.3), and a three-block one with an extent map (§2.4).
@@ -625,13 +718,30 @@ tlive(void)
 		fail("the checker passed an unknown csumalg");
 	said("an unknown csumalg", "csumalg 99");
 
-	/* §2.1: every region start is a Wunit boundary */
+	/* §2.1: every region start is a blksz boundary */
 	live(d, &s, &c);
 	sbpoke32(d, &s, 112, s.logoff + 1);	/* logoff */
 	checks++;
 	if(report(d, nil) == 0)
 		fail("the checker passed a misaligned region start");
 	said("a misaligned region", "not a 4096-byte boundary");
+
+	/*
+	 * §2.4: emapsz must cover 24 + 20*nblkmax, and nblkmax is a
+	 * u32 the superblock supplies, so the sum reaches 2^36 and a
+	 * ulong comparison wraps it.  A superblock naming 2^30 blocks
+	 * with the 512-byte emapsz this geometry formatted must be
+	 * caught here and by name: past this check ckindex allocates
+	 * emapsz bytes and ckemap walks nblkmax entries of it, which
+	 * is 4 GiB beyond the buffer.
+	 */
+	live(d, &s, &c);
+	sbpoke64(d, &s, 72, 1ULL<<42);		/* objmax */
+	sbpoke32(d, &s, 80, 1UL<<30);		/* nblkmax */
+	checks++;
+	if(report(d, nil) == 0)
+		fail("the checker passed an emapsz too small for nblkmax");
+	said("an emapsz too small for its nblkmax", "is too small for");
 
 	/*
 	 * A checker is the one tool run against hostile bytes: a
@@ -647,12 +757,28 @@ tlive(void)
 	devclose(d);
 }
 
+static char *imgpath = "/tmp/shoalfmtcktest.img";
+
+/*
+ * §13 says a test that wants a file image creates and removes its
+ * own under /tmp.  The success paths below do; a sysfatal or a
+ * mutant that dies inside ckstore does not, so the removals are also
+ * registered here and run however this program exits.
+ */
+static void
+cleanup(void)
+{
+	remove(ckpath);
+	remove(imgpath);
+}
+
 void
 main(int, char**)
 {
 	Dev *d;
 	char *path;
 
+	atexit(cleanup);
 	if((null = open("/dev/null", OWRITE)) < 0)
 		null = 2;
 
@@ -661,7 +787,7 @@ main(int, char**)
 	tround(d, "simulated disk");
 	devclose(d);
 
-	path = "/tmp/shoalfmtcktest.img";
+	path = imgpath;
 	remove(path);
 	if((d = fileopen(path, Secsz, (vlong)Nsec*Secsz, 0)) == nil)
 		sysfatal("fileopen: %r");
@@ -676,6 +802,7 @@ main(int, char**)
 	devclose(d);
 	remove(path);
 
+	tbigblk();
 	tdamage();
 	treformat();
 	tcutream();

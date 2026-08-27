@@ -85,6 +85,16 @@ idxunpack(Idxent *e, uchar *p, ulong nemap)
 		werrstr("state %d", e->state);
 		return -1;
 	}
+	/*
+	 * §0: a flags field's undefined bits are a MUST-be-zero the
+	 * reader checks, because an unknown flag means the entry
+	 * asserts something this build does not know how to honour —
+	 * here, some other reason to keep an object out of a read.
+	 */
+	if(e->flags & ~Icorrupt){
+		werrstr("reserved flags bit set (%#ux)", e->flags);
+		return -1;
+	}
 	if(e->state == Sfree){
 		if(e->oidlen != 0 || e->emapslot != 0){
 			werrstr("free slot with oidlen %d emapslot %lud",

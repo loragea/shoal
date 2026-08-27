@@ -77,7 +77,7 @@ sdflush(Dev *d)
 {
 	Sd *s;
 	uchar cdb[10];
-	char buf[32];
+	char buf[32], err[ERRMAX];
 	long n;
 	int rv;
 
@@ -92,9 +92,16 @@ sdflush(Dev *d)
 	qlock(&s->raw);
 	memset(cdb, 0, sizeof cdb);
 	cdb[0] = 0x35;			/* SYNCHRONIZE CACHE (10) */
+	/*
+	 * Save the error before recovering: rawrecover closes and
+	 * reopens, and a failing open sets errstr, so wrapping %r
+	 * afterwards would report the reopen's error rather than the
+	 * flush's — and the caller classifies what it is given.
+	 */
 	if(write(s->rawfd, cdb, sizeof cdb) != sizeof cdb){
-		werrstr("%s: flush cdb: %r", d->name);
+		rerrstr(err, sizeof err);
 		rawrecover(s);
+		werrstr("%s: flush cdb: %s", d->name, err);
 		qunlock(&s->raw);
 		return -1;
 	}
@@ -103,16 +110,18 @@ sdflush(Dev *d)
 	 * SYNCHRONIZE CACHE carries no data, so the count is zero.
 	 */
 	if(read(s->rawfd, buf, 0) < 0){
-		werrstr("%s: flush: %r", d->name);
+		rerrstr(err, sizeof err);
 		rawrecover(s);
+		werrstr("%s: flush: %s", d->name, err);
 		qunlock(&s->raw);
 		return -1;
 	}
 	buf[0] = '\0';
 	n = read(s->rawfd, buf, sizeof buf - 1);
 	if(n < 0){
-		werrstr("%s: flush status: %r", d->name);
+		rerrstr(err, sizeof err);
 		rawrecover(s);
+		werrstr("%s: flush status: %s", d->name, err);
 		rv = -1;
 	}else{
 		buf[n] = '\0';
@@ -283,7 +292,7 @@ sdopen(char *part, int flags)
 	d->name = strdup(part);
 	d->secsz = secsz;
 	d->size = dir->length - dir->length % secsz;
-	d->wunit = Blkszstore;
+	d->wunit = Wunitdflt;
 	d->rdonly = (flags & Drdonly) != 0;
 	d->flushmode = flags & Drdonly ? Funknown : Fasserted;
 	d->aux = s;

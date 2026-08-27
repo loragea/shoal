@@ -122,7 +122,7 @@ fileopen(char *path, ulong secsz, vlong size, int flags)
 	d->name = strdup(path);
 	d->secsz = secsz;
 	d->size = size - size % secsz;
-	d->wunit = Blkszstore;
+	d->wunit = Wunitdflt;
 	d->flushmode = Fnone;
 	d->rdonly = (flags & Drdonly) != 0;
 	d->aux = f;

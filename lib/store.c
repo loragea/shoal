@@ -117,10 +117,15 @@ geomok(Store *s, Dev *d)
 			sb->secsz, d->secsz);
 		return -1;
 	}
-	if(sb->blksz == 0 || sb->blksz % sb->secsz != 0
-	|| sb->blksz > (ulong)d->wunit){
-		werrstr("blksz %lud against a %lud-byte write unit", sb->blksz,
-			d->wunit);
+	/*
+	 * §2.1 bounds blksz by the format, not by the device: a grain
+	 * larger than the unit's Wunit is written in Wunit pieces (§0),
+	 * so a store formatted on one unit opens on another.
+	 */
+	if(sb->blksz == 0 || (sb->blksz & (sb->blksz - 1)) != 0
+	|| sb->blksz < sb->secsz || sb->blksz > Blkszmax){
+		werrstr("blksz %lud is not a power of two in [%lud, %d]",
+			sb->blksz, sb->secsz, Blkszmax);
 		return -1;
 	}
 	if(sb->nblkmax == 0 || sb->objmax == 0

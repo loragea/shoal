@@ -10,7 +10,9 @@
  * devsd truncates a request to SDmaxio and to the partition end
  * rather than splitting or failing, so a short count is normal and is
  * never an error (docs/platform/9front-storage.md §5).  Every access
- * therefore loops until the whole range is done.  Two error strings
+ * therefore loops until the whole range is done, and a write longer
+ * than the device's Wunit is issued as Wunit pieces rather than
+ * refused (§0).  Two error strings
  * are not media errors and are reported as their own classes:
  * `interrupted', which means reqqueueflush aborted the system call
  * this proc was in, and Echange, which means the unit's partitions
@@ -24,19 +26,30 @@
  * error reaches a classifier it is `%s: flush: interrupted' rather
  * than the kernel's bare word, and an exact match would read an
  * ordinary client interrupt as media damage (§0).
+ *
+ * Only the last `: '-separated segment is matched, because everything
+ * before it is text the operator chose: a partition may be named
+ * `interrupted' — partition names are free text — and matching the
+ * whole string would classify a media error on it as a flushed
+ * request, which §0 unwinds into §3.3's step-7 exit instead of
+ * reporting.  The kernel's own word is what follows the last wrap.
  */
 int
 deverr(void)
 {
-	char err[ERRMAX];
+	char err[ERRMAX], *p;
 
 	rerrstr(err, sizeof err);
 	if(err[0] == '\0')
 		return Denone;
-	if(strstr(err, "interrupted") != nil)
+	if((p = strrchr(err, ':')) != nil && p[1] == ' ')
+		p += 2;
+	else
+		p = err;
+	if(strstr(p, "interrupted") != nil)
 		return Deintr;
 	/* the kernel's Echange is "media or partition has changed" */
-	if(strstr(err, "has changed") != nil)
+	if(strstr(p, "has changed") != nil)
 		return Dechange;
 	return Deio;
 }
@@ -105,20 +118,21 @@ devwrite(Dev *d, void *a, long n, vlong off)
 		werrstr("%s: unaligned write %ld at %lld", d->name, n, off);
 		return -1;
 	}
-	if((ulong)n > d->wunit){
-		/*
-		 * §0: the store MUST NOT issue a single pwrite larger
-		 * than Wunit.  A larger one buys nothing — devsd issues
-		 * one request per pwrite and the drivers split it again
-		 * — and obscures what one device round trip costs.
-		 */
-		werrstr("%s: write %ld at %lld exceeds the %lud-byte write "
-			"unit", d->name, n, off, d->wunit);
-		return -1;
-	}
+	/*
+	 * §0: the store MUST NOT issue a single pwrite larger than
+	 * Wunit — a larger one buys nothing, since devsd issues one
+	 * request per pwrite and the drivers split it again, and it
+	 * obscures what one device round trip costs.  A longer write
+	 * is split here rather than refused: Wunit is a property of
+	 * the device and blksz is a property of the format (§2.1), so
+	 * a grain larger than the unit is written in unit pieces.
+	 */
 	p = a;
 	while(n > 0){
-		m = (*d->ops->write)(d, p, n, off);
+		m = n;
+		if((ulong)m > d->wunit)
+			m = d->wunit;
+		m = (*d->ops->write)(d, p, m, off);
 		if(m < 0)
 			return -1;
 		if(m == 0){
@@ -157,7 +171,8 @@ devclose(Dev *d)
 
 /*
  * Zero a byte range, writing in pieces of unit bytes.  unit is the
- * caller's Wunit: §0 forbids a single pwrite larger than it.
+ * caller's buffer size — a grain, at every call site — and need not
+ * be the device's Wunit: devwrite splits a piece longer than that.
  */
 int
 devzero(Dev *d, vlong off, vlong n, ulong unit)
@@ -165,7 +180,7 @@ devzero(Dev *d, vlong off, vlong n, ulong unit)
 	uchar *buf;
 	long m;
 
-	if(unit == 0 || unit % d->secsz != 0 || unit > d->wunit){
+	if(unit == 0 || unit % d->secsz != 0){
 		werrstr("devzero: bad unit %lud", unit);
 		return -1;
 	}

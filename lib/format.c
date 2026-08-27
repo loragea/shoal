@@ -9,10 +9,11 @@
  *
  * Every derived quantity is recorded in the superblock so that no
  * reader recomputes it from assumptions.  Region starts are rounded
- * up to a Wunit boundary — §2.1 requires it of the log and it costs
+ * up to a blksz boundary — §2.1 requires it of the log and it costs
  * at most blksz-secsz bytes for each of the others, which is what
- * keeps every checkpoint page write and every grain write aligned as
- * well as sized to one device request.
+ * keeps every checkpoint page write and every grain write aligned.
+ * No bound here depends on the device's Wunit: a grain larger than
+ * one is written in Wunit pieces (§0).
  */
 
 static uvlong
@@ -47,7 +48,7 @@ int
 geometry(Super *s, Fmtcfg *c, vlong partbytes)
 {
 	uvlong nsec, lastsec, pagesecs, avail, nbm, bpp, need, nobj;
-	uvlong logbytes;
+	uvlong logbytes, emapsz;
 
 	memset(s, 0, sizeof *s);
 	if(!pow2(c->secsz)){
@@ -59,15 +60,18 @@ geometry(Super *s, Fmtcfg *c, vlong partbytes)
 			c->blksz);
 		return -1;
 	}
-	if(c->blksz > Blkszstore){
+	if(c->blksz > Blkszmax){
 		/*
-		 * §0: blksz is the grain, the checksum block and one
-		 * device request, and the store MUST NOT issue a write
-		 * larger than that request.  A bigger blksz is not one
-		 * round trip on either driver.
+		 * §2.1: blksz is layer-a's — a map header attribute with
+		 * no upper bound of its own — so the ceiling here is the
+		 * format's and not the device's.  A grain, a bitmap page
+		 * and a checkpoint page are each one blksz buffer this
+		 * store composes whole in memory.  The device's Wunit
+		 * does not appear: devwrite splits a longer write, so
+		 * what formats does not depend on a build constant.
 		 */
-		werrstr("blksz %lud exceeds the %d-byte write unit",
-			c->blksz, Blkszstore);
+		werrstr("blksz %lud exceeds the %d-byte format limit",
+			c->blksz, Blkszmax);
 		return -1;
 	}
 	if(!pow2(c->objmax) || c->objmax < c->blksz){
@@ -98,7 +102,20 @@ geometry(Super *s, Fmtcfg *c, vlong partbytes)
 	s->objmax = c->objmax;
 	s->csumalg = c->csumalg;
 	s->nblkmax = c->objmax / c->blksz;
-	s->emapsz = roundup(Emaphdrsz + 20*(uvlong)s->nblkmax, c->secsz);
+	emapsz = roundup(Emaphdrsz + 20*(uvlong)s->nblkmax, c->secsz);
+	if(emapsz >= (1ULL<<32)){
+		/*
+		 * emapsz is u32 in the superblock (§2.2), and every
+		 * reader sizes a buffer from it.  20*nblkmax reaches
+		 * 2^36 at a legal nblkmax, so this is a refusal beside
+		 * the nblkmax and logbytes ones and not a coincidence
+		 * of the defaults.
+		 */
+		werrstr("extent-map entry of %llud bytes for %lud blocks "
+			"reaches 2^32", emapsz, s->nblkmax);
+		return -1;
+	}
+	s->emapsz = emapsz;
 
 	/*
 	 * The defaults need no u32 range check of their own: nslots is
@@ -178,6 +195,28 @@ geometry(Super *s, Fmtcfg *c, vlong partbytes)
 				partbytes);
 			return -1;
 		}
+	}
+	/*
+	 * That loop steps 1 -> need(1) and stops at the first page
+	 * count that covers itself, which is not always the smallest
+	 * one that does: a page taken costs one grain, so need falls
+	 * by at most one page for each page added, and the jump lands
+	 * up to ceil((need(1)-1)/bpp) pages high — four pages at
+	 * blksz 512 on a 20 GiB partition.  Walking down reaches the
+	 * smallest, and one page at a time suffices because the valid
+	 * counts are upward closed: a bigger bitmap leaves fewer
+	 * grains to cover.  That is what makes §2.1's bound — the
+	 * ceiling, or the single page above it where the ceiling has
+	 * no fixed point — a property of this arithmetic rather than
+	 * a hope about small partitions.
+	 */
+	while(nbm > 1){
+		s->datasecs = avail - (nbm - 1)*pagesecs;
+		s->ngrains = s->datasecs / pagesecs;
+		need = (s->ngrains + bpp - 1) / bpp;
+		if(need > nbm - 1)
+			break;
+		nbm--;
 	}
 	s->bmapsecs = nbm*pagesecs;
 	s->dataoff = s->bmapoff + s->bmapsecs;

@@ -209,7 +209,7 @@ tshort(void)
 	long n, i, nw;
 
 	d = sim();
-	n = Blkszstore;			/* §0's Wunit: the largest write */
+	n = Blkszstore;			/* §2.1's default blksz */
 	if((w = malloc(n)) == nil || (r = malloc(n)) == nil)
 		sysfatal("malloc: %r");
 	pat(w, n, 7);
@@ -453,36 +453,92 @@ twrapped(void)
 	eqv("a wrapped media error is one", deverr(), Deio);
 	werrstr("");
 	eqv("no error string is no error class", deverr(), Denone);
+
+	/*
+	 * §0: only the last `: '-separated segment is classified,
+	 * because everything before it is the operator's text.
+	 * Partition names are free text, so a partition named
+	 * `interrupted' must not turn a media error into a flushed
+	 * request — the direction that discards damage silently.
+	 */
+	werrstr("/dev/sdF0/interrupted: read 512 at 0: i/o error");
+	eqv("a media error on a partition named interrupted",
+		deverr(), Deio);
+	werrstr("/dev/sdF0/interrupted: flush: interrupted");
+	eqv("a real interrupt on that partition is still one",
+		deverr(), Deintr);
+	werrstr("interrupted");
+	eqv("an unwrapped interrupt", deverr(), Deintr);
 }
 
 /*
  * §0: the store MUST NOT issue a single pwrite larger than Wunit, and
- * the device layer is where that is enforced rather than at each call
- * site.  A read has the opposite rule and is not capped.
+ * the device layer is where that holds rather than at each call site
+ * — but Wunit is the device's and blksz is the format's (§2.1), so a
+ * longer write is split into unit pieces rather than refused.  A read
+ * has the opposite rule and is not split.
  */
 static void
 tlimits(void)
 {
 	Dev *d;
-	uchar *big;
+	Simop *t;
+	uchar *big, *back;
+	long i, n, nw;
 
 	d = sim();
-	eqv("the write unit", d->wunit, Blkszstore);
-	if((big = mallocz(2*Blkszstore, 1)) == nil)
+	eqv("the write unit", d->wunit, Wunitdflt);
+	n = 3*Wunitdflt;
+	if((big = malloc(n)) == nil || (back = malloc(n)) == nil)
 		sysfatal("malloc: %r");
+	pat(big, n, 9);
 	checks++;
-	if(devwrite(d, big, Blkszstore, 0) < 0)
+	if(devwrite(d, big, Wunitdflt, 0) < 0)
 		fail("a write of exactly Wunit was refused: %r");
+
+	/* a write of three units is three requests, and all of it lands */
+	simtracereset(d);
 	checks++;
-	if(devwrite(d, big, Blkszstore + Secsz, 0) == 0)
-		fail("a write larger than Wunit was accepted");
+	if(devwrite(d, big, n, 0) < 0)
+		fail("a write larger than Wunit was refused: %r");
+	nw = 0;
+	for(i = 0; i < simtrace(d, &t); i++)
+		if(t[i].op == Sopwrite){
+			nw++;
+			checks++;
+			if(t[i].n > Wunitdflt)
+				fail("a single request of %ld bytes exceeds "
+					"the %lud-byte write unit", t[i].n,
+					d->wunit);
+		}
+	eqv("requests a three-unit write took", nw, 3);
+	if(devread(d, back, n, 0) < 0)
+		fail("read: %r");
 	checks++;
-	if(devread(d, big, 2*Blkszstore, 0) < 0)
+	if(memcmp(big, back, n) != 0)
+		fail("a split write lost bytes");
+
+	checks++;
+	if(devread(d, back, n, 0) < 0)
 		fail("a read larger than Wunit was refused: %r");
+
+	/* devzero's unit is the caller's grain, not the device's unit */
+	simtracereset(d);
 	checks++;
-	if(devzero(d, 0, 4*Blkszstore, 2*Blkszstore) == 0)
-		fail("devzero with a unit larger than Wunit was accepted");
+	if(devzero(d, 0, 4*(vlong)Wunitdflt, 2*Wunitdflt) < 0)
+		fail("devzero with a unit larger than Wunit was refused: %r");
+	nw = 0;
+	for(i = 0; i < simtrace(d, &t); i++)
+		if(t[i].op == Sopwrite){
+			nw++;
+			checks++;
+			if(t[i].n > Wunitdflt)
+				fail("devzero issued a %ld-byte request",
+					t[i].n);
+		}
+	eqv("requests a two-unit devzero of four units took", nw, 4);
 	free(big);
+	free(back);
 	devclose(d);
 }
 
@@ -853,11 +909,61 @@ tcrash(void)
 }
 
 /*
+ * §13: the named crash set and the crash mode are set by two calls,
+ * and neither order may lose the set.  simcrashkeep selects Scnamed
+ * itself, so the reverse order is the one that can go wrong.
+ */
+static void
+tkeeporder(void)
+{
+	Dev *d;
+	uchar w[Secsz], r[Secsz];
+
+	d = sim();
+	pat(w, Secsz, 13);
+	if(devwrite(d, w, Secsz, 8*Secsz) < 0)
+		fail("write: %r");
+	simcrashkeep(d, 8*Secsz, Secsz);
+	simcrashmode(d, Scnamed);
+	simcrash(d);
+	simpeek(d, 8*Secsz, r, Secsz);
+	checks++;
+	if(memcmp(r, w, Secsz) != 0)
+		fail("simcrashmode(Scnamed) after simcrashkeep lost the "
+			"named set");
+
+	/* and every other mode does discard it */
+	if(devwrite(d, w, Secsz, 9*Secsz) < 0)
+		fail("write: %r");
+	simcrashkeep(d, 9*Secsz, Secsz);
+	simcrashmode(d, Scdrop);
+	simcrash(d);
+	simpeek(d, 9*Secsz, r, Secsz);
+	checks++;
+	if(memcmp(r, w, Secsz) == 0)
+		fail("a crash kept a sector no policy named");
+	devclose(d);
+}
+
+/*
  * §7 puts the queue procs, the I/O procs, the flusher and the
  * checkpointer on one Dev, all of them proccreate'd and genuinely
  * parallel.  Every operation of every proc must reach the trace, or a
  * crash test asserting an order asserts it of a record with holes in
  * it.
+ *
+ * simslow is what makes this discriminating rather than lucky.  The
+ * sim's two shared counters — the trace index and the dirty count —
+ * are each read, then yielded across, then stored; with the lock
+ * held that is invisible, and with it removed eight procs lose
+ * records on every run.  Without the yields the same mutation ships
+ * green most of the time, which is a test that has caught nothing.
+ *
+ * The trace array is grown past what the procs will need before the
+ * first one is forked, so that the trace is not reallocated under
+ * them.  A build without the lock then fails on the counters, which
+ * is the property being tested, rather than inside the allocator,
+ * which would leave a broken proc and a parent in waitpid.
  */
 static void
 tprocs(void)
@@ -865,11 +971,20 @@ tprocs(void)
 	Dev *d;
 	Simop *t;
 	uchar *buf, *seen;
+	uchar pre[Secsz];
 	long i, n;
 	int j;
 
 	if((d = simopen(Secsz, Nproc*Npwrite + 8, Seed)) == nil)
 		sysfatal("simopen: %r");
+	pat(pre, Secsz, 1);
+	for(i = 0; i < 2*Nproc*Npwrite; i++)
+		if(devwrite(d, pre, Secsz, (vlong)(Nproc*Npwrite)*Secsz) < 0)
+			fail("prefill: %r");
+	if(devflush(d) < 0)
+		fail("prefill flush: %r");
+	eqv("the dirty set is empty before the procs start", simdirty(d), 0);
+	simslow(d, 1);
 	simtracereset(d);
 	for(j = 0; j < Nproc; j++){
 		switch(rfork(RFPROC|RFMEM)){
@@ -905,6 +1020,7 @@ tprocs(void)
 			j++;
 	eqv("sectors written other than once", j, 0);
 	free(seen);
+	simslow(d, 0);
 	devclose(d);
 }
 
@@ -976,6 +1092,7 @@ main(int, char**)
 	ttrace();
 	tpoint();
 	tdead();
+	tkeeporder();
 	tprocs();
 	tfile();
 	tclassify();

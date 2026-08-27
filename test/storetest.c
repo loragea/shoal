@@ -20,6 +20,14 @@ enum
 	Blk	= 4096,			/* the small geometry's blksz */
 };
 
+/*
+ * The blksz of the geometry under test.  Layer-a §1.4's checksum
+ * block is the grain, so the shadow's csum has to be computed at the
+ * size the store was formatted with; every test but tbigblk formats
+ * the small geometry.
+ */
+static ulong csumblk = Blk;
+
 /* a shadow copy of what an object should hold */
 typedef struct Shadow Shadow;
 struct Shadow
@@ -78,7 +86,7 @@ checkobj(Store *s, char *name, Shadow *sh, char *what)
 	eqv("len", oi.len, sh->len);
 	if(oi.len != sh->len)
 		return;
-	objcsum(sh->p, sh->len, Blk, csum);
+	objcsum(sh->p, sh->len, csumblk, csum);
 	checks++;
 	if(memcmp(csum, oi.csum, Csumlen) != 0)
 		fail("%s: %s: stored csum is not the csum of its content",
@@ -582,6 +590,65 @@ tflushchan(void)
 	devclose(d);
 }
 
+/*
+ * §0 and §2.1: `blksz` is the format's and `Wunit` is the device's,
+ * so a store formatted with a grain larger than the unit's write
+ * unit opens and runs — devwrite splits each grain write into
+ * `Wunit` pieces (§0).  Nothing above the device layer may consult
+ * `wunit`, which is a build constant here and a property of whatever
+ * unit the store is carried to next.
+ */
+static void
+tbigblk(void)
+{
+	Dev *d;
+	Store *s;
+	Super sb;
+	Fmtcfg c;
+	Shadow sh;
+	uchar *buf;
+
+	memset(&sh, 0, sizeof sh);
+	if((d = simopen(Tsecsz, Tnsec, Tseed)) == nil)
+		sysfatal("simopen: %r");
+	smallcfg(&c);
+	c.blksz = 4*Wunitdflt;			/* 64 KiB: four write units */
+	c.objmax = 4*(uvlong)c.blksz;
+	c.logbytes = 4*(uvlong)c.blksz;
+	if(geometry(&sb, &c, d->size) < 0){
+		fail("a geometry at a blksz above the write unit: %r");
+		devclose(d);
+		return;
+	}
+	eqv("the grain is above the device write unit", sb.blksz,
+		4*(uvlong)d->wunit);
+	if(fmtstore(d, &sb) < 0){
+		fail("fmtstore at a blksz above the write unit: %r");
+		devclose(d);
+		return;
+	}
+	if((s = mustopen(d, "a grain above the write unit")) == nil){
+		devclose(d);
+		return;
+	}
+	csumblk = c.blksz;
+	mkobj(s, "wide", 1);
+	buf = mkbuf(c.blksz + 100, 3);
+	wr(s, "wide", &sh, buf, c.blksz + 100, 0, 2);
+	checkobj(s, "wide", &sh, "a grain above the write unit");
+
+	/* and the log it wrote replays from the same disk */
+	storeclose(s);
+	if((s = mustopen(d, "replayed above the write unit")) != nil){
+		checkobj(s, "wide", &sh, "replayed above the write unit");
+		storeclose(s);
+	}
+	csumblk = Blk;
+	free(buf);
+	free(sh.p);
+	devclose(d);
+}
+
 void
 main(int argc, char **argv)
 {
@@ -593,6 +660,7 @@ main(int argc, char **argv)
 	tpublish();
 	tcondemn();
 	tflushchan();
+	tbigblk();
 	if(fails > 0){
 		fprint(2, "storetest: %d of %d checks failed\n", fails, checks);
 		exits("failed");
