@@ -1509,31 +1509,40 @@ availability traded for an honest answer, and it is a product call,
 - An instance MUST serve requests on one connection **concurrently**:
   a request blocked in step 4 MUST NOT block requests on other
   objects, or reads of `/status`, `/ctl` or `/map`. `lib9p`'s `srv`
-  loop is single-threaded (9p(2)); in its terms this means every
-  handler that can block calls `srvrelease` so the loop continues in
-  another proc, and `srvacquire` before it responds.
+  loop is single-threaded (9p(2)); in its terms this means object
+  operations are pushed off the loop to `9pqueue`(2) `Reqqueue`s —
+  one queue per object hash, each with its own proc — so the loop
+  goes on serving while a pushed request blocks. The per-object total
+  order the write path needs is then the queue's, not a lock's: two
+  operations on one object share a queue and run one after the other.
+  Whatever mechanism an implementation chooses, it MUST NOT be held
+  across a client's think time — it is entered in step 2 and left in
+  step 6 or 7, never spanning more than the sum bounded above.
 - A `Tflush` naming a pending object operation MUST be answered with
   `Rflush`. `devmnt` sends `Tflush` on interrupt and waits for
   `Rflush`; a server that never answers leaves the client process
   wedged and unkillable. `lib9p` requires `Srv.flush` for any slow
-  request; implementing it is not optional here.
-- On flush the instance MUST abandon the client-visible request
-  (answer `Rflush`, no `Rwrite`, no `Rerror`) and MUST then perform
-  **the whole of step 7**: discard the staged update, release the
-  per-object lock, clear the per-(object, peer) sync state for every
-  candidate involved, invalidate `cur` for `o`, and re-run the
-  currency check before serving `o` again. The only difference from
-  step 7 is that no error is returned to the client. The replication
-  attempt already in flight MAY complete, which is exactly why the
-  cleanup is not optional: a peer that durably committed
-  `(E, ver+1)` while the primary discarded its stage leaves the
-  primary holding `(E, ver)` with stale sync state and a `cur` it has
-  no right to. Without the re-check the primary would later re-issue
-  `(E, ver+1)` over different content and violate I3 — the same
-  defect as a crash between steps 4 and 6 (§5.2's restart rule).
-- The per-object lock MUST NOT be held across a client's think time:
-  it is taken in step 2 and released in step 6 or 7, never spanning
-  more than the sum bounded above.
+  request; implementing it is not optional here, and `reqqueueflush`
+  is what implements it for a queue pool.
+- On flush the instance MUST answer `Rflush` and MUST perform **the
+  whole of step 7**: discard the staged update, clear the
+  per-(object, peer) sync state for every candidate involved,
+  invalidate `cur` for `o`, and re-run the currency check before
+  serving `o` again. The instance MAY already have answered the
+  flushed request itself — with `Rwrite`, or with an `Rerror` such as
+  the `interrupted` a queued request is given when it is removed —
+  before that `Rflush`; 9P has the client discard the reply to a
+  request it flushed, and `lib9p` sends a parked `Rflush` only from
+  inside the flushed request's own response. So the client learns no
+  outcome either way, and the operation's effect is exactly the "MAY
+  or MAY NOT have been applied" case. The replication attempt already
+  in flight MAY complete, which is exactly why the cleanup is not
+  optional: a peer that durably committed `(E, ver+1)` while the
+  primary discarded its stage leaves the primary holding `(E, ver)`
+  with stale sync state and a `cur` it has no right to. Without the
+  re-check the primary would later re-issue `(E, ver+1)` over
+  different content and violate I3 — the same defect as a crash
+  between steps 4 and 6 (§5.2's restart rule).
 
 ### 5.5 The `/repl` push channel
 
