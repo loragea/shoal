@@ -309,6 +309,284 @@ tcutream(void)
 	devclose(d);
 }
 
+/*
+ * The live-object half of the checker, §12: the bitmap cross-check,
+ * the extent maps a live entry claims, and the log scan from the
+ * checkpoint mark.  A formatted store has no live object in it, so
+ * none of that runs unless a test builds one — and the entries are
+ * built through the codecs, at the offsets §2 gives them, rather than
+ * by the write path, which does not exist yet.
+ */
+
+static char *ckpath = "/tmp/shoalcktest.out";
+static char ckbuf[65536];
+
+/* run the checker, keeping its report for what it said as well as how much */
+static int
+report(Dev *d, char *oid)
+{
+	Ckcfg c;
+	int fd, bad;
+	long n;
+
+	memset(&c, 0, sizeof c);
+	if((fd = create(ckpath, ORDWR, 0666)) < 0)
+		sysfatal("create %s: %r", ckpath);
+	c.out = fd;
+	c.verbose = 1;
+	c.oid = oid;
+	bad = ckstore(d, &c);
+	seek(fd, 0, 0);
+	if((n = readn(fd, ckbuf, sizeof ckbuf - 1)) < 0)
+		n = 0;
+	ckbuf[n] = '\0';
+	close(fd);
+	remove(ckpath);
+	return bad;
+}
+
+static void
+said(char *what, char *want)
+{
+	checks++;
+	if(strstr(ckbuf, want) == nil)
+		fail("%s: the report does not say `%s'", what, want);
+}
+
+static void
+putidx(Dev *d, Super *s, ulong slot, Idxent *e)
+{
+	uchar p[Idxentsz];
+
+	idxpack(p, e);
+	simpoke(d, idxentoff(s, slot), p, Idxentsz);
+}
+
+/* an extent map of nblk grains starting at g0, sealed */
+static void
+putemap(Dev *d, Super *s, ulong slot, ulong nblk, ulong g0, ulong past)
+{
+	uchar *p;
+	Emap m;
+	ulong i;
+
+	if((p = mallocz(s->emapsz, 1)) == nil)
+		sysfatal("malloc: %r");
+	for(i = 0; i < nblk; i++){
+		emapsetgrain(p, i, g0 + i);
+		memset(emapdig(p, s->nblkmax, i), 0x11 + i, Blkdlen);
+	}
+	if(past != 0)
+		emapsetgrain(p, nblk, past);
+	m.nblk = nblk;
+	m.vers = Storevers;
+	emappack(p, s->emapsz, &m);
+	simpoke(d, emapentoff(s, slot), p, s->emapsz);
+	free(p);
+}
+
+static void
+markgrain(Dev *d, Super *s, uvlong g, int on)
+{
+	uchar *p;
+	Bmpage h;
+	uvlong page, bpp, off;
+
+	bpp = bmbits(s->blksz);
+	page = g/bpp;
+	off = (uvlong)s->bmapoff*s->secsz + page*(uvlong)s->blksz;
+	if((p = malloc(s->blksz)) == nil)
+		sysfatal("malloc: %r");
+	simpeek(d, off, p, s->blksz);
+	if(on)
+		bmset(p, g % bpp);
+	else
+		bmclr(p, g % bpp);
+	memset(&h, 0, sizeof h);
+	h.vers = Storevers;
+	h.page = page;
+	h.ckseq = 0;
+	bmpack(p, s->blksz, &h);
+	simpoke(d, off, p, s->blksz);
+	free(p);
+}
+
+/* one log record at the checkpoint mark, carrying no entries */
+static void
+putlog(Dev *d, Super *s, uvlong seq)
+{
+	uchar *p;
+	Lrec r;
+
+	if((p = mallocz(s->secsz, 1)) == nil)
+		sysfatal("malloc: %r");
+	memset(&r, 0, sizeof r);
+	r.vers = Storevers;
+	r.nsec = 1;
+	r.seq = seq;
+	r.nent = 0;
+	lrecpack(p, &r, s->secsz);
+	simpoke(d, (uvlong)s->cklogoff*s->secsz, p, s->secsz);
+	free(p);
+}
+
+/*
+ * A store with two live objects in it: a one-block object whose map
+ * is inline (§2.3), and a three-block one with an extent map (§2.4).
+ * Grains 1 and 2..4 are theirs; grain 0 is the reserved one.
+ */
+static void
+live(Dev *d, Super *s, Fmtcfg *c)
+{
+	Idxent e;
+	int i;
+
+	if(geometry(s, c, d->size) < 0 || fmtstore(d, s) < 0)
+		sysfatal("format: %r");
+
+	memset(&e, 0, sizeof e);
+	e.state = Slive;
+	e.oidlen = 5;
+	e.vers = Storevers;
+	e.qidpath = 11;
+	e.len = 1000;
+	e.ver = 1;
+	e.grain0 = 1;
+	memmove(e.oid, "small", 5);
+	memset(e.dig0, 0x22, Blkdlen);
+	putidx(d, s, 1, &e);
+
+	memset(&e, 0, sizeof e);
+	e.state = Slive;
+	e.oidlen = 3;
+	e.vers = Storevers;
+	e.qidpath = 12;
+	e.len = 2*(uvlong)s->blksz + 100;	/* three blocks */
+	e.ver = 1;
+	e.emapslot = 5;
+	memmove(e.oid, "big", 3);
+	putidx(d, s, 2, &e);
+	putemap(d, s, 5, 3, 2, 0);
+
+	for(i = 1; i <= 4; i++)
+		markgrain(d, s, i, 1);
+}
+
+static void
+tlive(void)
+{
+	Dev *d;
+	Super s;
+	Fmtcfg c;
+	Idxent e;
+
+	if((d = simopen(Secsz, Nsec, Seed)) == nil)
+		sysfatal("simopen: %r");
+	smallcfg(&c);
+
+	/* the clean case: two live objects, four grains, one log record */
+	live(d, &s, &c);
+	putlog(d, &s, s.ckseq + 1);
+	checks++;
+	if(report(d, nil) != 0)
+		fail("a store with two live objects reported problems");
+	said("live objects", "index: 2 live");
+	said("the grain cross-check", "4 referenced");
+	said("the extent maps", "extent maps: 1 claimed, 0 bad");
+	said("the log scan", "log: 1 valid records");
+
+	/* §5 step 7: a record whose seq is not the successor is not one */
+	putlog(d, &s, s.ckseq + 7);
+	checks++;
+	if(report(d, nil) != 0)
+		fail("a log record out of sequence was a problem, not a stop");
+	said("an out-of-sequence log record", "log: 0 valid records");
+
+	/* -o dumps the object's entry and every block of its map */
+	live(d, &s, &c);
+	report(d, "big");
+	said("-o", "block 2: grain 4");
+
+	/* a bit set under no live map at all */
+	live(d, &s, &c);
+	markgrain(d, &s, 9, 1);
+	checks++;
+	if(report(d, nil) == 0)
+		fail("the checker passed a leaked grain");
+	said("a leaked grain", "referenced by nothing");
+
+	/* a bit cleared under a grain a live map names */
+	live(d, &s, &c);
+	markgrain(d, &s, 3, 0);
+	checks++;
+	if(report(d, nil) == 0)
+		fail("the checker passed a phantom grain");
+	said("a phantom grain", "clear in the bitmap");
+
+	/* two live entries naming one grain */
+	live(d, &s, &c);
+	memset(&e, 0, sizeof e);
+	e.state = Slive;
+	e.oidlen = 5;
+	e.vers = Storevers;
+	e.len = 1000;
+	e.grain0 = 3;			/* block 1 of the big object */
+	memmove(e.oid, "small", 5);
+	putidx(d, &s, 1, &e);
+	checks++;
+	if(report(d, nil) == 0)
+		fail("the checker passed a grain referenced twice");
+	said("a grain referenced twice", "is referenced twice");
+
+	/* a grain number the data region does not have */
+	live(d, &s, &c);
+	memset(&e, 0, sizeof e);
+	e.state = Slive;
+	e.oidlen = 5;
+	e.vers = Storevers;
+	e.len = 1000;
+	e.grain0 = s.ngrains;
+	memmove(e.oid, "small", 5);
+	putidx(d, &s, 1, &e);
+	checks++;
+	if(report(d, nil) == 0)
+		fail("the checker passed a grain at ngrains");
+	said("a grain past the data region", "ngrains is");
+
+	/* §2.4: an extent-map slot naming a grain at or beyond nblk */
+	live(d, &s, &c);
+	putemap(d, &s, 5, 3, 2, 8);
+	checks++;
+	if(report(d, nil) == 0)
+		fail("the checker passed a grain beyond nblk");
+	said("a grain beyond nblk", "at or beyond nblk");
+
+	/* §2.4: nblk is blkcount(len) and nothing else */
+	live(d, &s, &c);
+	putemap(d, &s, 5, 2, 2, 0);
+	checks++;
+	if(report(d, nil) == 0)
+		fail("the checker passed an nblk that len contradicts");
+	said("an nblk len contradicts", "says nblk");
+
+	/* §2.3: a multi-block entry must have an extent-map slot */
+	live(d, &s, &c);
+	memset(&e, 0, sizeof e);
+	e.state = Slive;
+	e.oidlen = 3;
+	e.vers = Storevers;
+	e.len = 2*(uvlong)s.blksz + 100;
+	e.emapslot = 0;
+	memmove(e.oid, "big", 3);
+	putidx(d, &s, 2, &e);
+	checks++;
+	if(report(d, nil) == 0)
+		fail("the checker passed a multi-block entry with no map");
+	said("a multi-block entry with no map", "no extent-map slot");
+
+	devclose(d);
+}
+
 void
 main(int, char**)
 {
@@ -341,6 +619,7 @@ main(int, char**)
 	tdamage();
 	treformat();
 	tcutream();
+	tlive();
 	if(fails > 0)
 		exits("failed");
 	print("fmtcktest: %d checks ok\n", checks);
