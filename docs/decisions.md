@@ -175,9 +175,10 @@ class (D5) and weights.
 **Decision:** shoal is implemented in 9front's native C — the Plan 9
 C dialect, built with `6c`/`6l` under `mk` — and builds and tests run
 on 9front itself; a Linux host, if any, is git hosting only. The 9P
-server side uses stock `lib9p` (9p(2)) with `srv` in multi-proc mode
-and an implemented `Srv.flush`, as `design/layer-a.md` §5.4.1
-requires. Hashing uses libsec's BLAKE2s (D7).
+server side uses stock `lib9p` (9p(2)): its `srv` loop is
+single-threaded, and slow requests get their own proc through
+`srvrelease`/`srvacquire`, with an implemented `Srv.flush`, as
+`design/layer-a.md` §5.4.1 requires. Hashing uses libsec's BLAKE2s (D7).
 **Rationale:** Native C is the only toolchain 9front ships and
 maintains, so it is the only one whose breakage is anyone's problem
 but ours. `lib9p` is what every 9front file server is written

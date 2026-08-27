@@ -159,10 +159,16 @@ commit.
   interface.** The protocol on `/dev/sdXX/raw` is: *write* the
   10-byte cdb, then *read* — the read is the data phase and is
   where the command is actually issued — then *read* again for
-  status. The file is `-lrw-------`: **exclusive, one opener per
-  unit**, so a process that wants to flush a disk holds one raw fd
-  for that disk. `devsd.c:1466-1519` (write), `devsd.c:1310-1341`
-  (read), `devsd.c:919-983` (`sdrio`).
+  status. The file is listed `-lrw-------` but is **not exclusive**:
+  `devsd.c:749-758` tests `unit->rawinuse` on open, and nothing ever
+  sets it (`devsd.c:786` only clears it), so two processes — or two
+  procs of one process — can hold `/dev/sdXX/raw` open at once
+  (verified: concurrent opens succeed). The cdb→data→status state is
+  **per unit** (`unit->state`, `unit->req`), so concurrent raw
+  commands on one unit corrupt each other's exchange; every user of
+  the raw file on a unit MUST serialise its own commands, and only
+  one process per unit should issue them. `devsd.c:1466-1519`
+  (write), `devsd.c:1310-1341` (read), `devsd.c:919-983` (`sdrio`).
 - **On AHCI the same opcode becomes a real ATA `FLUSH CACHE`.**
   `sdiahci.c:1857-1861` → `sdiahci.c:1664-1672` →
   `sdiahci.c:378-392`.

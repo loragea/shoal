@@ -1481,10 +1481,10 @@ availability traded for an honest answer, and it is a product call,
 
 - An instance MUST serve requests on one connection **concurrently**:
   a request blocked in step 4 MUST NOT block requests on other
-  objects, or reads of `/status`, `/ctl` or `/map`. In `lib9p` terms
-  this means a `Srv` with per-request worker procs, not the default
-  single-threaded loop, which serialises all traffic on the
-  connection.
+  objects, or reads of `/status`, `/ctl` or `/map`. `lib9p`'s `srv`
+  loop is single-threaded (9p(2)); in its terms this means every
+  handler that can block calls `srvrelease` so the loop continues in
+  another proc, and `srvacquire` before it responds.
 - A `Tflush` naming a pending object operation MUST be answered with
   `Rflush`. `devmnt` sends `Tflush` on interrupt and waits for
   `Rflush`; a server that never answers leaves the client process
