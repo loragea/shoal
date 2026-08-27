@@ -92,7 +92,7 @@ enum
 
 /*
  * What the device can say about durability, which is what shoalck
- * prints and what /status reports (§3.2, §12).  The three states are
+ * prints and what /status reports (§3.2, §12).  The four states are
  * not two: a tool that never opened the raw channel has not observed
  * write-through, and must not claim the operator asserted it.
  */
@@ -167,9 +167,16 @@ Dev*	simopen(ulong secsz, uvlong nsec, ulong seed);
  * write cache: a written sector is visible to reads at once but is
  * durable only after a flush, and a crash decides sector by sector
  * which of the two a dirty sector keeps.  Faults are armed for the
- * next n operations (n <= 0 arms them until disarmed); several may be
- * armed at once, and simfaultat aims one at a byte range.  Arming
- * Sfnone disarms every one of them, and so does a crash.
+ * next n operations (n <= 0 arms them until disarmed); at most eight
+ * may be armed at once — a ninth is a sysfatal — and simfaultat aims
+ * one at a byte range.  Arming Sfnone disarms every one of them, and
+ * so does a crash.
+ *
+ * One device operation takes at most one fault: the first armed one
+ * it can take, which is then consumed unless it is sticky.  A short
+ * count and a tear therefore apply to one devwrite rather than to one
+ * request — the wrapper loops, and the next iteration takes the next
+ * fault.
  */
 enum
 {
