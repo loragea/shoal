@@ -406,6 +406,18 @@ tidx(void)
 	checks++;
 	if(idxunpack(&f, want, 0x11223344) == 0)
 		fail("index entry: emapslot == nemap was accepted");
+
+	/*
+	 * §0: a flags field's undefined bits are a MUST-be-zero the
+	 * reader checks.  Bit 0 is Icorrupt; the rest are reserved,
+	 * and a checksum-valid entry that sets one is refused.
+	 */
+	memmove(got, want, n);
+	got[2] = Icorrupt|0x02;
+	reccsumset(got, Idxentsz, 208);
+	checks++;
+	if(idxunpack(&f, got, 0x11223345) == 0)
+		fail("index entry: a reserved flags bit was accepted");
 	flip("index entry", want, n, 16, decidx);
 	free(got);
 	free(want);
@@ -648,12 +660,37 @@ tlog(void)
 	eqv("log record nent", t.nent, 3);
 	eqv("log record Fwrap", t.flags & Fwrap, Fwrap);
 
+	/*
+	 * §0: the same rule over the record's own flags field.  Bit 0
+	 * is Fwrap and the other fifteen are reserved, so a
+	 * checksum-valid record that sets one is not a record this
+	 * build knows how to continue from.
+	 */
+	memmove(got, want, n);
+	PBIT16(got + 52, Fwrap|0x02);
+	reccsumset(got, 512, 16);
+	checks++;
+	if(lrecvalid(got, 512, &t, 0, 8, 42) == 0)
+		fail("log record: a reserved flags bit was accepted");
+
 	/* nsec is bounds-checked against the region before it is used */
 	memmove(got, want, n);
 	PBIT32(got + 12, 1000000);
 	checks++;
 	if(lrecvalid(got, 512, &t, 0, 8, 42) == 0)
 		fail("log record: nsec past the region end was accepted");
+
+	/*
+	 * §2.7 defines no bit of an entry header's flags, so all eight
+	 * are reserved and §0 makes every one a MUST-be-zero.  The
+	 * entry stream carries no checksum of its own — the record's
+	 * covers it — so this is the byte on its own.
+	 */
+	memmove(got, want, n);
+	got[Lrechdrsz + 1] = 0x01;
+	checks++;
+	if(lentunpack(&e, got + Lrechdrsz, n - Lrechdrsz) == 0)
+		fail("entry header: a reserved flags bit was accepted");
 
 	/* walk the entry stream */
 	checks++;

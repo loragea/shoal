@@ -61,6 +61,12 @@ lrecunpack(Lrec *r, uchar *p)
 	r->time = GBIT64(p + 40);
 	r->nent = GBIT32(p + 48);
 	r->flags = GBIT16(p + 52);
+	/* §0: undefined flag bits are a MUST-be-zero the reader checks */
+	if(r->flags & ~Fwrap){
+		werrstr("log record: reserved flags bit set (%#ux)",
+			r->flags);
+		return -1;
+	}
 	return 0;
 }
 
@@ -121,6 +127,15 @@ lentunpack(Lent *e, uchar *p, long n)
 	}
 	e->kind = p[0];
 	e->flags = p[1];
+	/*
+	 * §2.7 defines no bit of an entry header's flags, so §0's
+	 * rule makes every one of them a MUST-be-zero.
+	 */
+	if(e->flags != 0){
+		werrstr("entry header: reserved flags bit set (%#ux)",
+			e->flags);
+		return -1;
+	}
 	e->len = GBIT32(p + 4);
 	if(e->len < Lenthdrsz || e->len > (ulong)n){
 		werrstr("entry length %lud, %ld bytes left", e->len, n);

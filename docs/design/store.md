@@ -142,9 +142,12 @@ it has one.
   upgrade — a new field takes a `vers` bump, which is a reformat — so
   rejecting buys nothing and two decoders differing about it is a
   bug. The one exception is a *flags* field, whose undefined bits are
-  a MUST-be-zero the reader checks: §2.7's `Eobj` `oflags` is the
-  only one so far, and it is checked because an unknown flag means
-  the record asks for something this build does not know how to do.
+  a MUST-be-zero **every decoder checks**, because an unknown flag
+  means the structure asks for something this build does not know how
+  to do — which is not the same as a field it can ignore. There are
+  four: §2.3's `Idxent.flags`, §2.7's `Lrec.flags`, §2.7's entry
+  header `flags` (which defines no bit at all, so all eight are
+  reserved) and §2.7's `Eobj` `oflags`.
 - Every header begins `magic` then `vers`. A store MUST refuse to
   open a structure whose `vers` it does not implement, and MUST say
   so rather than guessing. There is no in-place format upgrade in
@@ -537,7 +540,8 @@ object size.
     off  size  field
       0     1  state     0 free, 1 live, 2 tomb
       1     1  oidlen    1..128
-      2     1  flags     bit0 corrupt (layer-a §7.5)
+      2     1  flags     bit0 corrupt (layer-a §7.5); bits 1..7
+                          reserved, MUST be zero (§0)
       3     1  vers      entry format version, 1
       4     4  emapslot  extent-map slot, 0 = none (inline map)
       8     8  qidpath
@@ -812,7 +816,8 @@ header:
      32     8  seq    u64, strictly increasing, never reused
      40     8  time   seconds, diagnostic only
      48     4  nent   entries in this record
-     52     2  flags  bit0 Fwrap (see below)
+     52     2  flags  bit0 Fwrap (see below); bits 1..15 reserved,
+                    MUST be zero (§0)
      54     2  pad
      56   ...  entries, a packed byte stream running to nsec*secsz
 
@@ -851,7 +856,9 @@ commit written after the wrap.
 
 Entries are `{u8 kind, u8 flags, u16 pad, u32 len}` — `len` counting
 the whole entry including this eight-byte header — followed by the
-body. The length is `u32` rather than `u16` because a whole-object
+body. No bit of the entry header's `flags` is defined, so all eight
+are reserved and MUST be zero (§0); `pad` is a reserved *byte* field
+and is ignored on read like any other. The length is `u32` rather than `u16` because a whole-object
 `Eobj` is `~230 + 28*(objmax/blksz)` bytes: 28.2 KiB at the defaults,
 and 112 KiB at a `blksz` of 4096, which a `u16` cannot encode at all.
 The format does not bound the block count per object; `shoalfmt`
