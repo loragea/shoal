@@ -165,9 +165,9 @@ struct Simop
 void	simfault(Dev*, int kind, int n);
 void	simcrash(Dev*);
 void	simarm(Dev*, char *point, int n);
-void	simpoke(Dev*, vlong off, void *buf, long n);	/* straight to durable storage */
-void	simpeek(Dev*, vlong off, void *buf, long n);	/* straight from durable storage */
-uvlong	simdirty(Dev*);					/* sectors written but not flushed */
+void	simpoke(Dev*, vlong off, void *buf, long n);	/* to durable storage */
+void	simpeek(Dev*, vlong off, void *buf, long n);	/* from durable storage */
+uvlong	simdirty(Dev*);				/* sectors written but not flushed */
 long	simtrace(Dev*, Simop**);
 void	simtracereset(Dev*);
 
@@ -368,9 +368,10 @@ struct Lrec
 	ushort	flags;
 };
 
-void	lrecpack(uchar *p, Lrec *r);
+void	lrecpack(uchar *p, Lrec *r, ulong secsz);
 int	lrecunpack(Lrec *r, uchar *p);
-int	lrecvalid(uchar *p, ulong secsz, Lrec *r, uvlong off, uvlong logsecs, uvlong seq);
+int	lrecvalid(uchar *p, ulong secsz, Lrec *r, uvlong off, uvlong logsecs,
+		uvlong seq);
 
 typedef struct Lent Lent;
 struct Lent

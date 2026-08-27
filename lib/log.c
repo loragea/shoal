@@ -30,7 +30,7 @@ enum
  * be in place: the checksum covers the whole nsec*secsz range.
  */
 void
-lrecpack(uchar *p, Lrec *r)
+lrecpack(uchar *p, Lrec *r, ulong secsz)
 {
 	memmove(p + 0, logmagic, 8);
 	PBIT32(p + 8, r->vers);
@@ -41,6 +41,7 @@ lrecpack(uchar *p, Lrec *r)
 	PBIT32(p + 48, r->nent);
 	PBIT16(p + 52, r->flags);
 	PBIT16(p + 54, 0);			/* pad */
+	reccsumset(p, r->nsec*secsz, 16);
 }
 
 int
@@ -71,7 +72,8 @@ lrecunpack(Lrec *r, uchar *p)
  * are sector counts relative to the start of the log region.
  */
 int
-lrecvalid(uchar *p, ulong secsz, Lrec *r, uvlong off, uvlong logsecs, uvlong seq)
+lrecvalid(uchar *p, ulong secsz, Lrec *r, uvlong off, uvlong logsecs,
+	uvlong seq)
 {
 	if(lrecunpack(r, p) < 0)
 		return -1;

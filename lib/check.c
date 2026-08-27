@@ -83,7 +83,7 @@ hex(char *buf, uchar *p, int n)
 	return buf;
 }
 
-/* an oid is layer-a §1.2 text; print it as such, escaping nothing it cannot hold */
+/* an oid is layer-a §1.2 text; anything else in the field is a fault */
 static char*
 oidstr(char *buf, uchar *oid, int n)
 {
@@ -102,7 +102,7 @@ region(Ck *k, char *nm, uvlong off, uvlong secs)
 		secs*(uvlong)k->s->secsz);
 }
 
-/* §5 step 3: every region inside the partition, no overlaps, and the marks sane */
+/* §5 step 3: regions inside the partition, no overlaps, sane marks */
 static void
 ckgeom(Ck *k)
 {
