@@ -418,6 +418,22 @@ twrapped(void)
 	eqv("a wrapped media error is one", deverr(), Deio);
 	werrstr("");
 	eqv("no error string is no error class", deverr(), Denone);
+
+	/*
+	 * §0: only the last `: '-separated segment is classified,
+	 * because everything before it is the operator's text.
+	 * Partition names are free text, so a partition named
+	 * `interrupted' must not turn a media error into a flushed
+	 * request — the direction that discards damage silently.
+	 */
+	werrstr("/dev/sdF0/interrupted: read 512 at 0: i/o error");
+	eqv("a media error on a partition named interrupted",
+		deverr(), Deio);
+	werrstr("/dev/sdF0/interrupted: flush: interrupted");
+	eqv("a real interrupt on that partition is still one",
+		deverr(), Deintr);
+	werrstr("interrupted");
+	eqv("an unwrapped interrupt", deverr(), Deintr);
 }
 
 /*

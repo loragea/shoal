@@ -26,19 +26,30 @@
  * error reaches a classifier it is `%s: flush: interrupted' rather
  * than the kernel's bare word, and an exact match would read an
  * ordinary client interrupt as media damage (§0).
+ *
+ * Only the last `: '-separated segment is matched, because everything
+ * before it is text the operator chose: a partition may be named
+ * `interrupted' — partition names are free text — and matching the
+ * whole string would classify a media error on it as a flushed
+ * request, which §0 unwinds into §3.3's step-7 exit instead of
+ * reporting.  The kernel's own word is what follows the last wrap.
  */
 int
 deverr(void)
 {
-	char err[ERRMAX];
+	char err[ERRMAX], *p;
 
 	rerrstr(err, sizeof err);
 	if(err[0] == '\0')
 		return Denone;
-	if(strstr(err, "interrupted") != nil)
+	if((p = strrchr(err, ':')) != nil && p[1] == ' ')
+		p += 2;
+	else
+		p = err;
+	if(strstr(p, "interrupted") != nil)
 		return Deintr;
 	/* the kernel's Echange is "media or partition has changed" */
-	if(strstr(err, "has changed") != nil)
+	if(strstr(p, "has changed") != nil)
 		return Dechange;
 	return Deio;
 }
