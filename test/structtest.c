@@ -112,6 +112,11 @@ static char logvec[] =
 	"0000000000000000000000000000000000000000000000000000000000000000"
 	"0000000000000000000000000000000000000000000000000000000000000000";
 
+enum
+{
+	Nverify	= 20000,	/* verifications per proc in tshared */
+};
+
 static int fails;
 static int checks;
 
@@ -732,10 +737,58 @@ tcsumrule(void)
 		fail("reccsumok accepted a flipped byte");
 }
 
+/*
+ * §0's verify rule is a read.  The obvious implementation zeroes the
+ * checksum field in place while it hashes, which is invisible to one
+ * proc and wrong for §7's: several procs read the same index and
+ * extent-map pages at once, and a reader that catches the transient
+ * sixteen zero bytes reports a checksum failure over a record that is
+ * perfectly good — which §5 step 10 turns into a lost object.  Two
+ * procs verifying one record is the schedule that shows it.
+ */
+static void
+tshared(void)
+{
+	Idxent e;
+	uchar *p;
+	int *bad, i, j;
+
+	if((p = malloc(Idxentsz)) == nil || (bad = mallocz(sizeof *bad, 1)) == nil)
+		sysfatal("malloc: %r");
+	memset(&e, 0, sizeof e);
+	e.state = Slive;
+	e.oidlen = 8;
+	e.vers = Storevers;
+	e.len = 4096;
+	e.grain0 = 9;
+	pat(e.oid, 8, 3);
+	idxpack(p, &e);
+	for(j = 0; j < 2; j++)
+		switch(rfork(RFPROC|RFMEM)){
+		case -1:
+			sysfatal("rfork: %r");
+		case 0:
+			for(i = 0; i < Nverify; i++)
+				if(!reccsumok(p, Idxentsz, 208))
+					(*bad)++;
+			exits(nil);
+		}
+	for(j = 0; j < 2; j++)
+		if(waitpid() < 0)
+			fail("waitpid: %r");
+	checks++;
+	if(*bad != 0)
+		fail("%d of %d concurrent verifications of one good record "
+			"failed", *bad, 2*Nverify);
+	free(bad);
+	free(p);
+}
+
 void
 main(int, char**)
 {
 	tcsumrule();
+	tshared();
 	tsuper();
 	tidx();
 	temap();

@@ -20,18 +20,31 @@ reccsumset(uchar *p, ulong n, ulong csumoff)
 	blkdigest(p, n, p + csumoff);
 }
 
+/*
+ * Verifying MUST NOT write.  The obvious implementation zeroes the
+ * checksum field in place, hashes and puts it back, which is correct
+ * for one proc and wrong for §7's: the checkpointer and the commit
+ * path read the same index and extent-map pages from several procs at
+ * once, and a second reader that sees the transient sixteen zero
+ * bytes gets a checksum failure §5 step 10 turns into a lost object.
+ * So the range is hashed in three pieces and the record is not
+ * touched.
+ */
 int
 reccsumok(uchar *p, ulong n, ulong csumoff)
 {
-	uchar saved[Recsumlen], want[Recsumlen];
-	int ok;
+	static uchar zeros[Recsumlen];
+	uchar want[Recsumlen];
+	DigestState *s;
+	ulong tail;
 
-	memmove(saved, p + csumoff, Recsumlen);
-	memset(p + csumoff, 0, Recsumlen);
-	blkdigest(p, n, want);
-	memmove(p + csumoff, saved, Recsumlen);
-	ok = memcmp(saved, want, Recsumlen) == 0;
-	return ok;
+	s = nil;
+	if(csumoff > 0)
+		s = blake2s_128(p, csumoff, nil, nil);
+	s = blake2s_128(zeros, Recsumlen, nil, s);
+	tail = n - csumoff - Recsumlen;
+	blake2s_128(tail > 0 ? p + csumoff + Recsumlen : zeros, tail, want, s);
+	return memcmp(p + csumoff, want, Recsumlen) == 0;
 }
 
 void
