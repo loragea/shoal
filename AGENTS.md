@@ -36,6 +36,11 @@ the decisions it rests on.
 | `docs/target.md` | The ratified deliverable target: layers, semantics contract, milestones, design envelope. |
 | `docs/decisions.md` | Design decisions with rationale; each row marked normative vs implementation policy. |
 | `docs/design/layer-a.md` | The ratified Layer A contract: object model, storage-server 9P export, cluster map, placement, write/read path, epoch/fencing, heal, monitor. Wire truth lives here. |
+| `docs/platform/9front-storage.md` | Verified 9front storage facts: file-server durability, the sd(3) raw path and flush behaviour, measured costs. |
+
+`docs/platform/` holds facts about the target platform rather than
+about shoal — each such doc cites 9front sources by path and line,
+naming the release those line numbers were read from.
 
 ## Building
 
