@@ -170,3 +170,268 @@ void	simpeek(Dev*, vlong off, void *buf, long n);	/* straight from durable stora
 uvlong	simdirty(Dev*);					/* sectors written but not flushed */
 long	simtrace(Dev*, Simop**);
 void	simtracereset(Dev*);
+
+/*
+ * On-disk structures, store.md §2.  Every one of them carries a
+ * BLAKE2s-128 checksum over its whole byte range with the checksum
+ * field itself zeroed (§0); reccsumset and reccsumok are that rule.
+ */
+enum
+{
+	Storevers	= 1,		/* format version of every header */
+	Csumblake2s	= 1,		/* csumalg: layer-a's blake2s256 */
+
+	Recsumlen	= Blkdlen,	/* 16, a record checksum */
+
+	Secszdflt	= 512,
+	Blkszstore	= 16384,	/* §0: blksz = Wunit = the grain */
+	Objmaxdflt	= 16*1024*1024,
+	Ndirtydflt	= 65536,
+	Logbytesdflt	= 64*1024*1024,
+	Nslotsmax	= 1<<20,	/* §2.1's cap on the nslots default */
+
+	Idxentsz	= 256,		/* §2.3 */
+	Dirtentsz	= 256,		/* §2.6 */
+	Emaphdrsz	= 24,		/* §2.4, before the grain array */
+	Bmhdrsz		= 48,		/* §2.5, before the bits */
+	Lrechdrsz	= 56,		/* §2.7, the record header */
+	Lenthdrsz	= 8,		/* §2.7, {u8 kind, u8 flags, u16 pad, u32 len} */
+
+	Oidmax		= 128,		/* layer-a §1.2 */
+	Peermax		= 72,		/* §2.6: node name 63 + '.' + 8 digits */
+};
+
+void	reccsumset(uchar *p, ulong n, ulong csumoff);
+int	reccsumok(uchar *p, ulong n, ulong csumoff);
+
+/* the superblock, §2.2 */
+typedef struct Super Super;
+struct Super
+{
+	ulong	vers;
+	ulong	hdrlen;		/* bytes covered by csum; secsz */
+	uvlong	gen;
+	uchar	uuid[16];
+	vlong	ctime;
+	ulong	secsz;
+	ulong	blksz;
+	uvlong	objmax;
+	ulong	nblkmax;
+	ulong	emapsz;
+	ulong	nslots;
+	ulong	nemap;
+	ulong	ndirty;
+	uvlong	ngrains;
+	uvlong	logoff, logsecs;
+	uvlong	idxoff, idxsecs;
+	uvlong	emapoff, emapsecs;
+	uvlong	dirtoff, dirtsecs;
+	uvlong	bmapoff, bmapsecs;
+	uvlong	dataoff, datasecs;
+	uvlong	ckseq;
+	uvlong	cklogoff;
+	uvlong	qidnext;
+	uvlong	epochhigh;
+	uchar	monid[16];
+	ulong	monidset;
+	ulong	csumalg;
+};
+
+void	superpack(uchar *p, Super *s);
+int	superunpack(Super *s, uchar *p, ulong secsz);
+uvlong	nbmpage(Super *s);
+uvlong	bmbits(ulong pagesz);
+vlong	grainoff(Super *s, ulong grain);
+uvlong	emapentoff(Super *s, ulong slot);
+uvlong	idxentoff(Super *s, ulong slot);
+uvlong	dirtentoff(Super *s, ulong slot);
+
+/*
+ * The two-slot rule, §2.2, stated in three clauses: exactly one valid
+ * copy means the update writes the invalid one; both valid means it
+ * writes the lower gen; neither valid means it MUST NOT write and
+ * MUST NOT serve.  superselect reads both copies and reports the
+ * choice and the reason for it, which is what shoalck prints.
+ */
+typedef struct Sbsel Sbsel;
+struct Sbsel
+{
+	Super	sb[2];
+	int	valid[2];
+	char	why[2][ERRMAX];	/* why a copy is invalid */
+	int	start;		/* copy to start from, -1 if neither */
+	int	victim;		/* copy the next update writes, -1 to refuse */
+	int	clause;		/* which of §2.2's three clauses decided */
+	uvlong	nextgen;
+};
+
+int	superselect(Dev*, Sbsel*);
+vlong	super1off(Dev*);
+
+/* the index entry, §2.3 */
+enum
+{
+	Sfree	= 0,
+	Slive	= 1,
+	Stomb	= 2,
+
+	Icorrupt = 1<<0,	/* index entry flags bit0, layer-a §7.5 */
+};
+
+typedef struct Idxent Idxent;
+struct Idxent
+{
+	uchar	state;
+	uchar	oidlen;
+	uchar	flags;
+	uchar	vers;
+	ulong	emapslot;	/* 0 = none: the map is inline */
+	uvlong	qidpath;
+	uvlong	len;
+	uvlong	ver;
+	uvlong	wepoch;
+	vlong	mtime;
+	uchar	csum[Csumlen];
+	uchar	oid[Oidmax];
+	ulong	grain0;		/* inline map: 0 = hole */
+	uchar	dig0[Blkdlen];
+};
+
+void	idxpack(uchar *p, Idxent *e);
+int	idxunpack(Idxent *e, uchar *p, ulong nemap);
+
+/* the extent-map entry, §2.4 */
+typedef struct Emap Emap;
+struct Emap
+{
+	ulong	nblk;
+	ulong	vers;
+};
+
+void	emappack(uchar *p, ulong emapsz, Emap *m);
+int	emapunpack(Emap *m, uchar *p, ulong emapsz, ulong nblkmax);
+ulong	emapgrain(uchar *p, ulong i);
+void	emapsetgrain(uchar *p, ulong i, ulong grain);
+uchar*	emapdig(uchar *p, ulong nblkmax, ulong i);
+
+/* a free-grain bitmap page, §2.5 */
+typedef struct Bmpage Bmpage;
+struct Bmpage
+{
+	ulong	vers;
+	ulong	page;
+	uvlong	ckseq;
+};
+
+void	bmpack(uchar *p, ulong pagesz, Bmpage *h);
+int	bmunpack(Bmpage *h, uchar *p, ulong pagesz, ulong page);
+int	bmget(uchar *p, uvlong bit);
+void	bmset(uchar *p, uvlong bit);
+void	bmclr(uchar *p, uvlong bit);
+
+/* a dirty record, §2.6 */
+typedef struct Dirtent Dirtent;
+struct Dirtent
+{
+	uvlong	epoch;
+	uchar	state;
+	uchar	oidlen;
+	uchar	peerlen;
+	uchar	vers;
+	uchar	oid[Oidmax];
+	uchar	peer[Peermax];
+};
+
+void	dirtpack(uchar *p, Dirtent *e);
+int	dirtunpack(Dirtent *e, uchar *p);
+
+/* the log record header and the entry stream, §2.7 */
+enum
+{
+	Fwrap	= 1<<0,		/* record flags bit0 */
+
+	Kobj	= 1,		/* entry kinds */
+	Kdirty	= 2,
+	Kslot	= 3,
+
+	Oslot	= 1<<0,		/* Eobj oflags bit0: this commit changes emapslot */
+};
+
+typedef struct Lrec Lrec;
+struct Lrec
+{
+	ulong	vers;
+	ulong	nsec;
+	uvlong	seq;
+	vlong	time;
+	ulong	nent;
+	ushort	flags;
+};
+
+void	lrecpack(uchar *p, Lrec *r);
+int	lrecunpack(Lrec *r, uchar *p);
+int	lrecvalid(uchar *p, ulong secsz, Lrec *r, uvlong off, uvlong logsecs, uvlong seq);
+
+typedef struct Lent Lent;
+struct Lent
+{
+	uchar	kind;
+	uchar	flags;
+	ulong	len;		/* whole entry, this 8-byte header included */
+	uchar	*body;		/* len - Lenthdrsz bytes */
+};
+
+int	lentunpack(Lent *e, uchar *p, long n);
+void	lentpack(uchar *p, int kind, int flags, ulong len);
+
+typedef struct Mapent Mapent;
+struct Mapent
+{
+	ulong	blk;
+	ulong	grain;
+	uchar	dig[Blkdlen];
+};
+
+typedef struct Objrec Objrec;
+struct Objrec
+{
+	ulong	slot;
+	ulong	emapslot;
+	uvlong	qidpath;
+	uchar	state;
+	uchar	oidlen;
+	uchar	oflags;
+	uvlong	len;
+	uvlong	ver;
+	uvlong	wepoch;
+	vlong	mtime;
+	uchar	csum[Csumlen];
+	uchar	oid[Oidmax];
+	ulong	nmap;
+	Mapent	*map;
+	ulong	nfree;
+	ulong	*freed;
+};
+
+typedef struct Dirtyrec Dirtyrec;
+struct Dirtyrec
+{
+	uchar	op;		/* 0 remove, 1 add */
+	uchar	peerlen;
+	uchar	oidlen;
+	uvlong	epoch;
+	uchar	peer[Peermax];
+	uchar	oid[Oidmax];
+};
+
+ulong	objreclen(Objrec *o);
+long	objrecpack(uchar *p, long max, Objrec *o);
+int	objrecunpack(Objrec *o, uchar *p, long n);
+void	objrecfree(Objrec *o);
+
+ulong	dirtyreclen(Dirtyrec *d);
+long	dirtyrecpack(uchar *p, long max, Dirtyrec *d);
+int	dirtyrecunpack(Dirtyrec *d, uchar *p, long n);
+
+long	slotrecpack(uchar *p, long max, ulong slot);
+int	slotrecunpack(ulong *slot, uchar *p, long n);

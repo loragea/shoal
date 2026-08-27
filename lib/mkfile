@@ -8,6 +8,9 @@ OFILES=\
 	devfile.$O\
 	devsd.$O\
 	devsim.$O\
+	log.$O\
+	ondisk.$O\
+	super.$O\
 
 HFILES=\
 	shoal.h\
