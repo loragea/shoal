@@ -757,12 +757,28 @@ tlive(void)
 	devclose(d);
 }
 
+static char *imgpath = "/tmp/shoalfmtcktest.img";
+
+/*
+ * §13 says a test that wants a file image creates and removes its
+ * own under /tmp.  The success paths below do; a sysfatal or a
+ * mutant that dies inside ckstore does not, so the removals are also
+ * registered here and run however this program exits.
+ */
+static void
+cleanup(void)
+{
+	remove(ckpath);
+	remove(imgpath);
+}
+
 void
 main(int, char**)
 {
 	Dev *d;
 	char *path;
 
+	atexit(cleanup);
 	if((null = open("/dev/null", OWRITE)) < 0)
 		null = 2;
 
@@ -771,7 +787,7 @@ main(int, char**)
 	tround(d, "simulated disk");
 	devclose(d);
 
-	path = "/tmp/shoalfmtcktest.img";
+	path = imgpath;
 	remove(path);
 	if((d = fileopen(path, Secsz, (vlong)Nsec*Secsz, 0)) == nil)
 		sysfatal("fileopen: %r");
