@@ -2434,7 +2434,7 @@ T1 formats a **small geometry** — a partition image of a few MiB with
 over one header sector, not over the whole store, and the cases that
 need `nslots = 2^20` are T2's.
 
-**What T1 covers today.** Six programs, all of them against the
+**What T1 covers today.** Nine programs, all of them against the
 simulated disk except where a file-backed device is the point:
 `csumtest` (layer-a §1.4's block digests and object checksums against
 known-answer vectors), `structtest` (§2's byte layouts against
@@ -2451,14 +2451,40 @@ that stops the device, the recorded trace and eight procs sharing one
 device — and the file-backed device, including the read-only open and
 the `Wunit` cap), `supertest` (§2.2's three clauses under torn
 superblock writes and under the `super` crash point, which is T1.9's
-first half), and `fmtcktest` (`shoalfmt` to `shoalck` over both a
+first half), `fmtcktest` (`shoalfmt` to `shoalck` over both a
 simulated disk and a file image; a store with a live one-block object
 and a live three-block one, built through the codecs, with each fault
 §2 and §5 name poked into it in turn and the checker's own words read
-back; and a ream cut short, which must leave no valid superblock).
-The short-count case is T1.3. Every case above the format — the crash
-matrix, replay, the log, group commit, stages, enumeration and the
-rest of the list — waits on the write path it exercises.
+back; and a ream cut short, which must leave no valid superblock),
+`storetest` (§5's ordered start-up: the tolerant index read, replay
+and its idempotence, §2.5's replay-coverage rule in all three of the
+cases it exists to tell apart, the automatic bitmap rebuild, §2.2's
+publisher and its durability orderings, §5 step 10's condemnation
+after — and only after — replay, and §3.2's refusal to start without
+a flush channel), `objtest` (§2.7's extent-map slot rule over all
+three transitions and both the crash and the re-replay schedules,
+§2.4's invariant on the shrinking side, §3.5's deferred reuse of
+grains and of slots under a held batch, §3.6's stage lifetimes and
+bounds, §6's four exhaustions with delete working throughout on the
+reserved tail, R7's dirty records across a restart, tombstones, and
+the key-preserving `corrupt` flag) and `committest` (§3.2's flush
+placement read off the device trace, the torn-header sweep over a
+whole sector, short counts on every call, §3.4's crash matrix at
+every point × every operation shape, several laps of the log
+including its wrap record, eight concurrent committers and the
+durable watermark under a held batch, §2.8's reclaim rule run both
+ways, the checkpoint mark against a concurrent publish, and
+`qid.path` across restarts).
+
+Against the list below that is T1.1–T1.8, T1.10–T1.14, T1.16,
+T1.18–T1.20 and T1.22–T1.26. Four cases are not covered and each
+waits on something this store does not have yet: **T1.9**'s second
+half and **T2.7** wait on the monitor's slot store (§10); **T1.15**
+waits on the enumeration snapshot of §9 and the `/obj` fid that reads
+it; **T1.17** and **T1.27** wait on the scrubber and the repair path
+of §8. T1.21 is covered for the orderings and the fields, but drives
+the four publish triggers in sequence rather than from concurrent
+procs.
 
 - **T1.1 crash matrix (R1–R4).** Every point above × {create,
   whole-block write, partial write, truncate, delete, 16 MiB

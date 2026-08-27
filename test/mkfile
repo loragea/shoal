@@ -10,6 +10,9 @@ TESTS=\
 	devtest\
 	supertest\
 	fmtcktest\
+	storetest\
+	objtest\
+	committest\
 
 LIB=../lib/libshoal.a$O
 HFILES=../lib/shoal.h ../lib/store.h t1.h

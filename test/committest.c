@@ -1,0 +1,908 @@
+#include <u.h>
+#include <libc.h>
+#include <libsec.h>
+#include <fcall.h>
+#include "../lib/shoal.h"
+#include "t1.h"
+
+/*
+ * T1 for the commit path: docs/design/store.md §3.2's write sequence
+ * and its two flushes, §3.4's crash points, §2.7's log continuity and
+ * its wrap record, §7's group commit and durable watermark, and
+ * §2.8's reclaim rule and checkpoint mark.
+ *
+ * The mechanism this design most depends on — the placement of the
+ * two flushes — cannot be discriminated on the reference hardware at
+ * all, so everything here runs against the simulated disk.
+ */
+
+enum
+{
+	Blk	= 4096,
+};
+
+/* what an object looked like, so a crash can be judged against it */
+typedef struct Snap Snap;
+struct Snap
+{
+	uvlong	len, ver, wepoch;
+	uchar	csum[Csumlen];
+	int	state;
+};
+
+static void
+snap(Store *s, char *name, Snap *sn)
+{
+	Objinfo oi;
+	uchar o[Oidmax];
+
+	oidof(o, name);
+	memset(sn, 0, sizeof *sn);
+	if(objstat(s, o, strlen(name), &oi) < 0)
+		return;
+	sn->len = oi.len;
+	sn->ver = oi.ver;
+	sn->wepoch = oi.wepoch;
+	sn->state = oi.state;
+	memmove(sn->csum, oi.csum, Csumlen);
+}
+
+static int
+sameas(Snap *a, Snap *b)
+{
+	return a->len == b->len && a->ver == b->ver && a->wepoch == b->wepoch
+		&& a->state == b->state
+		&& memcmp(a->csum, b->csum, Csumlen) == 0;
+}
+
+static void
+mk(Store *s, char *name)
+{
+	uchar o[Oidmax];
+
+	oidof(o, name);
+	if(objcreate(s, o, strlen(name), 1, 1, nil) < 0)
+		fail("objcreate %s: %r", name);
+}
+
+static int
+wr(Store *s, char *name, void *a, long n, uvlong off, uvlong ver)
+{
+	uchar o[Oidmax];
+
+	oidof(o, name);
+	return objwrite(s, o, strlen(name), a, n, off, ver, 1, nil, 0);
+}
+
+static void
+mustverify(Store *s, char *name, char *what)
+{
+	Vfy v;
+	uchar o[Oidmax];
+
+	oidof(o, name);
+	if(objverify(s, o, strlen(name), &v) < 0){
+		fail("%s: objverify %s: %r", what, name);
+		return;
+	}
+	checks++;
+	if(v.arraybad || v.nbad != 0)
+		fail("%s: %s: verify: arraybad=%d nbad=%lud", what, name,
+			v.arraybad, v.nbad);
+	vfyfree(&v);
+}
+
+/*
+ * T1.13.  From the recorded device trace, a flush precedes the header
+ * write and another follows it, for every commit shape.  This is the
+ * test that makes T1.1's flush mutations detectable as a *sequence*
+ * even where they are not detectable as a loss — on the reference
+ * hardware removing a flush changes nothing a process crash can see.
+ */
+static void
+tflushseq(void)
+{
+	Dev *d;
+	Store *s;
+	Simop *t;
+	Super sb;
+	Sbsel sel;
+	uchar *buf;
+	long n, i, last;
+	vlong lo, hi;
+
+	d = newdisk();
+	if((s = mustopen(d, "flush sequence")) == nil)
+		return;
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	sb = sel.sb[sel.start];
+	lo = (vlong)sb.logoff*sb.secsz;
+	hi = lo + (vlong)sb.logsecs*sb.secsz;
+	mk(s, "f");
+	buf = mkbuf(3*Blk, 61);
+
+	/* a lone one-sector commit: flush, write, flush */
+	simtracereset(d);
+	if(wr(s, "f", buf, 64, 0, 2) < 0)
+		fail("objwrite: %r");
+	n = simtrace(d, &t);
+	last = -1;
+	for(i = 0; i < n; i++)
+		if(t[i].op == Sopwrite && t[i].off >= lo && t[i].off < hi)
+			last = i;
+	checks++;
+	if(last < 1)
+		fail("no log write in the trace of a commit");
+	else{
+		eqv("the header write is one sector", t[last].n, sb.secsz);
+		checks++;
+		if(t[last-1].op != Sopflush)
+			fail("no flush precedes the header write");
+		checks++;
+		if(last+1 >= n || t[last+1].op != Sopflush)
+			fail("no flush follows the header write");
+	}
+
+	/*
+	 * A commit whose record needs a body: the body sectors go
+	 * first, then the pre-flush, then the header, then the
+	 * post-flush.  The header goes last unconditionally, which is
+	 * what makes the commit point one sector for any record size.
+	 */
+	simtracereset(d);
+	if(wr(s, "f", buf, 3*Blk, 0, 3) < 0)
+		fail("objwrite: %r");
+	n = simtrace(d, &t);
+	last = -1;
+	for(i = 0; i < n; i++)
+		if(t[i].op == Sopwrite && t[i].off >= lo && t[i].off < hi)
+			last = i;
+	checks++;
+	if(last < 1)
+		fail("no log write in the trace of a multi-sector commit");
+	else{
+		eqv("the header write is still one sector", t[last].n, sb.secsz);
+		eqv("and it is the record's first sector", t[last].off < t[last-2].off
+			|| t[last-2].op != Sopwrite, 1);
+		checks++;
+		if(t[last-1].op != Sopflush)
+			fail("no flush precedes the header write");
+		checks++;
+		if(last+1 >= n || t[last+1].op != Sopflush)
+			fail("no flush follows the header write");
+	}
+	free(buf);
+	storeclose(s);
+	devclose(d);
+}
+
+/*
+ * T1.2, the torn-header sweep.  A record is valid only if its
+ * checksum verifies over its whole byte range and its sequence number
+ * is the expected successor.  A header torn anywhere leaves old bytes
+ * or new bytes in every field, and either way the stored digest and
+ * the hashed range disagree — so every mixture but the whole new
+ * header must leave the *old* four-tuple, and the whole new header
+ * must leave the new one.
+ */
+static void
+ttorn(void)
+{
+	Dev *d;
+	Store *s;
+	Super sb;
+	Sbsel sel;
+	Snap before, after, got;
+	uchar *buf, *old, *new, *mix;
+	vlong off;
+	ulong k;
+	int bad;
+
+	d = newdisk();
+	if((s = mustopen(d, "torn header")) == nil)
+		return;
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	sb = sel.sb[sel.start];
+	buf = mkbuf(64, 67);
+	mk(s, "t");
+	if(wr(s, "t", buf, 64, 0, 2) < 0)
+		fail("objwrite: %r");
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	snap(s, "t", &before);
+
+	/* the sector the next commit's header will land in */
+	{
+		Storestat st;
+
+		storestat(s, &st);
+		off = (vlong)st.cklogoff*sb.secsz;
+	}
+	old = malloc(sb.secsz);
+	new = malloc(sb.secsz);
+	mix = malloc(sb.secsz);
+	if(old == nil || new == nil || mix == nil)
+		sysfatal("malloc: %r");
+	simpeek(d, off, old, sb.secsz);
+	if(wr(s, "t", buf, 64, 128, 3) < 0)
+		fail("objwrite: %r");
+	snap(s, "t", &after);
+	simpeek(d, off, new, sb.secsz);
+	storeclose(s);
+	checks++;
+	if(memcmp(old, new, sb.secsz) == 0)
+		fail("the commit did not land where the checkpoint mark said");
+
+	bad = 0;
+	for(k = 0; k <= sb.secsz && !bad; k++){
+		memmove(mix, old, sb.secsz);
+		memmove(mix, new, k);
+		simpoke(d, off, mix, sb.secsz);
+		if((s = openstore(d)) == nil){
+			fail("a torn header must not stop the store starting "
+				"(%lud new bytes): %r", k);
+			bad = 1;
+			break;
+		}
+		/*
+		 * A prefix long enough to cover every byte the record
+		 * differs in is not a tear at all — it is the record.
+		 * Anything short of that must leave the old four-tuple,
+		 * because the checksum covers the whole sector.
+		 */
+		snap(s, "t", &got);
+		if(!sameas(&got, memcmp(mix, new, sb.secsz) == 0 ? &after
+			: &before)){
+			fail("a header with %lud new bytes left neither the "
+				"old nor the new four-tuple", k);
+			bad = 1;
+		}
+		storeclose(s);
+	}
+	checks++;
+	free(old);
+	free(new);
+	free(mix);
+	free(buf);
+	devclose(d);
+}
+
+/*
+ * T1.3.  devsd truncates a request rather than splitting or failing,
+ * so a short count is normal and is never an error; every access in
+ * the store loops until the whole range is done.
+ */
+static void
+tshort(void)
+{
+	Dev *d;
+	Store *s;
+	uchar *buf, *got;
+
+	d = newdisk();
+	simfault(d, Sfshort, 0);		/* sticky: every call */
+	if((s = mustopen(d, "short counts")) == nil){
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(3*Blk, 71);
+	if((got = malloc(3*Blk)) == nil)
+		sysfatal("malloc: %r");
+	mk(s, "sh");
+	if(wr(s, "sh", buf, 3*Blk, 0, 2) < 0)
+		fail("objwrite under short counts: %r");
+	mustverify(s, "sh", "short counts");
+	storeclose(s);
+	if((s = mustopen(d, "short counts, replayed")) == nil){
+		devclose(d);
+		return;
+	}
+	mustverify(s, "sh", "short counts, replayed");
+	storeclose(s);
+	simfault(d, Sfnone, 0);
+	devclose(d);
+	free(buf);
+	free(got);
+}
+
+/*
+ * T1.1, the crash matrix.  R2 is the invariant: after any crash an
+ * object's published four-tuple is exactly the pre-update or exactly
+ * the post-update value, never a mix.  Every point of §3.4 against
+ * every shape of operation, with the object re-verified after the
+ * restart.
+ */
+static void
+onecrash(char *point, int mode, char *op, int expectnew)
+{
+	Dev *d;
+	Store *s;
+	Snap before, after, got;
+	uchar *buf, o[Oidmax];
+	char what[128];
+	int r;
+
+	snprint(what, sizeof what, "%s at %s", op, point);
+	d = newdisk();
+	if((s = mustopen(d, what)) == nil)
+		return;
+	buf = mkbuf(3*Blk, 73);
+	mk(s, "m");
+	if(wr(s, "m", buf, 2*Blk, 0, 2) < 0)
+		fail("%s: setup write: %r", what);
+	if(storecheckpoint(s) < 0)
+		fail("%s: storecheckpoint: %r", what);
+	snap(s, "m", &before);
+
+	simcrashdead(d, 1);
+	simcrashmode(d, mode);
+	simarm(d, point, 0);
+	oidof(o, "m");
+	if(strcmp(op, "create") == 0)
+		r = objcreate(s, (uchar*)"n", 1, 3, 1, nil);
+	else if(strcmp(op, "whole-block write") == 0)
+		r = wr(s, "m", buf, Blk, 0, 3);
+	else if(strcmp(op, "partial write") == 0)
+		r = wr(s, "m", buf, 100, 7, 3);
+	else if(strcmp(op, "truncate") == 0)
+		r = objtrunc(s, o, 1, Blk, 3, 1);
+	else
+		r = objremove(s, o, 1, 3, 1);
+	USED(r);
+	storeclose(s);
+	simrevive(d);
+
+	if((s = mustopen(d, what)) == nil){
+		devclose(d);
+		free(buf);
+		return;
+	}
+	if(strcmp(op, "create") == 0){
+		/* the four-tuple under test is the new object's existence */
+		Objinfo oi;
+
+		checks++;
+		if((objstat(s, (uchar*)"n", 1, &oi) == 0) != expectnew)
+			fail("%s: the create %s survive", what,
+				expectnew ? "should" : "should not");
+	}else{
+		snap(s, "m", &got);
+		checks++;
+		if(expectnew){
+			if(sameas(&got, &before))
+				fail("%s: the update was lost after its "
+					"post-flush returned", what);
+		}else if(!sameas(&got, &before)){
+			after = got;
+			fail("%s: the four-tuple is neither the old one nor "
+				"unchanged (len %llud ver %llud)", what,
+				after.len, after.ver);
+		}
+		mustverify(s, "m", what);
+	}
+	storeclose(s);
+	devclose(d);
+	free(buf);
+}
+
+static void
+tmatrix(void)
+{
+	static char *ops[] = {
+		"create", "whole-block write", "partial write",
+		"truncate", "delete",
+	};
+	int i;
+
+	for(i = 0; i < nelem(ops); i++){
+		/*
+		 * before the record is durable: the old value, always.
+		 * The stage point is where the last staged grain write
+		 * returns, so it exists only for the operations that
+		 * write content; a create, a truncate to a block boundary
+		 * and a delete are metadata-only commits (§11).
+		 */
+		if(i == 1 || i == 2)
+			onecrash("stage", Scdrop, ops[i], 0);
+		onecrash("precommit", Scdrop, ops[i], 0);
+		onecrash("commit", Scdrop, ops[i], 0);
+		onecrash("postwrite", Scdrop, ops[i], 0);
+		/* the header landed and survived: the new value */
+		onecrash("postwrite", Sckeep, ops[i], 1);
+		/* after the post-flush: the new value, guaranteed */
+		onecrash("preack", Scdrop, ops[i], 1);
+	}
+}
+
+/*
+ * T1.11 and T1.4.  A record MUST NOT straddle the end of the region:
+ * one that ends flush with the end wraps by arithmetic, and Fwrap
+ * covers the case where sectors remain but too few for the next
+ * record.  Driving the log several times round the ring exercises
+ * both, and the records left ahead of the tail from earlier laps are
+ * what the sequence seed exists to reject.
+ */
+static void
+twrap(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	uchar *small, *big;
+	char name[32];
+	int i, j;
+
+	d = newdisk();
+	if((s = mustopen(d, "log wrap")) == nil)
+		return;
+	small = mkbuf(64, 79);
+	big = mkbuf(16*Blk, 83);
+	for(i = 0; i < 4; i++){
+		snprint(name, sizeof name, "w%d", i);
+		mk(s, name);
+	}
+	/*
+	 * A mix of one-sector and multi-sector records, so the tail
+	 * reaches the region end exactly and also lands with too few
+	 * sectors left for the next record.
+	 */
+	for(i = 0; i < 60; i++){
+		for(j = 0; j < 4; j++){
+			snprint(name, sizeof name, "w%d", j);
+			if(wr(s, name, small, 64, (uvlong)j*64, 2 + i) < 0)
+				fail("small write %d: %r", i);
+		}
+		snprint(name, sizeof name, "w%d", i % 4);
+		if(wr(s, name, big, 16*Blk, 0, 200 + i) < 0)
+			fail("big write %d: %r", i);
+		if(storecheckpoint(s) < 0)
+			fail("storecheckpoint: %r");
+	}
+	storestat(s, &st);
+	istrue("the log wrapped several times", st.seqnext > 128);
+	for(i = 0; i < 4; i++){
+		snprint(name, sizeof name, "w%d", i);
+		mustverify(s, name, "after several laps");
+	}
+
+	/* now a crash mid-lap: replay must stop at the first bad record */
+	snprint(name, sizeof name, "w0");
+	if(wr(s, name, small, 64, 0, 999) < 0)
+		fail("write before the crash: %r");
+	simcrashdead(d, 1);
+	simcrashmode(d, Scdrop);
+	simarm(d, "commit", 0);
+	wr(s, name, small, 64, 0, 1000);
+	storeclose(s);
+	simrevive(d);
+	if((s = mustopen(d, "after a lap and a crash")) == nil){
+		devclose(d);
+		return;
+	}
+	for(i = 0; i < 4; i++){
+		snprint(name, sizeof name, "w%d", i);
+		mustverify(s, name, "after a lap and a crash");
+	}
+	{
+		Objinfo oi;
+
+		if(objstat(s, (uchar*)"w0", 2, &oi) < 0)
+			fail("objstat: %r");
+		else
+			eqv("the last acked write survived the lap",
+				oi.ver, 999);
+	}
+	storeclose(s);
+	devclose(d);
+	free(small);
+	free(big);
+}
+
+/*
+ * T1.8, the durable watermark.  A batch's members are woken only when
+ * that batch's post-flush has returned, every lower-numbered batch's
+ * has, and the batch has been applied.  Without the ordering, a crash
+ * after batch n+1 landed and batch n did not would leave replay
+ * stopping at n and discarding n+1 — an acked write lost.
+ */
+typedef struct Writer Writer;
+struct Writer
+{
+	Store	*s;
+	char	name[16];
+	uvlong	ver;
+	int	nwrite;
+	int	done;
+	int	err;
+};
+
+static void
+writerproc(void *a)
+{
+	Writer *w;
+	uchar *buf, o[Oidmax];
+	int i;
+
+	w = a;
+	buf = mkbuf(Blk, 89);
+	oidof(o, w->name);
+	for(i = 0; i < w->nwrite; i++)
+		if(objwrite(w->s, o, strlen(w->name), buf, Blk, 0,
+			w->ver + i, 1, nil, 0) < 0){
+			w->err = 1;
+			break;
+		}
+	free(buf);
+	w->done = 1;
+}
+
+static void
+tgroup(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Writer *w;
+	Objinfo oi;
+	uchar o[Oidmax];
+	char name[16];
+	int i, k, alldone;
+
+	d = newdisk();
+	if((s = openstoreck(d)) == nil){
+		fail("group commit: storeopen: %r");
+		devclose(d);
+		return;
+	}
+	if((w = mallocz(8*sizeof *w, 1)) == nil)
+		sysfatal("mallocz: %r");
+	for(i = 0; i < 8; i++){
+		snprint(name, sizeof name, "g%d", i);
+		mk(s, name);
+		w[i].s = s;
+		strcpy(w[i].name, name);
+		w[i].ver = 10;
+		w[i].nwrite = 12;
+	}
+	for(i = 0; i < 8; i++)
+		if(spawnproc(writerproc, &w[i]) < 0)
+			fail("spawn: %r");
+	for(k = 0; k < 20000; k++){
+		alldone = 1;
+		for(i = 0; i < 8; i++)
+			if(!w[i].done)
+				alldone = 0;
+		if(alldone)
+			break;
+		sleep(1);
+	}
+	checks++;
+	for(i = 0; i < 8; i++)
+		if(!w[i].done || w[i].err){
+			fail("writer %d did not finish cleanly", i);
+			break;
+		}
+	storestat(s, &st);
+	istrue("every batch was applied", st.watermark + 1 == st.seqnext);
+	for(i = 0; i < 8; i++){
+		snprint(name, sizeof name, "g%d", i);
+		oidof(o, name);
+		if(objstat(s, o, strlen(name), &oi) < 0)
+			fail("objstat %s: %r", name);
+		else
+			eqv("every acked write is visible", oi.ver, 21);
+		mustverify(s, name, "eight committers");
+	}
+	storeclose(s);
+
+	if((s = openstoreck(d)) == nil){
+		fail("eight committers, replayed: storeopen: %r");
+		devclose(d);
+		free(w);
+		return;
+	}
+	for(i = 0; i < 8; i++){
+		snprint(name, sizeof name, "g%d", i);
+		oidof(o, name);
+		if(objstat(s, o, strlen(name), &oi) < 0)
+			fail("objstat %s: %r", name);
+		else
+			eqv("and survives the restart", oi.ver, 21);
+		mustverify(s, name, "eight committers, replayed");
+	}
+
+	/*
+	 * Now hold one batch and let the next one land.  The later
+	 * batch's writer must not be woken: it was never acked, and
+	 * after the restart its record is behind a gap in the sequence
+	 * and is correctly discarded.
+	 */
+	storestat(s, &st);
+	memset(w, 0, 2*sizeof *w);
+	for(i = 0; i < 2; i++){
+		w[i].s = s;
+		snprint(w[i].name, sizeof w[i].name, "g%d", i);
+		w[i].ver = 40 + i;
+		w[i].nwrite = 1;
+	}
+	storehook(s, "batch", st.seqnext);
+	if(spawnproc(writerproc, &w[0]) < 0)
+		fail("spawn: %r");
+	for(k = 0; k < 4000; k++){
+		storestat(s, &st);
+		if(st.seqnext > st.watermark + 1)
+			break;
+		sleep(1);
+	}
+	if(spawnproc(writerproc, &w[1]) < 0)
+		fail("spawn: %r");
+	sleep(200);
+	checks++;
+	if(w[1].done)
+		fail("a batch was acked before every lower-numbered batch "
+			"had been applied");
+	storehook(s, "batch", 0);
+	for(k = 0; k < 4000 && !(w[0].done && w[1].done); k++)
+		sleep(1);
+	istrue("both writers finished once the hold was released",
+		w[0].done && w[1].done);
+	storeclose(s);
+	devclose(d);
+	free(w);
+}
+
+/*
+ * T1.10.  Log space before the newly published cklogoff is reclaimed
+ * only after the superblock write has returned.  Reclaiming earlier
+ * lets a crash leave a superblock naming an older checkpoint whose
+ * log has already been overwritten, which is the one way this format
+ * can lose data.  §13 puts the mutation in the store as a hook, so
+ * both halves of the argument are run here.
+ */
+static void
+treclaim(int early)
+{
+	Dev *d;
+	Store *s;
+	Sbsel sel;
+	uchar *buf;
+	vlong sboff;
+	int i, n;
+	char *what;
+
+	what = early ? "reclaim before the publish" : "reclaim after it";
+	d = newdisk();
+	if((s = mustopen(d, what)) == nil)
+		return;
+	buf = mkbuf(64, 97);
+	mk(s, "r");
+	if(wr(s, "r", buf, 64, 0, 2) < 0)
+		fail("%s: objwrite: %r", what);
+	if(storecheckpoint(s) < 0)
+		fail("%s: storecheckpoint: %r", what);
+	/*
+	 * Commits between the two checkpoints, so that the two marks
+	 * are further apart than §6's reserved log tail: the whole
+	 * difference the rule makes is the space between them, and the
+	 * reserve would otherwise absorb it.
+	 */
+	for(i = 0; i < 16; i++)
+		if(wr(s, "r", buf, 64, 64, 3 + i) < 0)
+			fail("%s: objwrite: %r", what);
+
+	/*
+	 * A checkpoint whose superblock write fails: the pages and the
+	 * flush are done, so the mark is earned, but the disk still
+	 * names the previous checkpoint — and step 3 never returned, so
+	 * the correct rule reclaims nothing.
+	 */
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	sboff = sel.victim == 0 ? 0 : super1off(d);
+	storehook(s, "reclaim", early);
+	/* two: the publisher reads both copies before it writes one */
+	simfaultat(d, Sfeio, 2, sboff, sel.sb[sel.start].secsz);
+	if(storecheckpoint(s) >= 0)
+		fail("%s: a checkpoint whose superblock write failed "
+			"reported success", what);
+	storehook(s, "reclaim", 0);
+	simfault(d, Sfnone, 0);
+
+	/* fill the log: with the correct rule there is nothing to reuse */
+	n = 0;
+	for(i = 0; i < 400; i++)
+		if(wr(s, "r", buf, 64, 0, 100 + i) < 0)
+			break;
+		else
+			n++;
+	storeclose(s);
+
+	s = openstore(d);
+	checks++;
+	if(early){
+		if(s != nil){
+			Objinfo oi;
+
+			/*
+			 * If it starts at all, the older superblock's log
+			 * must still describe what the disk holds — which
+			 * it cannot, because the commits above overwrote
+			 * it.  Either the store refuses or an acked write
+			 * is gone.
+			 */
+			if(objstat(s, (uchar*)"r", 1, &oi) == 0
+			&& oi.ver == (uvlong)(100 + n - 1))
+				fail("reclaiming before the publish lost "
+					"nothing, so the rule is untested");
+			storeclose(s);
+		}
+	}else{
+		if(s == nil)
+			fail("%s: the store must start: %r", what);
+		else{
+			Objinfo oi;
+
+			if(objstat(s, (uchar*)"r", 1, &oi) < 0)
+				fail("%s: objstat: %r", what);
+			else
+				eqv("every acked write survived", oi.ver,
+					100 + n - 1);
+			mustverify(s, "r", what);
+			storeclose(s);
+		}
+	}
+	devclose(d);
+	free(buf);
+}
+
+/*
+ * T1.22.  The new ckseq/cklogoff become publishable only after the
+ * checkpoint's flush has returned, so a publish triggered by
+ * something else mid-checkpoint carries the *old* mark.  Otherwise an
+ * epochhigh publish landing between §2.8's step 1 and step 2 writes
+ * the new ckseq with the pages it describes still in a volatile cache
+ * — and the reclaim rule then licenses overwriting the log records
+ * that would have rebuilt them.
+ */
+static void
+tckmark(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Sbsel sel;
+	uchar *buf;
+	vlong sboff;
+	uvlong ck0;
+	int i;
+
+	d = newdisk();
+	if((s = mustopen(d, "checkpoint mark")) == nil)
+		return;
+	buf = mkbuf(64, 101);
+	mk(s, "p");
+	if(wr(s, "p", buf, 64, 0, 2) < 0)
+		fail("objwrite: %r");
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	storestat(s, &st);
+	ck0 = st.ckseq;
+	if(wr(s, "p", buf, 64, 64, 3) < 0)
+		fail("objwrite: %r");
+
+	/*
+	 * Force an epochhigh publish after the first checkpoint page
+	 * write, and drop the checkpoint's own superblock write, so the
+	 * mid-checkpoint publish is the newest superblock on the disk.
+	 */
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	storehook(s, "publish", 1);
+	sboff = sel.victim == 0 ? super1off(d) : 0;
+	simfaultat(d, Sfdrop, 1, sboff, sel.sb[sel.start].secsz);
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	storehook(s, "publish", 0);
+	storeclose(s);
+
+	if(superselect(d, &sel) < 0){
+		fail("superselect: %r");
+		devclose(d);
+		free(buf);
+		return;
+	}
+	eqv("a publish mid-checkpoint carries the old checkpoint mark",
+		sel.sb[sel.start].ckseq, ck0);
+	istrue("and its own field advanced", sel.sb[sel.start].epochhigh > 0);
+
+	if((s = mustopen(d, "after a mid-checkpoint publish")) == nil){
+		devclose(d);
+		free(buf);
+		return;
+	}
+	storestat(s, &st);
+	istrue("replay still covers the pages that publish described",
+		st.pmax <= (st.nreplay > 0 ? st.watermark : st.ckseq));
+	mustverify(s, "p", "after a mid-checkpoint publish");
+	storeclose(s);
+	devclose(d);
+	free(buf);
+	USED(i);
+}
+
+/*
+ * T1.23.  The qidnext high-water is durable before any path in its
+ * batch is issued, and epochhigh before the instance acts under it.
+ * No path is ever re-issued, across any number of restarts.
+ */
+static void
+tqid(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Objinfo oi;
+	uchar o[Oidmax];
+	uvlong seen[64];
+	char name[32];
+	int i, j, n;
+
+	d = newdisk();
+	n = 0;
+	for(j = 0; j < 3; j++){
+		if((s = mustopen(d, "qid.path")) == nil){
+			devclose(d);
+			return;
+		}
+		if(j == 0 && epochadopt(s, 11) < 0)
+			fail("epochadopt: %r");
+		for(i = 0; i < 8; i++){
+			snprint(name, sizeof name, "q%d.%d", j, i);
+			oidof(o, name);
+			if(objcreate(s, o, strlen(name), 1, 1, &oi) < 0){
+				fail("objcreate: %r");
+				continue;
+			}
+			seen[n++] = oi.qidpath;
+		}
+		storestat(s, &st);
+		istrue("the recorded high-water is above every path issued",
+			st.qidnext > seen[n-1]);
+		eqv("epochhigh survives every restart", st.epochhigh, 11);
+		storeclose(s);
+	}
+	checks++;
+	for(i = 0; i < n; i++)
+		for(j = i+1; j < n; j++)
+			if(seen[i] == seen[j]){
+				fail("qid.path %llud was issued twice",
+					seen[i]);
+				i = n;
+				break;
+			}
+	devclose(d);
+}
+
+void
+main(int argc, char **argv)
+{
+	USED(argc); USED(argv);
+	tflushseq();
+	ttorn();
+	tshort();
+	tmatrix();
+	twrap();
+	tgroup();
+	treclaim(0);
+	treclaim(1);
+	tckmark();
+	tqid();
+	if(fails > 0){
+		fprint(2, "committest: %d of %d checks failed\n", fails, checks);
+		exits("failed");
+	}
+	print("committest: %d checks ok\n", checks);
+	exits(nil);
+}
