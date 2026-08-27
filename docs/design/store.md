@@ -1810,7 +1810,17 @@ empty when it arrives. Batching happens only among commits that
 coincide with a write already in flight, which is precisely the
 coincidence worth exploiting.
 
-**The I/O procs.** Grain writes, extent-map reads, and the pieces of a
+**The I/O procs — not built.** The device interface of §0 is
+synchronous: it carries no `Ioproc*`, and the engine in `libshoal`
+coordinates with `QLock` and `Rendez` alone and takes a **spawn
+callback** from the program that hosts it. So the pool described here
+is `shoalsrv`'s and not the library's, and until `shoalsrv` exists
+nothing in the tree runs an `iocall`. That split is deliberate rather
+than pending: `libshoal` must link into a T1 test program, which is
+not a libthread program, so the library cannot name libthread's
+types. The rest of this paragraph is the shape the pool will have.
+
+Grain writes, extent-map reads, and the pieces of a
 record body larger than `Wunit` are issued through a bounded pool of
 `ioproc`(2) slaves (policy; default 8) sharing the partition fd —
 `pwrite` carries its own offset, so concurrent requests on one fd are
