@@ -3,6 +3,7 @@
 LIB=libshoal.a$O
 
 OFILES=\
+	check.$O\
 	csum.$O\
 	dev.$O\
 	devfile.$O\

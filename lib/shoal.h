@@ -458,3 +458,17 @@ int	geometry(Super *s, Fmtcfg *c, vlong partbytes);
 int	fmtstore(Dev *d, Super *s);
 char*	csumalgname(ulong alg);
 ulong	csumalgno(char *name);
+
+/*
+ * Inspection and checking, §12.  shoalck is a front end over this.
+ */
+typedef struct Ckcfg Ckcfg;
+struct Ckcfg
+{
+	int	verbose;	/* -l: dump log records */
+	int	quiet;		/* report problems only */
+	char	*oid;		/* -o: dump one object */
+	int	out;		/* fd for the report */
+};
+
+int	ckstore(Dev *d, Ckcfg *c);
