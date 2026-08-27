@@ -2578,19 +2578,14 @@ are one requirement: **the map text, including its `stale` records,
 MUST be durable against power loss before the acknowledgement that
 publishes it.**
 
-That requirement is normative; the mechanism is not, and this design
-does not pretend a mechanism exists. 9front has no `fsync(2)`, and
-cwfs and hjfs commit on their own schedule, so "the monitor MUST
-fsync `/map`" — as the previous revision put it — named a primitive
-the target platform does not have. The candidates are a raw partition
-the monitor writes and reads itself, a file server `ctl` sync
-operation where one is offered, or a small dedicated log device.
-Which of them actually gives power-loss durability on 9front, and at
-what cost per commit, is evidence work: §10.2 carries it as the
-**second-largest unknown** in the design, behind the equivalent
-question for the object store (§5.4). Both are the same question
-asked of two different processes, and neither may be answered by
-assumption.
+That requirement is normative; the mechanism is not. 9front has no
+`fsync(2)`, and cwfs and hjfs commit on their own schedule, so "the
+monitor MUST fsync `/map`" — as the previous revision put it — named
+a primitive the target platform does not have. How the monitor
+obtains durability is decisions.md **D13** (a small raw partition the
+monitor writes and reads itself; the evidence is
+`docs/platform/9front-storage.md`), the same answer as for the object
+store (§5.4), and it is implementation policy.
 
 It MUST keep the last `retain` (default 8) published maps under
 `/maps`, and MUST keep at least the immediately previous one, which
