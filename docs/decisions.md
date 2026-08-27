@@ -196,3 +196,46 @@ is exactly the component §5.4.1 and §2.1 are written against.
 use any language, library and build system it likes; what a
 conforming implementation must match is the wire and the formats
 (`design/layer-a.md`), not this.
+
+## D13 — Durable state lives on raw partitions shoal manages itself (2026-08-27)
+
+**Decision:** shoal's durability point is a raw disk partition it
+manages itself, not a file on a 9front file system. Each
+storage-server instance owns a raw partition — one instance per disk
+(D4) — and implements its own on-disk store with write-ahead commit,
+so that `design/layer-a.md` §1.3's four-tuple atomicity and §5.4's
+durability-before-ack are properties of code shoal owns. The monitor
+likewise owns a small raw partition, a slot store, for the map (§8.2).
+**Rationale:** `platform/9front-storage.md` is the evidence. No 9front
+file system gives durable-before-ack at a price the write path can
+pay. cwfs and hjfs acknowledge writes that are only in their own
+buffer cache, lose them on power loss, and are left structurally
+damaged by the crash — unremovable directories, out-of-range block
+pointers, files whose `stat` succeeds and whose `read` does not — and
+cwfs reboots reporting nothing wrong. gefs is correct, and the only
+one that survives a crash intact, but its null-`Twstat` commit costs
+530–620 ms per durable write: ~60× `replms`, which also breaks §5.4
+step 5a's bound on the monitor round trip inside a client write. A raw
+partition costs 8.4 ms per commit and scales with concurrency.
+**Considered and rejected:** cwfs or hjfs plus a console `sync`. The
+`sync` does make prior writes durable, but it is a whole-file-system
+barrier whose cost is set by other writers (25.3 s measured after
+40 MB of unrelated dirty data), there is no per-file alternative, and
+the container itself does not survive the crash — a store built on it
+would need a repair story for the file system as well as for its own
+records.
+**Recorded fallback:** gefs plus a null `Twstat` is a correct,
+zero-implementation answer at ~8 durable writes/s aggregate. It is the
+fallback if the raw store is not built, and taking it means
+renegotiating the throughput target.
+**Deployment consequence, as fact:** shoal data disks are raw
+partitions, not cwfs, and the monitor needs a partition of its own (a
+few MB) on whichever disk it runs; carving them is an operator step.
+A SCSI `SYNCHRONIZE CACHE` is issued after each commit write: real on
+virtio and on AHCI, a silent no-op on the legacy IDE driver, where
+durability therefore additionally requires the drive's write cache to
+be off (`platform/9front-storage.md` §5).
+**Implementation policy — the whole row.** The mechanism is ours; a
+conforming implementation may store objects however it likes. The
+normative requirements are unchanged and live in `design/layer-a.md`
+§1.3, §5.4 and §8.2.
