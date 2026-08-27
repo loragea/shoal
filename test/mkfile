@@ -1,0 +1,32 @@
+</$objtype/mkfile
+
+# T1 unit tests.  Each test is a self-contained program that exits
+# non-zero and prints a one-line "FAIL: reason" when it fails.  To
+# add one: write foo.c here and add foo to TESTS.
+TESTS=\
+	csumtest\
+
+LIB=../lib/libshoal.a$O
+HFILES=../lib/shoal.h
+LDFLAGS=
+
+PROGS=${TESTS:%=$O.%}
+
+default:V:	all
+
+all:V:	$PROGS
+
+$O.%:	%.$O $LIB
+	$LD $LDFLAGS -o $target $prereq
+
+%.$O:	%.c $HFILES
+	$CC $CFLAGS $stem.c
+
+test:V:	$PROGS
+	for(t in $PROGS){
+		echo '	'^$t
+		./$t || exit 'test failed'
+	}
+
+clean nuke:V:
+	rm -f *.[$OS] [$OS].* $CLEANFILES
