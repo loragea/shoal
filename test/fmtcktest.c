@@ -161,6 +161,7 @@ tdamage(void)
 	Super s;
 	Fmtcfg c;
 	uchar *p;
+	uvlong off;
 
 	if((d = simopen(Secsz, Nsec, Seed)) == nil)
 		sysfatal("simopen: %r");
@@ -177,6 +178,31 @@ tdamage(void)
 	checks++;
 	if(check(d) == 0)
 		fail("the checker passed a store with a damaged index entry");
+
+	/*
+	 * §2.4 and §12: the format does not zero the extent-map region,
+	 * because nothing reads a slot no live index entry claims and
+	 * the commit that allocates one zeroes it.  So a store formatted
+	 * over a region full of another life's bytes checks clean.
+	 */
+	memset(p, 0xa5, s.blksz);
+	for(off = emapentoff(&s, 0); off + s.blksz <= emapentoff(&s, s.nemap);
+		off += s.blksz)
+		simpoke(d, off, p, s.blksz);
+	if(geometry(&s, &c, d->size) < 0 || fmtstore(d, &s) < 0)
+		sysfatal("reformat: %r");
+	checks++;
+	if(check(d) != 0)
+		fail("a format over a dirty extent-map region did not check "
+			"clean");
+	simpeek(d, emapentoff(&s, 1), p, s.blksz);
+	for(off = 0; off < s.blksz; off++)
+		if(p[off] != 0xa5)
+			break;
+	checks++;
+	if(off < s.blksz)
+		fail("the format wrote %llud bytes into the extent-map region",
+			(uvlong)s.emapsecs*s.secsz);
 
 	/* undo it, and damage a bitmap page instead */
 	if(geometry(&s, &c, d->size) < 0 || fmtstore(d, &s) < 0)

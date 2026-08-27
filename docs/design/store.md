@@ -2203,13 +2203,21 @@ its `qidnext` and its `epochhigh` — which defeats the very thing `-r`
 exists to make loud, and which `shoalck` would report as a healthy
 store.
 
-It then zeroes the log and the extent-map region; writes every index
-entry and every dirty record as a valid **free** record, and every bitmap page with a valid
+It then zeroes the log; writes every index entry and every dirty
+record as a valid **free** record, and every bitmap page with a valid
 header at `ckseq = 0` — sixteen zero bytes are not the checksum of a
 zeroed record, so a region merely zeroed would make §5 step 10
 condemn every slot and §5 step 5 report `bmaprebuild=yes`; sets bit 0
 of the bitmap (grain 0 is never allocatable); and writes both
 superblocks **last**, copy 0 at `gen = 0` and copy 1 at `gen = 1`.
+
+The extent-map region is **not** zeroed. §2.4 puts the zeroing of an
+entry on the commit that allocates its slot, precisely because a
+released entry's bytes are not to be trusted; no reader reaches a
+slot no live index entry claims, and at format that is every slot. It
+is also 5.1 GiB of the 5.5 GiB of metadata on a 4 TB disk, which at
+8.4 ms per `Wunit` write is about 47 minutes of an otherwise
+50-minute format.
 
 It prints the geometry it chose — including how many multi-block
 objects `nemap` supports, which is the number an operator needs to

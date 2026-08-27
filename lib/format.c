@@ -250,10 +250,15 @@ fmtstore(Dev *d, Super *s)
 		if(devwrite(d, buf, s->blksz, off) < 0)
 			goto bad;
 
-	/* the extent-map region: nothing reads a slot no live entry claims */
-	if(devzero(d, (vlong)s->emapoff*s->secsz,
-		(vlong)s->emapsecs*s->secsz, s->blksz) < 0)
-		goto bad;
+	/*
+	 * The extent-map region is left as it is.  §2.4 puts the
+	 * zeroing of an entry on the commit that allocates its slot,
+	 * because a released entry's bytes are not to be trusted
+	 * anyway; no reader reaches a slot no live index entry claims,
+	 * and at format that is every slot.  It is 5.1 GiB of the
+	 * 5.5 GiB of metadata on a 4 TB disk at the defaults, which is
+	 * about 47 minutes of an otherwise 50-minute format.
+	 */
 
 	/* free dirty records */
 	memset(&de, 0, sizeof de);
