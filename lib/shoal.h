@@ -411,6 +411,7 @@ enum
 	Kslot	= 3,
 
 	Oslot	= 1<<0,		/* Eobj oflags bit0: this commit changes emapslot */
+	Ocorrupt = 1<<1,	/* bit1: the corrupt flag this commit publishes */
 };
 
 typedef struct Lrec Lrec;
@@ -530,3 +531,149 @@ struct Ckcfg
 };
 
 int	ckstore(Dev *d, Ckcfg *c);
+
+/*
+ * The store engine, store.md §3 to §7: start-up and replay, the log
+ * commit path, group commit, the checkpointer, the allocator, the
+ * superblock publisher and a library-level object API.  The 9P
+ * surface is not here — it is layer-a's, and it is what cmd/shoalsrv
+ * will be.
+ *
+ * Procs.  The engine needs procs of its own — a flusher and a
+ * checkpointer — and its callers put several more on it, so it must
+ * run both in a plain-libc T1 program and inside a libthread 9P
+ * server.  It therefore takes a spawn callback at open and uses
+ * QLock, Rendez and Lock and nothing else: a T1 program passes an
+ * rfork(RFPROC|RFMEM) wrapper, and the server will pass proccreate.
+ * The engine's procs call the Dev directly, which is proc-safe, so
+ * there is no Ioproc anywhere in lib/ and none in the device vtable.
+ *
+ * Per-object ordering (layer-a §5.4.1, R14) is the caller's: in the
+ * server it is store.md §7's Reqqueue pool, and a T1 program keeps
+ * one proc per object.  The engine serialises the state every proc
+ * shares (§7's four QLocks) and nothing else.
+ */
+typedef struct Store Store;
+typedef struct Storecfg Storecfg;
+typedef struct Storestat Storestat;
+typedef struct Objinfo Objinfo;
+typedef struct Stage Stage;
+
+/*
+ * Store and Stage are opaque outside lib/: their definitions are in
+ * lib/store.h.  2c(1)'s type signatures are computed from the C
+ * signof operator, so a function taking a Store* signs differently in
+ * a file that has the definition and one that has not; the pragma is
+ * what that mechanism provides for exactly this case.
+ */
+#pragma incomplete Store
+#pragma incomplete Stage
+
+enum
+{
+	Logdepthdflt	= 4,		/* §7's semaphore */
+	Logdepthmax	= 8,
+	Ckmsdflt	= 30000,	/* §2.8 */
+	Ckhighdflt	= 4,		/* checkpoint past logsecs/ckhigh used */
+	Ckwaitmsdflt	= 5000,		/* §6's bounded wait */
+	Logresvdiv	= 16,		/* §6's reserved tail */
+	Stagemaxdflt	= 2048,		/* §3.6, grains per stage */
+	Stagetotdflt	= 16384,	/* §3.6, grains per process */
+	Stagemsdflt	= 30000,
+	Emapcachedflt	= 4096,		/* §9's LRU */
+	Qidbatch	= 1024,		/* §2.2's qidnext batch */
+};
+
+struct Storecfg
+{
+	int	(*spawn)(void (*)(void*), void*);
+	int	noflush;		/* §3.2's -w */
+	int	nockptproc;		/* no checkpointer proc: T1 drives it */
+	ulong	logdepth;
+	ulong	ckms;
+	ulong	ckhigh;
+	ulong	ckwaitms;
+	ulong	stagemax, stagetot, stagems;
+	ulong	emapcache;
+};
+
+struct Storestat
+{
+	int	flushmode;
+	int	bmaprebuild;
+	uvlong	ckseq, cklogoff;
+	uvlong	watermark, seqnext;
+	uvlong	qidnext, epochhigh;
+	int	monidset;
+	uvlong	grainfree, staged;
+	uvlong	slotfree, emapfree;
+	uvlong	logfree;		/* sectors */
+	uvlong	nlive, ntomb, nlost;
+	uvlong	ndirty, ndirtydrop;
+	uvlong	nreplay, pmax;
+};
+
+struct Objinfo
+{
+	ulong	slot;
+	ulong	emapslot;
+	uvlong	qidpath, len, ver, wepoch;
+	vlong	mtime;
+	uchar	csum[Csumlen];
+	int	state;
+	int	corrupt;
+};
+
+Store*	storeopen(Dev*, Storecfg*);
+void	storeclose(Store*);	/* stop the procs; write nothing */
+int	storecheckpoint(Store*);
+void	storestat(Store*, Storestat*);
+void	storehook(Store*, char *name, uvlong n);	/* §13's -X hooks */
+ulong	storelost(Store*, ulong i);	/* the i'th condemned slot */
+int	storefullsync(Store*, char *peer);
+
+/* §2.2's publisher: durable before the value is acted on */
+uvlong	qidalloc(Store*);
+int	epochadopt(Store*, uvlong epoch);
+int	monidpin(Store*, uchar id[16]);
+
+/* the object API.  Digest and csum handling is §4's. */
+int	objstat(Store*, uchar *oid, int oidlen, Objinfo*);
+int	objcreate(Store*, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
+		Objinfo*);
+long	objread(Store*, uchar *oid, int oidlen, void *a, long n, uvlong off);
+int	objwrite(Store*, uchar *oid, int oidlen, void *a, long n, uvlong off,
+		uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr);
+int	objtrunc(Store*, uchar *oid, int oidlen, uvlong len, uvlong ver,
+		uvlong wepoch);
+int	objremove(Store*, uchar *oid, int oidlen, uvlong ver, uvlong wepoch);
+int	objdiscard(Store*, uchar *oid, int oidlen);
+int	objcorrupt(Store*, uchar *oid, int oidlen, int set);
+
+/*
+ * Verify, §8.  It answers the set of mismatching block indices, and
+ * separately whether the digest array itself is suspect — the two
+ * need different repairs, so a boolean would be the wrong answer.
+ */
+typedef struct Vfy Vfy;
+struct Vfy
+{
+	int	arraybad;	/* hash(dig[]) != csum */
+	ulong	nbad;
+	ulong	*bad;		/* nbad block indices */
+};
+int	objverify(Store*, uchar *oid, int oidlen, Vfy*);
+void	vfyfree(Vfy*);
+
+/* the dirty set, §2.6 and layer-a §7.1 */
+int	dirtyadd(Store*, uchar *oid, int oidlen, char *peer, uvlong epoch);
+int	dirtydel(Store*, uchar *oid, int oidlen, char *peer);
+int	dirtyhas(Store*, uchar *oid, int oidlen, char *peer);
+ulong	dirtycount(Store*);
+
+/* multi-request op=full stages, §3.6 */
+Stage*	stageopen(Store*, uchar *oid, int oidlen, uvlong len, int force);
+int	stagewrite(Stage*, void *a, long n, uvlong off);
+int	stagefinal(Stage*, uvlong ver, uvlong wepoch);
+void	stagediscard(Stage*);
+void	stagesweep(Store*, vlong now);

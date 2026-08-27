@@ -222,7 +222,7 @@ objrecunpack(Objrec *o, uchar *p, long n)
 		werrstr("Eobj: oidlen %d", o->oidlen);
 		return -1;
 	}
-	if(o->oflags & ~Oslot){
+	if(o->oflags & ~(Oslot|Ocorrupt)){
 		werrstr("Eobj: reserved oflags bit set (%#ux)", o->oflags);
 		return -1;
 	}

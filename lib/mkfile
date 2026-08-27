@@ -3,18 +3,26 @@
 LIB=libshoal.a$O
 
 OFILES=\
+	alloc.$O\
+	apply.$O\
 	check.$O\
+	ckpt.$O\
+	commit.$O\
 	csum.$O\
 	dev.$O\
 	devfile.$O\
 	devsd.$O\
 	devsim.$O\
+	emap.$O\
 	format.$O\
 	log.$O\
+	obj.$O\
 	ondisk.$O\
+	store.$O\
 	super.$O\
 
 HFILES=\
 	shoal.h\
+	store.h\
 
 </sys/src/cmd/mklib

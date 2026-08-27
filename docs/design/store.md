@@ -841,8 +841,16 @@ eighth of the log region.
     nfree × u32 grain
 
 `oflags` bit0 is **`Oslot`**: this commit changes `emapslot`, in
-either direction (the slot rule below). Bits 1..7 are reserved and
-MUST be zero.
+either direction (the slot rule below). Bit 1 is **`Ocorrupt`**: the
+value of the index entry's `corrupt` flag (§2.3) that this commit
+publishes. Bits 2..7 are reserved and MUST be zero.
+
+`Ocorrupt` is in the record for the same reason everything else here
+is: §8 makes the `corrupt` flag durable through an `Eobj` that
+changes nothing else, and every clause of the apply below is a
+function of the record alone. An apply that carried the entry's own
+flag through instead would be a clause that reads live state, and
+replay would silently clear what a scrub had found.
 
 `nmap` names the blocks this commit changes; every other block below
 `nblk` is unchanged, except under the slot rule below. `nfree` names
@@ -851,8 +859,9 @@ replaced, and every grain beyond a new shorter `len`.
 
 Applying an `Eobj` sets absolute values, and it MUST, in this order:
 
-1. set the four-tuple and `len` in the index entry, and derive
-   `nblk = blkcount(len)` from that `len`;
+1. set the four-tuple, `len` and the `corrupt` flag (from
+   `Ocorrupt`) in the index entry, and derive `nblk = blkcount(len)`
+   from that `len`;
 2. if the record carries `Oslot`, allocate or release the extent-map
    slot `emapslot` names **and zero the whole target map** — all
    `emapsz` bytes of a newly allocated extent-map entry, or
@@ -1120,19 +1129,24 @@ overwriting a good one. A device flush is device-wide, so one flush
 after every stager in the batch has finished its grain writes covers
 all of them; it costs 175 µs against an 8.4 ms write.
 
-**The raw channel has one owner.** The flush is a SCSI
+**The raw channel has one owner at a time.** The flush is a SCSI
 `SYNCHRONIZE CACHE` issued through `/dev/sdXX/raw` as a
 write-cdb / read-data / read-status triple, 4.2 µs per round trip on
 a held fd against 462 µs if the file is opened and closed around each
 command. The triple is per-unit kernel state, so it MUST NOT be
-interleaved: within the store, **one flusher proc owns the raw fd**
-and every flush — the committers', the checkpointer's, the
-superblock publisher's — is a request to it. The flusher coalesces:
-a caller asks for "a flush that began after time *t*", and one
+interleaved: within the store **every flush goes through one
+coalescing function** — the committers', the checkpointer's, the
+superblock publisher's — which issues at most one device flush at a
+time. A caller asks for "a flush that began after time *t*", and one
 device flush satisfies every caller waiting at the moment it is
 issued, which is what keeps `logdepth` concurrent committers from
-costing `logdepth` flushes. Outside the store the same exclusion is
-the operator's (§2.1).
+costing `logdepth` flushes; a caller woken by a *later* round than
+the one it asked for is answered by that round, because flushes are
+cumulative. The exclusion is a lock rather than a dedicated proc,
+because a proc buys nothing here that the lock does not: the caller
+that would have sent the request is the caller that waits for the
+answer either way. Outside the store the same exclusion is the
+operator's (§2.1).
 
 **Starting without the flush channel is refused.** If the raw
 channel cannot be opened — no raw file, or permissions — the store
@@ -1655,9 +1669,8 @@ its properties are load-bearing:
 
 **Shared in-memory state, and the locks over it.** Deleting the
 per-object lock does not delete the need to protect the structures
-every proc touches. Four `QLock`s cover all of it — beside the ones
-`Reqqueue` and `Ioproc` keep for their own queues, which the store
-does not touch:
+every proc touches. Four `QLock`s cover all of it — beside the one
+`Reqqueue` keeps for its own queue, which the store does not touch:
 
 | Lock | Covers | Taken by |
 |---|---|---|
@@ -1768,29 +1781,34 @@ empty when it arrives. Batching happens only among commits that
 coincide with a write already in flight, which is precisely the
 coincidence worth exploiting.
 
-**The I/O procs.** Grain writes, extent-map reads, and the pieces of a
-record body larger than `Wunit` are issued through a bounded pool of
-`ioproc`(2) slaves (policy; default 8) sharing the partition fd —
-`pwrite` carries its own offset, so concurrent requests on one fd are
-safe. `Ioproc`s are libthread's own bounded pool of slave I/O procs:
-`iocall` carries `pread`/`pwrite`, for which there is no wrapper, and
-`iointerrupt`/`ioflush` are the cancellation path a flushed request
-needs. A proc made with a bare `rfork` would be the wrong tool here —
-libthread keeps its `Proc` in per-process private storage, so a proc
-forked outside it can use neither a channel nor a `qlock` nor
-`threadsleep`, which is exactly what handing a result back to a
-waiting worker requires. The pool exists because the sustained
-throughput figures in §11 are measured with several requests in
-flight; without it every one of them is a single-writer figure.
+**Procs, and where they come from.** The engine is a library, and it
+must run both inside the libthread 9P server and inside a plain-libc
+T1 program (§12, §13). So it **takes a `spawn(void(*fn)(void*),
+void*)` callback at open** and uses `QLock`, `Rendez` and `Lock` and
+nothing else: T1 passes an `rfork(RFPROC|RFMEM)` wrapper, the server
+passes `proccreate`, and libc's `qlock`(2) primitives mean the same
+thing under both. There is no `<thread.h>` anywhere in the library.
+
+The procs it makes for itself are the checkpointer (§2.8) and nothing
+else; the concurrency the throughput figures in §11 depend on is the
+callers' — a queue proc issues its own grain writes, and a committer
+writes its own record — so the requests in flight are the procs
+already in flight, and no pool of I/O slaves stands between them and
+the device. Each of those procs calls the `Dev` vtable (§0) directly,
+which is proc-safe: `pread`/`pwrite` carry their own offsets, so
+concurrent requests on one fd are safe, and the simulated disk holds
+one lock over all of it. This is also what settles the question of
+whether an `Ioproc` belongs in the vtable: it does not, and the
+vtable stays four calls and a geometry.
 
 **How many procs, and how big.** The service loop, 64 queue procs,
-8 I/O procs, the flusher, the checkpointer and the scrubber: about 76,
-which is unremarkable on 9front but is a number worth having written
-down, since the queue count is a tunable and each queue is a proc.
-Every one of them is created by `proccreate` — `reqqueuecreate`
-included — so the program sets `mainstacksize` explicitly: a queue
-proc composes a `blksz` block and builds a record on its stack, and
-the default is not sized for that.
+the checkpointer and the scrubber: about 67, which is unremarkable on
+9front but is a number worth having written down, since the queue
+count is a tunable and each queue is a proc. In the server every one
+of them is created by `proccreate` — `reqqueuecreate` included — so
+the program sets `mainstacksize` explicitly: a queue proc composes a
+`blksz` block and builds a record on its stack, and the default is
+not sized for that.
 
 Throughput follows: one batch holds a hundred-odd small commits in one
 `Wunit` of body, so the commit path's ceiling is thousands of commits
@@ -1849,7 +1867,8 @@ a full pass takes about `scrubdays`. At layer-a §7.5's ~4 MiB/s on a
 4 TB disk that is ~7% of one CPU spent hashing, continuously, which
 is worth knowing on a two-vCPU node that also runs the write path.
 On mismatch it sets the index entry's `corrupt` flag — durably, via
-an `Eobj` that changes nothing else, so a restart does not forget —
+an `Eobj` that changes nothing else but its `Ocorrupt` bit (§2.7), so
+a restart does not forget —
 lists the object in `/lost`, and fails client access with
 `checksum mismatch`. A corrupt
 copy loses arbitration against everything including absence (layer-a
@@ -1913,7 +1932,7 @@ version.
 
 *Policy.*
 
-The in-memory index is an array of `nslots` entries plus an oid arena
+The in-memory index is an array of `nslots` entries plus the oids
 plus a hash table. Per entry:
 
     qidpath 8, len 8, ver 8, wepoch 8, mtime 8, csum 32,
@@ -1922,11 +1941,12 @@ plus a hash table. Per entry:
 
 which is 128 bytes rounded. There is no lock in the entry: §7's
 queues serialise per object, so the 32 bytes an `RWLock` costs on
-amd64 — on every slot, occupied or not — are not spent. The oid arena
-averages ~24 bytes an object; the hash table is 2^19 `u32` buckets
-with chaining through `hashnext`.
+amd64 — on every slot, occupied or not — are not spent. The oids
+average ~24 bytes an object and are allocated one at a time, so a
+discarded tombstone gives its bytes back; the hash table is 2^19
+`u32` buckets with chaining through `hashnext`.
 
-| objects | index | arena | buckets | total |
+| objects | index | oids | buckets | total |
 |---|---|---|---|---|
 | 2.6·10^5 | 33 MB | 6 MB | 2 MB | **41 MB** |
 | 2^20 | 128 MB* | 24 MB | 8 MB | **160 MB** |
@@ -2377,29 +2397,36 @@ models what the real one is allowed to do:
   race the seeded generator: a run stays reproducible from its seed
   and an order assertion stays an assertion.
 
-Points: `stage` (after the last staged grain write), `precommit`
-(after the pre-flush, before the body write), `body:n` (after *n*
-body sectors), `commit:n` (after *n* header bytes — the torn-header
-sweep), `postwrite` (after the header write returns, before the
-post-flush), `preack`, `ckpt:n` (after *n* checkpoint page writes),
-`reclaim` (reclaim log space before the checkpoint's superblock
-write), `super` (after a superblock write returns, before its
-flush — the two copies are written in sequence only by `shoalfmt`),
-`publish` (force an `epochhigh` publish at the current point, so it
-can be combined with `ckpt:n`), `batch:n` (hold batch *n*'s write and
-let *n+1* complete). Each T1 test names the requirement it
-discriminates and the mutation that must break it; **each mutation is
-run**, per `AGENTS.md`.
+Points: `stage` (after the last staged grain write), `body:n` (after
+*n* body sectors), `precommit` (after the pre-flush, which follows the
+body write, and before the header write), `commit` (immediately before
+the header write, so the commit point is not reached), `postwrite`
+(after the header write returns, before the post-flush), `preack`,
+`ckpt:n` (after *n* checkpoint page writes), `super` (after a
+superblock write returns, before its flush — the two copies are
+written in sequence only by `shoalfmt`). A crash at a point is the end
+of a run, so the simulated disk can be told to **stop the device** at
+the crash: every subsequent read, write and flush fails until the
+test brings the machine back. Without that the writes a schedule
+places *after* its crash point would still land, and a crash at
+`commit` would still leave a committed record. The schedules that
+examine what a partly completed sequence left behind — §2.2's two
+superblock writes — keep the run going instead, so it is a choice the
+test makes.
 
-A crash at a point is the end of a run, so the simulated disk can be
-told to **stop the device** at the crash: every subsequent read, write
-and flush fails until the test brings the machine back. Without that
-the writes a schedule places *after* its crash point would still
-land, and a crash before the commit record's header write would still
-leave a committed record. The schedules that examine what a partly
-completed sequence left behind — §2.2's two superblock writes — need
-the run to carry on instead, so stopping is a choice the test makes
-rather than what a crash always does.
+The torn-header sweep of T1.2 is staged rather than crashed at: the
+record is written and then a byte-wise mixture of its old and its new
+header bytes is placed on the platter, which is what a torn write
+leaves and what the sweep must be exhaustive over.
+
+Three of §13's points are *mutations* rather than crashes, and are
+built into the store as hooks that are inert unless a test asks for
+them: `reclaim` (reclaim log space before the checkpoint's superblock
+write returns), `publish` (force an `epochhigh` publish after the
+*n*'th checkpoint page write, so it can be combined with `ckpt:n`),
+and `batch:n` (hold batch *n*'s record write and let *n+1* complete).
+Each T1 test names the requirement it discriminates and the mutation
+that must break it; **each mutation is run**, per `AGENTS.md`.
 
 T1 formats a **small geometry** — a partition image of a few MiB with
 `-n` and `-e` in the hundreds — so that `mk test` stays within
@@ -2419,17 +2446,17 @@ and §12 make a MUST, the bitmap sizing swept over 300 partitions, and
 the maximal-record bound the log sizing rests on), `devtest` (the
 simulated disk's own semantics — the volatile cache, torn and subset
 writes, short counts, the error classes wrapped as a caller wraps
-them, aimed and multiple faults, the crash victim policies, the
-recorded trace and eight procs sharing one device — and the
-file-backed device, including the read-only open and the `Wunit`
-cap), `supertest` (§2.2's three clauses under torn superblock writes
-and under the `super` crash point, which is T1.9's first half), and
-`fmtcktest` (`shoalfmt` to `shoalck` over both a simulated disk and a
-file image; a store with a live one-block object and a live
-three-block one, built through the codecs, with each fault §2 and §5
-name poked into it in turn and the checker's own words read back; and
-a ream cut short, which must leave no valid superblock). The
-short-count case is T1.3. Every case above the format — the crash
+them, aimed and multiple faults, the crash victim policies, a crash
+that stops the device, the recorded trace and eight procs sharing one
+device — and the file-backed device, including the read-only open and
+the `Wunit` cap), `supertest` (§2.2's three clauses under torn
+superblock writes and under the `super` crash point, which is T1.9's
+first half), and `fmtcktest` (`shoalfmt` to `shoalck` over both a
+simulated disk and a file image; a store with a live one-block object
+and a live three-block one, built through the codecs, with each fault
+§2 and §5 name poked into it in turn and the checker's own words read
+back; and a ream cut short, which must leave no valid superblock).
+The short-count case is T1.3. Every case above the format — the crash
 matrix, replay, the log, group commit, stages, enumeration and the
 rest of the list — waits on the write path it exercises.
 

@@ -12,7 +12,7 @@ TESTS=\
 	fmtcktest\
 
 LIB=../lib/libshoal.a$O
-HFILES=../lib/shoal.h
+HFILES=../lib/shoal.h ../lib/store.h t1.h
 LDFLAGS=
 
 PROGS=${TESTS:%=$O.%}

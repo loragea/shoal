@@ -700,12 +700,23 @@ tlog(void)
 			eqv("Eslot slot", slot, 100);
 	}
 
-	/* §2.7: bits 1..7 of oflags are reserved and MUST be zero */
+	/* §2.7: bits 2..7 of oflags are reserved and MUST be zero */
 	memmove(got, want, n);
-	got[Lrechdrsz + Lenthdrsz + 18] = 0x02;
+	got[Lrechdrsz + Lenthdrsz + 18] = 0x04;
 	checks++;
 	if(objrecunpack(&u, got + Lrechdrsz + Lenthdrsz, 140) == 0)
 		fail("Eobj: a reserved oflags bit was accepted");
+
+	/* Ocorrupt is bit1 and is accepted */
+	memmove(got, want, n);
+	got[Lrechdrsz + Lenthdrsz + 18] = Oslot|Ocorrupt;
+	checks++;
+	if(objrecunpack(&u, got + Lrechdrsz + Lenthdrsz, 140) < 0)
+		fail("Eobj: Ocorrupt was rejected: %r");
+	else{
+		eqv("Eobj oflags", u.oflags, Oslot|Ocorrupt);
+		objrecfree(&u);
+	}
 
 	flip("log record", want, n, Lrechdrsz + 8, declog);
 	free(got);
