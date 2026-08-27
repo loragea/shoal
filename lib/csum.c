@@ -4,8 +4,8 @@
 #include "shoal.h"
 
 /*
- * libsec's digest calls dereference their input pointer even for a
- * zero-length final call, so hand them this rather than nil.
+ * A zero-length call into libsec still hands the input pointer to
+ * memmove, so pass this rather than nil.
  */
 static uchar nothing[1];
 
