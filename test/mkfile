@@ -5,6 +5,11 @@
 # add one: write foo.c here and add foo to TESTS.
 TESTS=\
 	csumtest\
+	structtest\
+	geomtest\
+	devtest\
+	supertest\
+	fmtcktest\
 
 LIB=../lib/libshoal.a$O
 HFILES=../lib/shoal.h
