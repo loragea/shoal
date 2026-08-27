@@ -1,7 +1,10 @@
 # The local object store
 
-Status: **design proposal**, not ratified. This is the design of the
-per-instance local store that sits behind the Layer A 9P export,
+Status: **design of record for M1** (2026-08-27), implementation
+policy under decisions.md D13; the one wire-level item it raises,
+§14(11)'s `op=meta corrupt=1` response, is a proposal awaiting
+ratification and is not part of the contract. This is the design of
+the per-instance local store that sits behind the Layer A 9P export,
 plus the much smaller store the monitor uses for its map. The
 contract it makes true locally is `docs/design/layer-a.md`; the
 platform evidence every cost and every durability claim rests on is
