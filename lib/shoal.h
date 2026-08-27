@@ -83,6 +83,29 @@ enum
 	Dechange,
 };
 
+enum
+{
+	/* open flags */
+	Dnoflush	= 1<<0,	/* §3.2's -w: run without the flush channel */
+	Drdonly		= 1<<1,	/* read-only: no raw channel, no write */
+};
+
+/*
+ * What the device can say about durability, which is what shoalck
+ * prints and what /status reports (§3.2, §12).  The three states are
+ * not two: a tool that never opened the raw channel has not observed
+ * write-through, and must not claim the operator asserted it.
+ */
+enum
+{
+	Fnone	= 0,		/* no flush channel exists: a file image */
+	Fraw,			/* the sd(3) raw channel is open */
+	Fasserted,		/* -w: the operator asserted write-through */
+	Funknown,		/* not opened, so not known: a read-only tool */
+};
+
+char*	flushname(int mode);
+
 struct Devops
 {
 	long	(*read)(Dev*, void*, long, vlong);
@@ -98,7 +121,9 @@ struct Dev
 	char	*name;		/* for diagnostics */
 	ulong	secsz;
 	vlong	size;		/* usable bytes, a whole number of sectors */
-	int	canflush;	/* 0: flush is a no-op (§3.2's -w) */
+	ulong	wunit;		/* §0's Wunit: the largest single write */
+	int	flushmode;
+	int	rdonly;
 	void	*aux;
 };
 
@@ -122,16 +147,26 @@ int	deverr(void);
  */
 void	devpoint(Dev*, char*, int);
 
-Dev*	sdopen(char *part, int noflush);
-Dev*	fileopen(char *path, ulong secsz, vlong size);
+/*
+ * A path names an sd(3) partition when the directory holding it is an
+ * sd unit — it has the unit's own ctl and raw files — and a plain file
+ * otherwise (§12).  The spelling of the path decides nothing: an sd
+ * unit is bound at #S in a cpu namespace as often as at /dev.
+ */
+int	sdpart(char *path);
+
+Dev*	sdopen(char *part, int flags);
+Dev*	fileopen(char *path, ulong secsz, vlong size, int flags);
 Dev*	simopen(ulong secsz, uvlong nsec, ulong seed);
 
 /*
  * Simulated-disk controls, store.md §13.  The sim models a volatile
  * write cache: a written sector is visible to reads at once but is
- * durable only after a flush, and simcrash drops everything written
- * since the last one.  Faults are armed for the next n operations
- * (n <= 0 arms them until disarmed with Sfnone).
+ * durable only after a flush, and a crash decides sector by sector
+ * which of the two a dirty sector keeps.  Faults are armed for the
+ * next n operations (n <= 0 arms them until disarmed); several may be
+ * armed at once, and simfaultat aims one at a byte range.  Arming
+ * Sfnone disarms every one of them, and so does a crash.
  */
 enum
 {

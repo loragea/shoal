@@ -199,7 +199,7 @@ tshort(void)
 	long n, i, nw;
 
 	d = sim();
-	n = 64*Secsz;
+	n = Blkszstore;			/* §0's Wunit: the largest write */
 	if((w = malloc(n)) == nil || (r = malloc(n)) == nil)
 		sysfatal("malloc: %r");
 	pat(w, n, 7);
@@ -344,13 +344,13 @@ tfile(void)
 
 	path = "/tmp/shoaldevtest.img";
 	remove(path);
-	if((d = fileopen(path, Secsz, 32*Secsz)) == nil){
+	if((d = fileopen(path, Secsz, 32*Secsz, 0)) == nil){
 		fail("fileopen: %r");
 		return;
 	}
 	eqv("file device size", d->size, 32*Secsz);
 	eqv("file device sector", d->secsz, Secsz);
-	eqv("a file has no flush channel", d->canflush, 0);
+	eqv("a file has no flush channel", d->flushmode, Fnone);
 	pat(w, Secsz, 23);
 	if(devwrite(d, w, Secsz, 8*Secsz) < 0)
 		fail("write: %r");
@@ -358,7 +358,7 @@ tfile(void)
 		fail("flush: %r");
 	devclose(d);
 
-	if((d = fileopen(path, Secsz, 0)) == nil){
+	if((d = fileopen(path, Secsz, 0, 0)) == nil){
 		fail("reopen: %r");
 		remove(path);
 		return;
@@ -373,6 +373,166 @@ tfile(void)
 	remove(path);
 }
 
+/*
+ * §0: the store MUST NOT issue a single pwrite larger than Wunit, and
+ * the device layer is where that is enforced rather than at each call
+ * site.  A read has the opposite rule and is not capped.
+ */
+static void
+tlimits(void)
+{
+	Dev *d;
+	uchar *big;
+
+	d = sim();
+	eqv("the write unit", d->wunit, Blkszstore);
+	if((big = mallocz(2*Blkszstore, 1)) == nil)
+		sysfatal("malloc: %r");
+	checks++;
+	if(devwrite(d, big, Blkszstore, 0) < 0)
+		fail("a write of exactly Wunit was refused: %r");
+	checks++;
+	if(devwrite(d, big, Blkszstore + Secsz, 0) == 0)
+		fail("a write larger than Wunit was accepted");
+	checks++;
+	if(devread(d, big, 2*Blkszstore, 0) < 0)
+		fail("a read larger than Wunit was refused: %r");
+	checks++;
+	if(devzero(d, 0, 4*Blkszstore, 2*Blkszstore) == 0)
+		fail("devzero with a unit larger than Wunit was accepted");
+	free(big);
+	devclose(d);
+}
+
+/* §12: shoalck opens read-only, so the write is refused twice over */
+static void
+trdonly(void)
+{
+	Dev *d;
+	Dir *dir, nd;
+	uchar w[Secsz], r[Secsz];
+	char *path;
+
+	/* the wrapper refuses on a device that would otherwise take it */
+	d = sim();
+	pat(w, Secsz, 29);
+	d->rdonly = 1;
+	checks++;
+	if(devwrite(d, w, Secsz, 4*Secsz) == 0)
+		fail("a write to a read-only device was accepted");
+	d->rdonly = 0;
+	devclose(d);
+
+	path = "/tmp/shoaldevro.img";
+	remove(path);
+	if((d = fileopen(path, Secsz, 32*Secsz, 0)) == nil){
+		fail("fileopen: %r");
+		return;
+	}
+	if(devwrite(d, w, Secsz, 4*Secsz) < 0)
+		fail("write: %r");
+	devclose(d);
+
+	if((d = fileopen(path, Secsz, 0, Drdonly)) == nil){
+		fail("read-only fileopen: %r");
+		remove(path);
+		return;
+	}
+	eqv("a read-only device says so", d->rdonly, 1);
+	if(devread(d, r, Secsz, 4*Secsz) < 0)
+		fail("read-only read: %r");
+	checks++;
+	if(memcmp(w, r, Secsz) != 0)
+		fail("a read-only device read the wrong bytes");
+	checks++;
+	if(devwrite(d, w, Secsz, 8*Secsz) == 0)
+		fail("a read-only file device accepted a write");
+	devclose(d);
+
+	/*
+	 * And the kernel enforces it rather than this code promising it:
+	 * a device the caller has no permission to write opens read-only
+	 * and no other way.  §12 wants the checker to run against a disk
+	 * its user may only read.
+	 */
+	if((dir = dirstat(path)) == nil){
+		fail("dirstat: %r");
+		remove(path);
+		return;
+	}
+	nulldir(&nd);
+	nd.mode = dir->mode & ~0222;
+	free(dir);
+	if(dirwstat(path, &nd) < 0){
+		fail("dirwstat: %r");
+		remove(path);
+		return;
+	}
+	checks++;
+	if((d = fileopen(path, Secsz, 0, 0)) != nil){
+		fail("a writable open of an unwritable image succeeded");
+		devclose(d);
+	}
+	checks++;
+	if((d = fileopen(path, Secsz, 0, Drdonly)) == nil)
+		fail("a read-only open of an unwritable image failed: %r");
+	else
+		devclose(d);
+	remove(path);
+}
+
+/*
+ * §12: what makes a path an sd(3) partition is the unit directory it
+ * lies in, not the spelling of the path.  The two files a unit always
+ * has are what this asks for, so the test can build one under /tmp.
+ */
+static void
+tclassify(void)
+{
+	char *dir, *nm[3];
+	int i, fd;
+
+	dir = "/tmp/shoalsdunit";
+	nm[0] = "/tmp/shoalsdunit/ctl";
+	nm[1] = "/tmp/shoalsdunit/raw";
+	nm[2] = "/tmp/shoalsdunit/shoal";
+	for(i = 0; i < 3; i++)
+		remove(nm[i]);
+	remove(dir);
+	if((fd = create(dir, OREAD, DMDIR|0777)) < 0){
+		fail("create %s: %r", dir);
+		return;
+	}
+	close(fd);
+	for(i = 0; i < 3; i++){
+		if((fd = create(nm[i], OWRITE, 0666)) < 0){
+			fail("create %s: %r", nm[i]);
+			break;
+		}
+		if(i == 0)
+			fprint(fd, "geometry 4096 512\n");
+		close(fd);
+	}
+	checks++;
+	if(!sdpart(nm[2]))
+		fail("a partition of a unit directory was taken for a file");
+	checks++;
+	if(sdpart("/tmp/shoalsdunit/ctl") == 0)
+		fail("the rule is the directory a path lies in, not its name");
+	remove(nm[0]);
+	checks++;
+	if(sdpart(nm[2]))
+		fail("a directory with no ctl file was taken for an sd unit");
+	remove(nm[1]);
+	remove(nm[2]);
+	remove(dir);
+
+	/* the old rule was the path's spelling, and it is not enough */
+	checks++;
+	if(sdpart("/dev/null"))
+		fail("a /dev path that is not a partition was taken for one");
+}
+
 void
 main(int, char**)
 {
@@ -380,9 +540,12 @@ main(int, char**)
 	ttear();
 	tshort();
 	terrors();
+	tlimits();
+	trdonly();
 	ttrace();
 	tpoint();
 	tfile();
+	tclassify();
 	if(fails > 0)
 		exits("failed");
 	print("devtest: %d checks ok\n", checks);

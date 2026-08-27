@@ -612,8 +612,7 @@ ckstore(Dev *d, Ckcfg *c)
 	k.d = d;
 	k.c = c;
 	say(&k, "device: %s, %lud-byte sectors, %lld bytes, flush=%s",
-		d->name, d->secsz, d->size,
-		d->canflush ? "raw" : "asserted-writethrough");
+		d->name, d->secsz, d->size, flushname(d->flushmode));
 
 	superselect(d, &sel);
 	for(i = 0; i < 2; i++){

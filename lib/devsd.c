@@ -14,7 +14,14 @@
  * (docs/platform/9front-storage.md §5), so this file serialises its
  * own commands under one QLock and store.md §2.1's deployment rule —
  * at most one process per sd unit issues raw commands — covers the
- * rest.  §3.2's single flusher proc is what owns this Dev.
+ * rest.  A second opener of the raw file is undetectable from here:
+ * the kernel's interlock is never set, so nothing this code does can
+ * discover the violation, which is why the rule is the operator's.
+ *
+ * §3.2's single flusher proc is what owns this Dev.  It must be a
+ * proc — proccreate, not threadcreate: the flush is three blocking
+ * system calls, and under libthread a QLock parks one thread while a
+ * blocking read parks the whole proc.
  */
 
 typedef struct Sd Sd;
@@ -22,6 +29,8 @@ struct Sd
 {
 	int	fd;
 	int	rawfd;
+	char	*rawpath;
+	int	broken;		/* the raw channel could not be recovered */
 	QLock	raw;
 };
 
@@ -43,6 +52,26 @@ sdwr(Dev *d, void *a, long n, vlong off)
 	return pwrite(s->fd, a, n, off);
 }
 
+/*
+ * Put the raw channel back after a failed command.  The cdb → data →
+ * status exchange is per-unit kernel state, and a command that failed
+ * inside devsd has already moved the unit on, but one whose system
+ * call was aborted before it reached devsd — a note, which §0 says can
+ * arrive at any device call — has not.  Guessing which is which leaves
+ * the unit in a state the next flush trips over, so the channel is
+ * closed and reopened instead: 462 µs on an error path
+ * (docs/platform/9front-storage.md §6), and it puts the unit back at
+ * Rawcmd whatever it was in the middle of.
+ */
+static void
+rawrecover(Sd *s)
+{
+	close(s->rawfd);
+	s->rawfd = open(s->rawpath, ORDWR);
+	if(s->rawfd < 0)
+		s->broken = 1;
+}
+
 static int
 sdflush(Dev *d)
 {
@@ -53,6 +82,10 @@ sdflush(Dev *d)
 	int rv;
 
 	s = d->aux;
+	if(s->broken){
+		werrstr("%s: the flush channel is gone", d->name);
+		return -1;
+	}
 	if(s->rawfd < 0)
 		return 0;		/* §3.2's -w: no channel, no flush */
 	rv = 0;
@@ -61,29 +94,29 @@ sdflush(Dev *d)
 	cdb[0] = 0x35;			/* SYNCHRONIZE CACHE (10) */
 	if(write(s->rawfd, cdb, sizeof cdb) != sizeof cdb){
 		werrstr("%s: flush cdb: %r", d->name);
+		rawrecover(s);
 		qunlock(&s->raw);
 		return -1;
 	}
 	/*
 	 * The data phase is where devsd actually issues the command;
-	 * SYNCHRONIZE CACHE carries no data, so the count is zero.  A
-	 * failure here still leaves the unit in its status state, so
-	 * the status read below runs either way to return it to Rawcmd.
+	 * SYNCHRONIZE CACHE carries no data, so the count is zero.
 	 */
-	werrstr("");
 	if(read(s->rawfd, buf, 0) < 0){
 		werrstr("%s: flush: %r", d->name);
-		rv = -1;
+		rawrecover(s);
+		qunlock(&s->raw);
+		return -1;
 	}
 	buf[0] = '\0';
 	n = read(s->rawfd, buf, sizeof buf - 1);
 	if(n < 0){
-		if(rv == 0)
-			werrstr("%s: flush status: %r", d->name);
+		werrstr("%s: flush status: %r", d->name);
+		rawrecover(s);
 		rv = -1;
 	}else{
 		buf[n] = '\0';
-		if(rv == 0 && atoi(buf) != 0){
+		if(atoi(buf) != 0){
 			werrstr("%s: flush: scsi status %s", d->name, buf);
 			rv = -1;
 		}
@@ -102,6 +135,7 @@ sdclose(Dev *d)
 		close(s->fd);
 	if(s->rawfd >= 0)
 		close(s->rawfd);
+	free(s->rawpath);
 	free(s);
 }
 
@@ -177,17 +211,46 @@ ctlsecsz(char *part)
 }
 
 /*
- * Open an sd(3) partition.  noflush is §3.2's -w: the operator's
+ * Is this path a partition of an sd(3) unit?  The question is about
+ * the directory the path lies in, not about how the path is spelled:
+ * a unit's directory holds the unit's own ctl and raw files beside its
+ * partitions, and #S/sdF0/name in a cpu namespace is as ordinary a way
+ * to name a partition as /dev/sdF0/name (§12).  Getting this wrong is
+ * silent — a partition opened as a plain file takes the default sector
+ * size and has no flush channel — so it is decided by what is there.
+ */
+int
+sdpart(char *path)
+{
+	char *f;
+	int ok;
+
+	if((f = unitfile(path, "ctl")) == nil)
+		return 0;
+	ok = access(f, AREAD) == 0;
+	free(f);
+	if(!ok)
+		return 0;
+	if((f = unitfile(path, "raw")) == nil)
+		return 0;
+	ok = access(f, AEXIST) == 0;
+	free(f);
+	return ok;
+}
+
+/*
+ * Open an sd(3) partition.  Dnoflush is §3.2's -w: the operator's
  * assertion that the unit is write-through, which is the only way to
- * run without the raw channel.
+ * run without the raw channel.  Drdonly opens the partition OREAD and
+ * opens no raw channel at all, so the durability of the unit is not
+ * observed and is reported as unknown rather than asserted.
  */
 Dev*
-sdopen(char *part, int noflush)
+sdopen(char *part, int flags)
 {
 	Dev *d;
 	Sd *s;
 	Dir *dir;
-	char *raw;
 	long secsz;
 
 	if((secsz = ctlsecsz(part)) < 0)
@@ -195,7 +258,7 @@ sdopen(char *part, int noflush)
 	if((s = mallocz(sizeof *s, 1)) == nil)
 		return nil;
 	s->rawfd = -1;
-	if((s->fd = open(part, ORDWR)) < 0){
+	if((s->fd = open(part, flags & Drdonly ? OREAD : ORDWR)) < 0){
 		free(s);
 		return nil;
 	}
@@ -214,21 +277,23 @@ sdopen(char *part, int noflush)
 	d->name = strdup(part);
 	d->secsz = secsz;
 	d->size = dir->length - dir->length % secsz;
+	d->wunit = Blkszstore;
+	d->rdonly = (flags & Drdonly) != 0;
+	d->flushmode = flags & Drdonly ? Funknown : Fasserted;
 	d->aux = s;
 	free(dir);
-	if(!noflush){
-		if((raw = unitfile(part, "raw")) == nil){
+	if((flags & (Dnoflush|Drdonly)) == 0){
+		if((s->rawpath = unitfile(part, "raw")) == nil){
 			devclose(d);
 			return nil;
 		}
-		s->rawfd = open(raw, ORDWR);
-		free(raw);
+		s->rawfd = open(s->rawpath, ORDWR);
 		if(s->rawfd < 0){
 			werrstr("%s: no flush channel: %r", part);
 			devclose(d);
 			return nil;
 		}
-		d->canflush = 1;
+		d->flushmode = Fraw;
 	}
 	return d;
 }

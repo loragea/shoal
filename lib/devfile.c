@@ -9,8 +9,11 @@
  * (docs/decisions.md D13) — but the store's whole engine sits behind
  * the §0 vtable, so a file-backed device is what lets shoalfmt and
  * shoalck work on an image and what lets a T1 test drive them without
- * a disk.  It has no flush channel: canflush is 0 and flush is a
- * no-op, which is §3.2's -w case.
+ * a disk.  It has no flush channel at all — flush is a no-op and the
+ * mode is Fnone — because there is nothing under a file for a flush
+ * to reach: the durability of an image is the file server's, not this
+ * store's, and it is never claimed to be §3.2's asserted
+ * write-through.
  */
 
 typedef struct File File;
@@ -66,10 +69,11 @@ static Devops fileops =
 /*
  * Open path as a device of secsz-byte sectors.  A size of 0 takes the
  * file's current length; any other size sets it, creating the file if
- * it is not there.
+ * it is not there.  Drdonly opens it OREAD, which is what shoalck
+ * wants: a checker that never writes should not need permission to.
  */
 Dev*
-fileopen(char *path, ulong secsz, vlong size)
+fileopen(char *path, ulong secsz, vlong size, int flags)
 {
 	Dev *d;
 	File *f;
@@ -79,9 +83,14 @@ fileopen(char *path, ulong secsz, vlong size)
 		werrstr("fileopen: secsz %lud is not a power of two", secsz);
 		return nil;
 	}
+	if((flags & Drdonly) != 0 && size > 0){
+		werrstr("fileopen: read-only, so it cannot size %s", path);
+		return nil;
+	}
 	if((f = mallocz(sizeof *f, 1)) == nil)
 		return nil;
-	if((f->fd = open(path, ORDWR)) < 0 && size > 0)
+	if((f->fd = open(path, flags & Drdonly ? OREAD : ORDWR)) < 0
+	&& size > 0)
 		f->fd = create(path, ORDWR, 0666);
 	if(f->fd < 0){
 		free(f);
@@ -113,7 +122,9 @@ fileopen(char *path, ulong secsz, vlong size)
 	d->name = strdup(path);
 	d->secsz = secsz;
 	d->size = size - size % secsz;
-	d->canflush = 0;
+	d->wunit = Blkszstore;
+	d->flushmode = Fnone;
+	d->rdonly = (flags & Drdonly) != 0;
 	d->aux = f;
 	return d;
 }

@@ -31,6 +31,20 @@ deverr(void)
 	return Deio;
 }
 
+char*
+flushname(int mode)
+{
+	switch(mode){
+	case Fraw:
+		return "raw";
+	case Fasserted:
+		return "asserted-writethrough";
+	case Funknown:
+		return "not-examined";
+	}
+	return "none";
+}
+
 int
 devread(Dev *d, void *a, long n, vlong off)
 {
@@ -67,6 +81,11 @@ devwrite(Dev *d, void *a, long n, vlong off)
 		werrstr("%s: write %ld at %lld out of range", d->name, n, off);
 		return -1;
 	}
+	if(d->rdonly){
+		werrstr("%s: write %ld at %lld: opened read-only", d->name,
+			n, off);
+		return -1;
+	}
 	if(n % d->secsz != 0 || off % d->secsz != 0){
 		/*
 		 * §0: every write's length is a sector multiple, because
@@ -74,6 +93,17 @@ devwrite(Dev *d, void *a, long n, vlong off)
 		 * read-modify-write of every sector it touches.
 		 */
 		werrstr("%s: unaligned write %ld at %lld", d->name, n, off);
+		return -1;
+	}
+	if((ulong)n > d->wunit){
+		/*
+		 * §0: the store MUST NOT issue a single pwrite larger
+		 * than Wunit.  A larger one buys nothing — devsd issues
+		 * one request per pwrite and the drivers split it again
+		 * — and obscures what one device round trip costs.
+		 */
+		werrstr("%s: write %ld at %lld exceeds the %lud-byte write "
+			"unit", d->name, n, off, d->wunit);
 		return -1;
 	}
 	p = a;
@@ -125,7 +155,7 @@ devzero(Dev *d, vlong off, vlong n, ulong unit)
 	uchar *buf;
 	long m;
 
-	if(unit == 0 || unit % d->secsz != 0){
+	if(unit == 0 || unit % d->secsz != 0 || unit > d->wunit){
 		werrstr("devzero: bad unit %lud", unit);
 		return -1;
 	}

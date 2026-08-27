@@ -72,7 +72,9 @@ it has one.
   buy and cost.
 - **`Wunit` governs writes only.** The store MUST NOT issue a single
   `pwrite` larger than `Wunit`, because a larger one buys nothing
-  and obscures what one device round trip costs. Reads have the
+  and obscures what one device round trip costs; the write wrapper
+  below refuses one, so the rule holds where every write passes
+  rather than at each call site. Reads have the
   opposite shape — the driver's split happens inside one syscall, so
   a 64 KiB `pread` is ~24 % faster per byte than four 16 KiB ones
   (`docs/platform/9front-storage.md` §6). **Bulk reads — recovery,
@@ -126,12 +128,17 @@ it has one.
   v1: a `vers` bump means reformat and refill from peers.
 - **The device is an interface, not a syscall.** Every device access
   in the store goes through one small vtable — read, write, flush,
-  and the geometry — with two implementations: the real `sd(3)`
-  partition plus its raw channel (§3.2), and a simulated disk with a
-  volatile write cache used by the T1 tests (§13). Nothing else in
+  and the geometry — with three implementations: the real `sd(3)`
+  partition plus its raw channel (§3.2), a simulated disk with a
+  volatile write cache used by the T1 tests (§13), and a plain file,
+  which is how the tools work on an image (§12). Nothing else in
   the store calls `pread`, `pwrite` or opens `/dev/sdXX/raw`. This
   is what makes the flush placements and the crash schedules of §3.4
-  testable at all.
+  testable at all. A device carries what it can say about durability
+  — `raw`, the operator's asserted write-through, none at all, or
+  not examined by a reader that opened it read-only — and a tool
+  reports that rather than inferring it from whether a flush would
+  do anything.
 
 ## 1. What the store must do
 
@@ -2161,14 +2168,22 @@ three tools below are thin front ends over the same library. This is
 a real constraint on the code layout rather than a preference, and it
 is expensive to undo once the engine has grown roots in a command.
 
-**A path under `/dev` is an sd(3) partition; anything else is a
-plain file.** Both tools take either. A file image is not a
-deployment target — D13 makes that a raw partition — but it is what
-lets an operator inspect a copy, and it is what lets the T1 cases of
-§13 drive format and check with no disk at all. `shoalfmt -z` sizes
-such an image; nothing else in either tool depends on which kind of
-device it was given, because §0's vtable is the only thing either of
-them calls.
+**A path is an sd(3) partition when the directory holding it is an
+sd unit's, and a plain file otherwise.** What is asked is whether
+that directory holds the unit's own `ctl` and `raw` files, not how
+the path is spelled: the kernel binds `#S` wherever the namespace
+puts it, and in a `cpu` or `rcpu` namespace `#S/sdF0/shoal` is often
+the only way to name a partition at all. A partition mistaken for a
+file is silent and expensive — the sector size falls back to the
+default, so every write becomes a read-modify-write of the sectors
+it touches (§0), and there is no flush channel to refuse to open —
+so the question is settled by what is there. Both tools take either
+kind. A file image is not a deployment target — D13 makes that a raw
+partition — but it is what lets an operator inspect a copy, and it
+is what lets the T1 cases of §13 drive format and check with no disk
+at all. `shoalfmt -z` sizes such an image; nothing else in either
+tool depends on which kind of device it was given, because §0's
+vtable is the only thing either of them calls.
 
 **`shoalfmt`** — format or ream an object-store partition.
 
@@ -2198,7 +2213,12 @@ region, refuses one whose `ngrains` reaches 2^32, and warns when
 §3.2's operator assertion, which is what lets it format a unit whose
 raw channel it cannot open.
 
-**`shoalck`** — inspect and check. It reads and never writes.
+**`shoalck`** — inspect and check. It reads and never writes, and
+opens the device read-only so the kernel enforces that rather than
+the code promising it — which also lets it run against a disk its
+user may only read. It opens no raw channel, so it reports the
+device's flush channel as *not examined* rather than claiming the
+operator asserted write-through.
 
     shoalck [-lq] [-o oid] /dev/sdXX/name
 

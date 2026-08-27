@@ -250,12 +250,12 @@ main(int, char**)
 
 	path = "/tmp/shoalfmtcktest.img";
 	remove(path);
-	if((d = fileopen(path, Secsz, (vlong)Nsec*Secsz)) == nil)
+	if((d = fileopen(path, Secsz, (vlong)Nsec*Secsz, 0)) == nil)
 		sysfatal("fileopen: %r");
 	tround(d, "file image");
 	devclose(d);
 	/* and it still checks clean after a close and reopen */
-	if((d = fileopen(path, Secsz, 0)) == nil)
+	if((d = fileopen(path, Secsz, 0, Drdonly)) == nil)
 		sysfatal("reopen: %r");
 	checks++;
 	if(check(d) != 0)

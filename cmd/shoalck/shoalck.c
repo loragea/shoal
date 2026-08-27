@@ -6,9 +6,10 @@
 
 /*
  * shoalck - inspect and check an object-store partition,
- * docs/design/store.md §12.  It reads and never writes.  The path is
- * an sd(3) partition when it lies under /dev and a plain file
- * otherwise.
+ * docs/design/store.md §12.  It reads and never writes, and opens the
+ * device read-only so that the kernel enforces that rather than this
+ * code promising it.  The path is an sd(3) partition when it names one
+ * of an sd unit's partitions and a plain file otherwise.
  */
 
 static void
@@ -47,10 +48,10 @@ main(int argc, char **argv)
 	path = argv[0];
 
 	/* read-only: no flush channel is wanted or opened */
-	if(strncmp(path, "/dev/", 5) == 0)
-		d = sdopen(path, 1);
+	if(sdpart(path))
+		d = sdopen(path, Dnoflush|Drdonly);
 	else
-		d = fileopen(path, Secszdflt, 0);
+		d = fileopen(path, Secszdflt, 0, Drdonly);
 	if(d == nil)
 		sysfatal("%s: %r", path);
 

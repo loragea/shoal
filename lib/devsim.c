@@ -275,7 +275,8 @@ simopen(ulong secsz, uvlong nsec, ulong seed)
 	d->name = strdup("simdisk");
 	d->secsz = secsz;
 	d->size = (vlong)secsz * nsec;
-	d->canflush = 1;
+	d->wunit = Blkszstore;
+	d->flushmode = Fraw;
 	d->aux = s;
 	return d;
 }

@@ -8,10 +8,10 @@
  * shoalfmt - format or ream an object-store partition,
  * docs/design/store.md §12.
  *
- * The path is an sd(3) partition when it lies under /dev, and a plain
- * file otherwise; a file is the image form the T1 tests and an
- * operator inspecting a copy both work against, and -z gives it a
- * size.
+ * The path is an sd(3) partition when it names one of an sd unit's
+ * partitions, and a plain file otherwise; a file is the image form the
+ * T1 tests and an operator inspecting a copy both work against, and -z
+ * gives it a size.
  */
 
 static void
@@ -169,13 +169,13 @@ main(int argc, char **argv)
 		usage();
 	path = argv[0];
 
-	if(strncmp(path, "/dev/", 5) == 0){
+	if(sdpart(path)){
 		if(size != 0)
 			sysfatal("-z sizes a file image, not a partition");
-		if((d = sdopen(path, noflush)) == nil)
+		if((d = sdopen(path, noflush ? Dnoflush : 0)) == nil)
 			sysfatal("%s: %r", path);
 	}else{
-		if((d = fileopen(path, c.secsz, size)) == nil)
+		if((d = fileopen(path, c.secsz, size, 0)) == nil)
 			sysfatal("%s: %r", path);
 	}
 	c.secsz = d->secsz;
