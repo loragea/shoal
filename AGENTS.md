@@ -57,7 +57,7 @@ shoal is written in the Plan 9 C dialect and built on 9front with
 | Path | Holds |
 |---|---|
 | `mkfile` | Root. Iterates `lib cmd test` for `all`, `clean` and `nuke`, and runs T1 for `test`. |
-| `lib/` | `libshoal.a$O`: code shared by servers, commands and tests. `lib/shoal.h` is its header; includers name it by relative path after `<u.h>`, `<libc.h>` and `<libsec.h>`. Built by `/sys/src/cmd/mklib`. |
+| `lib/` | `libshoal.a$O`: code shared by servers, commands and tests. `lib/shoal.h` is its header; includers name it by relative path after `<u.h>`, `<libc.h>`, `<libsec.h>` and `<fcall.h>` — the last for the GBIT/PBIT macros every on-disk integer is packed with. Built by `/sys/src/cmd/mklib`. |
 | `cmd/` | One directory per command, each built by `/sys/src/cmd/mkone` — so it produces `$O.out` and installs as `$TARG` in `/$objtype/bin`. `cmd/mkfile` lists them in `DIRS`. |
 | `test/` | T1 test programs. |
 
@@ -77,6 +77,17 @@ fails on the first failing program. To add one: write `test/foo.c`
 and add `foo` to `TESTS` in `test/mkfile`. Known-answer vectors are
 computed outside this codebase, and the test source says how they
 were computed.
+
+T1 needs no partition because every device access in the store goes
+through one vtable (`docs/design/store.md` §0). Two of its three
+implementations are what T1 drives: a **simulated disk**, which is a
+test program's own memory and models a volatile write cache, torn and
+partial writes, short counts, the error classes, and a crash at a
+named point with every operation recorded in issue order; and a
+**file-backed device**, which is how a test drives `shoalfmt` and
+`shoalck` over an image. A test that wants the second creates and
+removes its own file under `/tmp`; nothing else in T1 touches the
+file system.
 
 **T2 — single-node integration** and **T3 — multi-node grid** are
 not yet defined. `docs/design/store.md` §13 proposes T2's shape for

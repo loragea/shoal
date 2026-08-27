@@ -251,7 +251,19 @@ recomputes them from assumptions:
     nblkmax = objmax / blksz                    (1024 at the defaults)
     emapsz  = roundup(24 + 20*nblkmax, secsz)   (20992 at the defaults)
     ngrains = datasecs / (blksz / secsz)
-    nbmpage = ceil(ngrains / (8 * (Wunit - 48)))
+    nbmpage = bmapsecs / (Wunit / secsz)
+
+`shoalfmt` sizes `bmapsecs` so that `nbmpage` is
+`ceil(ngrains / (8 * (Wunit - 48)))` — the bitmap must cover the
+grains that are left once it has taken its own pages, which is a
+fixed point rather than a formula — and a reader takes `nbmpage`
+from `bmapsecs`, which is recorded, rather than recomputing it.
+
+Every region start is rounded up to a `Wunit` boundary. The reserved
+run above requires that of `logoff`, and it costs at most
+`blksz - secsz` bytes for each of the others, which is what makes
+every checkpoint page write and every grain write aligned as well as
+sized to one device request.
 
 `ngrains` MUST be < 2^32: grain numbers are `u32`, and grain 0 is
 reserved to mean *no grain* — a hole — at the cost of one unusable
@@ -360,15 +372,24 @@ One sector. `hdrlen` is the byte range the checksum covers and is
     232     8  epochhigh highest map epoch adopted, layer-a §6.3
     240    16  monid     pinned monitor identity, layer-a §6.3
     256     4  monidset  0 until the first map is adopted
-    260   252  reserved, zero
+    260     4  csumalg   layer-a §3.2's algorithm name, as a number
+    264   ...  reserved to `secsz`, zero (248 bytes at `secsz` 512)
 
 **What the superblock carries, and why each field is here.** The
 geometry, because no reader may recompute it from assumptions; the
 `uuid`, because layer-a §3.4 requires an identity readable before
 the instance has a map (R9); the checkpoint mark `ckseq`/`cklogoff`,
-because replay must know where to start (§5); and the three
+because replay must know where to start (§5); the three
 per-instance facts layer-a requires to survive a restart and gives
-no home — `qidnext` (R16), `epochhigh` and `monid`/`monidset` (R15).
+no home — `qidnext` (R16), `epochhigh` and `monid`/`monidset` (R15);
+and `csumalg`, because §14(8) makes it a MUST that the server refuse
+to serve when the adopted map's `blksz`, `objmax` or `csumalg`
+differs from what the disk was formatted with, and a mismatch it
+cannot see is a mismatch it cannot refuse. `blksz` and `objmax` are
+already here as geometry; `csumalg` is here for that check alone,
+and it is the one whose mismatch invalidates every stored digest.
+The number is this format's own — 1 is layer-a's `blake2s256` — so a
+reader compares numbers and the map's spelling stays layer-a's.
 
 **Two-slot rule, validity first.** The rule is stated in three
 clauses, and the order matters:
@@ -482,6 +503,16 @@ else" true here. A commit that grows an object past one block
 allocates an extent-map slot, and one that shrinks it to one block
 or fewer frees it; both happen in the same commit as the length
 change (§2.7).
+
+**A free entry is a valid record, not zeroes.** `state = 0`,
+`vers = 1`, every other field zero, and the checksum computed like
+any other entry's. Sixteen zero bytes are not the checksum of 240
+zero bytes, so a region merely zeroed at format would fail every
+entry's checksum and §5 step 10 would condemn every slot on the
+first start. This is the same argument §2.5 makes for a bitmap page,
+and `shoalfmt` (§12) discharges it the same way. A reader takes
+`oidlen = 0` and `emapslot = 0` as part of what makes an entry free,
+and rejects an entry that claims `state = 0` with either set.
 
 A slot's number is not its `qid.path`: slots are recycled when a
 tombstone is discarded, `qid.path` values are not. A create over an
@@ -663,6 +694,12 @@ requires durable no later than the ack (§14(2)).
      28   128  oid
     156    72  peer    the iid
     228    28  reserved, zero
+
+A free record, like a free index entry (§2.3), is a valid record and
+not zeroes: `state = 0`, `vers = 1`, the rest zero, and the checksum
+computed. `shoalfmt` writes the region that way, and §5 step 6
+rejects a record that claims `state = 0` with a non-zero `oidlen` or
+`peerlen`.
 
 72 bytes bounds an iid: layer-a §3.3 bounds a node name at 63
 characters and an index is a decimal integer, so 63 + `.` + an
@@ -2106,8 +2143,10 @@ only the constant, and the hashing terms stop being negligible.
 
 ## 12. Tooling
 
-*Policy.* Three new commands under `cmd/`, each an `mkone`
-directory listed in `cmd/mkfile`'s `DIRS`.
+*Policy.* Three commands under `cmd/`, each an `mkone` directory
+listed in `cmd/mkfile`'s `DIRS`. `shoalfmt` and `shoalck` are built;
+`shoalmonfmt` is not, and the two flags of `shoalck` that write or
+read object content are marked below.
 
 **Where the code lives, and why the test tier decides it.** Every
 T1 case in §13 drives format, commit, replay, checkpoint, allocation
@@ -2122,43 +2161,68 @@ three tools below are thin front ends over the same library. This is
 a real constraint on the code layout rather than a preference, and it
 is expensive to undo once the engine has grown roots in a command.
 
+**A path under `/dev` is an sd(3) partition; anything else is a
+plain file.** Both tools take either. A file image is not a
+deployment target — D13 makes that a raw partition — but it is what
+lets an operator inspect a copy, and it is what lets the T1 cases of
+§13 drive format and check with no disk at all. `shoalfmt -z` sizes
+such an image; nothing else in either tool depends on which kind of
+device it was given, because §0's vtable is the only thing either of
+them calls.
+
 **`shoalfmt`** — format or ream an object-store partition.
 
-    shoalfmt [-r] [-b blksz] [-o objmax] [-n nslots] [-e nemap]
-             [-d ndirty] [-L logbytes] [-u uuid] /dev/sdXX/name
+    shoalfmt [-rw] [-b blksz] [-o objmax] [-c csumalg] [-n nslots]
+             [-e nemap] [-d ndirty] [-L logbytes] [-u uuid]
+             [-z size] /dev/sdXX/name
 
-Writes both superblocks, zeroes the log, index, extent-map and dirty
-regions, writes every bitmap page with a valid header at `ckseq = 0`
-— a zeroed page fails its own checksum, so a formatted store would
-otherwise start with `bmaprebuild=yes` (§5 step 5) — sets bit 0 of
-the bitmap (grain 0 is never allocatable), and prints the geometry it
-chose — including how many multi-block objects `nemap` supports,
-which is the number an operator needs to size a workload that is not
-Layer B's. It generates a random
-`uuid` unless given one, and **refuses a partition that already
-carries a valid superblock unless `-r`** — reaming a disk destroys an
-instance's identity, and layer-a §1.5 makes that a
+Zeroes the log and the extent-map region; writes every index entry
+and every dirty record as a valid **free** record, and every bitmap
+page with a valid header at `ckseq = 0` — sixteen zero bytes are not
+the checksum of a zeroed record, so a region merely zeroed would make
+§5 step 10 condemn every slot and §5 step 5 report
+`bmaprebuild=yes`; sets bit 0 of the bitmap (grain 0 is never
+allocatable); and writes both superblocks **last**, copy 0 at
+`gen = 0` and copy 1 at `gen = 1`, so that a crash part way through a
+format leaves no valid superblock rather than a valid one naming
+regions that were never written. It prints the geometry it chose —
+including how many multi-block objects `nemap` supports, which is the
+number an operator needs to size a workload that is not Layer B's. It
+generates a random `uuid` unless given one, and **refuses a partition
+that already carries a valid superblock unless `-r`** — reaming a
+disk destroys an instance's identity, and layer-a §1.5 makes that a
 reformat-before-rejoin event, so it should take a flag. It refuses a
 geometry whose maximal `Eobj` record exceeds an eighth of the log
-region, and warns when `nslots` implies more than 1% of the partition
-in metadata.
+region, refuses one whose `ngrains` reaches 2^32, and warns when
+`nslots` implies more than 1% of the partition in metadata. `-w` is
+§3.2's operator assertion, which is what lets it format a unit whose
+raw channel it cannot open.
 
-**`shoalck`** — inspect and check.
+**`shoalck`** — inspect and check. It reads and never writes.
 
-    shoalck [-v] [-l] [-R] [-o oid] /dev/sdXX/name
+    shoalck [-lq] [-o oid] /dev/sdXX/name
 
-Default: print both superblocks, the geometry, log head/tail and
-sequence range, slot, extent-map-slot and grain occupancy, and the
-dirty-record count; verify every index entry's checksum and every
-bitmap page's; cross-check the bitmap against the grains every live
-map references, scanning each object to `nblk` and not beyond; exit
-non-zero on any inconsistency. `-l` dumps the log records. `-o` dumps
-one object's index entry and extent map. `-v` verifies every object's
-content against its digests — an offline scrub. `-R` rebuilds the
-free-grain bitmap from the live maps and rewrites the checkpoint,
-which is the offline form of §5 step 11's automatic rebuild.
+Default: print both superblocks and which one §2.2's three clauses
+select, which copy the next update would write and under which
+clause; the geometry and the region table; the log's record count and
+sequence range from the checkpoint mark; slot, extent-map-slot and
+grain occupancy, and the dirty-record count. It verifies every index
+entry's checksum and every bitmap page's, reports `Pmax` and whether
+the bitmap is stamped ahead of the superblock, and cross-checks the
+bitmap against the grains every live map references, scanning each
+object to `nblk` and not beyond; it exits non-zero on any
+inconsistency. `-l` dumps the log records and their entries; a second
+`-l` dumps each `Eobj`'s block map. `-q` prints the problems and
+nothing else. `-o` dumps one object's index entry and extent map.
 
-**`shoalmonfmt`** — format a monitor map partition.
+**Not built yet.** `-v`, which verifies every object's content
+against its digests — an offline scrub — and `-R`, which rebuilds the
+free-grain bitmap from the live maps and rewrites the checkpoint, the
+offline form of §5 step 11's automatic rebuild. Both wait on the
+write path they check.
+
+**`shoalmonfmt`** — format a monitor map partition. Not built yet;
+§10 is the format it will write.
 
     shoalmonfmt [-r] [-s slotsz] [-R retain] /dev/sdXX/name
 
@@ -2258,6 +2322,23 @@ T1 formats a **small geometry** — a partition image of a few MiB with
 `AGENTS.md`'s seconds. The sweeps that are exhaustive are exhaustive
 over one header sector, not over the whole store, and the cases that
 need `nslots = 2^20` are T2's.
+
+**What T1 covers today.** Five programs, all of them against the
+simulated disk except where a file-backed device is the point:
+`structtest` (§2's byte layouts against known-answer vectors, and a
+flipped byte caught in every structure), `geomtest` (§2.1's
+arithmetic at the 4 TiB worked example and at the small geometry
+above, and every refusal §2.1 and §12 make a MUST), `devtest` (the
+simulated disk's own semantics — the volatile cache, torn and subset
+writes, short counts, the error classes and the recorded trace — and
+the file-backed device), `supertest` (§2.2's three clauses under torn
+superblock writes and under the `super` crash point, which is T1.9's
+first half), and `fmtcktest` (`shoalfmt` to `shoalck` over both a
+simulated disk and a file image, and the checker finding what a
+poked-in fault leaves behind). The short-count case is T1.3. Every
+case above the format — the crash matrix, replay, the log, group
+commit, stages, enumeration and the rest of the list — waits on the
+write path it exercises.
 
 - **T1.1 crash matrix (R1–R4).** Every point above × {create,
   whole-block write, partial write, truncate, delete, 16 MiB
