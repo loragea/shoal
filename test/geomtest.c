@@ -216,6 +216,35 @@ trefuse(void)
 	checks++;
 	if(geometry(&s, &c, 4*1024*1024) == 0)
 		fail("a partition too small for a data region was accepted");
+
+	/*
+	 * §0: blksz is the grain, the checksum block and one device
+	 * request at once, and a write may not exceed that request.
+	 */
+	dflt(&c);
+	c.blksz = 2*Blkszstore;
+	checks++;
+	if(geometry(&s, &c, 1024LL*1024*1024) == 0)
+		fail("a blksz above the write unit was accepted");
+
+	/* §2.2: nblkmax is u32, so objmax/blksz must fit one */
+	dflt(&c);
+	c.objmax = 1ULL<<46;			/* 2^32 blocks at blksz 2^14 */
+	checks++;
+	if(geometry(&s, &c, 64LL*1024*1024*1024) == 0)
+		fail("an objmax whose nblkmax reaches 2^32 was accepted");
+
+	/* §2.7: a record's length is u32, so the log region must fit one */
+	dflt(&c);
+	c.logbytes = 4LL*1024*1024*1024;
+	checks++;
+	if(geometry(&s, &c, 64LL*1024*1024*1024) == 0)
+		fail("a log region that does not fit a u32 length was accepted");
+	dflt(&c);
+	c.logbytes = 2LL*1024*1024*1024;
+	checks++;
+	if(geometry(&s, &c, 64LL*1024*1024*1024) < 0)
+		fail("a 2 GiB log was refused: %r");
 }
 
 void

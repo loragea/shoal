@@ -82,6 +82,16 @@ lrecvalid(uchar *p, ulong secsz, Lrec *r, uvlong off, uvlong logsecs,
 			r->nsec, off, logsecs);
 		return -1;
 	}
+	if(logsecs*(uvlong)secsz >= (1ULL<<32)){
+		/*
+		 * The record length is computed in a u32, and shoalfmt
+		 * refuses a log region that does not fit one (§2.1); a
+		 * superblock claiming otherwise is not one to hash on.
+		 */
+		werrstr("log region of %llud bytes exceeds a u32 length",
+			logsecs*(uvlong)secsz);
+		return -1;
+	}
 	if(!reccsumok(p, r->nsec*secsz, 16)){
 		werrstr("checksum mismatch");
 		return -1;

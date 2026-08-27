@@ -628,6 +628,17 @@ tlog(void)
 	checks++;
 	if(lrecvalid(want, 512, &t, 0, 8, 43) == 0)
 		fail("log record: an out-of-sequence record was accepted");
+
+	/*
+	 * §2.7: nsec*secsz is a u32, and shoalfmt refuses a log region
+	 * that does not fit one (§2.1).  A superblock claiming a bigger
+	 * one is not something to hash a range on: a corrupt nsec could
+	 * wrap it.
+	 */
+	checks++;
+	if(lrecvalid(want, 512, &t, 0, (1ULL<<32)/512, 42) == 0)
+		fail("log record: a log region too big for a u32 length "
+			"was accepted");
 	eqv("log record nent", t.nent, 3);
 	eqv("log record Fwrap", t.flags & Fwrap, Fwrap);
 

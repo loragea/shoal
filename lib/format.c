@@ -54,9 +54,27 @@ geometry(Super *s, Fmtcfg *c, vlong partbytes)
 			c->blksz);
 		return -1;
 	}
+	if(c->blksz > Blkszstore){
+		/*
+		 * §0: blksz is the grain, the checksum block and one
+		 * device request, and the store MUST NOT issue a write
+		 * larger than that request.  A bigger blksz is not one
+		 * round trip on either driver.
+		 */
+		werrstr("blksz %lud exceeds the %d-byte write unit",
+			c->blksz, Blkszstore);
+		return -1;
+	}
 	if(!pow2(c->objmax) || c->objmax < c->blksz){
 		werrstr("objmax %llud is not a power of two at least blksz",
 			c->objmax);
+		return -1;
+	}
+	if(c->objmax / c->blksz >= (1ULL<<32)){
+		/* nblkmax is u32 in the superblock (§2.2) */
+		werrstr("objmax %llud over blksz %lud needs %llud blocks, "
+			"which reaches 2^32", c->objmax, c->blksz,
+			c->objmax / c->blksz);
 		return -1;
 	}
 	if(c->csumalg != Csumblake2s){
@@ -96,6 +114,16 @@ geometry(Super *s, Fmtcfg *c, vlong partbytes)
 		s->nemap = nobj < 1 ? 1 : nobj;
 	s->ndirty = c->ndirty ? c->ndirty : Ndirtydflt;
 	logbytes = c->logbytes ? c->logbytes : Logbytesdflt;
+	/*
+	 * A record's length is nsec*secsz and is computed in a u32
+	 * (§2.7), so a log region that does not fit one would let a
+	 * corrupt nsec wrap the range a checksum is taken over.  The
+	 * default is 64 MiB and §2.1 contemplates nothing near this.
+	 */
+	if(roundup(logbytes, c->blksz) >= (1ULL<<32)){
+		werrstr("log of %llud bytes reaches 2^32", logbytes);
+		return -1;
+	}
 
 	nsec = (uvlong)partbytes / c->secsz;
 	pagesecs = c->blksz / c->secsz;

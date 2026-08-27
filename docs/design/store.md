@@ -2227,8 +2227,12 @@ that already carries a valid superblock unless `-r`** — reaming a
 disk destroys an instance's identity, and layer-a §1.5 makes that a
 reformat-before-rejoin event, so it should take a flag. It refuses a
 geometry whose maximal `Eobj` record exceeds an eighth of the log
-region, refuses one whose `ngrains` reaches 2^32, and warns when
-`nslots` implies more than 1% of the partition in metadata. `-w` is §3.2's operator assertion, which is what lets it
+region, one whose `ngrains` reaches 2^32, one whose `nblkmax`
+(`objmax`/`blksz`) reaches 2^32, one whose `blksz` exceeds `Wunit`
+— `blksz` is one device request (§0) — and one whose log region does
+not fit the `u32` a record length is computed in (§2.7); and it warns
+when the metadata it has sized comes to more than 1% of the
+partition. `-w` is §3.2's operator assertion, which is what lets it
 format a unit whose raw channel it cannot open.
 
 **`shoalck`** — inspect and check. It reads and never writes, and
