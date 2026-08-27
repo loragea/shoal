@@ -1,0 +1,14 @@
+</$objtype/mkfile
+
+TARG=shoalck
+
+OFILES=\
+	shoalck.$O\
+
+HFILES=\
+	../../lib/shoal.h\
+
+LIB=../../lib/libshoal.a$O
+BIN=/$objtype/bin
+
+</sys/src/cmd/mkone
