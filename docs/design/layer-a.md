@@ -195,7 +195,7 @@ instance, and on the primary, before the primary answers `Rwrite`.
 
 Object content is divided into fixed-size **checksum blocks** of
 `blksz` bytes (map header, immutable, power of two, default
-65536). Block *i* covers bytes `[i*blksz, min((i+1)*blksz, len))`.
+16384 — the target platform's device write unit, §10.2). Block *i* covers bytes `[i*blksz, min((i+1)*blksz, len))`.
 The final partial block is hashed over its actual length. A hole
 (§2.4) hashes as the zero bytes it reads as.
 
@@ -214,8 +214,8 @@ The final partial block is hashed over its actual length. A hole
 
 Block digests are stored locally alongside the object (format:
 implementation policy) so a small write re-hashes one block, not
-the whole object; at the defaults that costs 16 bytes per 64 KiB,
-~0.025% of capacity. The two-level construction keeps partial
+the whole object; at the defaults that costs 16 bytes per 16 KiB,
+~0.1% of capacity. The two-level construction keeps partial
 writes cheap while leaving `csum` a single value two instances can
 compare in one line of text.
 
@@ -242,8 +242,11 @@ commits that as its record. `op=get` on a tombstone fails
 "pull the winner" reduces, for a tombstone winner, to this
 metadata-only adoption.
 
-**Discard.** A tombstone occupies a metadata record and nothing
-else, so discarding it is a space optimisation, not a requirement.
+**Discard.** A tombstone occupies a metadata record. How large that
+record is — and whether an implementation also reserves a per-object
+metadata extent beside it — is implementation-dependent, so what a
+discard reclaims is too. Discarding is a space optimisation, not a
+requirement.
 The first draft's discard rule (confirmation from the current
 placement set plus `tombdays`) was unsound: strays, `out` disks and
 long-absent disks are by definition outside the placement set, are
@@ -536,7 +539,10 @@ produced an error.
   recorded with the object; it MUST NOT be derived by hashing the
   id, because a hash cannot guarantee distinctness. A path value
   MUST NOT be reused for a different id while the first id's record
-  exists. (The first draft suggested a 64-bit hash, which contradicts
+  exists. The counter's durable high-water MUST be recorded, and
+  that record MUST be durable, **before any path value it covers is
+  issued**; an implementation MAY advance it in batches, which is
+  what keeps a create from costing a durable write. (The first draft suggested a 64-bit hash, which contradicts
   its own MUST.) Discarding a tombstone (§1.5) destroys the record,
   so a later create of the same id on that instance allocates a fresh
   path — the id's `qid.path` is stable for the lifetime of the
@@ -882,7 +888,14 @@ only when an operator or the `outmins` timer changes `status`.
 1. The operator starts an object server on the new disk with the
    node name, the monitor's address, and a class tag. On an
    unformatted disk it generates a random 128-bit `uuid`, writes it
-   into a local superblock, and never changes it again.
+   into a local superblock, and never changes it again. Formatting
+   precedes registration and therefore precedes the map, so the
+   operator MUST also supply the immutable cluster-wide attributes a
+   local layout depends on — `objmax`, `blksz` and `csumalg` (§8.5)
+   — and the instance MUST refuse to serve if the map it later
+   adopts disagrees with any of them. A `csumalg` mismatch
+   invalidates every stored digest; the other two invalidate the
+   layout.
 2. It attaches to the monitor with `role=instance` and writes
    `register uuid=<hex> node=<name> addr=<dial> class=<tag>`.
    Registration is idempotent and is repeated at every start.
@@ -1086,8 +1099,10 @@ This is the mechanism the first draft lacked.
 **Currency.** An instance is **current** for object `o` at epoch `E`
 when it has completed a *currency check* for `o` at `E` and has held
 serving primaryship for `o` continuously since. An instance records
-the result durably as `cur=<epoch>` beside the object (visible in
-`/meta`). It MUST invalidate `cur`:
+the result as `cur=<epoch>` beside the object (visible in `/meta`).
+The value need not be durable: the second rule below requires it
+discarded before any restart could read it. It MUST invalidate
+`cur`:
 
 - for every object, when it adopts a new epoch; and
 - for every object, **on process start** — after a clean exit as
@@ -1377,8 +1392,15 @@ A `role=client` write, create, truncate or remove on the primary:
         acknowledgement. The primary MUST bound that round trip by
         `replms`; if the monitor cannot be reached, or answers
         nothing in `replms`, go to 7.
-     b. durably record the fine-grained dirty record
-        `(oid, peer, epoch)` locally (§7.1) for each member of `M`.
+     b. record the fine-grained dirty record `(oid, peer, epoch)`
+        locally (§7.1) for each member of `M`, durable **no later
+        than** the update itself. Committing it in the same durable
+        commit as step 6 is permitted, and is what an implementation
+        with a write-ahead log will do; what is forbidden is a
+        durable update with no durable dirty record. An instance
+        that takes that licence MUST also obey §7.1's restart rule,
+        which is what covers the crash between an acker's commit and
+        this instance's own.
      It SHOULD additionally report `unreachable <iid>` (§8.3) for a
      member that timed out. That report is a `/health` diagnostic
      only: it MUST NOT influence `up` for anybody (§8.4), and the
@@ -1449,7 +1471,12 @@ statement is their sum. In the worst case one client operation costs
     object (each itself bounded by the terms above)
 
 so **≤ 3·`replms` plus local I/O, plus the queue ahead of it on the
-same object**. Every term is named and bounded, and the only
+same object**. The local-I/O terms are not a rounding error: on the
+D13 raw store they are tens of milliseconds each, and a commit that
+has to wait for the local store to reclaim its own log space is
+bounded by that store's checkpoint cost rather than by `replms`
+(`docs/design/store.md` §6, §11). Whoever tunes `replms` down toward
+a sub-millisecond LAN needs those numbers in front of them. Every term is named and bounded, and the only
 unbounded work in the write path — the currency check's pull of a
 winning copy from elsewhere, up to `objmax` — is explicitly *not*
 inside a client request: the request answers `not ready` and the pull
@@ -1593,6 +1620,16 @@ Receiver rules:
   then-current key** — earlier chunks stage without comparing, and a
   concurrent local update between chunks is what the commit-time
   check exists to catch.
+- **A receiver-side stage has a lifetime and a bound.** The receiver
+  MUST discard an incomplete `op=full` stage, releasing whatever it
+  holds, when the `/repl` fid is clunked, when a chunk of it is
+  flushed, when no chunk for that object has arrived within an
+  implementation-defined timeout, and at restart. It MUST bound the
+  space staged on one fid and MUST answer `disk full` to a chunk
+  that would exceed the bound. Without a lifetime a sender that dies
+  mid-transfer leaves the receiver holding staged space that nothing
+  ever releases, and a whole-disk heal can exhaust a nearly empty
+  disk.
 - Adopt `ver`/`wepoch` verbatim; never invent either.
 - **Commit before replying.** The reply to the `Twrite` (or to the
   `final=1` chunk of an `op=full`) MUST NOT be sent until the update
@@ -1649,6 +1686,13 @@ overlaps, so ~150 ms is right at 64 KiB; **strictly serialised**, at
 a 0.2 ms LAN RTT, it is 134 ms + 256·0.2 ms ≈ 185 ms at 64 KiB and
 134 ms + 2048·0.2 ms ≈ 545 ms at the 8 KiB floor. Sizing decisions
 that rest on this belong in §10.2.
+
+All of that is wire time. The receiver must also make the object
+durable, and on the D13 raw store a whole `objmax` object costs
+seconds of local writes rather than milliseconds
+(`docs/design/store.md` §11) — so a resync is disk-bound, not
+wire-bound, and §5.2's rule that a pull never runs inside a client
+request is the stronger for it.
 
 ### 5.6 The `/rpc` request/response channel
 
@@ -2006,6 +2050,17 @@ rather than splitting its brain, and the operator resolves it with
 `forceepoch` (§8.6). The first draft left this undefined, where
 either choice — accept or reject — was unsafe by default.
 
+**Both facts must survive a restart.** An instance MUST make the
+highest epoch it has adopted durable **before it acts under that
+epoch** — before it serves, acks, replicates, or reports the epoch
+in `/status` — and MUST make its pinned `monid` durable on the same
+terms. §8.6's rebuild reads that `epoch=` field out of `/status` and
+publishes above it, so an instance that forgets it across a restart
+makes the rebuild republish an epoch that already exists; and the
+tripwire below is only a tripwire if a restart remembers the pin.
+Where the two values live is implementation policy
+(`docs/design/store.md` §2.2).
+
 **Monitor identity.** The map header carries `monid=` (§3.2), a
 random 128-bit value generated once when the cluster is created and
 never changed. An instance caches the `monid` of the first map it
@@ -2166,6 +2221,15 @@ peer enters `up=heal` — the coarse flag is how "I have nothing
 recorded for you" is kept distinct from "I have checked". This bound
 is why D4's whole-object resync is enough and no per-write log is
 needed.
+
+**After a restart an instance MUST treat every peer as `fullsync`**
+— or, equivalently, MUST NOT report `synced` for a peer on the
+strength of a dirty set constructed before the restart. A crash
+between an acker's durable commit and this instance's own can leave
+this instance with no record that the peer fell behind, which is
+exactly the window §5.4 step 5b's "no later than" licence opens;
+without this rule the reporter could resolve a mark while the
+subject is genuinely behind.
 
 An instance MUST work its dirty records for a peer whenever that
 peer is reachable, **regardless of whether it is still the serving
@@ -3009,9 +3073,15 @@ owner should see:
 - Measured `msize` on 9front, which sets the forwarded-write chunk,
   how often clients see short writes, and the real resync time
   (§5.5's arithmetic assumes 64 KiB payloads and a 0.2 ms RTT).
-- Whether `blksz=65536` and BLAKE2s-128 block digests sit at the
-  right point on the metadata-size vs re-hash-cost curve, and what
-  a per-4 KiB-write re-hash actually costs on the fleet.
+- **Settled:** `blksz` sits at the target platform's device write
+  unit, 16384 — the largest write that is one device request there,
+  and so the value at which a checksum block, a local allocation
+  unit and one device request are the same constant and a
+  partial-block rewrite costs the least it can. The measurements and
+  the arithmetic are `docs/design/store.md` §0 and §11; `blksz` is a
+  map header attribute, so the choice costs no format break. What a
+  per-4 KiB-write re-hash costs on the fleet is still worth
+  measuring, but it no longer gates the default.
 - Whether `objmax=16 MiB` is right, against resync time, object
   counts, and Layer B's striping efficiency.
 - Timer defaults (`pollms`, `leasems`, `replms`, `deadms`,
