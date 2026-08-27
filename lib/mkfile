@@ -1,0 +1,11 @@
+</$objtype/mkfile
+
+LIB=libshoal.a$O
+
+OFILES=\
+	csum.$O\
+
+HFILES=\
+	shoal.h\
+
+</sys/src/cmd/mklib

@@ -1,2 +1,13 @@
 CLAUDE.md
 wt/
+
+# Plan 9 build products (one object suffix per architecture)
+*.[056789qvt]
+*.a[056789qvt]
+[056789qvt].out
+[056789qvt].*
+*.acid
+y.tab.?
+y.debug
+y.output
+lex.yy.c
