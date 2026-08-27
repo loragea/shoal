@@ -773,6 +773,20 @@ tcsumrule(void)
 	checks++;
 	if(reccsumok(buf, sizeof buf, 0))
 		fail("reccsumok accepted a flipped byte");
+
+	/*
+	 * §0: reccsumok is a public entry point and n is a length its
+	 * caller may have taken from a header field.  A range too
+	 * short to hold the checksum it names is refused, because the
+	 * tail length is unsigned and would otherwise wrap to ~4 GiB
+	 * and hash that far past the buffer.
+	 */
+	checks++;
+	if(reccsumok(buf, Recsumlen - 1, 0))
+		fail("reccsumok accepted a range shorter than its checksum");
+	checks++;
+	if(reccsumok(buf, 8, 16))
+		fail("reccsumok accepted a range ending before its checksum");
 }
 
 /*

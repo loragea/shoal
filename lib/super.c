@@ -35,15 +35,32 @@ reccsumok(uchar *p, ulong n, ulong csumoff)
 {
 	static uchar zeros[Recsumlen];
 	uchar want[Recsumlen];
-	DigestState *s;
+	DigestState ds;
 	ulong tail;
 
-	s = nil;
+	/*
+	 * n is a length a caller may take from a header field, and
+	 * tail is unsigned: without this a short n wraps it to ~4 GiB
+	 * and the hash reads that far past the buffer.
+	 */
+	if(n < csumoff + Recsumlen)
+		return 0;
+	/*
+	 * The state is this proc's own, zeroed: libsec seeds a state
+	 * it is handed rather than allocating one, and frees only what
+	 * it allocated.  Passing nil would allocate three times per
+	 * verify and return nil under memory pressure, and the next
+	 * call in the chain would silently start a fresh digest — a
+	 * good record read as damaged, which §5 step 10 turns into a
+	 * /lost entry.
+	 */
+	memset(&ds, 0, sizeof ds);
 	if(csumoff > 0)
-		s = blake2s_128(p, csumoff, nil, nil);
-	s = blake2s_128(zeros, Recsumlen, nil, s);
+		blake2s_128(p, csumoff, nil, &ds);
+	blake2s_128(zeros, Recsumlen, nil, &ds);
 	tail = n - csumoff - Recsumlen;
-	blake2s_128(tail > 0 ? p + csumoff + Recsumlen : zeros, tail, want, s);
+	blake2s_128(tail > 0 ? p + csumoff + Recsumlen : zeros, tail, want,
+		&ds);
 	return memcmp(p + csumoff, want, Recsumlen) == 0;
 }
 
