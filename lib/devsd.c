@@ -283,7 +283,7 @@ sdopen(char *part, int flags)
 	d->name = strdup(part);
 	d->secsz = secsz;
 	d->size = dir->length - dir->length % secsz;
-	d->wunit = Blkszstore;
+	d->wunit = Wunitdflt;
 	d->rdonly = (flags & Drdonly) != 0;
 	d->flushmode = flags & Drdonly ? Funknown : Fasserted;
 	d->aux = s;

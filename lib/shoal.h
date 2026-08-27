@@ -131,8 +131,11 @@ struct Dev
  * Loop-until-complete wrappers (store.md §0).  devsd truncates a
  * request rather than splitting or failing, so a short count is
  * normal; these loop, and fail only on a real error or on no
- * progress.  They return 0 or -1 with the error string set; deverr
- * classifies that string.
+ * progress.  devwrite also splits: §0 forbids a single pwrite larger
+ * than the device's wunit, so a longer write is issued as wunit
+ * pieces rather than refused, which is what lets a blksz above the
+ * device's write unit be formatted at all (§2.1).  They return 0 or
+ * -1 with the error string set; deverr classifies that string.
  */
 int	devread(Dev*, void*, long, vlong);
 int	devwrite(Dev*, void*, long, vlong);
@@ -237,7 +240,9 @@ enum
 	Recsumlen	= Blkdlen,	/* 16, a record checksum */
 
 	Secszdflt	= 512,
-	Blkszstore	= 16384,	/* §0: blksz = Wunit = the grain */
+	Blkszstore	= 16384,	/* §2.1: the default blksz, layer-a's */
+	Blkszmax	= 1024*1024,	/* §2.1: the format's blksz ceiling */
+	Wunitdflt	= 16384,	/* §0's Wunit on the reference unit */
 	Objmaxdflt	= 16*1024*1024,
 	Ndirtydflt	= 65536,
 	Logbytesdflt	= 64*1024*1024,

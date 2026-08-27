@@ -60,21 +60,32 @@ it has one.
   is exactly `blksz`, so grain *i* of an object holds checksum block
   *i* (layer-a §1.4) and one number in one array locates both the
   bytes and the digest.
-- **`blksz` = `Wunit` = the grain = 16384 bytes**, and that is the
-  cluster default `blksz` (layer-a §1.4). One constant, three roles:
-  a checksum block, an allocation unit, and one device request.
-  `sdvirtio` splits a request at 32 sectors and issues the pieces
-  serially, and `devsd` issues exactly one request per `pwrite`, so
-  16 KiB is the largest write that is one device round trip
-  (`docs/platform/9front-storage.md` §5). Every block write, every log
-  record sector run and every checkpoint page is therefore one
-  request by construction. §15 records what a smaller grain would
-  buy and cost.
+- **`blksz` and `Wunit` are two different things that the cluster
+  default makes equal.** `blksz` is layer-a's: a map header
+  attribute, a power of two, default 16384 (layer-a §1.4), fixed at
+  cluster creation and recorded in this store's superblock. `Wunit`
+  is the device's: the largest single write the device layer issues,
+  which `sdvirtio`'s 32-sector split and `devsd`'s one request per
+  `pwrite` put at 16 KiB on the reference unit
+  (`docs/platform/9front-storage.md` §5). At the cluster default the
+  two coincide, and that is what the default is for — one constant
+  in three roles, a checksum block, an allocation unit and one device
+  request, so that every block write, every checkpoint page and every
+  log record that fits a unit is one request. That is a property of
+  the default, **not a MUST**: this store MUST accept any `blksz`
+  layer-a permits, within the format's own bounds (§2.1), and a grain
+  larger than `Wunit` is written in `Wunit` pieces rather than
+  refused. §15 records what a smaller grain would buy and cost.
 - **`Wunit` governs writes only.** The store MUST NOT issue a single
   `pwrite` larger than `Wunit`, because a larger one buys nothing
   and obscures what one device round trip costs; the write wrapper
-  below refuses one, so the rule holds where every write passes
-  rather than at each call site. Reads have the
+  below splits a longer one into `Wunit` pieces, so the rule holds
+  where every write passes rather than at each call site. Nothing
+  rests on how many requests a write takes: a record is valid only if
+  its checksum verifies over its whole byte range, so a record that
+  landed in part is rejected however many requests carried it, which
+  is exactly the argument §3.2 makes for writing the header sector
+  last. Reads have the
   opposite shape — the driver's split happens inside one syscall, so
   a 64 KiB `pread` is ~24 % faster per byte than four 16 KiB ones
   (`docs/platform/9front-storage.md` §6). **Bulk reads — recovery,
@@ -259,7 +270,7 @@ both copies.
 
 The reserved run between copy 0 and the log is alignment, not spare
 room: the log is the region every commit writes, so `shoalfmt` rounds
-`logoff` up to a `Wunit` boundary (32 sectors at the defaults) and
+`logoff` up to a `blksz` boundary (32 sectors at the defaults) and
 zeroes what is left over. Nothing reads it, and nothing may start
 using it without a `vers` bump, since a store built before the change
 would not know it was occupied.
@@ -270,24 +281,38 @@ recomputes them from assumptions:
     nblkmax = objmax / blksz                    (1024 at the defaults)
     emapsz  = roundup(24 + 20*nblkmax, secsz)   (20992 at the defaults)
     ngrains = datasecs / (blksz / secsz)
-    nbmpage = bmapsecs / (Wunit / secsz)
+    nbmpage = bmapsecs / (blksz / secsz)
 
 `shoalfmt` sizes `bmapsecs` so that the bitmap covers the grains
 that are left once it has taken its own pages. That is a fixed point
 rather than a formula — a page taken shrinks the data region, which
 shrinks `ngrains`, which can shrink the number of pages needed — and
-it lands on `ceil(ngrains / (8 * (Wunit - 48)))` where a fixed point
+it lands on `ceil(ngrains / (8 * (blksz - 48)))` where a fixed point
 exists there and **one page above it** where none does, which happens
 when `n-1` pages need `n` and `n` pages need `n-1`. So a reader MUST
 take `nbmpage` from the recorded `bmapsecs` rather than recomputing
 it, and MUST NOT read a surplus page as a fault: its bits cover grain
 numbers at or above `ngrains`, which nothing ever allocates.
 
-Every region start is rounded up to a `Wunit` boundary. The reserved
+Every region start is rounded up to a `blksz` boundary. The reserved
 run above requires that of `logoff`, and it costs at most
 `blksz - secsz` bytes for each of the others, which is what makes
-every checkpoint page write and every grain write aligned as well as
-sized to one device request.
+every checkpoint page write and every grain write aligned. The
+alignment is `blksz` and not `Wunit` deliberately: **no geometry this
+store accepts may depend on a build constant**, since `Wunit` is a
+property of the unit a store happens to be opened on and `blksz` is
+recorded on the disk.
+
+**What bounds `blksz`.** `blksz` is layer-a's and layer-a §1.4 sets
+no ceiling on it, so the ceiling here is this format's: a power of
+two, at least `secsz` and **at most 1 MiB**. The reason is memory,
+not the device — a grain, a bitmap page and a checkpoint page are
+each one `blksz` buffer the store composes whole, and §7's queue
+procs build them on their own stacks, which is why that section sets
+`mainstacksize` explicitly. A `blksz` above the device's `Wunit` is
+accepted and costs `ceil(blksz/Wunit)` requests per grain write
+(§0); a store formatted on one unit therefore stays readable and
+writable on a unit whose write unit differs.
 
 `ngrains` MUST be < 2^32: grain numbers are `u32`, and grain 0 is
 reserved to mean *no grain* — a hole — at the cost of one unusable
@@ -614,8 +639,9 @@ Holes therefore cost no space and no special case in `csum`
 ### 2.5 Free-grain bitmap
 
 One copy, `bmapsecs` sectors, divided into `nbmpage` pages of
-`Wunit` bytes. Each page is one device request and carries its own
-header and checksum:
+`blksz` bytes. At the default `blksz` a page is one device request;
+above it a page is written in `Wunit` pieces like any other buffer
+(§0). Each page carries its own header and checksum:
 
     off  size  field
       0     8  magic  "shoalbm\0"
@@ -2130,11 +2156,13 @@ Three things this table says that are worth saying in words.
 
 **A 4 KiB client write costs a 16 KiB grain write.** Copy-on-write at
 `blksz` granularity is what buys the atomicity of §3, and it makes a
-small write cost four times its size. Setting `blksz` = `Wunit` = the
-grain is what keeps that factor at four rather than sixteen, and it
-makes every block write exactly one device request, so there is no
-"issue the grain four ways" question to answer and no proc pool to
-size for it. The workload this store is built for — Layer B striping
+small write cost four times its size. The cluster default puts
+`blksz` at the device's `Wunit`, which is what keeps that factor at
+four rather than sixteen and makes every block write exactly one
+device request, so there is no "issue the grain four ways" question
+to answer and no proc pool to size for it. A cluster that chose a
+larger `blksz` would pay `ceil(blksz/Wunit)` requests per grain and
+every row below scales with it; the table is the default's. The workload this store is built for — Layer B striping
 through an `msize`-sized 9P path — writes whole blocks.
 
 **A 16 MiB `op=full` is disk-bound, not wire-bound.** Layer-a §5.5
@@ -2248,11 +2276,14 @@ disk destroys an instance's identity, and layer-a §1.5 makes that a
 reformat-before-rejoin event, so it should take a flag. It refuses a
 geometry whose maximal `Eobj` record exceeds an eighth of the log
 region, one whose `ngrains` reaches 2^32, one whose `nblkmax`
-(`objmax`/`blksz`) reaches 2^32, one whose `blksz` exceeds `Wunit`
-— `blksz` is one device request (§0) — and one whose log region does
-not fit the `u32` a record length is computed in (§2.7); and it warns
+(`objmax`/`blksz`) reaches 2^32, one whose `blksz` is not a power of
+two between `secsz` and §2.1's 1 MiB ceiling, and one whose
+log region does not fit the `u32` a record length is computed in
+(§2.7); and it warns
 when the metadata it has sized comes to more than 1% of the
-partition. `-w` is §3.2's operator assertion, which is what lets it
+partition. It does **not** refuse a `blksz` above the device's write
+unit: that unit is the device's property and `blksz` is the format's
+(§0, §2.1). `-w` is §3.2's operator assertion, which is what lets it
 format a unit whose raw channel it cannot open.
 
 **`shoalck`** — inspect and check. It reads and never writes, and
@@ -2412,7 +2443,7 @@ writes, short counts, the error classes wrapped as a caller wraps
 them, aimed and multiple faults, the crash victim policies, the
 recorded trace and eight procs sharing one device — and the
 file-backed device, including the read-only open and the `Wunit`
-cap), `supertest` (§2.2's three clauses under torn superblock writes
+split), `supertest` (§2.2's three clauses under torn superblock writes
 and under the `super` crash point, which is T1.9's first half), and
 `fmtcktest` (`shoalfmt` to `shoalck` over both a simulated disk and a
 file image; a store with a live one-block object and a live
@@ -2887,13 +2918,15 @@ rather than amendments, because they touch the wire.
   4 KiB write and a 16 KiB write both cost 8.4 ms. It would only pay
   on hardware where a write's cost tracks its size.
 
-- **A larger `blksz` than `Wunit`** — the previous default of 64 KiB
-  made a block four device requests and a 4 KiB client write cost a
-  64 KiB rewrite, and it made the "one commit record, one device
-  request" property hold only for the log. Rejected once `Wunit` was
-  measured: there is no property a block larger than one device
-  request buys, and the metadata it saves (a quarter of the map and
-  digest arrays) is 0.4% of a partition.
+- **A larger `blksz` than `Wunit` as the default** — the previous
+  default of 64 KiB made a block four device requests and a 4 KiB
+  client write cost a 64 KiB rewrite, and it made the "one commit
+  record, one device request" property hold only for the log.
+  Rejected as the *default* once `Wunit` was measured: there is no
+  property a block larger than one device request buys, and the
+  metadata it saves (a quarter of the map and digest arrays) is 0.4%
+  of a partition. The geometry itself is still accepted — §2.1
+  bounds `blksz` by the format and not by any device (§0).
 
 - **Preallocating a full `objmax` extent per object** — no block map
   at all, one base grain per object. Rejected: 2.6·10^5 objects ×

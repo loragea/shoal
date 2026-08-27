@@ -422,32 +422,72 @@ twrapped(void)
 
 /*
  * §0: the store MUST NOT issue a single pwrite larger than Wunit, and
- * the device layer is where that is enforced rather than at each call
- * site.  A read has the opposite rule and is not capped.
+ * the device layer is where that holds rather than at each call site
+ * — but Wunit is the device's and blksz is the format's (§2.1), so a
+ * longer write is split into unit pieces rather than refused.  A read
+ * has the opposite rule and is not split.
  */
 static void
 tlimits(void)
 {
 	Dev *d;
-	uchar *big;
+	Simop *t;
+	uchar *big, *back;
+	long i, n, nw;
 
 	d = sim();
-	eqv("the write unit", d->wunit, Blkszstore);
-	if((big = mallocz(2*Blkszstore, 1)) == nil)
+	eqv("the write unit", d->wunit, Wunitdflt);
+	n = 3*Wunitdflt;
+	if((big = malloc(n)) == nil || (back = malloc(n)) == nil)
 		sysfatal("malloc: %r");
+	pat(big, n, 9);
 	checks++;
-	if(devwrite(d, big, Blkszstore, 0) < 0)
+	if(devwrite(d, big, Wunitdflt, 0) < 0)
 		fail("a write of exactly Wunit was refused: %r");
+
+	/* a write of three units is three requests, and all of it lands */
+	simtracereset(d);
 	checks++;
-	if(devwrite(d, big, Blkszstore + Secsz, 0) == 0)
-		fail("a write larger than Wunit was accepted");
+	if(devwrite(d, big, n, 0) < 0)
+		fail("a write larger than Wunit was refused: %r");
+	nw = 0;
+	for(i = 0; i < simtrace(d, &t); i++)
+		if(t[i].op == Sopwrite){
+			nw++;
+			checks++;
+			if(t[i].n > Wunitdflt)
+				fail("a single request of %ld bytes exceeds "
+					"the %lud-byte write unit", t[i].n,
+					d->wunit);
+		}
+	eqv("requests a three-unit write took", nw, 3);
+	if(devread(d, back, n, 0) < 0)
+		fail("read: %r");
 	checks++;
-	if(devread(d, big, 2*Blkszstore, 0) < 0)
+	if(memcmp(big, back, n) != 0)
+		fail("a split write lost bytes");
+
+	checks++;
+	if(devread(d, back, n, 0) < 0)
 		fail("a read larger than Wunit was refused: %r");
+
+	/* devzero's unit is the caller's grain, not the device's unit */
+	simtracereset(d);
 	checks++;
-	if(devzero(d, 0, 4*Blkszstore, 2*Blkszstore) == 0)
-		fail("devzero with a unit larger than Wunit was accepted");
+	if(devzero(d, 0, 4*(vlong)Wunitdflt, 2*Wunitdflt) < 0)
+		fail("devzero with a unit larger than Wunit was refused: %r");
+	nw = 0;
+	for(i = 0; i < simtrace(d, &t); i++)
+		if(t[i].op == Sopwrite){
+			nw++;
+			checks++;
+			if(t[i].n > Wunitdflt)
+				fail("devzero issued a %ld-byte request",
+					t[i].n);
+		}
+	eqv("requests a two-unit devzero of four units took", nw, 4);
 	free(big);
+	free(back);
 	devclose(d);
 }
 

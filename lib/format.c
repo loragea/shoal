@@ -9,10 +9,11 @@
  *
  * Every derived quantity is recorded in the superblock so that no
  * reader recomputes it from assumptions.  Region starts are rounded
- * up to a Wunit boundary — §2.1 requires it of the log and it costs
+ * up to a blksz boundary — §2.1 requires it of the log and it costs
  * at most blksz-secsz bytes for each of the others, which is what
- * keeps every checkpoint page write and every grain write aligned as
- * well as sized to one device request.
+ * keeps every checkpoint page write and every grain write aligned.
+ * No bound here depends on the device's Wunit: a grain larger than
+ * one is written in Wunit pieces (§0).
  */
 
 static uvlong
@@ -59,15 +60,18 @@ geometry(Super *s, Fmtcfg *c, vlong partbytes)
 			c->blksz);
 		return -1;
 	}
-	if(c->blksz > Blkszstore){
+	if(c->blksz > Blkszmax){
 		/*
-		 * §0: blksz is the grain, the checksum block and one
-		 * device request, and the store MUST NOT issue a write
-		 * larger than that request.  A bigger blksz is not one
-		 * round trip on either driver.
+		 * §2.1: blksz is layer-a's — a map header attribute with
+		 * no upper bound of its own — so the ceiling here is the
+		 * format's and not the device's.  A grain, a bitmap page
+		 * and a checkpoint page are each one blksz buffer this
+		 * store composes whole in memory.  The device's Wunit
+		 * does not appear: devwrite splits a longer write, so
+		 * what formats does not depend on a build constant.
 		 */
-		werrstr("blksz %lud exceeds the %d-byte write unit",
-			c->blksz, Blkszstore);
+		werrstr("blksz %lud exceeds the %d-byte format limit",
+			c->blksz, Blkszmax);
 		return -1;
 	}
 	if(!pow2(c->objmax) || c->objmax < c->blksz){

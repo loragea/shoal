@@ -153,6 +153,78 @@ tround(Dev *d, char *what)
 	free(p);
 }
 
+/*
+ * §2.1: blksz is layer-a's, bounded by the format and not by the
+ * device's write unit, so a store formatted at a grain above that
+ * unit must format and check like any other — every region, bitmap
+ * page and grain write goes out in Wunit pieces (§0).
+ */
+static void
+tbigblk(void)
+{
+	Dev *d;
+	Super s;
+	Fmtcfg c;
+	Simop *t;
+	Bmpage bh;
+	uchar *p;
+	long i, n, nw, big;
+	int nbad;
+
+	if((d = simopen(Secsz, Nsec, Seed)) == nil)
+		sysfatal("simopen: %r");
+	memset(&c, 0, sizeof c);
+	c.secsz = Secsz;
+	c.blksz = 4*Wunitdflt;			/* 64 KiB: four write units */
+	c.objmax = 1024*1024;
+	c.nslots = 512;
+	c.nemap = 256;
+	c.ndirty = 256;
+	c.logbytes = 256*1024;
+	c.csumalg = Csumblake2s;
+	if(geometry(&s, &c, d->size) < 0){
+		fail("a geometry at a blksz above the write unit: %r");
+		devclose(d);
+		return;
+	}
+	eqv("a grain above the device write unit", s.blksz,
+		4*(uvlong)Wunitdflt);
+	simtracereset(d);
+	if(fmtstore(d, &s) < 0){
+		fail("a format at a blksz above the write unit: %r");
+		devclose(d);
+		return;
+	}
+	nw = big = 0;
+	n = simtrace(d, &t);
+	for(i = 0; i < n; i++)
+		if(t[i].op == Sopwrite){
+			nw++;
+			if(t[i].n > (long)d->wunit)
+				big++;
+		}
+	eqv("format requests above the device write unit", big, 0);
+	checks++;
+	if(nw < (long)(s.blksz/d->wunit))
+		fail("a format at a 64 KiB blksz took %ld requests", nw);
+	checks++;
+	if((nbad = check(d)) != 0)
+		fail("a store formatted at a 64 KiB blksz reported %d "
+			"problem(s)", nbad);
+	if((p = malloc(s.blksz)) == nil)
+		sysfatal("malloc: %r");
+	if(devread(d, p, s.blksz, (vlong)s.bmapoff*s.secsz) < 0)
+		fail("bitmap read: %r");
+	checks++;
+	if(bmunpack(&bh, p, s.blksz, 0) < 0)
+		fail("bitmap page 0 at a 64 KiB blksz: %r");
+	else
+		eqv("grain 0 is marked allocated at a 64 KiB blksz",
+			bmget(p, 0), 1);
+	free(p);
+	devclose(d);
+}
+
 /* the checker earns its keep: it must find what a fault leaves behind */
 static void
 tdamage(void)
@@ -625,7 +697,7 @@ tlive(void)
 		fail("the checker passed an unknown csumalg");
 	said("an unknown csumalg", "csumalg 99");
 
-	/* §2.1: every region start is a Wunit boundary */
+	/* §2.1: every region start is a blksz boundary */
 	live(d, &s, &c);
 	sbpoke32(d, &s, 112, s.logoff + 1);	/* logoff */
 	checks++;
@@ -676,6 +748,7 @@ main(int, char**)
 	devclose(d);
 	remove(path);
 
+	tbigblk();
 	tdamage();
 	treformat();
 	tcutream();

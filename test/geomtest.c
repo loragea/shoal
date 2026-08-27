@@ -218,14 +218,29 @@ trefuse(void)
 		fail("a partition too small for a data region was accepted");
 
 	/*
-	 * §0: blksz is the grain, the checksum block and one device
-	 * request at once, and a write may not exceed that request.
+	 * §2.1: blksz is layer-a's, so every power of two layer-a
+	 * permits between secsz and the format's 1 MiB ceiling is
+	 * accepted — the device's write unit does not bound it, since
+	 * a larger grain is written in Wunit pieces (§0).
 	 */
 	dflt(&c);
-	c.blksz = 2*Blkszstore;
+	c.blksz = 4*Blkszstore;			/* 64 KiB, above Wunit */
+	c.objmax = 4*1024*1024;
 	checks++;
-	if(geometry(&s, &c, 1024LL*1024*1024) == 0)
-		fail("a blksz above the write unit was accepted");
+	if(geometry(&s, &c, 64LL*1024*1024*1024) < 0)
+		fail("a blksz above the device write unit was refused: %r");
+	dflt(&c);
+	c.blksz = Blkszmax;
+	c.objmax = 64*1024*1024;
+	checks++;
+	if(geometry(&s, &c, 64LL*1024*1024*1024) < 0)
+		fail("a blksz at the format ceiling was refused: %r");
+	dflt(&c);
+	c.blksz = 2*Blkszmax;
+	c.objmax = 64*1024*1024;
+	checks++;
+	if(geometry(&s, &c, 64LL*1024*1024*1024) == 0)
+		fail("a blksz above the format ceiling was accepted");
 
 	/* §2.2: nblkmax is u32, so objmax/blksz must fit one */
 	dflt(&c);

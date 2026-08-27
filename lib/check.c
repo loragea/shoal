@@ -156,7 +156,7 @@ ckgeom(Ck *k)
 		if(i > 0 && o[i] < o[i-1] + n[i-1])
 			problem(k, "%s region %llud overlaps %s %llud+%llud",
 				nm[i], o[i], nm[i-1], o[i-1], n[i-1]);
-		/* §2.1: every region start is a Wunit boundary */
+		/* §2.1: every region start is a blksz boundary */
 		if(o[i] % pagesecs != 0)
 			problem(k, "%s region starts at sector %llud, which is "
 				"not a %lud-byte boundary", nm[i], o[i],
