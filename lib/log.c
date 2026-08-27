@@ -21,7 +21,6 @@ static char logmagic[8] = { 's','h','o','a','l','l','o','g' };
 
 enum
 {
-	Objfixed	= 84,	/* Eobj bytes before oid[oidlen] */
 	Dirtyfixed	= 12,	/* Edirty bytes before peer[] */
 };
 

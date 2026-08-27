@@ -115,6 +115,7 @@ static char logvec[] =
 enum
 {
 	Nverify	= 20000,	/* verifications per proc in tshared */
+	Nblkmax	= 1024,		/* nblkmax at §2.1's defaults */
 };
 
 static int fails;
@@ -784,11 +785,111 @@ tshared(void)
 	free(p);
 }
 
+/*
+ * §2.7's Eobj at its extremes: the maximal record the format's bound
+ * is computed for — a full-length oid with every block named and
+ * every old grain freed — and the truncate that names no block at
+ * all.  objrecunpack bounds oid, nmap and nfree against the entry end
+ * before each read, and the maximal record is where those bounds are
+ * exactly met rather than comfortably.
+ */
+static void
+tobjmax(void)
+{
+	Objrec o, u;
+	Mapent map[Nblkmax];
+	ulong freed[Nblkmax];
+	uchar *p;
+	long n, m;
+	int i;
+
+	memset(&o, 0, sizeof o);
+	o.slot = 7;
+	o.emapslot = 3;
+	o.qidpath = 99;
+	o.state = Slive;
+	o.oidlen = Oidmax;
+	o.oflags = Oslot;
+	o.len = (uvlong)Nblkmax*4096;
+	o.ver = 2;
+	o.wepoch = 3;
+	o.mtime = 1700000000;
+	pat(o.csum, Csumlen, 11);
+	pat(o.oid, Oidmax, 5);
+	for(i = 0; i < Nblkmax; i++){
+		map[i].blk = i;
+		map[i].grain = 1000 + i;
+		pat(map[i].dig, Blkdlen, i + 1);
+		freed[i] = 2000 + i;
+	}
+	o.nmap = Nblkmax;
+	o.map = map;
+	o.nfree = Nblkmax;
+	o.freed = freed;
+
+	n = objreclen(&o);
+	eqv("the maximal Eobj entry", n, 228 + 28*Nblkmax);
+	if((p = mallocz(n, 1)) == nil)
+		sysfatal("malloc: %r");
+	m = objrecpack(p, n, &o);
+	checks++;
+	if(m != n)
+		fail("maximal Eobj: packed %ld of %ld bytes: %r", m, n);
+	checks++;
+	if(objrecunpack(&u, p + Lenthdrsz, n - Lenthdrsz) < 0)
+		fail("maximal Eobj: %r");
+	else{
+		eqv("oidlen survives", u.oidlen, Oidmax);
+		eqv("nmap survives", u.nmap, Nblkmax);
+		eqv("nfree survives", u.nfree, Nblkmax);
+		checks++;
+		if(memcmp(u.oid, o.oid, Oidmax) != 0)
+			fail("maximal Eobj: the oid did not survive");
+		checks++;
+		if(u.map[Nblkmax-1].grain != 1000 + Nblkmax - 1
+		|| u.freed[Nblkmax-1] != 2000 + Nblkmax - 1)
+			fail("maximal Eobj: the last map or freed entry did "
+				"not survive");
+		objrecfree(&u);
+	}
+	/* one byte short of the whole entry is a refusal, not a read */
+	checks++;
+	if(objrecunpack(&u, p + Lenthdrsz, n - Lenthdrsz - 1) == 0)
+		fail("a truncated maximal Eobj was accepted");
+	free(p);
+
+	/* a truncate names no block and frees the ones it dropped */
+	memset(&o, 0, sizeof o);
+	o.slot = 7;
+	o.state = Slive;
+	o.oidlen = 4;
+	o.len = 10;
+	pat(o.oid, 4, 3);
+	o.nfree = 2;
+	o.freed = freed;
+	n = objreclen(&o);
+	eqv("a truncate's Eobj entry", n, 8 + 84 + 4 + 4 + 4 + 8);
+	if((p = mallocz(n, 1)) == nil)
+		sysfatal("malloc: %r");
+	if(objrecpack(p, n, &o) != n)
+		fail("truncate Eobj: %r");
+	checks++;
+	if(objrecunpack(&u, p + Lenthdrsz, n - Lenthdrsz) < 0)
+		fail("truncate Eobj: %r");
+	else{
+		eqv("nmap 0 survives", u.nmap, 0);
+		eqv("nfree survives a truncate", u.nfree, 2);
+		objrecfree(&u);
+	}
+	free(p);
+}
+
 void
 main(int, char**)
 {
 	tcsumrule();
 	tshared();
+	tobjmax();
 	tsuper();
 	tidx();
 	temap();

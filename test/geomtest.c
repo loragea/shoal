@@ -248,6 +248,38 @@ trefuse(void)
 }
 
 /*
+ * §2.7 and §12: the bound the log sizing is checked against is the
+ * largest Eobj this geometry can be asked for — a full-length oid,
+ * every block named, every old grain freed — and it must be the
+ * length the log path would actually emit for that record, rounded
+ * up to a sector.
+ */
+static void
+tmaxrec(void)
+{
+	Fmtcfg c;
+	Super s;
+	Objrec o;
+	uvlong want;
+
+	dflt(&c);
+	if(geometry(&s, &c, 64LL*1024*1024*1024) < 0){
+		fail("64 GiB defaults: %r");
+		return;
+	}
+	memset(&o, 0, sizeof o);
+	o.oidlen = Oidmax;
+	o.nmap = s.nblkmax;
+	o.nfree = s.nblkmax;
+	/* §2.7: 8 + 84 + 128 + 4 + 24*nblkmax + 4 + 4*nblkmax */
+	eqv("the maximal Eobj entry", objreclen(&o),
+		228 + 28*(uvlong)s.nblkmax);
+	want = Lrechdrsz + objreclen(&o);
+	want = (want + s.secsz - 1)/s.secsz*s.secsz;
+	eqv("the record bound covers it exactly", maxrecbytes(&s), want);
+}
+
+/*
  * §2.1: the bitmap covers the grains that are left once it has taken
  * its own pages, which is a fixed point rather than a formula.  It
  * lands on the ceiling wherever a fixed point exists there and one
@@ -309,6 +341,7 @@ main(int, char**)
 	tworked();
 	tsmall();
 	trefuse();
+	tmaxrec();
 	tbitmap();
 	if(fails > 0)
 		exits("failed");

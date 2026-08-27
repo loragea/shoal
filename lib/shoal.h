@@ -249,6 +249,7 @@ enum
 	Bmhdrsz		= 48,		/* §2.5, before the bits */
 	Lrechdrsz	= 56,		/* §2.7, the record header */
 	Lenthdrsz	= 8,		/* §2.7, {u8 kind, u8 flags, u16 pad, u32 len} */
+	Objfixed	= 84,		/* §2.7, Eobj bytes before oid[oidlen] */
 
 	Oidmax		= 128,		/* layer-a §1.2 */
 	Peermax		= 72,		/* §2.6: node name 63 + '.' + 8 digits */
@@ -509,6 +510,7 @@ struct Fmtcfg
 };
 
 int	geometry(Super *s, Fmtcfg *c, vlong partbytes);
+uvlong	maxrecbytes(Super *s);	/* the largest Eobj record, §2.7 */
 int	fmtstore(Dev *d, Super *s);
 char*	csumalgname(ulong alg);
 ulong	csumalgno(char *name);

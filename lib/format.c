@@ -27,13 +27,18 @@ pow2(uvlong n)
 	return n > 0 && (n & (n-1)) == 0;
 }
 
-/* the largest Eobj record this geometry can be asked for (§2.7) */
-static uvlong
+/*
+ * The largest Eobj record this geometry can be asked for (§2.7): one
+ * entry with a full-length oid, every block named and every block's
+ * old grain freed.  This is objreclen's arithmetic, in uvlong because
+ * nblkmax is a u32 and objreclen's ulong is 32 bits.
+ */
+uvlong
 maxrecbytes(Super *s)
 {
 	uvlong ent;
 
-	ent = Lenthdrsz + 84 + Oidmax + 4 + 24*(uvlong)s->nblkmax
+	ent = Lenthdrsz + Objfixed + Oidmax + 4 + 24*(uvlong)s->nblkmax
 		+ 4 + 4*(uvlong)s->nblkmax;
 	return roundup(Lrechdrsz + ent, s->secsz);
 }
