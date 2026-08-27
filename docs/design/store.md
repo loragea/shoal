@@ -260,11 +260,16 @@ recomputes them from assumptions:
     ngrains = datasecs / (blksz / secsz)
     nbmpage = bmapsecs / (Wunit / secsz)
 
-`shoalfmt` sizes `bmapsecs` so that `nbmpage` is
-`ceil(ngrains / (8 * (Wunit - 48)))` — the bitmap must cover the
-grains that are left once it has taken its own pages, which is a
-fixed point rather than a formula — and a reader takes `nbmpage`
-from `bmapsecs`, which is recorded, rather than recomputing it.
+`shoalfmt` sizes `bmapsecs` so that the bitmap covers the grains
+that are left once it has taken its own pages. That is a fixed point
+rather than a formula — a page taken shrinks the data region, which
+shrinks `ngrains`, which can shrink the number of pages needed — and
+it lands on `ceil(ngrains / (8 * (Wunit - 48)))` where a fixed point
+exists there and **one page above it** where none does, which happens
+when `n-1` pages need `n` and `n` pages need `n-1`. So a reader MUST
+take `nbmpage` from the recorded `bmapsecs` rather than recomputing
+it, and MUST NOT read a surplus page as a fault: its bits cover grain
+numbers at or above `ngrains`, which nothing ever allocates.
 
 Every region start is rounded up to a `Wunit` boundary. The reserved
 run above requires that of `logoff`, and it costs at most

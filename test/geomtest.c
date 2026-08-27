@@ -247,12 +247,69 @@ trefuse(void)
 		fail("a 2 GiB log was refused: %r");
 }
 
+/*
+ * §2.1: the bitmap covers the grains that are left once it has taken
+ * its own pages, which is a fixed point rather than a formula.  It
+ * lands on the ceiling wherever a fixed point exists there and one
+ * page above it where none does, so the property to hold the sizing
+ * to is the bound and the coverage, not an equality — and a reader
+ * takes nbmpage from the recorded bmapsecs either way.
+ */
+static void
+tbitmap(void)
+{
+	Fmtcfg c;
+	Super s;
+	vlong part;
+	uvlong bpp, ceil, over;
+	int i;
+
+	over = 0;
+	for(i = 1; i <= 300; i++){
+		dflt(&c);
+		c.blksz = 512;
+		c.objmax = 65536;
+		c.nslots = 512;
+		c.nemap = 256;
+		c.ndirty = 256;
+		c.logbytes = 256*1024;
+		part = (vlong)i*1024*1024 + 512*(i%7);
+		if(geometry(&s, &c, part) < 0)
+			continue;
+		bpp = bmbits(s.blksz);
+		ceil = (s.ngrains + bpp - 1)/bpp;
+		if(nbmpage(&s) > ceil)
+			over++;
+		checks++;
+		if(nbmpage(&s) < ceil || nbmpage(&s) > ceil + 1)
+			fail("a %lld-byte partition took %llud bitmap pages "
+				"for %llud grains, ceiling %llud", part,
+				nbmpage(&s), s.ngrains, ceil);
+		checks++;
+		if(nbmpage(&s)*bpp < s.ngrains)
+			fail("a %lld-byte partition's bitmap does not cover "
+				"its %llud grains", part, s.ngrains);
+		checks++;
+		if(s.dataoff != s.bmapoff + s.bmapsecs)
+			fail("a %lld-byte partition's data does not follow "
+				"its bitmap", part);
+	}
+	/*
+	 * And the surplus is real rather than hypothetical: at least
+	 * one of those partitions has no fixed point at the ceiling.
+	 */
+	checks++;
+	if(over == 0)
+		fail("no swept geometry needed a page above the ceiling");
+}
+
 void
 main(int, char**)
 {
 	tworked();
 	tsmall();
 	trefuse();
+	tbitmap();
 	if(fails > 0)
 		exits("failed");
 	print("geomtest: %d checks ok\n", checks);
