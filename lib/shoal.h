@@ -180,6 +180,21 @@ enum
 	Sfintr,		/* `interrupted': the request was flushed, §0 */
 };
 
+/*
+ * What a crash does with the sectors written since the last flush.
+ * Scdrop is the default and is what a device that lost its whole
+ * cache does; the others are how §13's schedules are staged, since a
+ * torn commit header and a header on the platter with its grain still
+ * in the cache both need a chosen subset to survive.
+ */
+enum
+{
+	Scdrop	= 0,	/* every dirty sector reverts */
+	Sckeep,		/* every dirty sector survives */
+	Scsome,		/* a subset chosen from the seed survives */
+	Scnamed,	/* the sectors simcrashkeep named survive */
+};
+
 /* recorded device operations, in issue order */
 enum
 {
@@ -198,12 +213,15 @@ struct Simop
 };
 
 void	simfault(Dev*, int kind, int n);
+void	simfaultat(Dev*, int kind, int n, vlong off, vlong len);
 void	simcrash(Dev*);
+void	simcrashmode(Dev*, int mode);
+void	simcrashkeep(Dev*, vlong off, vlong len);
 void	simarm(Dev*, char *point, int n);
 void	simpoke(Dev*, vlong off, void *buf, long n);	/* to durable storage */
 void	simpeek(Dev*, vlong off, void *buf, long n);	/* from durable storage */
 uvlong	simdirty(Dev*);				/* sectors written but not flushed */
-long	simtrace(Dev*, Simop**);
+long	simtrace(Dev*, Simop**);	/* good until the next operation */
 void	simtracereset(Dev*);
 
 /*

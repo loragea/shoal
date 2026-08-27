@@ -19,9 +19,16 @@
  *	- short counts on every read and write, which §0's
  *	  loop-until-complete wrappers must absorb;
  *	- Eio, Echange and `interrupted' are told apart, because §0
- *	  makes the last two not media errors;
+ *	  makes the last two not media errors, and are told apart
+ *	  through whatever a caller wrapped them in;
+ *	- several faults are armed at once and one can be aimed at a
+ *	  named sector;
+ *	- a crash leaves each dirty sector holding either its durable
+ *	  bytes or its cached ones, as the test chooses, which is what
+ *	  lets a torn commit header survive one;
  *	- the flush and write sequence is recorded in issue order, so a
- *	  test can assert the order and not only the outcome.
+ *	  test can assert the order and not only the outcome;
+ *	- procs sharing one Dev do not lose each other's operations.
  */
 
 enum
@@ -29,6 +36,9 @@ enum
 	Secsz	= 512,
 	Nsec	= 512,
 	Seed	= 0x5ee1,
+
+	Nproc	= 8,		/* procs sharing one Dev */
+	Npwrite	= 400,		/* writes each of them issues */
 };
 
 static int fails;
@@ -170,7 +180,7 @@ ttear(void)
 	checks++;
 	if(torn == 0 || torn == 8)
 		fail("a torn multi-sector write landed %s", torn ?
-			"whole" : "nowhere");
+			"nowhere" : "whole");
 
 	/* a dropped write reports success and changes nothing */
 	simfault(d, Sfdrop, 1);
@@ -482,6 +492,298 @@ trdonly(void)
 }
 
 /*
+ * §13 wants a short count and a tear in one schedule and §8 wants an
+ * Eio on one named sector, so faults are armed several at a time and
+ * each may be aimed.
+ */
+static void
+tfaults(void)
+{
+	Dev *d;
+	Simop *t;
+	uchar w[Secsz], r[Secsz], *big;
+	long i, n, nw, got;
+	int torn;
+
+	d = sim();
+	/* aimed at one sector, it fires there and nowhere else */
+	simfaultat(d, Sfeio, 1, 40*Secsz, Secsz);
+	checks++;
+	if(devread(d, r, Secsz, 41*Secsz) < 0)
+		fail("a fault aimed at one sector hit another: %r");
+	checks++;
+	if(devread(d, r, Secsz, 40*Secsz) == 0)
+		fail("a fault aimed at a sector did not fire there");
+
+	/* two of them armed at once, each in its own place */
+	simfault(d, Sfnone, 0);
+	simfaultat(d, Sfdrop, 1, 8*Secsz, Secsz);
+	simfaultat(d, Sfeio, 1, 9*Secsz, Secsz);
+	pat(w, Secsz, 5);
+	if(devwrite(d, w, Secsz, 8*Secsz) < 0)
+		fail("the dropped write reported failure: %r");
+	checks++;
+	if(devwrite(d, w, Secsz, 9*Secsz) == 0)
+		fail("the second armed fault did not fire");
+	if(devread(d, r, Secsz, 8*Secsz) < 0)
+		fail("read: %r");
+	checks++;
+	if(memcmp(w, r, Secsz) == 0)
+		fail("a dropped write landed");
+
+	/* a read does not consume a write-only fault */
+	simfault(d, Sfnone, 0);
+	simfault(d, Sftearsec, 1);
+	if(devread(d, r, Secsz, 0) < 0)
+		fail("read: %r");
+	if((big = malloc(8*Secsz)) == nil)
+		sysfatal("malloc: %r");
+	pat(big, 8*Secsz, 21);
+	if(devwrite(d, big, 8*Secsz, 24*Secsz) < 0)
+		fail("write: %r");
+	torn = 0;
+	for(i = 0; i < 8; i++){
+		if(devread(d, r, Secsz, (24+i)*Secsz) < 0)
+			fail("read: %r");
+		if(memcmp(big + i*Secsz, r, Secsz) != 0)
+			torn++;
+	}
+	free(big);
+	checks++;
+	if(torn == 0)
+		fail("a read consumed a write-only fault");
+
+	/* the trace records the count that landed, not the one asked for */
+	simfault(d, Sfnone, 0);
+	simtracereset(d);
+	simfault(d, Sfshort, 1);
+	if(devwrite(d, w, Secsz, 48*Secsz) < 0)
+		fail("write: %r");
+	if((big = malloc(8*Secsz)) == nil)
+		sysfatal("malloc: %r");
+	pat(big, 8*Secsz, 3);
+	simfault(d, Sfnone, 0);
+	simfault(d, Sfshort, 1);
+	simtracereset(d);
+	if(devwrite(d, big, 8*Secsz, 48*Secsz) < 0)
+		fail("short write: %r");
+	n = simtrace(d, &t);
+	got = 0;
+	nw = 0;
+	for(i = 0; i < n; i++)
+		if(t[i].op == Sopwrite){
+			got += t[i].n;
+			nw++;
+		}
+	free(big);
+	checks++;
+	if(nw < 2 || t[0].n >= 8*Secsz)
+		fail("the trace recorded the requested count, not the short one");
+	eqv("the trace's write counts add up", got, 8*Secsz);
+
+	/* a flush can fail, and a failed one makes nothing durable */
+	simfault(d, Sfnone, 0);
+	if(devflush(d) < 0)
+		fail("flush: %r");
+	pat(w, Secsz, 41);
+	if(devwrite(d, w, Secsz, 56*Secsz) < 0)
+		fail("write: %r");
+	simfault(d, Sfeio, 1);
+	checks++;
+	if(devflush(d) == 0)
+		fail("an armed Eio did not reach the flush");
+	eqv("a failed flush is classified", deverr(), Deio);
+	eqv("a failed flush made nothing durable", simdirty(d), 1);
+
+	/* a crash disarms whatever was armed */
+	simfault(d, Sfeio, 0);
+	simcrash(d);
+	checks++;
+	if(devread(d, r, Secsz, 0) < 0)
+		fail("a crash left the armed fault armed");
+	devclose(d);
+}
+
+/*
+ * §13: a crash leaves each sector written since the last flush holding
+ * either its durable bytes or its cached ones.  Two schedules depend
+ * on it: a torn commit header that survives to be read back (§3.2's
+ * atomicity point), and a commit header on the platter with the grain
+ * it describes still in the cache — the hazard the pre-flush exists to
+ * prevent.
+ */
+static void
+tcrash(void)
+{
+	Dev *d, *e;
+	uchar w[Secsz], r[Secsz], g[Secsz];
+	Idxent ie;
+	uvlong kept;
+	int i;
+
+	d = sim();
+	memset(&ie, 0, sizeof ie);
+	ie.state = Slive;
+	ie.oidlen = 4;
+	ie.vers = Storevers;
+	ie.len = 1;
+	pat(ie.oid, 4, 3);
+	idxpack(w, &ie);
+	memset(w + Idxentsz, 0, Secsz - Idxentsz);
+	if(devwrite(d, w, Secsz, 8*Secsz) < 0 || devflush(d) < 0)
+		fail("write: %r");
+	ie.len = 2;
+	idxpack(w, &ie);
+	simfault(d, Sftearbyte, 1);
+	if(devwrite(d, w, Secsz, 8*Secsz) < 0)
+		fail("torn write: %r");
+	simcrashkeep(d, 8*Secsz, Secsz);
+	simcrash(d);
+	simpeek(d, 8*Secsz, r, Secsz);
+	checks++;
+	if(idxunpack(&ie, r, 16) == 0)
+		fail("a crash undid a torn write instead of keeping it");
+
+	/* the header lands, the grain it describes stays in the cache */
+	pat(g, Secsz, 7);
+	pat(w, Secsz, 9);
+	if(devwrite(d, g, Secsz, 20*Secsz) < 0
+	|| devwrite(d, w, Secsz, 21*Secsz) < 0)
+		fail("write: %r");
+	simcrashkeep(d, 21*Secsz, Secsz);
+	simcrash(d);
+	simpeek(d, 21*Secsz, r, Secsz);
+	checks++;
+	if(memcmp(r, w, Secsz) != 0)
+		fail("the sector named as a survivor did not survive");
+	simpeek(d, 20*Secsz, r, Secsz);
+	checks++;
+	if(memcmp(r, g, Secsz) == 0)
+		fail("a sector not named as a survivor survived");
+
+	/* every dirty sector survives, and the mode does not stick */
+	simcrashmode(d, Sckeep);
+	for(i = 0; i < 16; i++)
+		if(devwrite(d, g, Secsz, (100+i)*Secsz) < 0)
+			fail("write: %r");
+	simcrash(d);
+	kept = 0;
+	for(i = 0; i < 16; i++){
+		simpeek(d, (100+i)*Secsz, r, Secsz);
+		if(memcmp(r, g, Secsz) == 0)
+			kept++;
+	}
+	eqv("sectors kept by a keep-all crash", kept, 16);
+	if(devwrite(d, w, Secsz, 200*Secsz) < 0)
+		fail("write: %r");
+	simcrash(d);
+	simpeek(d, 200*Secsz, r, Secsz);
+	checks++;
+	if(memcmp(r, w, Secsz) == 0)
+		fail("the crash policy outlived the crash it was set for");
+
+	/*
+	 * A subset chosen from the seed: neither all nor none, and the
+	 * same subset for the same seed, which is what makes a failing
+	 * schedule reproducible.
+	 */
+	simcrashmode(d, Scsome);
+	for(i = 0; i < 32; i++)
+		if(devwrite(d, g, Secsz, (300+i)*Secsz) < 0)
+			fail("write: %r");
+	simcrash(d);
+	kept = 0;
+	for(i = 0; i < 32; i++){
+		simpeek(d, (300+i)*Secsz, r, Secsz);
+		if(memcmp(r, g, Secsz) == 0)
+			kept++;
+	}
+	checks++;
+	if(kept == 0 || kept == 32)
+		fail("a seeded subset crash kept %llud of 32 sectors", kept);
+
+	if((e = simopen(Secsz, Nsec, Seed)) == nil)
+		sysfatal("simopen: %r");
+	devclose(d);
+	d = sim();
+	for(i = 0; i < 32; i++){
+		if(devwrite(d, g, Secsz, (300+i)*Secsz) < 0
+		|| devwrite(e, g, Secsz, (300+i)*Secsz) < 0)
+			fail("write: %r");
+	}
+	simcrashmode(d, Scsome);
+	simcrashmode(e, Scsome);
+	simcrash(d);
+	simcrash(e);
+	kept = 0;
+	for(i = 0; i < 32; i++){
+		simpeek(d, (300+i)*Secsz, r, Secsz);
+		simpeek(e, (300+i)*Secsz, w, Secsz);
+		if(memcmp(r, w, Secsz) != 0)
+			kept++;
+	}
+	eqv("sectors two runs of one seed disagree about", kept, 0);
+	devclose(e);
+	devclose(d);
+}
+
+/*
+ * §7 puts the queue procs, the I/O procs, the flusher and the
+ * checkpointer on one Dev, all of them proccreate'd and genuinely
+ * parallel.  Every operation of every proc must reach the trace, or a
+ * crash test asserting an order asserts it of a record with holes in
+ * it.
+ */
+static void
+tprocs(void)
+{
+	Dev *d;
+	Simop *t;
+	uchar *buf, *seen;
+	long i, n;
+	int j;
+
+	if((d = simopen(Secsz, Nproc*Npwrite + 8, Seed)) == nil)
+		sysfatal("simopen: %r");
+	simtracereset(d);
+	for(j = 0; j < Nproc; j++){
+		switch(rfork(RFPROC|RFMEM)){
+		case -1:
+			sysfatal("rfork: %r");
+		case 0:
+			if((buf = malloc(Secsz)) == nil)
+				sysfatal("malloc: %r");
+			for(i = 0; i < Npwrite; i++){
+				pat(buf, Secsz, j + 1);
+				if(devwrite(d, buf, Secsz,
+					(vlong)(j*Npwrite + i)*Secsz) < 0)
+					sysfatal("write: %r");
+			}
+			exits(nil);
+		}
+	}
+	for(j = 0; j < Nproc; j++)
+		if(waitpid() < 0)
+			fail("waitpid: %r");
+
+	n = simtrace(d, &t);
+	eqv("operations recorded", n, Nproc*Npwrite);
+	eqv("sectors dirtied", simdirty(d), Nproc*Npwrite);
+	if((seen = mallocz(Nproc*Npwrite, 1)) == nil)
+		sysfatal("malloc: %r");
+	for(i = 0; i < n; i++)
+		if(t[i].op == Sopwrite && t[i].off/Secsz < Nproc*Npwrite)
+			seen[t[i].off/Secsz]++;
+	j = 0;
+	for(i = 0; i < Nproc*Npwrite; i++)
+		if(seen[i] != 1)
+			j++;
+	eqv("sectors written other than once", j, 0);
+	free(seen);
+	devclose(d);
+}
+
+/*
  * §12: what makes a path an sd(3) partition is the unit directory it
  * lies in, not the spelling of the path.  The two files a unit always
  * has are what this asks for, so the test can build one under /tmp.
@@ -542,8 +844,11 @@ main(int, char**)
 	terrors();
 	tlimits();
 	trdonly();
+	tfaults();
+	tcrash();
 	ttrace();
 	tpoint();
+	tprocs();
 	tfile();
 	tclassify();
 	if(fails > 0)

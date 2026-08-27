@@ -2312,16 +2312,28 @@ small interface. The T1 implementation is an in-memory disk that
 models what the real one is allowed to do:
 
 - a **volatile write cache**: a written sector is durable only after
-  a flush; a simulated crash discards every sector written since the
-  last flush, chosen adversarially rather than at random;
+  a flush; a crash leaves each sector written since the last flush
+  holding either its durable bytes or its cached ones, and which of
+  the two is the test's to choose — all, none, a subset drawn from
+  the seed, or a named set of sectors. That is what lets a torn
+  commit header survive to be read back, and what stages the hazard
+  §3.2's pre-flush exists to prevent: the commit record on the
+  platter with a staged grain still in the cache;
 - **torn and partial writes**: a write may land as any byte-wise
   mixture of old and new bytes within any sector it covers, and may
   land in any subset of its sectors;
 - **short counts** on every read and write;
-- `Echange` and `Eio` on demand;
+- `Echange`, `Eio` and `interrupted` on demand, on a read, a write or
+  a flush; several faults may be armed at once and each may be aimed
+  at a byte range, since one schedule wants a short count and a tear
+  together and §8 wants an `Eio` on one named sector;
 - **crash at a chosen point**, by name, with the flush and write
   sequence recorded so a test can assert the *order* as well as the
-  outcome.
+  outcome;
+- **one lock over all of it**, so that the procs §7 puts on one
+  device do not lose each other's operations out of the trace or
+  race the seeded generator: a run stays reproducible from its seed
+  and an order assertion stays an assertion.
 
 Points: `stage` (after the last staged grain write), `precommit`
 (after the pre-flush, before the body write), `body:n` (after *n*
