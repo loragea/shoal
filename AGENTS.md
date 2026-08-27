@@ -2,8 +2,9 @@
 
 shoal is a Plan 9-native distributed storage system: horizontal
 scaling across nodes and disks with replication, striping, and a
-mountable live filesystem. Target platform: 9front. Nothing is
-implemented yet; see `docs/target.md` for the ratified target.
+mountable live filesystem. Target platform: 9front. See
+`docs/target.md` for the ratified target and `docs/decisions.md` for
+the decisions it rests on.
 
 ## Ground rules
 
@@ -36,7 +37,40 @@ implemented yet; see `docs/target.md` for the ratified target.
 | `docs/decisions.md` | Design decisions with rationale; each row marked normative vs implementation policy. |
 | `docs/design/layer-a.md` | The ratified Layer A contract: object model, storage-server 9P export, cluster map, placement, write/read path, epoch/fencing, heal, monitor. Wire truth lives here. |
 
+## Building
+
+shoal is written in the Plan 9 C dialect and built on 9front with
+`6c`/`6l` under `mk` (decisions.md D12). From the repo root:
+
+- `mk` — build `lib/libshoal.a$O`, then every command in `cmd/`,
+  then the T1 test programs in `test/`.
+- `mk test` — build everything, then run T1 (below).
+- `mk clean`, `mk nuke` — remove build products in every
+  subdirectory.
+
+| Path | Holds |
+|---|---|
+| `mkfile` | Root. Iterates `lib cmd test` for `all`, `clean` and `nuke`, and runs T1 for `test`. |
+| `lib/` | `libshoal.a$O`: code shared by servers, commands and tests. `lib/shoal.h` is its header; includers name it by relative path after `<u.h>`, `<libc.h>` and `<libsec.h>`. Built by `/sys/src/cmd/mklib`. |
+| `cmd/` | One directory per command, each built by `/sys/src/cmd/mkone` — so it produces `$O.out` and installs as `$TARG` in `/$objtype/bin`. `cmd/mkfile` lists them in `DIRS`. |
+| `test/` | T1 test programs. |
+
+Every mkfile starts with `</$objtype/mkfile`. A new command is a
+directory under `cmd/` with an `mkone` mkfile plus its name in
+`cmd/mkfile`'s `DIRS`; a new library source file is a name in
+`lib/mkfile`'s `OFILES`.
+
 ## Test tiers
 
-TBD — defined when the first code lands. Expected shape: unit
-(host-side, no VMs), single-node integration, multi-node grid.
+**T1 — unit.** `mk test` at the repo root. Runs on any single
+9front machine: no disks, no network, no second node, seconds to
+run. Each test is a C program in `test/` linking `libshoal`; it
+exits non-zero if any check failed and prints one
+`FAIL: <reason>` line per failed check to standard error. `mk test`
+fails on the first failing program. To add one: write `test/foo.c`
+and add `foo` to `TESTS` in `test/mkfile`. Known-answer vectors are
+computed outside this codebase, and the test source says how they
+were computed.
+
+**T2 — single-node integration** and **T3 — multi-node grid** are
+not yet defined.
