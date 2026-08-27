@@ -1,7 +1,7 @@
 # Layer A — distributed object store
 
-Status: **ratified 2026-08-24** (decisions.md D8). Nothing is
-implemented yet; this is the contract M1–M4 build against.
+Status: **ratified 2026-08-24** (decisions.md D8). This is the
+contract M1–M4 build against.
 
 Scope: the object model, the per-disk storage server's 9P export,
 the cluster map, the placement function, the write/read path, epoch
