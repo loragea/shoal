@@ -154,7 +154,33 @@ commit.
   `sdvirtio.c:41-42,232`.
 - **`sdvirtio` splits a request at 32 sectors (16 KiB)** and issues
   the pieces serially, so a 64 KiB write costs 4× a 16 KiB one.
-  `sdvirtio.c:496-517`.
+  `sdvirtio.c:496-517`. `sdiahci` splits at 8192 sectors under LBA48
+  and 128 otherwise, also serially, `sdiahci.c:1803-1807`.
+- **`devsd` issues exactly one request per `pwrite`** — no chunking
+  loop and no coalescing, `devsd.c:887` — so a write of ≤ 16 KiB is
+  one device request on both drivers.
+- **`devsd` truncates a request rather than splitting or failing.**
+  It clamps to `SDmaxio`/`secsize` sectors and to the partition end
+  and then shortens the returned count: a short count is normal and
+  is never an error. `SDmaxio` is a fixed 2 MB compile-time constant,
+  `sd.h:136`; there is no per-device variant. Measured: a 4 MiB
+  `pread` returned short. A read starting past the partition end
+  returns 0; a write there fails `Eio`. `devsd.c:835-841,855-857`.
+- **A write whose length is not a sector multiple becomes a
+  read-modify-write.** `devsd` pre-reads every sector the request
+  covers and writes them back, so the tail sector is rewritten with
+  bytes the caller did not supply, and it drops `unit->ctl` before
+  the I/O on non-removable media, so the cycle is not atomic against
+  a concurrent writer. `devsd.c:849-858,873-880`.
+- **`Echange` invalidates every open partition fid.** I/O fails when
+  `unit->vers + pp->vers` no longer matches the fid's `qid.vers`
+  (`devsd.c:820-821`); any `part`/`delpart` write to the unit's `ctl`
+  file bumps it (`devsd.c:227-284`), as does a media change
+  (`devsd.c:617-618`, `sdincvers` at `devsd.c:213-225`). The kernel
+  itself creates only `data` plus whatever `sdXXpart=` supplies; it
+  is `/rc/bin/diskparts`, run from `termrc`/`cpurc`, that replays a
+  written partition table into `ctl` at boot — so an operator
+  re-running it against a live unit breaks a running program's fds.
 - **A user process reaches the flush through `devsd`'s raw
   interface.** The protocol on `/dev/sdXX/raw` is: *write* the
   10-byte cdb, then *read* — the read is the data phase and is
@@ -202,6 +228,10 @@ commit operation the mechanism needs.
 | cwfs file + console `sync` | 145 ms (global barrier) | 6/s | does not scale | yes, when synced |
 | any file, no sync | 24–100 µs | — | — | **no** — 34, 59, 183 and 1096 acked records lost |
 
+A cdb round trip on a held `/dev/sdXX/raw` fd costs 4.2 µs;
+opening and closing the raw file around each command costs 462 µs
+instead (200 iterations each).
+
 Raw-partition writes cost the same 8.4 ms for anything up to
 16 KiB and exactly 4× that at 64 KiB (the request split, §5), so
 **writing in units of ≤ 16 KiB is free relative to 512 B, and
@@ -212,6 +242,33 @@ here. Reads are ~280 µs.
 The two `sync` rows are worse than the numbers suggest: their cost
 is a function of the *whole file system's* dirty set, not the
 caller's, so one writer cannot bound them.
+
+**Reads are not writes.** Sequential reads by request size, one
+proc, same guest:
+
+| request | per request | bandwidth |
+|---|---|---|
+| 512 B | 173 µs | 2.8 MB/s |
+| 4 KiB | 234 µs | 16.7 MB/s |
+| 16 KiB | 240 µs | 65.1 MB/s |
+| 32 KiB | 386 µs | 81.0 MB/s |
+| 64 KiB | 776 µs | 80.5 MB/s |
+| 256 KiB | 3762 µs | 66.5 MB/s |
+| 1 MiB | 16951 µs | 59.0 MB/s |
+
+The driver's 32-sector split happens inside one syscall, so a 64 KiB
+`pread` pays one syscall and one kernel round trip where four 16 KiB
+`pread`s pay four: **bulk reading in 32–64 KiB requests is ~24 %
+faster than in 16 KiB ones**, the opposite of the write rule above.
+Beyond 64 KiB the bandwidth falls again.
+
+**Hashing costs more than the write path suggests.** libsec's
+BLAKE2s with a 16-byte digest, measured on the same guest: 4.86 µs
+for 256 bytes, 94 µs for 5632, **265 µs for 16 KiB**, 1187 µs for
+64 KiB — a streaming rate of 50–59 MB/s. That is 3 % of an 8.4 ms
+device write for one 16 KiB block, but it is slower than the disk
+reads above, so any pass that reads and hashes a whole region is
+bounded by the hashing and not by the I/O.
 
 **What these numbers are.** One virtualised machine — a two-vCPU
 KVM guest with virtio-blk — not a fleet, and one release. Treat the
