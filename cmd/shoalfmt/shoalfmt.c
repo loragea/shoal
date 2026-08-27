@@ -51,6 +51,22 @@ num(char *s)
 	return v;
 }
 
+/*
+ * nslots, nemap and ndirty are u32 on disk (§2.2) and blksz is too,
+ * so a value that does not fit one must be refused here rather than
+ * truncated into a geometry the store would then believe.
+ */
+static ulong
+num32(char *s)
+{
+	uvlong v;
+
+	v = num(s);
+	if(v == 0 || v >= (1ULL<<32))
+		sysfatal("%s is out of range: 1 to 2^32-1", s);
+	return v;
+}
+
 static void
 gethex(uchar *p, int n, char *s)
 {
@@ -117,7 +133,7 @@ main(int argc, char **argv)
 		noflush = 1;
 		break;
 	case 'b':
-		c.blksz = num(EARGF(usage()));
+		c.blksz = num32(EARGF(usage()));
 		break;
 	case 'o':
 		c.objmax = num(EARGF(usage()));
@@ -127,13 +143,13 @@ main(int argc, char **argv)
 			sysfatal("unknown csumalg; this build has blake2s256");
 		break;
 	case 'n':
-		c.nslots = num(EARGF(usage()));
+		c.nslots = num32(EARGF(usage()));
 		break;
 	case 'e':
-		c.nemap = num(EARGF(usage()));
+		c.nemap = num32(EARGF(usage()));
 		break;
 	case 'd':
-		c.ndirty = num(EARGF(usage()));
+		c.ndirty = num32(EARGF(usage()));
 		break;
 	case 'L':
 		c.logbytes = num(EARGF(usage()));

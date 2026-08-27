@@ -77,6 +77,13 @@ geometry(Super *s, Fmtcfg *c, vlong partbytes)
 	s->nblkmax = c->objmax / c->blksz;
 	s->emapsz = roundup(Emaphdrsz + 20*(uvlong)s->nblkmax, c->secsz);
 
+	/*
+	 * The defaults need no u32 range check of their own: nslots is
+	 * capped at Nslotsmax, and nemap is nobj, which is at most
+	 * ngrains because objmax is at least blksz - so the ngrains
+	 * bound below is the one that binds.  An operator's own -n and
+	 * -e are checked where they are parsed.
+	 */
 	nobj = (partbytes + c->objmax - 1) / c->objmax;
 	s->nslots = c->nslots;
 	if(s->nslots == 0){
