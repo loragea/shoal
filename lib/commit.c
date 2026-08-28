@@ -367,7 +367,7 @@ applybatch(Store *s, Batch *b)
 		if(it->obj != nil && applyrec(s, it->obj, it->emap) < 0)
 			r = -1;
 		for(i = 0; i < it->ndirty; i++)
-			if(applydirty(s, &it->dirty[i]) < 0)
+			if(applydirty(s, &it->dirty[i], nil) < 0)
 				r = -1;
 		if(it->haseslot && applyslot(s, it->eslot) < 0)
 			r = -1;

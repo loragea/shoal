@@ -203,7 +203,7 @@ maplimit(Store *s, Ient *e)
  * read from a lap this store never wrote; applying half of it and
  * then refusing is worse than refusing all of it.
  */
-static int
+int
 objrecok(Store *s, Objrec *o)
 {
 	uvlong nblk;
@@ -377,21 +377,111 @@ applyrec(Store *s, Objrec *o, Emape *c)
 }
 
 /*
- * Edirty (§2.7 kind 2).  layer-a §7.1's fine-grained dirty set, which
- * §14(2) folds into the same record as the update it belongs to, so
- * that either both are durable or neither.
+ * The peer set, §2.6.  A peer is remembered as soon as one of its
+ * fine-grained records exists, because the exhaustion rule below has
+ * to be able to name the peer whose records it drops.  fullsync is
+ * never persisted: it is set for every peer at start (§5 step 12).
  */
-int
-applydirty(Store *s, Dirtyrec *d)
+Peer*
+addpeer(Store *s, uchar *name, int n)
+{
+	Peer *p;
+
+	for(p = s->peers; p != nil; p = p->next)
+		if(strlen(p->name) == (ulong)n
+		&& memcmp(p->name, name, n) == 0)
+			return p;
+	if((p = mallocz(sizeof *p, 1)) == nil)
+		return nil;
+	memmove(p->name, name, n);
+	p->name[n] = '\0';
+	p->fullsync = 1;
+	p->next = s->peers;
+	s->peers = p;
+	return p;
+}
+
+static int
+peerowns(Dirtent *t, Peer *p)
+{
+	return t->peerlen == strlen(p->name)
+		&& memcmp(t->peer, p->name, t->peerlen) == 0;
+}
+
+/*
+ * §2.6: ndirty is an implementation limit in exactly layer-a §7.1's
+ * sense.  When it is exhausted the store discards every fine-grained
+ * record for the peer with the most records and marks that peer
+ * fullsync, which layer-a §7.1 explicitly permits — the records are
+ * dropped, not the write.  Dropping them here, in the apply, is what
+ * keeps §3.2's commit path and §5's replay answering the same thing:
+ * a full region that the live path refused and replay ignored would
+ * be a store whose memory differs from what its own log rebuilds.
+ */
+static int
+dropworstpeer(Store *s)
 {
 	Dirtent *t;
-	ulong i;
+	Peer *p, *worst;
+	ulong i, n, best;
 
+	worst = nil;
+	best = 0;
+	for(p = s->peers; p != nil; p = p->next){
+		n = 0;
+		for(i = 0; i < s->sb.ndirty; i++)
+			if((t = s->dirt[i]) != nil && peerowns(t, p))
+				n++;
+		if(n > best){
+			best = n;
+			worst = p;
+		}
+	}
+	if(worst == nil)
+		return -1;
+	for(i = 0; i < s->sb.ndirty; i++)
+		if((t = s->dirt[i]) != nil && peerowns(t, worst)){
+			free(t);
+			s->dirt[i] = nil;
+			s->ndirtused--;
+			dirtdirty(s, i);
+		}
+	worst->fullsync = 1;
+	return 0;
+}
+
+/* the field checks §2.6 makes on a record, before anything is believed */
+int
+dirtyrecok(Store *s, Dirtyrec *d)
+{
+	USED(s);
 	if(d->oidlen < 1 || d->oidlen > Oidmax || d->peerlen < 1
 	|| d->peerlen > Peermax){
 		werrstr("Edirty: oidlen %d peerlen %d", d->oidlen, d->peerlen);
 		return -1;
 	}
+	return 0;
+}
+
+/*
+ * Edirty (§2.7 kind 2).  layer-a §7.1's fine-grained dirty set, which
+ * §14(2) folds into the same record as the update it belongs to, so
+ * that either both are durable or neither.
+ *
+ * spare, when the caller passes one, is a record the commit path
+ * allocated before its log record was written (§3.2): the apply of a
+ * durable record does not allocate.  Replay passes none and allocates
+ * here, where a failure stops the replay rather than half-applying a
+ * record.
+ */
+int
+applydirty(Store *s, Dirtyrec *d, Dirtent **spare)
+{
+	Dirtent *t;
+	ulong i;
+
+	if(dirtyrecok(s, d) < 0)
+		return -1;
 	for(i = 0; i < s->sb.ndirty; i++){
 		if((t = s->dirt[i]) == nil)
 			continue;
@@ -410,20 +500,23 @@ applydirty(Store *s, Dirtyrec *d)
 	}
 	if(d->op == 0)
 		return 0;			/* removing what is not there */
-	for(i = 0; i < s->sb.ndirty; i++)
-		if(s->dirt[i] == nil)
+	addpeer(s, d->peer, d->peerlen);
+	for(;;){
+		for(i = 0; i < s->sb.ndirty; i++)
+			if(s->dirt[i] == nil)
+				break;
+		if(i < s->sb.ndirty)
 			break;
-	if(i == s->sb.ndirty){
-		/*
-		 * §2.6: ndirty is an implementation limit in layer-a
-		 * §7.1's sense.  Exhausting it is a fullsync for the peer
-		 * that owns the most records, which layer-a permits; the
-		 * records are dropped, not the write.
-		 */
-		werrstr("dirty region full");
-		return -1;
+		if(dropworstpeer(s) < 0){
+			werrstr("dirty region full");
+			return -1;
+		}
 	}
-	if((t = mallocz(sizeof *t, 1)) == nil)
+	if(spare != nil && *spare != nil){
+		t = *spare;
+		*spare = nil;
+		memset(t, 0, sizeof *t);
+	}else if((t = mallocz(sizeof *t, 1)) == nil)
 		return -1;
 	t->epoch = d->epoch;
 	t->state = 1;

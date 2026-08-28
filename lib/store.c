@@ -296,8 +296,6 @@ readbitmap(Store *s)
  * worst one peer's fine-grained mark, and the restart fullsync covers
  * it.  R7 is what the region is for.
  */
-static void addpeer(Store*, uchar*, int);
-
 static int
 readdirty(Store *s)
 {
@@ -342,24 +340,6 @@ readdirty(Store *s)
 	return 0;
 }
 
-static void
-addpeer(Store *s, uchar *name, int n)
-{
-	Peer *p;
-
-	for(p = s->peers; p != nil; p = p->next)
-		if(strlen(p->name) == (ulong)n
-		&& memcmp(p->name, name, n) == 0)
-			return;
-	if((p = mallocz(sizeof *p, 1)) == nil)
-		return;
-	memmove(p->name, name, n);
-	p->name[n] = '\0';
-	p->fullsync = 1;
-	p->next = s->peers;
-	s->peers = p;
-}
-
 /* apply one record's entries, through the same function §3.2 uses */
 static int
 applyents(Store *s, uchar *p, Lrec *r)
@@ -400,10 +380,10 @@ applyents(Store *s, uchar *p, Lrec *r)
 			if(dirtyrecunpack(&d, e.body, e.len - Lenthdrsz) < 0)
 				return -1;
 			qlock(&s->qlstate);
-			rc = applydirty(s, &d);
+			rc = applydirty(s, &d, nil);
 			qunlock(&s->qlstate);
-			if(rc == 0)
-				addpeer(s, d.peer, d.peerlen);
+			if(rc < 0)
+				return -1;
 			break;
 		case Kslot:
 			if(slotrecunpack(&slot, e.body, e.len - Lenthdrsz) < 0)
