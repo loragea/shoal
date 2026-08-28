@@ -236,6 +236,19 @@ objrecok(Store *s, Objrec *o)
 	 * with nothing left pointing at it.
 	 */
 	nblk = blkcount(o->len, s->sb.blksz);
+	/*
+	 * An object of more than one block keeps its map out of line, so
+	 * a record that claims otherwise names blocks the entry cannot
+	 * hold.  This writer never produces one, but replay accepts
+	 * records from any build, and the entry such a record leaves has
+	 * objverify copy from the nil mapdig returns for i >= 1 on an
+	 * inline map.
+	 */
+	if(nblk > 1 && o->emapslot == 0){
+		werrstr("Eobj: len %llud is %llud blocks with no extent-map "
+			"slot", o->len, nblk);
+		return -1;
+	}
 	for(i = 0; i < o->nmap; i++){
 		if(o->map[i].blk >= s->sb.nblkmax || o->map[i].blk >= nblk){
 			werrstr("Eobj: block %lud, nblk %llud, nblkmax %lud",

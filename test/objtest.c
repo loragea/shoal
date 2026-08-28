@@ -480,7 +480,8 @@ tstage(void)
 	Store *s;
 	Stage *g, *g2;
 	Storestat st, st2;
-	uchar *buf, *got, o[Oidmax], o2[Oidmax];
+	Objinfo oi, oi2;
+	uchar *buf, *got, *other, o[Oidmax], o2[Oidmax];
 	uvlong before, before2;
 	int i;
 
@@ -559,6 +560,39 @@ tstage(void)
 	if(memcmp(got, buf, 2*Blk) != 0)
 		fail("op=full: content differs");
 	mustverify(s, "full", "op=full");
+
+	/*
+	 * §3.3 and layer-a §5.4 step 7: a discarded stage leaves the
+	 * object untouched — same content, same key, same csum, still
+	 * verifying — because the published state was never modified.
+	 * The free-grain count returning is not that property; this is.
+	 */
+	if(ostat(s, "full", &oi) < 0)
+		fail("objstat full: %r");
+	other = mkbuf(2*Blk, 71);
+	if((g = stageopen(s, o, 4, 2*Blk, 0)) == nil)
+		fail("stageopen: %r");
+	else{
+		if(stagewrite(g, other, 2*Blk, 0) < 0)
+			fail("stagewrite: %r");
+		stagediscard(g);
+	}
+	if(ostat(s, "full", &oi2) < 0)
+		fail("objstat full after a discard: %r");
+	else{
+		eqv("a discarded stage leaves the key", oi2.ver, oi.ver);
+		eqv("and the wepoch", oi2.wepoch, oi.wepoch);
+		eqv("and the length", oi2.len, oi.len);
+		checks++;
+		if(memcmp(oi2.csum, oi.csum, Csumlen) != 0)
+			fail("a discarded stage changed the csum");
+	}
+	rd(s, "full", got, 2*Blk, 0, "after a discarded stage");
+	checks++;
+	if(memcmp(got, buf, 2*Blk) != 0)
+		fail("a discarded stage changed the content");
+	mustverify(s, "full", "after a discarded stage");
+	free(other);
 
 	/* the per-fid bound */
 	if((g = stageopen(s, o, 4, 64*1024, 0)) == nil)
@@ -1144,21 +1178,35 @@ tcorrupt(void)
 	Dev *d;
 	Store *s;
 	Objinfo oi;
+	Storestat st;
+	uvlong lf;
 	uchar *buf, oid[Oidmax];
 
 	d = newdisk();
 	if((s = mustopen(d, "corrupt flag")) == nil)
 		return;
-	buf = mkbuf(2*Blk, 59);
+	buf = mkbuf(16*Blk, 59);
 	mk(s, "c");
-	mustwr(s, "c", buf, 2*Blk, 0);
+	mustwr(s, "c", buf, 16*Blk, 0);
 	oidof(oid, "c");
+	storestat(s, &st);
+	lf = st.logfree;
 	if(objcorrupt(s, oid, 1, 1, nil, 0) < 0)
 		fail("objcorrupt: %r");
+	/*
+	 * §2.7's slot rule is what makes a commit name every block, and
+	 * this one changes no emapslot: an empty nmap leaves the map it
+	 * inherits exactly as it is, so §8's "an Eobj that changes
+	 * nothing but the corrupt flag" is one sector however large the
+	 * object.
+	 */
+	storestat(s, &st);
+	eqv("a commit that changes nothing but the corrupt flag is one "
+		"sector", lf - st.logfree, 1);
 	if(objstat(s, oid, 1, &oi) < 0)
 		fail("objstat: %r");
 	eqv("the corrupt flag is set", oi.corrupt, 1);
-	eqv("and nothing else changed", oi.len, 2*Blk);
+	eqv("and nothing else changed", oi.len, 16*Blk);
 	mustverify(s, "c", "after the corrupt flag");
 	storeclose(s);
 	if((s = mustopen(d, "corrupt flag replayed")) == nil){

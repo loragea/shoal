@@ -243,7 +243,6 @@ ttorn(void)
 		if((s = openstore(d)) == nil){
 			fail("a torn header must not stop the store starting "
 				"(%lud new bytes): %r", k);
-			bad = 1;
 			break;
 		}
 		/*
@@ -583,6 +582,7 @@ twrapbig(void)
 	vlong lo, hi;
 	int i, j, k, wraps, lastw, lastf;
 
+	p = 0;
 	d = wrapdisk();
 	if((s = openstore(d)) == nil){
 		fail("the wrap geometry: storeopen: %r");
@@ -1247,6 +1247,92 @@ tackflush(void)
 	devclose(d);
 	free(buf);
 	free(k);
+}
+
+/*
+ * §2.7's range checks run before a record is believed, and this is
+ * one of them: an object of more than one block keeps its map out of
+ * line, so a record with `len` above `blksz` and `emapslot` zero
+ * names blocks the index entry cannot hold.  This writer never
+ * produces one; replay accepts records from any build, and the entry
+ * such a record would leave has objverify reading through the nil an
+ * inline map returns for every block but the first.
+ */
+static void
+tinlinemap(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Super sb;
+	Sbsel sel;
+	Objinfo oi;
+	Lrec r;
+	uchar *buf, *rec;
+	long n;
+	vlong off;
+
+	d = newdisk();
+	if((s = mustopen(d, "an inline map for many blocks")) == nil)
+		return;
+	buf = mkbuf(64, 149);
+	mk(s, "q0");
+	if(wr(s, "q0", buf, 64, 0, 2) < 0)
+		fail("objwrite: %r");
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	storestat(s, &st);
+	storeclose(s);
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	sb = sel.sb[sel.start];
+
+	if((rec = mallocz(sb.secsz, 1)) == nil)
+		sysfatal("mallocz: %r");
+	{
+		Objrec o;
+
+		memset(&o, 0, sizeof o);
+		o.slot = 1;
+		o.emapslot = 0;
+		o.qidpath = 99;
+		o.state = Slive;
+		o.oidlen = 2;
+		memmove(o.oid, "q1", 2);
+		o.len = 2*(uvlong)sb.blksz;	/* two blocks, inline map */
+		o.ver = 1;
+		o.wepoch = 1;
+		n = objrecpack(rec + Lrechdrsz, sb.secsz - Lrechdrsz, &o);
+	}
+	checks++;
+	if(n < 0)
+		fail("objrecpack: %r");
+	else{
+		memset(&r, 0, sizeof r);
+		r.vers = Storevers;
+		r.nsec = 1;
+		r.seq = st.ckseq + 1;
+		r.nent = 1;
+		lrecpack(rec, &r, sb.secsz);
+		off = (vlong)st.cklogoff*sb.secsz;
+		simpoke(d, off, rec, sb.secsz);
+		if((s = openstore(d)) == nil)
+			fail("a record naming an inline map for two blocks "
+				"must not stop the store starting: %r");
+		else{
+			storestat(s, &st);
+			eqv("and it is not applied", st.nreplay, 0);
+			checks++;
+			if(objstat(s, (uchar*)"q1", 2, &oi) == 0)
+				fail("a record naming an inline map for two "
+					"blocks was applied");
+			mustverify(s, "q0", "after a refused record");
+			storeclose(s);
+		}
+	}
+	free(rec);
+	free(buf);
+	devclose(d);
 }
 
 /*
@@ -1971,7 +2057,6 @@ tckmark(void)
 	uchar *buf;
 	vlong sboff;
 	uvlong ck0;
-	int i;
 
 	d = newdisk();
 	if((s = mustopen(d, "checkpoint mark")) == nil)
@@ -2024,7 +2109,6 @@ tckmark(void)
 	storeclose(s);
 	devclose(d);
 	free(buf);
-	USED(i);
 }
 
 /*
@@ -2093,6 +2177,7 @@ main(int argc, char **argv)
 	tgroup();
 	tmaxbatch();
 	tbignsec();
+	tinlinemap();
 	tckptmark();
 	tackflush();
 	tfailed();

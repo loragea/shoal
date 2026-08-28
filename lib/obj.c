@@ -980,7 +980,16 @@ objcorrupt(Store *s, uchar *oid, int oidlen, int set, Dirtyrec *dr, int ndr)
 	if(updopen(&u, s, oid, oidlen, oi.len, 1) < 0)
 		return -1;
 	mapopen(s, &mold, &u.e, u.cold);
-	if(u.oldnblk > 0 && nameall(&u, &mold) < 0){
+	/*
+	 * §2.7's slot rule is what makes a commit name every block, and
+	 * this commit changes no emapslot: clause 2 zeroes nothing, so
+	 * the map the apply inherits is this object's own and an empty
+	 * nmap leaves it exactly as it is.  Naming them anyway would put
+	 * nblkmax map triples — 28.2 KiB at the defaults — into a record
+	 * §8 describes as "an Eobj that changes nothing but the corrupt
+	 * flag".
+	 */
+	if(u.oslot && nameall(&u, &mold) < 0){
 		updabort(&u);
 		updclose(&u);
 		return -1;
