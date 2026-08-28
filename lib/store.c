@@ -918,19 +918,28 @@ storestat(Store *s, Storestat *st)
 	st->nlive = s->nlive;
 	st->ntomb = s->ntomb;
 	st->ndirty = s->ndirtused;
-	qunlock(&s->qlstate);
 	st->nlost = s->nlost;
+	qunlock(&s->qlstate);
 	st->ndirtydrop = s->ndirtydrop;
 	st->nreplay = s->nreplay;
 	st->pmax = s->pmax;
 }
 
+/*
+ * §5 step 10's list.  storecondemn reallocs s->lost from any worker
+ * proc, on the first read of a damaged extent map, so both the count
+ * and the array are qlstate's: reading them unlocked — as this could
+ * while the list was built once at start — indexes a freed array.
+ */
 ulong
 storelost(Store *s, ulong i)
 {
-	if(i >= s->nlost)
-		return ~0UL;
-	return s->lost[i];
+	ulong slot;
+
+	qlock(&s->qlstate);
+	slot = i < s->nlost ? s->lost[i] : ~0UL;
+	qunlock(&s->qlstate);
+	return slot;
 }
 
 int
