@@ -327,3 +327,4 @@ int	publishlocked(Store*);
 /* store.c */
 int	storeproc(Store*, void (*)(void*), void*);
 void	storeprocdone(Store*);
+void	storecondemn(Store*, ulong slot);	/* §5 step 10, at run time */

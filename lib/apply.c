@@ -311,7 +311,6 @@ applyrec(Store *s, Objrec *o, Emape *c)
 			}
 			emapmark(s, o->emapslot);
 			memset(c->p, 0, s->sb.emapsz);
-			c->bad = 0;
 		}else{
 			if(e->emapslot != 0)
 				emapclear(s, e->emapslot);
@@ -329,6 +328,14 @@ applyrec(Store *s, Objrec *o, Emape *c)
 		emapmark(s, e->emapslot);
 		PBIT32(c->p + 16, (ulong)nblk);
 		PBIT32(c->p + 20, Storevers);
+		/*
+		 * §5 step 9: an entry a record touches is restored by
+		 * applying the deltas and recomputing its checksum — the
+		 * bytes the record does not name are this object's own,
+		 * old-or-new and therefore intact — so it is no longer the
+		 * entry that failed its csum.
+		 */
+		c->bad = 0;
 		emapdirty(s, c);
 	}
 	mapopen(s, &m, e, c);

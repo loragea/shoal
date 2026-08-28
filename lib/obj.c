@@ -272,6 +272,32 @@ grainwrite(Store *s, uchar *buf, ulong g)
 }
 
 /*
+ * The extent map of an object about to be read or updated.  §5 step
+ * 9: an entry that fails its csum128 and that replay did not touch is
+ * damage the log does not cover, so the slot is condemned (§5 step
+ * 10) rather than served — every grain number in it is the damaged
+ * bytes', and a block read through one is another object's content
+ * returned as this object's.
+ */
+static Emape*
+mapread(Store *s, ulong slot, ulong emapslot)
+{
+	Emape *c;
+
+	if((c = emapget(s, emapslot, 0)) == nil)
+		return nil;
+	if(c->bad){
+		emapunpin(s, c);
+		qlock(&s->qlstate);
+		storecondemn(s, slot);
+		qunlock(&s->qlstate);
+		werrstr("slot %lud: extent map failed its checksum", slot);
+		return nil;
+	}
+	return c;
+}
+
+/*
  * Start an update of an existing object: take a copy of the entry,
  * work out which extent-map slot the new length needs, and pin both
  * the map being read and the map the apply will change.
@@ -322,7 +348,7 @@ updopen(Upd *u, Store *s, uchar *oid, int oidlen, uvlong newlen, int wanttomb)
 	qunlock(&s->qlstate);
 
 	if(u->e.emapslot != 0
-	&& (u->cold = emapget(s, u->e.emapslot, 0)) == nil){
+	&& (u->cold = mapread(s, u->slot, u->e.emapslot)) == nil){
 		qlock(&s->qlstate);
 		if(u->emapresv)
 			emapresvclr(s, u->newslot);
@@ -841,7 +867,7 @@ objread(Store *s, uchar *oid, int oidlen, void *a, long n, uvlong off)
 	if((uvlong)n > len - off)
 		n = len - off;
 	c = nil;
-	if(e.emapslot != 0 && (c = emapget(s, e.emapslot, 0)) == nil)
+	if(e.emapslot != 0 && (c = mapread(s, slot, e.emapslot)) == nil)
 		return -1;
 	mapopen(s, &m, &e, c);
 	if((buf = malloc(s->sb.blksz)) == nil){
@@ -915,7 +941,7 @@ objverify(Store *s, uchar *oid, int oidlen, Vfy *v)
 	qunlock(&s->qlstate);
 	nblk = blkcount(e.len, s->sb.blksz);
 	c = nil;
-	if(e.emapslot != 0 && (c = emapget(s, e.emapslot, 0)) == nil)
+	if(e.emapslot != 0 && (c = mapread(s, slot, e.emapslot)) == nil)
 		return -1;
 	mapopen(s, &m, &e, c);
 	buf = malloc(s->sb.blksz);

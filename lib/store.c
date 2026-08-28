@@ -582,6 +582,30 @@ completemaps(Store *s)
 	}
 }
 
+/*
+ * §5 step 10, at run time.  An extent-map entry that fails its
+ * csum128 and that replay did not touch is media damage the log
+ * cannot repair, and it is found when the object is first read rather
+ * than at start (§5 step 9 reads only the entries replay touched).
+ * The slot goes to /lost with kind=corrupt: it is unhashed, so it is
+ * not served, and it is not reused, because completemaps counts a bad
+ * slot as used.
+ */
+void
+storecondemn(Store *s, ulong slot)
+{
+	ulong *l;
+
+	if(slot >= s->sb.nslots || s->idx[slot].bad)
+		return;
+	ientunhash(s, slot);
+	s->idx[slot].bad = 1;
+	if((l = realloc(s->lost, (s->nlost+1)*sizeof *l)) == nil)
+		return;
+	s->lost = l;
+	s->lost[s->nlost++] = slot;
+}
+
 /* §5 step 10: condemn what replay did not restore */
 static int
 condemn(Store *s)

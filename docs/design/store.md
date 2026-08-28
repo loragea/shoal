@@ -1505,11 +1505,18 @@ lose arbitration against everything including absence.
    bounds-checked against `ngrains`; one out of range is damage
    replay did not cover, and the slot goes to `/lost`. A failing
    `csum128` on an entry replay did *not* touch is fatal for that
-   slot in the same way.
+   slot in the same way. Step 9 reads only the entries replay
+   touched, so an entry no record named is judged when the object is
+   first read rather than at start: the read refuses, and the slot is
+   condemned exactly as step 10 condemns an index entry. Serving it
+   instead would answer from grain numbers and digests that are the
+   damaged bytes'.
 10. Condemn what is left. An index entry that still fails its
     checksum after replay, or fails a range check, is genuine media
     damage: it is listed in `/lost` with `kind=corrupt`, its slot is
-    not reused, and it is not served. The line carries `slot=<n>`
+    not reused, and it is not served. The same list takes the slots
+    step 9's rule condemns later, when a damaged extent-map entry is
+    first read. The line carries `slot=<n>`
     and **omits `oid=`**, rather than printing 128 bytes the store
     does not trust or inventing an oid layer-a §1.2's grammar would
     not admit; §14(15) records the deviation from layer-a §2.2's
