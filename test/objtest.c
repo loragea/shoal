@@ -806,9 +806,233 @@ tdirty(void)
 	eqv("and the removal survives a restart", dirtycount(s), 1);
 	istrue("the removed record is gone",
 		!dirtyhas(s, oid, 4, "node7.1"));
+
+	/*
+	 * §14(2) folds the Edirty entries into the same record as the
+	 * update they belong to, so that either both are durable or
+	 * neither — and that has to hold for every mutating call, not
+	 * only for objwrite.  A truncate, a delete, a heal and the
+	 * corrupt flag can each leave a peer stale; committed as a
+	 * second record, a crash between the two leaves the update
+	 * durable and the stale mark absent, which is layer-a §5.4's
+	 * `degraded' arrived at silently.
+	 */
+	mk(s, "dtr");
+	mk(s, "drm");
+	mk(s, "dck");
+	mustwr(s, "dtr", buf, 64, 0);
+	mustwr(s, "dck", buf, 64, 0);
+	dr[0].peerlen = 7;
+	memmove(dr[0].peer, "node9.3", 7);
+	dr[0].oidlen = 3;
+	memmove(dr[0].oid, "dtr", 3);
+	oidof(oid, "dtr");
+	if(objtrunc(s, oid, 3, 16, 3, 1, dr, 1) < 0)
+		fail("objtrunc with a dirty record: %r");
+	memmove(dr[0].oid, "drm", 3);
+	oidof(oid, "drm");
+	if(objremove(s, oid, 3, 3, 1, dr, 1) < 0)
+		fail("objremove with a dirty record: %r");
+	memmove(dr[0].oid, "dck", 3);
+	oidof(oid, "dck");
+	if(objcorrupt(s, oid, 3, 1, dr, 1) < 0)
+		fail("objcorrupt with a dirty record: %r");
+	eqv("each write-path call carried its record", dirtycount(s), 4);
+	storeclose(s);
+	if((s = mustopen(d, "dirty from every write path")) == nil){
+		devclose(d);
+		return;
+	}
+	eqv("and each is in the same record as its update", dirtycount(s), 4);
+	oidof(oid, "dtr");
+	istrue("a truncate's stale mark is durable",
+		dirtyhas(s, oid, 3, "node9.3"));
+	oidof(oid, "drm");
+	istrue("a delete's stale mark is durable",
+		dirtyhas(s, oid, 3, "node9.3"));
+	oidof(oid, "dck");
+	istrue("a corrupt flag's stale mark is durable",
+		dirtyhas(s, oid, 3, "node9.3"));
 	storeclose(s);
 	devclose(d);
 	free(buf);
+}
+
+/*
+ * §3.6's final=1: the arbitration comparison layer-a §5.5 makes once,
+ * at commit time, against the receiver's then-current key.  Three
+ * receivers have to be told apart — one holding a lower key, one
+ * holding an equal key, and one holding no key at all — and the last
+ * is the common case for a heal, because layer-a §1.3 makes absence
+ * lose arbitration against any verifying copy.
+ */
+static Stage*
+fullstage(Store *s, char *name, uchar *content, uvlong len, int force)
+{
+	Stage *g;
+	uchar o[Oidmax];
+
+	oidof(o, name);
+	if((g = stageopen(s, o, strlen(name), len, force)) == nil){
+		fail("stageopen %s: %r", name);
+		return nil;
+	}
+	if(stagewrite(g, content, len, 0) < 0){
+		fail("stagewrite %s: %r", name);
+		stagediscard(g);
+		return nil;
+	}
+	return g;
+}
+
+static void
+tfull(void)
+{
+	Dev *d;
+	Store *s;
+	Stage *g;
+	Objinfo oi;
+	Dirtyrec dr;
+	Storestat st;
+	uchar *a, *b, *got, oid[Oidmax];
+
+	d = newdisk();
+	if((s = mustopen(d, "op=full")) == nil)
+		return;
+	a = mkbuf(2*Blk, 61);
+	b = mkbuf(2*Blk, 67);
+	if((got = malloc(2*Blk)) == nil)
+		sysfatal("malloc: %r");
+
+	/*
+	 * The heal of a copy this instance does not hold.  One Eobj
+	 * carries the create and the content, so there is no moment at
+	 * which the object is live, empty and at the winning key.
+	 */
+	memset(&dr, 0, sizeof dr);
+	dr.op = 1;
+	dr.epoch = 9;
+	dr.oidlen = 1;
+	dr.oid[0] = 'f';
+	dr.peerlen = 7;
+	memmove(dr.peer, "node3.1", 7);
+	storestat(s, &st);
+	if((g = fullstage(s, "f", a, 2*Blk, 0)) != nil){
+		checks++;
+		if(stagefinal(g, 4, 2, &dr, 1) < 0)
+			fail("op=full to an instance holding no copy: %r");
+	}
+	if(ostat(s, "f", &oi) < 0)
+		fail("objstat f: %r");
+	else{
+		eqv("the heal published the sender's ver", oi.ver, 4);
+		eqv("and its wepoch", oi.wepoch, 2);
+		eqv("and the whole object's length", oi.len, 2*Blk);
+		istrue("and it took a qid.path", oi.qidpath != 0);
+	}
+	rd(s, "f", got, 2*Blk, 0, "op=full to an absent object");
+	checks++;
+	if(memcmp(got, a, 2*Blk) != 0)
+		fail("op=full to an absent object: content differs");
+	mustverify(s, "f", "op=full to an absent object");
+	oidof(oid, "f");
+	istrue("the heal's stale mark rode in the same record",
+		dirtyhas(s, oid, 1, "node3.1"));
+
+	/* layer-a §5.5's comparison, made against that key */
+	if((g = fullstage(s, "f", b, 2*Blk, 0)) != nil)
+		refused("an op=full at a lower key", stagefinal(g, 3, 2, nil, 0),
+			"stale version");
+	if((g = fullstage(s, "f", b, 2*Blk, 0)) != nil)
+		refused("an op=full at an equal key without force",
+			stagefinal(g, 4, 2, nil, 0), "stale version");
+	if(ostat(s, "f", &oi) < 0)
+		fail("objstat f: %r");
+	else
+		eqv("a refused op=full changes nothing", oi.ver, 4);
+	rd(s, "f", got, 2*Blk, 0, "after a refused op=full");
+	checks++;
+	if(memcmp(got, a, 2*Blk) != 0)
+		fail("a refused op=full changed the content");
+	storestat(s, &st);
+	eqv("and it stages nothing", st.staged, 0);
+
+	/* equal key with force=1 is §1.3's divergence repair */
+	if((g = fullstage(s, "f", b, 2*Blk, 1)) != nil){
+		checks++;
+		if(stagefinal(g, 4, 2, nil, 0) < 0)
+			fail("op=full force=1 at an equal key: %r");
+	}
+	rd(s, "f", got, 2*Blk, 0, "op=full force=1");
+	checks++;
+	if(memcmp(got, b, 2*Blk) != 0)
+		fail("op=full force=1 did not replace the content");
+	mustverify(s, "f", "op=full force=1");
+
+	/* and a strictly greater key needs no flag */
+	if((g = fullstage(s, "f", a, 2*Blk, 0)) != nil){
+		checks++;
+		if(stagefinal(g, 5, 2, nil, 0) < 0)
+			fail("op=full at a greater key: %r");
+	}
+	if(ostat(s, "f", &oi) < 0)
+		fail("objstat f: %r");
+	else
+		eqv("a greater key applies", oi.ver, 5);
+
+	/*
+	 * D14: a copy that fails local verification contributes no key
+	 * (layer-a §1.3), so it has none to defend and takes the push at
+	 * any key.  Without the exemption a holder that committed
+	 * (E, ver+1) and then lost the content refuses the serving
+	 * primary's repair at the lower (E, ver) — by the very copy that
+	 * asked for it — and is unrepairable for the life of the disk.
+	 */
+	oidof(oid, "f");
+	if(objcorrupt(s, oid, 1, 1, nil, 0) < 0)
+		fail("objcorrupt: %r");
+	if((g = fullstage(s, "f", b, 2*Blk, 0)) != nil){
+		checks++;
+		if(stagefinal(g, 2, 1, nil, 0) < 0)
+			fail("op=full to a corrupt copy at a lower key: %r");
+	}
+	if(ostat(s, "f", &oi) < 0)
+		fail("objstat f: %r");
+	else{
+		eqv("the push applied at the lower key", oi.ver, 2);
+		eqv("and the flag survives it, for §8's verify to clear",
+			oi.corrupt, 1);
+	}
+	rd(s, "f", got, 2*Blk, 0, "op=full to a corrupt copy");
+	checks++;
+	if(memcmp(got, b, 2*Blk) != 0)
+		fail("op=full to a corrupt copy did not replace the content");
+	mustverify(s, "f", "op=full to a corrupt copy");
+
+	storeclose(s);
+	if((s = mustopen(d, "op=full replayed")) == nil){
+		devclose(d);
+		free(a);
+		free(b);
+		free(got);
+		return;
+	}
+	if(ostat(s, "f", &oi) < 0)
+		fail("objstat f: %r");
+	else{
+		eqv("every op=full replays", oi.ver, 2);
+		eqv("with its corrupt flag", oi.corrupt, 1);
+	}
+	rd(s, "f", got, 2*Blk, 0, "op=full replayed");
+	checks++;
+	if(memcmp(got, b, 2*Blk) != 0)
+		fail("op=full replayed: content differs");
+	mustverify(s, "f", "op=full replayed");
+	storeclose(s);
+	devclose(d);
+	free(a);
+	free(b);
+	free(got);
 }
 
 /*
@@ -1059,6 +1283,7 @@ main(int argc, char **argv)
 	tstage();
 	texhaust();
 	tdirty();
+	tfull();
 	ttomb();
 	tcorrupt();
 	tbounds();
