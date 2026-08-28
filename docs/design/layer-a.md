@@ -154,6 +154,8 @@ lose to a copy produced under a later map even if a counter raced.
   only copy, the object is `object lost` (§7.5). This replaces the
   first draft's "treat it as `(0,0)`", which had a corrupt copy
   beating absence.
+  Such a holder says so on the wire with the `corrupt=1` `op=meta`
+  response (§5.6), which is where the rule's wire form lives.
 - **Equal keys, differing content.** Equal keys MUST imply equal
   content (invariant I3, §5.7); the delta rule (§5.3) and the resync
   rule (§7.2) are what make that true. If a primary nevertheless
@@ -268,6 +270,9 @@ when **all** of the following hold:
    instance from answering: F3 (§6.4) bars such an instance from
    serving clients and from acking, never from answering `op=meta`.
    Without that, an evacuation would make this condition unreachable.
+   A `corrupt=1` `op=meta` response (§5.6) is neither kind of
+   confirmation and blocks the discard as an unreachable instance
+   does.
 2. **Retention.** `tombdays` (map header, default 7) have elapsed
    since the tombstone's `mtime`.
 3. **Epoch supersession.** The current epoch is strictly greater
@@ -1633,6 +1638,16 @@ Receiver rules:
   then-current key** — earlier chunks stage without comparing, and a
   concurrent local update between chunks is what the commit-time
   check exists to catch.
+- **A receiver whose own copy fails local verification (§7.5) MUST
+  treat that copy as absent for the comparison above**, and so MUST
+  accept an `op=full` for that object at any key — greater, equal or
+  lower, `force=1` or not. A copy that contributes no key (§1.3; on
+  the wire it is the `corrupt=1` `op=meta` response of §5.6) has no
+  key to defend. Without this rule a holder that committed
+  `(E, ver+1)` and then lost the content to a media fault refuses
+  the serving primary's repair push at the lower `(E, ver)` as
+  `stale version` — by the very copy that asked for it — and is
+  unrepairable for the life of the disk.
 - **A receiver-side stage has a lifetime and a bound.** The receiver
   MUST discard an incomplete `op=full` stage, releasing whatever it
   holds, when the `/repl` fid is clunked, when a chunk of it is
@@ -1760,6 +1775,8 @@ Responses:
     meta oid=<oid> ver=<u64> wepoch=<u64> csum=<hex64> len=<u64>
          state=live|tomb cur=<u64>
     meta oid=<oid> absent=1
+    meta oid=<oid> ver=<u64> wepoch=<u64> csum=<hex64> len=<u64>
+         state=live|tomb cur=<u64> corrupt=1
     get  oid=<oid> ver=<u64> wepoch=<u64> off=<u64> n=<u32>
          dcsum=<hex32>                      followed by n bytes
     list lines=<u32> more=<0|1>      followed by lines advert lines
@@ -1771,6 +1788,26 @@ Responses:
   what tombstone confirmation needs. An instance answers `op=meta`
   whatever its own `up`/`status` (§6.4 F3), which is what keeps
   §1.5's confirmation and §7.4's evacuation reachable.
+- **`corrupt=1`** is the third form. An instance whose copy of
+  `<oid>` fails local verification (§7.5) MUST answer it, and MUST
+  NOT answer either with a key alone or with `absent=1`. The line
+  carries the key the instance holds, but the response
+  **contributes no key**: it MUST lose arbitration against
+  everything including absence (§1.3), whatever key the line
+  carries, and it MUST NOT count as either kind of §1.5 discard
+  confirmation — it blocks a tombstone discard exactly as an
+  unreachable instance does. It **does satisfy** a §5.2 currency
+  check as a *response*: a corrupt holder is neither absent nor
+  unreachable, so withholding the answer would leave the check
+  permanently incompletable and darken the object cluster-wide on
+  one media fault, with a good copy on the primary and a repairable
+  one on the holder. Finally it licenses the serving primary — which
+  the completed check is what elects — to push `op=full force=1`
+  (§5.5) at an equal key to the reporting holder, which is §1.3's
+  key-preserving repair. A response form rather than an error,
+  because `op=meta` is answered whatever the instance's `up`/`status`
+  (§6.4 F3) and a caller must be able to tell a corrupt holder from
+  an unreachable one.
 - `op=get` carries the **expected key**. If the object's committed
   key is not exactly `(wepoch, ver)`, the server MUST fail with
   `stale version`; the puller re-reads `op=meta` and retries. That
