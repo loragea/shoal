@@ -38,6 +38,11 @@
  *     entry to mark dirty again (§2.8), and freeing it under the
  *     checkpointer would leave the on-disk entry half written and
  *     nothing in memory to rewrite it.
+ *   - wb is written under qlstate and read here under qlemap, which
+ *     is legal only because ckpt.c orders the two flags so that one
+ *     of dirty and wb is always set while an entry is in write-back.
+ *     etrim's test reads them in that order and so can never see the
+ *     handover.
  */
 
 static Emape*

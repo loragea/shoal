@@ -274,20 +274,31 @@ checkpoint(Store *s)
 		}
 		s->edirty = c->dnext;
 		c->dnext = nil;
-		c->dirty = 0;
+		/*
+		 * wb rises before dirty falls, and falls after dirty rises
+		 * again: etrim reads the pair under qlemap while these run
+		 * under qlstate (§7 rule 1 is that the two are never held
+		 * together), so the entry must never be seen with both
+		 * clear.  It would then be freed under the write-back, and
+		 * the bytes memmove'd below would be freed memory sealed
+		 * with a fresh csum128 and written to the entry's own
+		 * offset — checksum-valid garbage, which §5 step 9 cannot
+		 * condemn.
+		 */
 		c->wb = 1;
+		c->dirty = 0;
 		slot = c->slot;
 		memmove(ebuf, c->p, s->sb.emapsz);
 		qunlock(&s->qlstate);
 		if(emapwrite(s, slot, ebuf) < 0)
 			r = -1;
 		qlock(&s->qlstate);
-		c->wb = 0;
 		if(r < 0 && !c->dirty){
 			c->dirty = 1;
 			c->dnext = s->edirty;
 			s->edirty = c;
 		}
+		c->wb = 0;
 		qunlock(&s->qlstate);
 		devpoint(s->d, "ckpt", ++npage);
 		if(s->pubatpage != 0 && npage == s->pubatpage)
