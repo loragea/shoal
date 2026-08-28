@@ -222,12 +222,17 @@ objrecok(Store *s, Objrec *o)
 		werrstr("Eobj: len %llud, objmax %llud", o->len, s->sb.objmax);
 		return -1;
 	}
+	/*
+	 * A block at or beyond the record's own nblk is not a block this
+	 * record has: clause 3 would mark its grain allocated and clause
+	 * 5 would then clear the entry that names it, leaking the grain
+	 * with nothing left pointing at it.
+	 */
 	nblk = blkcount(o->len, s->sb.blksz);
-	USED(nblk);
 	for(i = 0; i < o->nmap; i++){
-		if(o->map[i].blk >= s->sb.nblkmax){
-			werrstr("Eobj: block %lud, nblkmax %lud", o->map[i].blk,
-				s->sb.nblkmax);
+		if(o->map[i].blk >= s->sb.nblkmax || o->map[i].blk >= nblk){
+			werrstr("Eobj: block %lud, nblk %llud, nblkmax %lud",
+				o->map[i].blk, nblk, s->sb.nblkmax);
 			return -1;
 		}
 		if(o->map[i].grain >= s->sb.ngrains){
