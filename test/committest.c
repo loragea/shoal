@@ -347,9 +347,9 @@ onecrash(char *point, int mode, char *op, int expectnew)
 	else if(strcmp(op, "partial write") == 0)
 		r = wr(s, "m", buf, 100, 7, 3);
 	else if(strcmp(op, "truncate") == 0)
-		r = objtrunc(s, o, 1, Blk, 3, 1);
+		r = objtrunc(s, o, 1, Blk, 3, 1, nil, 0);
 	else
-		r = objremove(s, o, 1, 3, 1);
+		r = objremove(s, o, 1, 3, 1, nil, 0);
 	USED(r);
 	storeclose(s);
 	simrevive(d);
@@ -1841,7 +1841,7 @@ tresv(void)
 	if(dirtydel(s, o, 2, "peer.0") >= 0)
 		fail("an Edirty drew on §6's reserved tail");
 	checks++;
-	if(objremove(s, o, 2, 900, 1) < 0)
+	if(objremove(s, o, 2, 900, 1, nil, 0) < 0)
 		fail("delete does not always work on the reserved tail: %r");
 	storeclose(s);
 	devclose(d);

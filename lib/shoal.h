@@ -655,7 +655,22 @@ uvlong	qidalloc(Store*);
 int	epochadopt(Store*, uvlong epoch);
 int	monidpin(Store*, uchar id[16]);
 
-/* the object API.  Digest and csum handling is §4's. */
+/*
+ * The object API.  Digest and csum handling is §4's.
+ *
+ * **Per-object serialisation is the caller's** (§3.1, §4, §7): the
+ * functions below serialise only the state every proc shares, so two
+ * concurrent writers to one object read the same old map and both
+ * free the same grains.  The server's Reqqueue pool (§7) is what
+ * orders them; a T1 program uses one proc per object.
+ *
+ * Every mutating call takes the Edirty records layer-a §5.4 step 5b
+ * asks for, because §14(2) puts them in the same log record as the
+ * update they belong to: either both are durable or neither.  A
+ * separate dirtyadd is a second record, and a crash between the two
+ * leaves the update durable and the stale mark absent — layer-a
+ * §5.4's `degraded' case, arrived at silently.
+ */
 int	objstat(Store*, uchar *oid, int oidlen, Objinfo*);
 int	objcreate(Store*, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 		Objinfo*);
@@ -663,10 +678,12 @@ long	objread(Store*, uchar *oid, int oidlen, void *a, long n, uvlong off);
 int	objwrite(Store*, uchar *oid, int oidlen, void *a, long n, uvlong off,
 		uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr);
 int	objtrunc(Store*, uchar *oid, int oidlen, uvlong len, uvlong ver,
-		uvlong wepoch);
-int	objremove(Store*, uchar *oid, int oidlen, uvlong ver, uvlong wepoch);
+		uvlong wepoch, Dirtyrec *dr, int ndr);
+int	objremove(Store*, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
+		Dirtyrec *dr, int ndr);
 int	objdiscard(Store*, uchar *oid, int oidlen);
-int	objcorrupt(Store*, uchar *oid, int oidlen, int set);
+int	objcorrupt(Store*, uchar *oid, int oidlen, int set, Dirtyrec *dr,
+		int ndr);
 
 /*
  * Verify, §8.  It answers the set of mismatching block indices, and
@@ -692,6 +709,6 @@ ulong	dirtycount(Store*);
 /* multi-request op=full stages, §3.6 */
 Stage*	stageopen(Store*, uchar *oid, int oidlen, uvlong len, int force);
 int	stagewrite(Stage*, void *a, long n, uvlong off);
-int	stagefinal(Stage*, uvlong ver, uvlong wepoch);
+int	stagefinal(Stage*, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr);
 void	stagediscard(Stage*);
 void	stagesweep(Store*, vlong now);

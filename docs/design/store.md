@@ -1393,10 +1393,26 @@ time of the last chunk. It is owned by the fid.
   Nothing is published and no log record is written.
 - **`final=1`** takes the object's queue (§7), re-reads the
   receiver's current key, applies layer-a §5.5's comparison against
-  it — greater, or equal with `force=1` — and, if it passes, commits
-  one `Eobj` naming every staged block and freeing every grain the
-  object held before. If it fails, the stage is discarded exactly as
-  below and the error is layer-a §5.5's.
+  it — strictly greater, or equal with `force=1` — and, if it passes,
+  commits one `Eobj` naming every staged block and freeing every
+  grain the object held before. If it fails, the stage is discarded
+  exactly as below and the error is layer-a §5.5's `stale version`.
+
+  **Two receivers have no key to defend, and the push applies to
+  both whatever it carries.** The first is an object this instance
+  does not hold: absence is not a key (layer-a §1.3), and it is the
+  common case for a heal. The same `Eobj` carries the create — this
+  commit reserves the index slot and the `qid.path` — because
+  creating the object first and staging into it afterwards would
+  publish a live zero-length object at the winning key before the
+  content landed, and a crash between the two would leave it live,
+  empty and outranking every good copy, so the resync it was meant to
+  complete would never be attempted again. The second is a local copy
+  whose `corrupt` flag is set (§8): it contributes no key at all
+  (layer-a §1.3, and D14's rule in §5.5), so a holder that committed
+  `(E, ver+1)` and then lost the content takes the serving primary's
+  repair at the lower `(E, ver)`. The push does not clear the flag —
+  §8 clears it from the verify that finds every block matching again.
 - **Lifetime.** A stage is discarded, and its reservations released,
   on `Tclunk` of the fid, on a `Tflush` of any of its chunks, when no
   chunk for it has arrived for `stagems` (policy, default
@@ -2070,17 +2086,19 @@ key-preserving `Eobj`, and the object leaves `/lost`. If the corrupt
 copy is the only copy, nothing repairs it and layer-a §7.5's `object
 lost` is the honest outcome.
 
-**One repair this store does not yet implement.** A corrupt holder
-whose own stored key is *greater* than the winner's — it committed
-`(E, ver+1)` and the content then went bad while the primary kept
-`(E, ver)` — contributes no key, so the primary wins arbitration at
-the lower key and its `op=full force=1` arrives as neither greater
-nor equal. Layer-a §5.5 accepts that push: a receiver whose own copy
-fails local verification treats it as absent for the comparison and
-takes the push at any key (D14). This store does not implement it
-yet: §3.6's `final=1` comparison, which is where the exemption
-belongs, is described there and not yet written. So today the copy
-stays in `/lost` and goes on blocking the tombstone discard.
+**The repair of a corrupt holder that outranks the winner.** A
+corrupt holder whose own stored key is *greater* than the winner's —
+it committed `(E, ver+1)` and the content then went bad while the
+primary kept `(E, ver)` — contributes no key, so the primary wins
+arbitration at the lower key and its `op=full force=1` arrives as
+neither greater nor equal. Layer-a §5.5 accepts that push: a receiver
+whose own copy fails local verification treats it as absent for the
+comparison and takes the push at any key (D14). §3.6's `final=1`
+comparison is where the exemption lives and it applies it: a stage
+committed against a copy whose `corrupt` flag is set is not compared
+at all. The flag survives the push, so the object stays out of
+arbitration until a verify finds every block matching and clears it
+with the key-preserving `Eobj` above.
 
 A commit that does not advance the key is a first-class case in this
 store, and there are three of them: block repair, whole-object

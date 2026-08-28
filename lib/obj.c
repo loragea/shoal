@@ -42,6 +42,8 @@ struct Upd
 	int	emapresv;		/* ... and an extent-map slot */
 };
 
+static void updclose(Upd*);
+
 static void
 updfree(Upd *u)
 {
@@ -393,6 +395,68 @@ updopen(Upd *u, Store *s, uchar *oid, int oidlen, uvlong newlen, int wanttomb)
 			emapresvclr(s, u->newslot);
 		qunlock(&s->qlstate);
 		free(u->e.oid);
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * Start an update of an object this instance does not hold: reserve
+ * an index slot and a qid.path so that one Eobj carries the create
+ * and the content together.  layer-a §5.5's op=full is the
+ * whole-object resync and the receiver holding nothing is its common
+ * case — §1.3 makes absence lose arbitration against any verifying
+ * copy, so absence is what a heal is usually repairing.  Creating the
+ * object first and staging into it afterwards would publish a live
+ * zero-length object at the winning key before the content landed,
+ * which is what §3.1 and §3.3 exist to prevent: a crash between the
+ * two leaves the object live, empty and at the key that wins, so the
+ * resync it was meant to complete is never attempted again.
+ */
+static int
+updnew(Upd *u, Store *s, uchar *oid, int oidlen, uvlong newlen)
+{
+	uvlong qid;
+
+	memset(u, 0, sizeof *u);
+	u->s = s;
+	u->newlen = newlen;
+	u->nblk = blkcount(newlen, s->sb.blksz);
+	u->oldnblk = 0;
+	qlock(&s->qlstate);
+	if(slotalloc(s, &u->slot) < 0){
+		qunlock(&s->qlstate);
+		werrstr("disk full");
+		return -1;
+	}
+	u->slotresv = 1;
+	if(u->nblk > 1){
+		if(emapalloc(s, &u->newslot) < 0){
+			slotresvclr(s, u->slot);
+			qunlock(&s->qlstate);
+			werrstr("disk full");
+			return -1;
+		}
+		u->emapresv = 1;
+	}
+	qunlock(&s->qlstate);
+	u->oslot = u->newslot != 0;
+	if((u->e.oid = malloc(oidlen)) == nil){
+		updabort(u);
+		return -1;
+	}
+	memmove(u->e.oid, oid, oidlen);
+	u->e.oidlen = oidlen;
+	if((qid = qidalloc(s)) == 0){
+		werrstr("qid.path: %r");
+		updabort(u);
+		updclose(u);
+		return -1;
+	}
+	u->e.qidpath = qid;
+	if(u->newslot != 0 && (u->cnew = emapget(s, u->newslot, 1)) == nil){
+		updabort(u);
+		updclose(u);
 		return -1;
 	}
 	return 0;
@@ -829,7 +893,7 @@ objwrite(Store *s, uchar *oid, int oidlen, void *a, long n, uvlong off,
 
 int
 objtrunc(Store *s, uchar *oid, int oidlen, uvlong len, uvlong ver,
-	uvlong wepoch)
+	uvlong wepoch, Dirtyrec *dr, int ndr)
 {
 	Upd u;
 	Omap mold;
@@ -856,7 +920,7 @@ objtrunc(Store *s, uchar *oid, int oidlen, uvlong len, uvlong ver,
 		return -1;
 	}
 	free(buf);
-	if(updcommit(&u, Slive, ver, wepoch, time(nil), 0, nil, 0) < 0){
+	if(updcommit(&u, Slive, ver, wepoch, time(nil), 0, dr, ndr) < 0){
 		updclose(&u);
 		return -1;
 	}
@@ -870,7 +934,8 @@ objtrunc(Store *s, uchar *oid, int oidlen, uvlong len, uvlong ver,
  * holds no extent-map slot, so the slot is released with the content.
  */
 int
-objremove(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch)
+objremove(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
+	Dirtyrec *dr, int ndr)
 {
 	Upd u;
 	Omap mold;
@@ -888,7 +953,7 @@ objremove(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch)
 		updclose(&u);
 		return -1;
 	}
-	if(updcommit(&u, Stomb, ver, wepoch, time(nil), 0, nil, 0) < 0){
+	if(updcommit(&u, Stomb, ver, wepoch, time(nil), 0, dr, ndr) < 0){
 		updclose(&u);
 		return -1;
 	}
@@ -904,7 +969,7 @@ objremove(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch)
  * alone, and replay would clear what a scrub had found.
  */
 int
-objcorrupt(Store *s, uchar *oid, int oidlen, int set)
+objcorrupt(Store *s, uchar *oid, int oidlen, int set, Dirtyrec *dr, int ndr)
 {
 	Upd u;
 	Omap mold;
@@ -921,7 +986,7 @@ objcorrupt(Store *s, uchar *oid, int oidlen, int set)
 		return -1;
 	}
 	if(updcommit(&u, u.e.state, u.e.ver, u.e.wepoch, u.e.mtime, set,
-		nil, 0) < 0){
+		dr, ndr) < 0){
 		updclose(&u);
 		return -1;
 	}
@@ -1302,18 +1367,66 @@ stagediscard(Stage *g)
  * commit's apply, so nothing about the transfer was ever durable
  * until this moment.
  */
+/* layer-a §1.3's arbitration key, compared lexicographically */
+static int
+keycmp(uvlong we, uvlong ver, uvlong we2, uvlong ver2)
+{
+	if(we != we2)
+		return we < we2 ? -1 : 1;
+	if(ver != ver2)
+		return ver < ver2 ? -1 : 1;
+	return 0;
+}
+
 int
-stagefinal(Stage *g, uvlong ver, uvlong wepoch)
+stagefinal(Stage *g, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 {
 	Store *s;
 	Upd u;
 	Omap mold;
 	uvlong i;
 	uchar dig[Blkdlen];
+	long slot;
+	int absent, corrupt, c;
 
 	s = g->s;
-	if(updopen(&u, s, g->oid, g->oidlen, g->len, 0) < 0)
+	qlock(&s->qlstate);
+	slot = ientfind(s, g->oid, g->oidlen);
+	absent = slot < 0 || s->idx[slot].state == Sfree;
+	qunlock(&s->qlstate);
+	if(absent){
+		if(updnew(&u, s, g->oid, g->oidlen, g->len) < 0)
+			return -1;
+	}else if(updopen(&u, s, g->oid, g->oidlen, g->len, 1) < 0)
 		return -1;
+	corrupt = !absent && (u.e.flags & Icorrupt) != 0;
+	/*
+	 * layer-a §5.5's comparison, made once here and against the
+	 * receiver's then-current key: strictly greater, or equal with
+	 * force=1, which is §1.3's divergence repair.  Earlier chunks
+	 * stage without comparing, and a concurrent local update between
+	 * chunks is what this exists to catch.
+	 *
+	 * D14 is the third case.  A copy that fails local verification
+	 * contributes no key (§1.3) — on the wire it is §5.6's corrupt=1
+	 * meta response — so it has no key to defend and the push
+	 * applies at any key, greater, equal or lower.  Without the
+	 * exemption a holder that committed (E, ver+1) and then lost the
+	 * content to a media fault refuses the serving primary's repair
+	 * push at the lower (E, ver) as `stale version', by the very
+	 * copy that asked for it, and is unrepairable for the life of
+	 * the disk.  The flag itself is not cleared here: §8 clears it
+	 * from the verify that finds every block matching again.
+	 */
+	if(!absent && !corrupt){
+		c = keycmp(wepoch, ver, u.e.wepoch, u.e.ver);
+		if(c < 0 || (c == 0 && !g->force)){
+			updabort(&u);
+			updclose(&u);
+			werrstr("stale version");
+			return -1;
+		}
+	}
 	mapopen(s, &mold, &u.e, u.cold);
 	for(i = 0; i < u.oldnblk; i++)
 		if(addfree(&u, mapgrain(&mold, i)) < 0){
@@ -1332,7 +1445,7 @@ stagefinal(Stage *g, uvlong ver, uvlong wepoch)
 			return -1;
 		}
 	}
-	if(updcommit(&u, Slive, ver, wepoch, time(nil), 0, nil, 0) < 0){
+	if(updcommit(&u, Slive, ver, wepoch, time(nil), corrupt, dr, ndr) < 0){
 		updclose(&u);
 		return -1;
 	}

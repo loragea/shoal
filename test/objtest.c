@@ -45,7 +45,7 @@ trunc(Store *s, char *name, uvlong len, uvlong ver)
 	uchar o[Oidmax];
 
 	oidof(o, name);
-	return objtrunc(s, o, strlen(name), len, ver, 1);
+	return objtrunc(s, o, strlen(name), len, ver, 1, nil, 0);
 }
 
 static int
@@ -54,7 +54,7 @@ rmv(Store *s, char *name, uvlong ver)
 	uchar o[Oidmax];
 
 	oidof(o, name);
-	return objremove(s, o, strlen(name), ver, 1);
+	return objremove(s, o, strlen(name), ver, 1, nil, 0);
 }
 
 static int
@@ -551,7 +551,7 @@ tstage(void)
 		if(stagewrite(g, buf, Blk, 0) < 0
 		|| stagewrite(g, buf + Blk, Blk, Blk) < 0)
 			fail("stagewrite: %r");
-		if(stagefinal(g, 9, 1) < 0)
+		if(stagefinal(g, 9, 1, nil, 0) < 0)
 			fail("stagefinal: %r");
 	}
 	rd(s, "full", got, 2*Blk, 0, "op=full");
@@ -663,7 +663,7 @@ texhaust(void)
 	/* a delete still works, and its discard returns the slot */
 	snprint(name, sizeof name, "s%d", 0);
 	oidof(o, name);
-	if(objremove(s, o, strlen(name), 2, 1) < 0)
+	if(objremove(s, o, strlen(name), 2, 1, nil, 0) < 0)
 		fail("delete under slot exhaustion: %r");
 	if(objdiscard(s, o, strlen(name)) < 0)
 		fail("tombstone discard under slot exhaustion: %r");
@@ -861,9 +861,9 @@ ttomb(void)
 	refused("a write to a tombstone",
 		objwrite(s, oid, 1, buf, 16, 0, 4, 1, nil, 0),
 		"object deleted");
-	refused("a truncate of a tombstone", objtrunc(s, oid, 1, 16, 4, 1),
+	refused("a truncate of a tombstone", objtrunc(s, oid, 1, 16, 4, 1, nil, 0),
 		"object deleted");
-	refused("a delete of a tombstone", objremove(s, oid, 1, 4, 1),
+	refused("a delete of a tombstone", objremove(s, oid, 1, 4, 1, nil, 0),
 		"object deleted");
 	refused("a read of an id nothing holds",
 		objread(s, (uchar*)"zz", 2, buf, 16, 0), "no such object");
@@ -929,7 +929,7 @@ tcorrupt(void)
 	mk(s, "c");
 	mustwr(s, "c", buf, 2*Blk, 0);
 	oidof(oid, "c");
-	if(objcorrupt(s, oid, 1, 1) < 0)
+	if(objcorrupt(s, oid, 1, 1, nil, 0) < 0)
 		fail("objcorrupt: %r");
 	if(objstat(s, oid, 1, &oi) < 0)
 		fail("objstat: %r");
@@ -945,7 +945,7 @@ tcorrupt(void)
 		fail("objstat: %r");
 	eqv("replay does not forget the corrupt flag", oi.corrupt, 1);
 	mustverify(s, "c", "replayed");
-	if(objcorrupt(s, oid, 1, 0) < 0)
+	if(objcorrupt(s, oid, 1, 0, nil, 0) < 0)
 		fail("objcorrupt clear: %r");
 	if(objstat(s, oid, 1, &oi) < 0)
 		fail("objstat: %r");
@@ -995,7 +995,7 @@ tbounds(void)
 		objwrite(s, o, 1, buf, 2, objmax - 1, 2, 1, nil, 0),
 		"object too large");
 	refused("a truncate past objmax",
-		objtrunc(s, o, 1, objmax + 1, 2, 1), "object too large");
+		objtrunc(s, o, 1, objmax + 1, 2, 1, nil, 0), "object too large");
 	refused("a read of a negative count",
 		objread(s, o, 1, buf, -1, 0), "negative read");
 

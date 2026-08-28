@@ -234,7 +234,7 @@ tholes(void)
 
 	/* truncate within a block re-hashes it over fewer bytes */
 	oidof(oid, "sparse");
-	if(objtrunc(s, oid, 6, 5*Blk + 3, 3, 1) < 0)
+	if(objtrunc(s, oid, 6, 5*Blk + 3, 3, 1, nil, 0) < 0)
 		fail("objtrunc: %r");
 	else
 		shtrunc(&sh, 5*Blk + 3);
@@ -858,7 +858,7 @@ textend(void)
 	mkobj(s, "q", 1);
 	wr(s, "q", &q, buf, 100, 0, 2);
 	oidof(oid, "q");
-	if(objtrunc(s, oid, 1, 3*Blk + 7, 3, 1) < 0)
+	if(objtrunc(s, oid, 1, 3*Blk + 7, 3, 1, nil, 0) < 0)
 		fail("objtrunc extend: %r");
 	else
 		shtrunc(&q, 3*Blk + 7);
@@ -868,7 +868,7 @@ textend(void)
 	mkobj(s, "r", 1);
 	wr(s, "r", &r, buf, 100, 0, 2);
 	oidof(oid, "r");
-	if(objtrunc(s, oid, 1, 300, 3, 1) < 0)
+	if(objtrunc(s, oid, 1, 300, 3, 1, nil, 0) < 0)
 		fail("objtrunc extend within a block: %r");
 	else
 		shtrunc(&r, 300);
@@ -883,12 +883,12 @@ textend(void)
 	mkobj(s, "t", 1);
 	wr(s, "t", &t, buf, 200, 0, 2);
 	oidof(oid, "t");
-	if(objtrunc(s, oid, 1, 40, 3, 1) < 0)
+	if(objtrunc(s, oid, 1, 40, 3, 1, nil, 0) < 0)
 		fail("objtrunc shrink: %r");
 	else
 		shtrunc(&t, 40);
 	checkobj(s, "t", &t, "truncated within a block");
-	if(objtrunc(s, oid, 1, 400, 4, 1) < 0)
+	if(objtrunc(s, oid, 1, 400, 4, 1, nil, 0) < 0)
 		fail("objtrunc re-extend: %r");
 	else
 		shtrunc(&t, 400);
@@ -898,7 +898,7 @@ textend(void)
 	mkobj(s, "v", 1);
 	wr(s, "v", &v, buf, 200, 0, 2);
 	oidof(oid, "v");
-	if(objtrunc(s, oid, 1, 40, 3, 1) < 0)
+	if(objtrunc(s, oid, 1, 40, 3, 1, nil, 0) < 0)
 		fail("objtrunc shrink: %r");
 	else
 		shtrunc(&v, 40);
@@ -913,16 +913,16 @@ textend(void)
 	 */
 	mkobj(s, "h", 1);
 	oidof(oid, "h");
-	if(objtrunc(s, oid, 1, Blk, 2, 1) < 0)
+	if(objtrunc(s, oid, 1, Blk, 2, 1, nil, 0) < 0)
 		fail("objtrunc to a hole: %r");
 	else
 		shtrunc(&h, Blk);
-	if(objtrunc(s, oid, 1, 40, 3, 1) < 0)
+	if(objtrunc(s, oid, 1, 40, 3, 1, nil, 0) < 0)
 		fail("objtrunc a hole down: %r");
 	else
 		shtrunc(&h, 40);
 	checkobj(s, "h", &h, "a hole truncated within itself");
-	if(objtrunc(s, oid, 1, 80, 4, 1) < 0)
+	if(objtrunc(s, oid, 1, 80, 4, 1, nil, 0) < 0)
 		fail("objtrunc a hole up: %r");
 	else
 		shtrunc(&h, 80);
