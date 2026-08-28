@@ -32,6 +32,12 @@
  *   - the hash table, the LRU and the pin counts are qlemap's.
  *   - eviction takes only unpinned, clean entries, and an unpinned
  *     entry's dirty flag is stable because only a pin holder sets it.
+ *     An entry the checkpointer has taken off the dirty list is
+ *     clean and may be unpinned, so it carries wb for as long as its
+ *     write-back is in flight: a failed write-back has to have an
+ *     entry to mark dirty again (§2.8), and freeing it under the
+ *     checkpointer would leave the on-disk entry half written and
+ *     nothing in memory to rewrite it.
  */
 
 static Emape*
@@ -101,7 +107,7 @@ etrim(Store *s)
 
 	for(c = s->elrutail; c != nil && s->nemapc > s->emapcap; c = p){
 		p = c->prev;
-		if(c->pin == 0 && !c->dirty && !c->busy)
+		if(c->pin == 0 && !c->dirty && !c->busy && !c->wb)
 			efree(s, c);
 	}
 }
@@ -263,7 +269,7 @@ emapreclaim(Store *s)
 	s->edirty = nil;
 	for(c = s->elrutail; c != nil && s->nemapc > s->emapcap; c = next){
 		next = c->prev;
-		if(c->pin == 0 && !c->busy)
+		if(c->pin == 0 && !c->busy && !c->wb)
 			efree(s, c);
 	}
 	return 0;

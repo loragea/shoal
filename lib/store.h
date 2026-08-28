@@ -71,6 +71,7 @@ struct Emape
 	int	busy;
 	int	pin;
 	int	dirty;
+	int	wb;			/* the checkpointer is writing it back */
 	int	bad;			/* the on-disk entry failed its csum */
 	uchar	*p;			/* emapsz bytes */
 	Emape	*hnext;

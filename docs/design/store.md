@@ -1037,6 +1037,19 @@ proof, which needs a page to be dirty at checkpoint *N* **iff** a
 record in `(ckseq(N−1), ckseq(N)]` changed it; a stage that dirties a
 page with no record behind it is damage replay cannot repair.
 
+**A page whose write failed stays dirty.** The mark is cleared when
+the page image is packed, so a change made after the pack re-marks the
+page; if the write then fails, the mark is put back before the
+checkpoint gives up. Losing it would not be an aborted checkpoint but
+a silent one: the page is clean, so the *next* checkpoint skips it and
+publishes a `ckseq` and a `cklogoff` past the records that dirtied it,
+and reclaims their log space — and the committed state is then in
+neither the log nor the region. It also breaks §3.4's proof, which
+needs a page to be dirty at checkpoint *N* **iff** a record in
+`(ckseq(N−1), ckseq(N)]` changed it; a page a record changed inside
+that range and that is not dirty at *N* is the same hole from the
+other side.
+
 The new `ckseq`/`cklogoff` become publishable only after step 2's
 flush has returned (§2.2), so a publish triggered by anything else
 mid-checkpoint carries the old mark.

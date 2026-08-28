@@ -39,6 +39,19 @@
  * and one more that is easy to lose: the new ckseq/cklogoff become
  * *publishable* only once the flush has returned (§2.2), so a publish
  * triggered by anything else mid-checkpoint carries the old mark.
+ *
+ * **A page whose write failed stays dirty.**  The mark is cleared
+ * under qlstate when the page image is packed, so a change made after
+ * the pack re-marks the page and is not lost; if the write then
+ * fails, the mark is put back before the checkpoint gives up.  Losing
+ * it is not an aborted checkpoint but a silent one: the page is
+ * clean, so the *next* checkpoint skips it and publishes a ckseq and
+ * a cklogoff past the records that dirtied it, and reclaims their log
+ * space.  The committed state is then in neither the log nor the
+ * region.  An extent-map entry is the same rule with an extra step,
+ * because it is off the dirty list as well as unmarked: it is held
+ * out of the eviction set (wb) for as long as the write is in flight,
+ * so there is still an entry to put back.
  */
 
 enum
@@ -79,7 +92,7 @@ publishlocked(Store *s)
 		return -1;
 	superpack(p, &im);
 	off = sel.victim == 0 ? 0 : super1off(s->d);
-	if(devwrite(s->d, p, s->sb.secsz, off) < 0){
+	if(devwriteretry(s->d, p, s->sb.secsz, off) < 0){
 		free(p);
 		return -1;
 	}
@@ -240,9 +253,13 @@ checkpoint(Store *s)
 				freeidx(buf + j*Idxentsz);
 		}
 		qunlock(&s->qlstate);
-		if(devwrite(s->d, buf, s->sb.blksz,
-			s->sb.idxoff*(uvlong)s->sb.secsz + i*(uvlong)s->sb.blksz) < 0)
+		if(devwriteretry(s->d, buf, s->sb.blksz,
+			s->sb.idxoff*(uvlong)s->sb.secsz + i*(uvlong)s->sb.blksz) < 0){
 			r = -1;
+			qlock(&s->qlstate);
+			s->idxdirty[i] = 1;
+			qunlock(&s->qlstate);
+		}
 		devpoint(s->d, "ckpt", ++npage);
 		if(s->pubatpage != 0 && npage == s->pubatpage)
 			epochadopt(s, s->pub.epochhigh + 1);
@@ -258,11 +275,20 @@ checkpoint(Store *s)
 		s->edirty = c->dnext;
 		c->dnext = nil;
 		c->dirty = 0;
+		c->wb = 1;
 		slot = c->slot;
 		memmove(ebuf, c->p, s->sb.emapsz);
 		qunlock(&s->qlstate);
 		if(emapwrite(s, slot, ebuf) < 0)
 			r = -1;
+		qlock(&s->qlstate);
+		c->wb = 0;
+		if(r < 0 && !c->dirty){
+			c->dirty = 1;
+			c->dnext = s->edirty;
+			s->edirty = c;
+		}
+		qunlock(&s->qlstate);
 		devpoint(s->d, "ckpt", ++npage);
 		if(s->pubatpage != 0 && npage == s->pubatpage)
 			epochadopt(s, s->pub.epochhigh + 1);
@@ -285,9 +311,13 @@ checkpoint(Store *s)
 				freedirt(buf + j*Dirtentsz);
 		}
 		qunlock(&s->qlstate);
-		if(devwrite(s->d, buf, s->sb.blksz,
-			s->sb.dirtoff*(uvlong)s->sb.secsz + i*(uvlong)s->sb.blksz) < 0)
+		if(devwriteretry(s->d, buf, s->sb.blksz,
+			s->sb.dirtoff*(uvlong)s->sb.secsz + i*(uvlong)s->sb.blksz) < 0){
 			r = -1;
+			qlock(&s->qlstate);
+			s->dirtdirty[i] = 1;
+			qunlock(&s->qlstate);
+		}
 		devpoint(s->d, "ckpt", ++npage);
 		if(s->pubatpage != 0 && npage == s->pubatpage)
 			epochadopt(s, s->pub.epochhigh + 1);
@@ -310,9 +340,13 @@ checkpoint(Store *s)
 		bh.page = i;
 		bh.ckseq = ckseq;
 		bmpack(buf, s->sb.blksz, &bh);
-		if(devwrite(s->d, buf, s->sb.blksz,
-			s->sb.bmapoff*(uvlong)s->sb.secsz + i*(uvlong)s->sb.blksz) < 0)
+		if(devwriteretry(s->d, buf, s->sb.blksz,
+			s->sb.bmapoff*(uvlong)s->sb.secsz + i*(uvlong)s->sb.blksz) < 0){
 			r = -1;
+			qlock(&s->qlstate);
+			s->bmdirty[i] = 1;
+			qunlock(&s->qlstate);
+		}
 		devpoint(s->d, "ckpt", ++npage);
 		if(s->pubatpage != 0 && npage == s->pubatpage)
 			epochadopt(s, s->pub.epochhigh + 1);
