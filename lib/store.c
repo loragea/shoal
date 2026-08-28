@@ -847,19 +847,14 @@ storeopen(Dev *d, Storecfg *cfg)
 	s->logstart = s->sb.cklogoff - s->sb.logoff;
 	s->qidcur = s->pub.qidnext;
 	s->cklast = nsec();
-	n = 0;
-	if(s->cfg.spawn != nil){
-		if(!s->cfg.nockptproc){
-			if(storeproc(s, ckptproc, s) < 0){
-				werrstr("%s: checkpointer: %r", d->name);
-				storefree(s);
-				return nil;
-			}
-			s->ckproc = 1;
+	if(s->cfg.spawn != nil && !s->cfg.nockptproc){
+		if(storeproc(s, ckptproc, s) < 0){
+			werrstr("%s: checkpointer: %r", d->name);
+			storefree(s);
+			return nil;
 		}
-		n++;
+		s->ckproc = 1;
 	}
-	USED(n);
 	return s;
 }
 

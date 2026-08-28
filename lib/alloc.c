@@ -97,7 +97,7 @@ stagedhas(Store *s, ulong g)
 	return 0;
 }
 
-static void
+static int
 stagedadd(Store *s, ulong g)
 {
 	Sgrain *n;
@@ -105,12 +105,13 @@ stagedadd(Store *s, ulong g)
 	if((n = s->stagefree) != nil)
 		s->stagefree = n->next;
 	else if((n = malloc(sizeof *n)) == nil)
-		sysfatal("shoal: staged set: %r");
+		return -1;
 	n->g = g;
 	n->next = s->stagebuck[g % s->nstagebuck];
 	s->stagebuck[g % s->nstagebuck] = n;
 	s->nstaged++;
 	s->grainfree--;
+	return 0;
 }
 
 static int
@@ -152,8 +153,9 @@ grainalloc(Store *s, ulong *gp)
 		if(g == 0 || g >= n)
 			g = 1;
 		if(!bitget(s->bmap, g) && !stagedhas(s, g)){
+			if(stagedadd(s, g) < 0)
+				return -1;
 			s->graincur = g + 1;
-			stagedadd(s, g);
 			*gp = g;
 			return 0;
 		}
