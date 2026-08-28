@@ -1640,7 +1640,7 @@ tckptfail(void)
 	Objinfo oi;
 	Sbsel sel;
 	Super sb;
-	uchar *buf, o[Oidmax];
+	uchar *buf, *w, *got, o[Oidmax];
 	ulong slot;
 
 	d = newdisk();
@@ -1690,7 +1690,18 @@ tckptfail(void)
 		fail("objstat c1: %r");
 	slot = oi.emapslot;
 	istrue("a three-block object has an extent-map slot", slot != 0);
-	if(wr(s, "c1", buf, 3*Blk, 0, 3) < 0)
+	/*
+	 * The second image has to differ from the first: the rewrite
+	 * allocates fresh grains, so a map left stale on the platter still
+	 * names the *old* grains, and those hold bytes whose digests match
+	 * the stale map.  Writing the same content back would therefore
+	 * verify off the stale map and the test would pass whether or not
+	 * the entry went back on the dirty list.  With different bytes the
+	 * index entry carries ver 3's csum over the old digests, and both
+	 * the content and the digest array disagree.
+	 */
+	w = mkbuf(3*Blk, 211);
+	if(wr(s, "c1", w, 3*Blk, 0, 3) < 0)
 		fail("objwrite: %r");
 	simfaultat(d, Sfeio, 1, (vlong)emapentoff(&sb, slot), sb.emapsz);
 	checks++;
@@ -1704,12 +1715,28 @@ tckptfail(void)
 	if((s = mustopen(d, "after a failed extent-map write")) == nil){
 		devclose(d);
 		free(buf);
+		free(w);
 		return;
 	}
 	mustverify(s, "c1", "after a failed extent-map write");
+	got = malloc(3*Blk);
+	if(got == nil)
+		sysfatal("malloc: %r");
+	oidof(o, "c1");
+	checks++;
+	if(objread(s, o, 2, got, 3*Blk, 0) != 3*Blk)
+		fail("objread c1 after a failed extent-map write: %r");
+	else{
+		checks++;
+		if(memcmp(got, w, 3*Blk) != 0)
+			fail("after a failed extent-map write: c1 is not the "
+				"image that was acked");
+	}
+	free(got);
 	storeclose(s);
 	devclose(d);
 	free(buf);
+	free(w);
 }
 
 /*
