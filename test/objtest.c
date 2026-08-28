@@ -1396,6 +1396,29 @@ tbounds(void)
 		fail("objstat: %r");
 	eqv("and the object is untouched", oi.len, 0);
 
+	/*
+	 * A count-0 write changes nothing.  layer-a §2.4 extends at a
+	 * write *at* offset > len — bytes landing above it — and 9P
+	 * clients issue count-0 Twrites, so taking one as an extend would
+	 * resize the object and publish a new key for a call that wrote
+	 * nothing, leaving a replica that took it at a different len from
+	 * one that did not, at the same key.
+	 */
+	checks++;
+	if(objwrite(s, o, 1, buf, 0, 5000, 3, 1, nil, 0) < 0)
+		fail("a count-0 write was refused: %r");
+	storestat(s, &st2);
+	eqv("a count-0 write writes no record", st2.logfree, st.logfree);
+	if(objstat(s, o, 1, &oi) < 0)
+		fail("objstat: %r");
+	else{
+		eqv("a count-0 write past len does not extend", oi.len, 0);
+		eqv("and publishes no key", oi.ver, 1);
+	}
+	refused("a count-0 write past objmax",
+		objwrite(s, o, 1, buf, 0, objmax + 1, 3, 1, nil, 0),
+		"object too large");
+
 	/* the last byte objmax admits is still an ordinary write */
 	checks++;
 	if(objwrite(s, o, 1, buf, 1, objmax - 1, 2, 1, nil, 0) < 0)

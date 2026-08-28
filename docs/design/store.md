@@ -1424,6 +1424,12 @@ time of the last chunk. It is owned by the fid.
   `(E, ver+1)` and then lost the content takes the serving primary's
   repair at the lower `(E, ver)`. The push does not clear the flag —
   §8 clears it from the verify that finds every block matching again.
+
+  A **count-0 write** is not one of these and is not an extend
+  either: layer-a §2.4 extends at a write *at* an offset above `len`,
+  meaning bytes landing there, and a count of zero lands none. It
+  commits no record and changes no key, so a replica that took one
+  and a replica that did not stay at the same `len` (§4).
 - **Lifetime.** A stage is discarded, and its reservations released,
   on `Tclunk` of the fid, on a `Tflush` of any of its chunks, when no
   chunk for it has arrived for `stagems` (policy, default

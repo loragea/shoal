@@ -844,6 +844,20 @@ objwrite(Store *s, uchar *oid, int oidlen, void *a, long n, uvlong off,
 		werrstr(oi.state == Stomb ? "object deleted" : "no such object");
 		return -1;
 	}
+	/*
+	 * layer-a §2.4 extends an object at "a write at offset > len" —
+	 * bytes landing above it.  A count of zero lands none, and 9P
+	 * clients issue count-0 Twrites, so taking one as an extend would
+	 * resize the object, re-derive csum, bump ver and commit a record
+	 * for a call that wrote nothing.  A replica that took the
+	 * zero-count write would then sit at a different len from one
+	 * that did not, at the same key: layer-a §1.3's I3 through a
+	 * legal client call.  The existence and bounds tests above still
+	 * run, so a count-0 write to a tombstone or past objmax fails as
+	 * it should.
+	 */
+	if(n == 0)
+		return 0;
 	newlen = oi.len;
 	if(off + n > newlen)
 		newlen = off + n;
