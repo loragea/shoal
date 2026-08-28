@@ -594,9 +594,11 @@ tbadmap(void)
 	Storestat st;
 	Shadow sh;
 	Objinfo oi, oi2;
+	Vfy vfy;
 	Sbsel sel;
 	Super sup;
-	uchar *buf, rd[64], junk[8], oid[Oidmax];
+	Stage *g;
+	uchar *buf, *other, rd[64], junk[8], oid[Oidmax];
 	ulong slot, gf, sf;
 
 	memset(&sh, 0, sizeof sh);
@@ -641,9 +643,28 @@ tbadmap(void)
 	storestat(s, &st);
 	eqv("the slot the damaged map belongs to is condemned", st.nlost, 1);
 	eqv("and it is named", storelost(s, 0), oi.slot);
+	/*
+	 * D14: the copy fails local verification, so it MUST answer with
+	 * corrupt=1 and MUST NOT answer as absent — absence is a §1.5
+	 * positive confirmation this holder cannot vouch for, and /lost
+	 * carries no oid, so an unhashed slot would be absent for the
+	 * life of the disk.  What "not served" means is the content: no
+	 * path reads through the damaged map.
+	 */
 	checks++;
-	if(objstat(s, oid, 4, &oi2) >= 0)
-		fail("a condemned slot is still served");
+	if(objstat(s, oid, 4, &oi2) < 0)
+		fail("a condemned slot answers as absent: %r");
+	else{
+		istrue("a condemned slot answers corrupt", oi2.corrupt != 0);
+		eqv("with the key it had", oi2.ver, 2);
+		eqv("and the qid.path it had", oi2.qidpath, oi.qidpath);
+	}
+	checks++;
+	if(objverify(s, oid, 4, &vfy) >= 0)
+		fail("a damaged extent map was verified through");
+	checks++;
+	if(objwrite(s, oid, 4, buf, 64, 0, 3, 1, nil, 0) >= 0)
+		fail("a write was served through a damaged extent map");
 
 	/*
 	 * The condemnation has to survive a restart, or step 10's "its
@@ -687,6 +708,39 @@ tbadmap(void)
 		fail("a damaged extent map was served after a restart");
 	storestat(s, &st);
 	eqv("and the next read condemns the slot again", st.nlost, 1);
+
+	/*
+	 * D14 again, from the sending side: a copy that fails local
+	 * verification has no key to defend, so §5.5's op=full MUST be
+	 * accepted at any key — here the copy's own — and the heal must
+	 * land in the slot and at the qid.path the object already had,
+	 * which layer-a §2.3 wants stable.
+	 */
+	if((g = stageopen(s, oid, 4, 3*Blk, 0)) == nil)
+		fail("stageopen: %r");
+	else{
+		other = mkbuf(3*Blk, 55);
+		if(stagewrite(g, other, 3*Blk, 0) < 0)
+			fail("stagewrite: %r");
+		checks++;
+		if(stagefinal(g, 2, 1, nil, 0) < 0)
+			fail("op=full to a condemned copy: %r");
+		else{
+			shwrite(&sh, other, 3*Blk, 0);
+			if(objstat(s, oid, 4, &oi2) < 0)
+				fail("objstat after the heal: %r");
+			else{
+				eqv("the heal keeps the slot", oi2.slot,
+					oi.slot);
+				eqv("and the qid.path", oi2.qidpath,
+					oi.qidpath);
+			}
+			checkobj(s, "wide", &sh, "after the heal");
+			storestat(s, &st);
+			eqv("and the slot is no longer lost", st.nlost, 0);
+		}
+		free(other);
+	}
 	storeclose(s);
 	devclose(d);
 	free(buf);

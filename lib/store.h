@@ -327,6 +327,7 @@ void	ientpack(Store*, ulong slot, uchar *p);
 void	zerodigest(Store*, uvlong len, ulong i, uchar *dig);
 void	ienthash(Store*, ulong slot);
 void	ientunhash(Store*, ulong slot);
+void	storefound(Store*, ulong slot);
 long	ientfind(Store*, uchar *oid, int oidlen);
 
 /* commit.c — the log, group commit and the flusher */

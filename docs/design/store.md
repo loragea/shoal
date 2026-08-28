@@ -1424,6 +1424,13 @@ time of the last chunk. It is owned by the fid.
   `(E, ver+1)` and then lost the content takes the serving primary's
   repair at the lower `(E, ver)`. The push does not clear the flag —
   §8 clears it from the verify that finds every block matching again.
+  A slot §5 step 10 condemned for a damaged extent map is the same
+  case, reached the other way: it carries `corrupt` too, and the push
+  is taken at any key. It rebuilds the map whole in a fresh
+  extent-map slot (§2.7's slot rule), in the index slot and at the
+  `qid.path` the object already had, and the grains the damaged entry
+  named are unrecoverable and stay marked used until that slot is
+  written again.
 
   A **count-0 write** is not one of these and is not an extend
   either: layer-a §2.4 extends at a write *at* an offset above `len`,
@@ -1627,7 +1634,17 @@ lose arbitration against everything including absence.
     key and its `qid.path`. Its `/lost` line is not restored at start,
     because step 9 reads only the entries replay touched; the next
     read of the object re-establishes it by the same rule that found
-    the damage. The line carries `slot=<n>`
+    the damage. Such a slot also stays **hashed**, and takes the
+    index entry's `corrupt` flag: what "not served" means for it is
+    that nothing reads through the damaged map — content reads,
+    verifies and every update but §5.5's `op=full` refuse — while
+    `objstat` still answers with the key and `corrupt=1`, which is
+    what D14 requires of a holder that cannot vouch for its copy and
+    therefore MUST NOT answer as absent. The flag is written back with
+    the entry, so a restart still knows the copy is not to be trusted.
+    An `op=full` that heals it (§3.6) drops it from `/lost`; the
+    `corrupt` flag survives the push, as it does for every other
+    receiver §3.6 names, and it is §8's verify that clears it. The line carries `slot=<n>`
     and **omits `oid=`**, rather than printing 128 bytes the store
     does not trust or inventing an oid layer-a §1.2's grammar would
     not admit; §14(15) records the deviation from layer-a §2.2's

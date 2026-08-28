@@ -594,9 +594,18 @@ completemaps(Store *s)
  * csum128 and that replay did not touch is media damage the log
  * cannot repair, and it is found when the object is first read rather
  * than at start (§5 step 9 reads only the entries replay touched).
- * The slot goes to /lost with kind=corrupt: it is unhashed, so it is
- * not served, and it is not reused, because completemaps counts a bad
- * slot as used.
+ * The slot goes to /lost with kind=corrupt, and it is not reused,
+ * because completemaps counts a bad slot as used.
+ *
+ * The entry stays hashed and takes Icorrupt.  D14: a copy that fails
+ * local verification MUST answer with corrupt=1 and MUST NOT answer
+ * absent=1, because absence is a §1.5 positive confirmation this
+ * holder cannot vouch for — and unhashing the slot is exactly
+ * absence, for the life of the disk, since /lost carries no oid.
+ * What "not served" means is that no path reads through the damaged
+ * map: objread, objverify and every update but §5.5's op=full refuse
+ * on bad, and op=full rebuilds the map whole in the slot and at the
+ * qid.path the object already had.
  */
 void
 storecondemn(Store *s, ulong slot)
@@ -605,12 +614,30 @@ storecondemn(Store *s, ulong slot)
 
 	if(slot >= s->sb.nslots || s->idx[slot].bad)
 		return;
-	ientunhash(s, slot);
 	s->idx[slot].bad = 1;
+	s->idx[slot].flags |= Icorrupt;
 	if((l = realloc(s->lost, (s->nlost+1)*sizeof *l)) == nil)
 		return;
 	s->lost = l;
 	s->lost[s->nlost++] = slot;
+}
+
+/*
+ * ... and the reverse: an apply that rebuilt a condemned slot's map
+ * has repaired it, so it is no longer lost.  Caller holds qlstate.
+ */
+void
+storefound(Store *s, ulong slot)
+{
+	ulong i;
+
+	for(i = 0; i < s->nlost; i++)
+		if(s->lost[i] == slot){
+			memmove(&s->lost[i], &s->lost[i+1],
+				(s->nlost - i - 1)*sizeof *s->lost);
+			s->nlost--;
+			return;
+		}
 }
 
 /* §5 step 10: condemn what replay did not restore */

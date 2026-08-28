@@ -321,8 +321,14 @@ mapread(Store *s, ulong slot, ulong emapslot)
  * work out which extent-map slot the new length needs, and pin both
  * the map being read and the map the apply will change.
  */
+enum
+{
+	Utomb	= 1,	/* a tombstone may be opened */
+	Ubad	= 2,	/* ... and so may a slot §5 step 10 condemned */
+};
+
 static int
-updopen(Upd *u, Store *s, uchar *oid, int oidlen, uvlong newlen, int wanttomb)
+updopen(Upd *u, Store *s, uchar *oid, int oidlen, uvlong newlen, int flags)
 {
 	long slot;
 	Ient *e;
@@ -336,7 +342,7 @@ updopen(Upd *u, Store *s, uchar *oid, int oidlen, uvlong newlen, int wanttomb)
 		return -1;
 	}
 	e = &s->idx[slot];
-	if(e->state != Slive && !(wanttomb && e->state == Stomb)){
+	if(e->state != Slive && !((flags & Utomb) && e->state == Stomb)){
 		qunlock(&s->qlstate);
 		/*
 		 * layer-a §2.6's set is prefix-free by design and these two
@@ -351,6 +357,16 @@ updopen(Upd *u, Store *s, uchar *oid, int oidlen, uvlong newlen, int wanttomb)
 			: "no such object");
 		return -1;
 	}
+	/*
+	 * §5 step 10's "not served": every path but §5.5's op=full
+	 * refuses a slot whose extent map is damaged, because every grain
+	 * number and digest it would read is the damaged bytes'.
+	 */
+	if(e->bad && !(flags & Ubad)){
+		qunlock(&s->qlstate);
+		werrstr("slot %lud: extent map failed its checksum", slot);
+		return -1;
+	}
 	u->slot = slot;
 	u->e = *e;
 	u->e.oid = malloc(e->oidlen);
@@ -362,8 +378,14 @@ updopen(Upd *u, Store *s, uchar *oid, int oidlen, uvlong newlen, int wanttomb)
 	u->newlen = newlen;
 	u->nblk = blkcount(newlen, s->sb.blksz);
 	u->oldnblk = blkcount(u->e.len, s->sb.blksz);
+	/*
+	 * A condemned entry's map is rebuilt whole in a *fresh* slot: the
+	 * old one's bytes are the damage, so §2.7's Oslot rule is what
+	 * this update needs and clause 2 zeroes the new entry before
+	 * naming every block.
+	 */
 	u->newslot = u->e.emapslot;
-	if(u->nblk > 1 && u->e.emapslot == 0){
+	if(u->nblk > 1 && (u->e.emapslot == 0 || u->e.bad)){
 		if(emapalloc(s, &u->newslot) < 0){
 			qunlock(&s->qlstate);
 			free(u->e.oid);
@@ -376,7 +398,17 @@ updopen(Upd *u, Store *s, uchar *oid, int oidlen, uvlong newlen, int wanttomb)
 	u->oslot = u->newslot != u->e.emapslot;
 	qunlock(&s->qlstate);
 
-	if(u->e.emapslot != 0
+	/*
+	 * D14: a copy that fails local verification contributes no key
+	 * and has no old map to read — the entry that named its grains
+	 * *is* the damaged bytes.  Those grains are unrecoverable and
+	 * stay marked used until the slot's map is written again; the
+	 * update names none of them, so oldnblk is 0 and nothing reads
+	 * through mold.
+	 */
+	if(u->e.bad)
+		u->oldnblk = 0;
+	else if(u->e.emapslot != 0
 	&& (u->cold = mapread(s, u->slot, u->e.emapslot)) == nil){
 		qlock(&s->qlstate);
 		if(u->emapresv)
@@ -995,7 +1027,7 @@ objcorrupt(Store *s, uchar *oid, int oidlen, int set, Dirtyrec *dr, int ndr)
 
 	if(objstat(s, oid, oidlen, &oi) < 0)
 		return -1;
-	if(updopen(&u, s, oid, oidlen, oi.len, 1) < 0)
+	if(updopen(&u, s, oid, oidlen, oi.len, Utomb) < 0)
 		return -1;
 	mapopen(s, &mold, &u.e, u.cold);
 	/*
@@ -1461,9 +1493,9 @@ stagefinal(Stage *g, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 	if(absent){
 		if(updnew(&u, s, g->oid, g->oidlen, g->len) < 0)
 			return stagefail(g);
-	}else if(updopen(&u, s, g->oid, g->oidlen, g->len, 1) < 0)
+	}else if(updopen(&u, s, g->oid, g->oidlen, g->len, Utomb|Ubad) < 0)
 		return stagefail(g);
-	corrupt = !absent && (u.e.flags & Icorrupt) != 0;
+	corrupt = !absent && ((u.e.flags & Icorrupt) != 0 || u.e.bad);
 	/*
 	 * layer-a §5.5's comparison, made once here and against the
 	 * receiver's then-current key: strictly greater, or equal with

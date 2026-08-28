@@ -312,7 +312,10 @@ applyrec(Store *s, Objrec *o, Emape *c)
 	e->flags = 0;
 	if(o->oflags & Ocorrupt)
 		e->flags |= Icorrupt;
-	e->bad = 0;
+	if(e->bad){
+		e->bad = 0;
+		storefound(s, o->slot);
+	}
 	e->qidpath = o->qidpath;
 	e->len = o->len;
 	e->ver = o->ver;
