@@ -2486,8 +2486,10 @@ models what the real one is allowed to do:
   them.
 
 Points: `stage` (after the last staged grain write), `body:n` (after
-*n* body sectors), `precommit` (after the pre-flush, which follows the
-body write, and before the header write), `commit` (immediately before
+*n* of the record's **body** sectors — the wrap record and the header
+sector are not body, so the common one-sector record has none of
+these points at all), `precommit` (after the body write and **before**
+the pre-flush), `commit` (after the pre-flush and immediately before
 the header write, so the commit point is not reached), `postwrite`
 (after the header write returns, before the post-flush), `preack`,
 `ckpt:n` (after *n* checkpoint page writes), `super` (after a

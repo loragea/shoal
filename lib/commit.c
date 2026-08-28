@@ -276,9 +276,14 @@ packbatch(Store *s, Batch *b, uchar *p, long max, ulong *nent)
 	return n;
 }
 
-/* blksz-bounded pieces, which devwrite splits again if need be (§0) */
+/*
+ * blksz-bounded pieces, which devwrite splits again if need be (§0).
+ * body marks the one call that writes the record's body sectors:
+ * §13's body:n is "after n body sectors", so the wrap record and the
+ * header sector — which is the commit point itself — do not emit it.
+ */
 static int
-logwrite(Store *s, uchar *p, ulong n, uvlong sec)
+logwrite(Store *s, uchar *p, ulong n, uvlong sec, int body)
 {
 	uvlong off;
 	ulong m, done;
@@ -290,7 +295,8 @@ logwrite(Store *s, uchar *p, ulong n, uvlong sec)
 			m = s->sb.blksz;
 		if(devwriteretry(s->d, p + done, m, off + done) < 0)
 			return -1;
-		devpoint(s->d, "body", (done + m)/s->sb.secsz);
+		if(body)
+			devpoint(s->d, "body", (done + m)/s->sb.secsz);
 	}
 	return 0;
 }
@@ -321,20 +327,20 @@ writerec(Store *s, Batch *b, uchar *p)
 		r.nent = 0;
 		r.flags = Fwrap;
 		lrecpack(w, &r, s->sb.secsz);
-		if(logwrite(s, w, s->sb.secsz, b->wrapoff) < 0){
+		if(logwrite(s, w, s->sb.secsz, b->wrapoff, 0) < 0){
 			free(w);
 			return -1;
 		}
 		free(w);
 	}
 	if(b->nsec > 1
-	&& logwrite(s, p + s->sb.secsz, (b->nsec-1)*s->sb.secsz, b->off+1) < 0)
-		return -1;
-	if(flushnow(s) < 0)
+	&& logwrite(s, p + s->sb.secsz, (b->nsec-1)*s->sb.secsz, b->off+1, 1) < 0)
 		return -1;
 	devpoint(s->d, "precommit", 0);
+	if(flushnow(s) < 0)
+		return -1;
 	devpoint(s->d, "commit", 0);
-	if(logwrite(s, p, s->sb.secsz, b->off) < 0)
+	if(logwrite(s, p, s->sb.secsz, b->off, 0) < 0)
 		return -1;
 	devpoint(s->d, "postwrite", 0);
 	if(flushnow(s) < 0)
