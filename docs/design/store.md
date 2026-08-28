@@ -2,8 +2,8 @@
 
 Status: **design of record for M1** (2026-08-27), implementation
 policy under decisions.md D13; the one wire-level item it raises,
-§14(11)'s `op=meta corrupt=1` response, is a proposal awaiting
-ratification and is not part of the contract. This is the design of
+§14(11)'s `op=meta corrupt=1` response, is ratified (decisions.md
+D14) and part of the layer-a contract. This is the design of
 the per-instance local store that sits behind the Layer A 9P export,
 plus the much smaller store the monitor uses for its map. The
 contract it makes true locally is `docs/design/layer-a.md`; the
@@ -1934,18 +1934,10 @@ and write of the object answers `not ready`, cluster-wide, forever,
 on one media fault, with a good copy on the primary and a repairable
 one on the holder. So this store answers, and the answer is the
 ordinary `meta` line for the key it holds with **`corrupt=1`
-appended**, which is the grammar §14(11) proposes. shoal's own
+appended**, which is the grammar layer-a §5.6 defines. shoal's own
 callers honour that rule: the response satisfies the currency check
 and contributes no key, so it loses arbitration against everything
 including absence.
-
-Against a reader that does not know the attribute the line degrades
-to an ordinary `meta` line, which is a real deviation and is why
-§14(11) exists — but a bounded one: the corrupt holder refuses
-`op=get` (`checksum mismatch`), so a caller that arbitrated for it
-gets a failed pull and retries elsewhere rather than adopting
-unreadable content. `absent=1` has no such floor, and an error has
-none either.
 
 **The repair path.** Because the check completes, the object has a
 serving primary again, and that primary does what layer-a §1.3
@@ -1957,17 +1949,17 @@ key-preserving `Eobj`, and the object leaves `/lost`. If the corrupt
 copy is the only copy, nothing repairs it and layer-a §7.5's `object
 lost` is the honest outcome.
 
-**One repair this store cannot accept yet.** A corrupt holder whose
-own stored key is *greater* than the winner's — it committed
+**One repair this store does not yet implement.** A corrupt holder
+whose own stored key is *greater* than the winner's — it committed
 `(E, ver+1)` and the content then went bad while the primary kept
 `(E, ver)` — contributes no key, so the primary wins arbitration at
 the lower key and its `op=full force=1` arrives as neither greater
-nor equal. Layer-a §5.5's receiver comparison refuses it, this store
-implements that comparison as ratified, and the copy stays in `/lost`
-and goes on blocking the tombstone discard. Closing it is the second
-half of §14(11)'s proposal — a copy that fails local verification
-behaves as absent for the receiver's comparison too — and that is a
-wire change, so it waits for ratification with the rest.
+nor equal. Layer-a §5.5 accepts that push: a receiver whose own copy
+fails local verification treats it as absent for the comparison and
+takes the push at any key (D14). This store does not implement it
+yet: §3.6's `final=1` comparison, which is where the exemption
+belongs, is described there and not yet written. So today the copy
+stays in `/lost` and goes on blocking the tombstone discard.
 
 A commit that does not advance the key is a first-class case in this
 store, and there are three of them: block repair, whole-object
@@ -2794,10 +2786,10 @@ would be a wire change.
 Fifteen places where layer-a is silent, self-defeating, or
 contradicted by the measurements. Each entry states the tension, its
 resolution, and where the argument for it lives; nothing here repeats
-an argument made in a section above. Items 1–5, 8, 9, 12, 13 and 14
-are amendments **made** to `docs/design/layer-a.md`; items 6, 7 and 15
-are recorded here and not made there; items 10 and 11 are **proposals**
-rather than amendments, because they touch the wire.
+an argument made in a section above. Items 1–5, 8, 9, 11, 12, 13 and
+14 are amendments **made** to `docs/design/layer-a.md`; items 6, 7
+and 15 are recorded here and not made there; item 10 is a **proposal**
+rather than an amendment, because it touches the wire.
 
 1. **`cur` cannot usefully be durable (layer-a §5.2).** Layer-a
    required currency recorded "durably as `cur=<epoch>`" and, two
@@ -2884,52 +2876,12 @@ rather than amendments, because they touch the wire.
     (always). That is a clarification of an existing MUST, and it sits
     beside the amendment item 14 did make.
 
-11. **`op=meta` has no way to say "I hold a copy that fails
-    verification".** A corrupt holder must either claim a key layer-a
-    §1.3 forbids a failing copy from claiming, or answer `absent=1`,
-    which layer-a §1.5 counts as a positive confirmation licensing a
-    tombstone discard it cannot vouch for. This is a wire change, so
-    it is *proposed* here and not made. The grammar, as a third form
-    of the `meta` response in layer-a §5.6:
-
-        meta oid=<oid> ver=<u64> wepoch=<u64> csum=<hex64> len=<u64>
-             state=live|tomb cur=<u64> corrupt=1
-
-    with these rules. An instance whose copy of `<oid>` fails local
-    verification (layer-a §7.5) MUST set `corrupt=1` and MUST NOT
-    answer `absent=1`. A `corrupt=1` response **contributes no key**:
-    it MUST lose arbitration against everything including absence
-    (layer-a §1.3), whatever key the line carries, and it MUST NOT
-    count as either kind of layer-a §1.5 confirmation — so it blocks
-    a tombstone discard exactly as an unreachable instance does. It
-    **does satisfy** a layer-a §5.2 currency check as a *response*:
-    the check needs an `op=meta` response from every witness that is
-    `up=yes` or `up=heal`, and a corrupt holder is neither absent nor
-    unreachable, so a rule that withheld the answer would leave the
-    check permanently incompletable and darken the object
-    cluster-wide on one media fault — with a good copy on the primary
-    and a repairable one on the holder. Finally it licenses the
-    serving primary — which the completed check is what elects — to
-    push `op=full force=1` at an equal key to the reporting holder,
-    layer-a §1.3's key-preserving repair and the only way to repair a
-    holder whose key already equals the sender's. Symmetrically, a
-    copy that fails local verification MUST behave as **absent** for
-    the receiver's own layer-a §5.5 comparison: an instance that
-    answers `corrupt=1` for `<oid>` MUST accept an `op=full` for it
-    at any key — greater, equal or lower, `force=1` or not — because
-    a line that contributes no key has no key to defend. Without that
-    half the set has a hole exactly where it is needed: a holder that
-    committed `(E, ver+1)` and then lost the content to a media fault
-    contributes no key, so the primary wins arbitration at the lower
-    `(E, ver)` and its repair push arrives as neither greater nor
-    equal and is refused as `stale version` — by the very copy that
-    asked for it, which is then unrepairable for the life of the disk
-    and blocks the tombstone discard for as long. A response form
-    rather than an error, because `op=meta` is answered whatever the
-    instance's `up`/`status` (layer-a §6.4 F3) and a caller must be
-    able to tell a corrupt holder from an unreachable one. §8 says
-    what this store answers until the grammar is ratified, and what
-    that costs against a reader that does not know the attribute.
+11. **`op=meta` had no way to say "I hold a copy that fails
+    verification".** *Made:* the owner ratified the `corrupt=1`
+    response form and its companion receiver rule on 2026-08-28
+    (decisions.md D14); the grammar and the rules live in layer-a
+    §5.6, the receiver half in layer-a §5.5, and what this store
+    answers — and what it does not yet implement — in §8.
 
 12. **A tombstone's cost.** Layer-a §1.5 said a tombstone "occupies a
     metadata record and nothing else". True here — 256 bytes, because
