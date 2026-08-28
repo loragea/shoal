@@ -1378,6 +1378,25 @@ keycmp(uvlong we, uvlong ver, uvlong we2, uvlong ver2)
 	return 0;
 }
 
+/*
+ * Every exit from stagefinal releases the stage, which is what §3.6
+ * means by "the stage is discarded exactly as below": a comparison
+ * that refuses the push has ended the transfer, and so has a commit
+ * that could not be made, so the handle is spent either way and its
+ * reservations must not outlive it.  The caller's error is preserved
+ * across the release.
+ */
+static int
+stagefail(Stage *g)
+{
+	char e[ERRMAX];
+
+	rerrstr(e, sizeof e);
+	stagediscard(g);
+	werrstr("%s", e);
+	return -1;
+}
+
 int
 stagefinal(Stage *g, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 {
@@ -1396,9 +1415,9 @@ stagefinal(Stage *g, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 	qunlock(&s->qlstate);
 	if(absent){
 		if(updnew(&u, s, g->oid, g->oidlen, g->len) < 0)
-			return -1;
+			return stagefail(g);
 	}else if(updopen(&u, s, g->oid, g->oidlen, g->len, 1) < 0)
-		return -1;
+		return stagefail(g);
 	corrupt = !absent && (u.e.flags & Icorrupt) != 0;
 	/*
 	 * layer-a §5.5's comparison, made once here and against the
@@ -1424,7 +1443,7 @@ stagefinal(Stage *g, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 			updabort(&u);
 			updclose(&u);
 			werrstr("stale version");
-			return -1;
+			return stagefail(g);
 		}
 	}
 	mapopen(s, &mold, &u.e, u.cold);
@@ -1432,7 +1451,7 @@ stagefinal(Stage *g, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 		if(addfree(&u, mapgrain(&mold, i)) < 0){
 			updabort(&u);
 			updclose(&u);
-			return -1;
+			return stagefail(g);
 		}
 	for(i = 0; i < g->nblk; i++){
 		if(g->grain[i] != 0)
@@ -1442,12 +1461,12 @@ stagefinal(Stage *g, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 		if(addmap(&u, i, g->grain[i], dig) < 0){
 			updabort(&u);
 			updclose(&u);
-			return -1;
+			return stagefail(g);
 		}
 	}
 	if(updcommit(&u, Slive, ver, wepoch, time(nil), corrupt, dr, ndr) < 0){
 		updclose(&u);
-		return -1;
+		return stagefail(g);
 	}
 	updclose(&u);
 	qlock(&s->qlstate);

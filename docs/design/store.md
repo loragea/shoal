@@ -1395,8 +1395,10 @@ time of the last chunk. It is owned by the fid.
   receiver's current key, applies layer-a §5.5's comparison against
   it — strictly greater, or equal with `force=1` — and, if it passes,
   commits one `Eobj` naming every staged block and freeing every
-  grain the object held before. If it fails, the stage is discarded
-  exactly as below and the error is layer-a §5.5's `stale version`.
+  grain the object held before. If it fails it discards the stage
+  exactly as below, whatever the reason — the transfer is over either
+  way and its reservations must not outlive it — and where the reason
+  is the comparison the error is layer-a §5.5's `stale version`.
 
   **Two receivers have no key to defend, and the push applies to
   both whatever it carries.** The first is an object this instance

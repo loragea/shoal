@@ -710,5 +710,6 @@ ulong	dirtycount(Store*);
 Stage*	stageopen(Store*, uchar *oid, int oidlen, uvlong len, int force);
 int	stagewrite(Stage*, void *a, long n, uvlong off);
 int	stagefinal(Stage*, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr);
+			/* consumes the stage, whether it succeeds or not */
 void	stagediscard(Stage*);
 void	stagesweep(Store*, vlong now);
