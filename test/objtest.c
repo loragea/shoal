@@ -462,10 +462,10 @@ tstage(void)
 {
 	Dev *d;
 	Store *s;
-	Stage *g;
+	Stage *g, *g2;
 	Storestat st, st2;
-	uchar *buf, *got, o[Oidmax];
-	uvlong before;
+	uchar *buf, *got, o[Oidmax], o2[Oidmax];
+	uvlong before, before2;
 	int i;
 
 	d = newdisk();
@@ -544,7 +544,7 @@ tstage(void)
 		fail("op=full: content differs");
 	mustverify(s, "full", "op=full");
 
-	/* the per-fid and per-process bounds are both enforced */
+	/* the per-fid bound */
 	if((g = stageopen(s, o, 4, 64*1024, 0)) == nil)
 		fail("stageopen: %r");
 	else{
@@ -555,6 +555,49 @@ tstage(void)
 		if(i == 16)
 			fail("stagemax was not enforced");
 		stagediscard(g);
+	}
+
+	/*
+	 * ... and the per-process one, which the per-fid bound is not.
+	 * The number of /repl fids is not limited, so a hundred senders
+	 * each below stagemax still reserve the disk.  T1's stagemax is 8
+	 * and its stagetot 12, so two handles at 8 and 5 grains is the
+	 * smallest case that reaches the process bound with neither
+	 * handle reaching its own: the refusal below can only be
+	 * stagetot's.
+	 */
+	oidof(o, "full");
+	oidof(o2, "full2");
+	storestat(s, &st2);
+	before2 = st2.grainfree;
+	g = stageopen(s, o, 4, 8*Blk, 0);
+	g2 = stageopen(s, o2, 5, 8*Blk, 0);
+	if(g == nil || g2 == nil)
+		fail("stageopen: %r");
+	else{
+		for(i = 0; i < 8; i++)
+			if(stagewrite(g, buf, Blk, (uvlong)i*Blk) < 0)
+				break;
+		checks++;
+		if(i != 8)
+			fail("the first handle reached stagemax at %d grains", i);
+		for(i = 0; i < 8; i++)
+			if(stagewrite(g2, buf, Blk, (uvlong)i*Blk) < 0)
+				break;
+		checks++;
+		if(i == 8)
+			fail("stagetot was not enforced: two handles staged "
+				"16 grains where stagetot is 12");
+		else if(i >= 8)
+			fail("the second handle reached its own stagemax");
+		storestat(s, &st2);
+		eqv("the process bound is where the grains stopped",
+			st2.staged, 12);
+		stagediscard(g);
+		stagediscard(g2);
+		storestat(s, &st2);
+		eqv("and both handles release what they held", st2.grainfree,
+			before2);
 	}
 	storeclose(s);
 	devclose(d);

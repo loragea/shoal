@@ -405,6 +405,36 @@ trebuild(void)
 		st.grainfree);
 	checkobj(s, "many", &sh, "after rebuild");
 	storeclose(s);
+
+	/*
+	 * The damage above lands in the page's payload, which leaves the
+	 * ckseq field at offset 32 holding its own correct value — so it
+	 * says nothing about where Pmax comes from.  §2.5 takes Pmax over
+	 * the pages that pass their own checksum and nothing else: a page
+	 * that failed one has an arbitrary ckseq, and believing it makes
+	 * the coverage rule refuse to start a store whose log covers
+	 * everything it must.  Damaging the field itself is what tells
+	 * the two apart.
+	 */
+	memset(junk, 0xa5, sizeof junk);
+	simpoke(d, (vlong)sel.sb[sel.start].bmapoff*sel.sb[sel.start].secsz + 32,
+		junk, 8);
+	if((s = openstore(d)) == nil){
+		fail("a torn bitmap page's own ckseq must not stop the store "
+			"starting: %r");
+		devclose(d);
+		free(sh.p);
+		free(buf);
+		return;
+	}
+	storestat(s, &st2);
+	istrue("a page that failed its checksum contributes no ckseq",
+		st2.pmax <= st2.ckseq);
+	eqv("and it is rebuilt like any other", st2.bmaprebuild, 1);
+	eqv("the rebuilt free map still equals the committed one",
+		st2.grainfree, st.grainfree);
+	checkobj(s, "many", &sh, "after a torn page ckseq");
+	storeclose(s);
 	devclose(d);
 	free(sh.p);
 	free(buf);

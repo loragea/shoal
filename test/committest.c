@@ -516,6 +516,7 @@ struct Writer
 	int	nwrite;
 	int	done;
 	int	err;
+	char	e[ERRMAX];
 };
 
 static void
@@ -531,6 +532,7 @@ writerproc(void *a)
 	for(i = 0; i < w->nwrite; i++)
 		if(objwrite(w->s, o, strlen(w->name), buf, Blk, 0,
 			w->ver + i, 1, nil, 0) < 0){
+			rerrstr(w->e, sizeof w->e);
 			w->err = 1;
 			break;
 		}
@@ -873,6 +875,106 @@ tmaxbatch(void)
 	}
 	storeclose(s);
 	devclose(d);
+	free(w);
+}
+
+/*
+ * T1.4 and §2.8: the checkpoint mark is bound to the *durable*
+ * watermark and not to the next sequence number.  A checkpoint taken
+ * while a batch is in flight is the case that tells them apart: the
+ * batch has a seq and a log offset stamped and nothing on the platter,
+ * so publishing seqnext-1 and the log tail names a record the log does
+ * not carry — and then reclaims the space of the records before it.
+ * The batch lands afterwards, below the published mark, and the next
+ * start replays from above it, so an acked write is in neither the log
+ * replay reads nor the pages the checkpoint wrote.
+ *
+ * In a single-proc run seqnext-1 is the watermark always, which is why
+ * this needs §13's batch:n and a second proc.
+ */
+static void
+tckptmark(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Writer *w;
+	Objinfo oi;
+	uchar *buf, o[Oidmax];
+	int k;
+
+	d = newdisk();
+	if((s = openstore(d)) == nil){
+		fail("the checkpoint mark: storeopen: %r");
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(64, 113);
+	mk(s, "k0");
+	if(wr(s, "k0", buf, 64, 0, 2) < 0)
+		fail("setup write: %r");
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+
+	/*
+	 * On the heap, not on this proc's stack: §7's procs are
+	 * rfork(RFPROC|RFMEM) procs, which share the data and bss
+	 * segments and not the stack — and every proc's stack is mapped
+	 * at the same address, so a child writing through a pointer into
+	 * its parent's stack writes its own and nothing faults.
+	 */
+	if((w = mallocz(sizeof *w, 1)) == nil)
+		sysfatal("mallocz: %r");
+	w->s = s;
+	strcpy(w->name, "k0");
+	w->ver = 60;
+	w->nwrite = 1;
+	storestat(s, &st);
+	storehook(s, "batch", st.seqnext);
+	if(spawnproc(writerproc, w) < 0)
+		fail("spawn: %r");
+	for(k = 0; k < 4000; k++){
+		storestat(s, &st);
+		if(st.seqnext > st.watermark + 1)
+			break;
+		sleep(1);
+	}
+	istrue("the batch is in flight", st.seqnext > st.watermark + 1);
+	if(storecheckpoint(s) < 0)
+		fail("a checkpoint under a held batch: %r");
+	storestat(s, &st);
+	checks++;
+	if(st.ckseq > st.watermark)
+		fail("the checkpoint published ckseq %llud above the durable "
+			"watermark %llud", st.ckseq, st.watermark);
+
+	storehook(s, "batch", 0);
+	for(k = 0; k < 4000 && !w->done; k++)
+		sleep(1);
+	checks++;
+	if(!w->done)
+		fail("the held batch was never woken");
+	else if(w->err)
+		fail("the held batch failed: %s", w->e);
+	storeclose(s);
+
+	if((s = openstore(d)) == nil){
+		fail("after a checkpoint under a held batch: storeopen: %r");
+		devclose(d);
+		free(buf);
+		free(w);
+		return;
+	}
+	oidof(o, "k0");
+	if(objstat(s, o, 2, &oi) < 0)
+		fail("objstat k0: %r");
+	else
+		eqv("the acked write below the published mark replays",
+			oi.ver, 60);
+	mustverify(s, "k0", "after a checkpoint under a held batch");
+	storeclose(s);
+	devclose(d);
+	free(buf);
 	free(w);
 }
 
@@ -1619,6 +1721,7 @@ main(int argc, char **argv)
 	tgroup();
 	tmaxbatch();
 	tbignsec();
+	tckptmark();
 	tfailed();
 	tckptfail();
 	tintr();
