@@ -246,3 +246,40 @@ be off (`platform/9front-storage.md` §5).
 conforming implementation may store objects however it likes. The
 normative requirements are unchanged and live in `design/layer-a.md`
 §1.3, §5.4 and §8.2.
+
+## D14 — `op=meta corrupt=1` and the corrupt-receiver rule (2026-08-28, Victor)
+
+**Decision:** `op=meta` gains a third response form — the ordinary
+`meta` line with `corrupt=1` appended — which an instance whose copy
+fails local verification MUST answer, in place of a key or
+`absent=1`. It contributes no key, satisfies a currency check as a
+response, counts as neither kind of tombstone-discard confirmation,
+and licenses the serving primary's `op=full force=1` at an equal
+key. Its companion receiver rule: an instance whose own copy fails
+local verification treats that copy as absent for the `op=full`
+comparison and accepts the push at any key. Both live in
+`design/layer-a.md` §5.6 and §5.5.
+**Rationale:** Every answer available without it is wrong — a key
+claims the arbitration position §1.3 forbids a failing copy,
+`absent=1` is a lie that §1.5 counts as a positive confirmation
+licensing a discard the holder cannot vouch for, and an error is not
+a response at all, so §5.2's currency check becomes permanently
+incompletable and every read and write of the object answers
+`not ready` cluster-wide, forever, on one media fault. The receiver
+rule closes the case the response form alone leaves open: a holder
+that committed `(E, ver+1)` and then lost the content contributes no
+key, so the primary wins arbitration at the lower `(E, ver)` and its
+repair push arrives neither greater nor equal — refused
+`stale version` by the very copy that asked for it, unrepairable for
+the life of the disk and blocking tombstone discard for as long.
+A response form rather than an error because `op=meta` is answered
+whatever the instance's `up`/`status`, and a caller must be able to
+tell a corrupt holder from an unreachable one.
+**Owner's note on why not `absent=1`:** "I would have thought it
+ought to be solvable with absent=1, but that might have made the
+complexity and latency rise sharply."
+**Normative:** the response form and the receiver rule.
+**Implementation policy:** how an instance detects a failing copy and
+records the condition across a restart, and whether a repair
+transfers whole objects or only the mismatching blocks (layer-a
+§7.5; `design/store.md` §8).
