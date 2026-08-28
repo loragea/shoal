@@ -1921,7 +1921,10 @@ Three rules make that discipline checkable rather than aspirational:
    that list for ever while its batch-mates sleep on a batch that
    never completes. So the pending queue's items and the entries they
    carry are the store's own allocations, and a caller passes a
-   template that is copied into one.
+   template that is copied into one. The `Eobj`'s `map` and `freed`
+   arrays are the exception: they stay the caller's *heap*, which is
+   shared for both kinds of proc, and they are safe because the caller
+   stays inside `logcommit` until its batch has been applied.
 
 The extent-map cache is where rule 2 needs a mechanism rather than a
 promise. A miss inserts an entry marked *loading* under `qlemap` and
@@ -1978,7 +1981,8 @@ member of one, and there is no separate assigner or writer proc:
    build constant — and it costs nothing: how many requests a record
    takes is not something §3.2's argument depends on.
 3. When its post-flush returns and every lower-numbered batch has
-   been applied, it applies its whole batch under `qlstate` (§3.2) —
+   released the ordering — which a batch that failed does without
+   applying — it applies its whole batch under `qlstate` (§3.2) —
    over pinned extent maps, so no part of the apply faults —
    advances the watermark, and wakes its members, which answer
    `Rwrite`.
@@ -3158,8 +3162,9 @@ rather than an amendment, because it touches the wire.
     verification".** *Made:* the owner ratified the `corrupt=1`
     response form and its companion receiver rule on 2026-08-28
     (decisions.md D14); the grammar and the rules live in layer-a
-    §5.6, the receiver half in layer-a §5.5, and what this store
-    answers — and what it does not yet implement — in §8.
+    §5.6, the receiver half in layer-a §5.5 and — for a copy this
+    store has condemned — in §3.6 and §5 step 10, and what this store
+    answers in §8. §13's uncovered list is where the open half is.
 
 12. **A tombstone's cost.** Layer-a §1.5 said a tombstone "occupies a
     metadata record and nothing else". True here — 256 bytes, because
