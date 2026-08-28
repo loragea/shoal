@@ -780,12 +780,155 @@ tbigblk(void)
 	devclose(d);
 }
 
+/*
+ * §4's re-hashing rules, over every shape of write that changes a
+ * block's covered length without naming it.  layer-a §1.4 hashes the
+ * final partial block over its actual length, so `len' alone changes
+ * digests: a growth past a partial final block re-hashes the block
+ * that held the old len, a truncate re-hashes the block that holds
+ * the new one, and an extension over bytes a truncate left behind
+ * reads — and so hashes — as zeros.
+ *
+ * Each case asserts the whole of what §4 promises through checkobj:
+ * the object reads back what was written, its stored csum is the csum
+ * of that byte image, and verify agrees with both.  The failure this
+ * catches is the expensive one: a stored csum that matches the digest
+ * array while neither matches the bytes gives verify arraybad=0 with
+ * one bad block, which routes §8 to a block repair over bytes that
+ * were never wrong, and leaves two instances that took the same
+ * writes publishing one key with two csums (layer-a §1.3's I3).
+ */
+static void
+textend(void)
+{
+	Dev *d;
+	Store *s;
+	Shadow p, q, r, t, v, h;
+	uchar *buf, oid[Oidmax];
+
+	memset(&p, 0, sizeof p);
+	memset(&q, 0, sizeof q);
+	memset(&r, 0, sizeof r);
+	memset(&t, 0, sizeof t);
+	memset(&v, 0, sizeof v);
+	memset(&h, 0, sizeof h);
+	d = newdisk();
+	if((s = mustopen(d, "extend")) == nil)
+		return;
+	buf = mkbuf(4*Blk, 71);
+
+	/* a partial block 0, then a sparse extend far past it */
+	mkobj(s, "p", 1);
+	wr(s, "p", &p, buf, 100, 0, 2);
+	checkobj(s, "p", &p, "a partial first block");
+	wr(s, "p", &p, buf + 100, 16, 2*Blk, 3);
+	checkobj(s, "p", &p, "grown past the partial block");
+
+	/* the same growth by truncate, which names no block at all */
+	mkobj(s, "q", 1);
+	wr(s, "q", &q, buf, 100, 0, 2);
+	oidof(oid, "q");
+	if(objtrunc(s, oid, 1, 3*Blk + 7, 3, 1) < 0)
+		fail("objtrunc extend: %r");
+	else
+		shtrunc(&q, 3*Blk + 7);
+	checkobj(s, "q", &q, "extended by truncate");
+
+	/* and within the block that holds the old len */
+	mkobj(s, "r", 1);
+	wr(s, "r", &r, buf, 100, 0, 2);
+	oidof(oid, "r");
+	if(objtrunc(s, oid, 1, 300, 3, 1) < 0)
+		fail("objtrunc extend within a block: %r");
+	else
+		shtrunc(&r, 300);
+	checkobj(s, "r", &r, "extended within the block");
+
+	/*
+	 * A truncate down within a block and back up: the bytes between
+	 * the two lengths are not the object's content and §4 has the
+	 * extension read them as zeros, so the block is composed afresh
+	 * rather than re-hashed over what the grain still holds.
+	 */
+	mkobj(s, "t", 1);
+	wr(s, "t", &t, buf, 200, 0, 2);
+	oidof(oid, "t");
+	if(objtrunc(s, oid, 1, 40, 3, 1) < 0)
+		fail("objtrunc shrink: %r");
+	else
+		shtrunc(&t, 40);
+	checkobj(s, "t", &t, "truncated within a block");
+	if(objtrunc(s, oid, 1, 400, 4, 1) < 0)
+		fail("objtrunc re-extend: %r");
+	else
+		shtrunc(&t, 400);
+	checkobj(s, "t", &t, "truncated within a block and re-extended");
+
+	/* the same, reached by a partial write above the new len */
+	mkobj(s, "v", 1);
+	wr(s, "v", &v, buf, 200, 0, 2);
+	oidof(oid, "v");
+	if(objtrunc(s, oid, 1, 40, 3, 1) < 0)
+		fail("objtrunc shrink: %r");
+	else
+		shtrunc(&v, 40);
+	wr(s, "v", &v, buf + 300, 8, 150, 4);
+	checkobj(s, "v", &v, "written above a truncated length");
+
+	/*
+	 * The final block a *hole*, truncated and extended within it.
+	 * Nothing re-hashes it — clause 4 of the apply recomputes the
+	 * zero digest from len — which is the case a clause 4 restricted
+	 * to the range a growth covers gets wrong with no crash at all.
+	 */
+	mkobj(s, "h", 1);
+	oidof(oid, "h");
+	if(objtrunc(s, oid, 1, Blk, 2, 1) < 0)
+		fail("objtrunc to a hole: %r");
+	else
+		shtrunc(&h, Blk);
+	if(objtrunc(s, oid, 1, 40, 3, 1) < 0)
+		fail("objtrunc a hole down: %r");
+	else
+		shtrunc(&h, 40);
+	checkobj(s, "h", &h, "a hole truncated within itself");
+	if(objtrunc(s, oid, 1, 80, 4, 1) < 0)
+		fail("objtrunc a hole up: %r");
+	else
+		shtrunc(&h, 80);
+	checkobj(s, "h", &h, "a hole extended within itself");
+
+	/* every one of them survives the restart the log describes */
+	storeclose(s);
+	if((s = mustopen(d, "extend replayed")) == nil){
+		devclose(d);
+		free(buf);
+		return;
+	}
+	checkobj(s, "p", &p, "grown past the partial block, replayed");
+	checkobj(s, "q", &q, "extended by truncate, replayed");
+	checkobj(s, "r", &r, "extended within the block, replayed");
+	checkobj(s, "t", &t, "re-extended, replayed");
+	checkobj(s, "v", &v, "written above a truncated length, replayed");
+	checkobj(s, "h", &h, "a hole extended within itself, replayed");
+	storeclose(s);
+	devclose(d);
+	free(buf);
+	free(p.p);
+	free(q.p);
+	free(r.p);
+	free(t.p);
+	free(v.p);
+	free(h.p);
+}
+
 void
 main(int argc, char **argv)
 {
 	USED(argc); USED(argv);
 	tbasic();
 	tholes();
+	textend();
 	tcoverage();
 	trebuild();
 	tpublish();

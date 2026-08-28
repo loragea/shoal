@@ -395,11 +395,31 @@ updclose(Upd *u)
 	u->e.oid = nil;
 }
 
-/* read block i of the object as it is now, into blksz bytes of buf */
-static int
-readblk(Store *s, Omap *m, ulong i, uchar *buf)
+/* the bytes of block i an object of this length covers (layer-a §1.4) */
+static ulong
+blkcover(Store *s, uvlong len, ulong i)
 {
-	ulong g;
+	uvlong lo, n;
+
+	lo = (uvlong)i*s->sb.blksz;
+	if(len <= lo)
+		return 0;
+	n = len - lo;
+	return n > s->sb.blksz ? s->sb.blksz : (ulong)n;
+}
+
+/*
+ * Read block i of an object of length len into blksz bytes of buf, as
+ * the object reads it: a read clamps to len (§4), so the bytes at and
+ * beyond the block's covered length are not this object's content and
+ * MUST compose and hash as the zeros they read as.  A truncate within
+ * a block leaves the old bytes in the grain, and without this the next
+ * partial write of that block would merge them back into the object.
+ */
+static int
+readblk(Store *s, Omap *m, ulong i, uchar *buf, uvlong len)
+{
+	ulong g, n;
 
 	g = mapgrain(m, i);
 	if(g == 0){
@@ -410,7 +430,12 @@ readblk(Store *s, Omap *m, ulong i, uchar *buf)
 		werrstr("grain %lud out of range", g);
 		return -1;
 	}
-	return grainread(s, buf, g);
+	if(grainread(s, buf, g) < 0)
+		return -1;
+	n = blkcover(s, len, i);
+	if(n < s->sb.blksz)
+		memset(buf + n, 0, s->sb.blksz - n);
+	return 0;
 }
 
 /*
@@ -431,7 +456,7 @@ stageblk(Upd *u, Omap *mold, ulong blk, uchar *src, ulong boff, ulong bn,
 	if(boff == 0 && bn == s->sb.blksz)
 		memmove(buf, src, bn);
 	else{
-		if(readblk(s, mold, blk, buf) < 0)
+		if(readblk(s, mold, blk, buf, u->e.len) < 0)
 			return -1;
 		memmove(buf + boff, src, bn);
 	}
@@ -494,43 +519,85 @@ nameall(Upd *u, Omap *mold)
 }
 
 /*
- * Re-hash the final block when its covered length changed but its
- * bytes did not (§4): layer-a §1.4 hashes the final partial block
- * over its actual length, so extending or truncating within a block
- * changes that block's digest without changing a byte.
+ * Re-hash one block whose covered length this update changes although
+ * the update names no byte of it (§4): layer-a §1.4 hashes the final
+ * partial block over its actual length, so a change to len changes
+ * that block's digest without a byte of the write touching it.
+ *
+ * Growing the coverage also changes what the block *reads* as, and
+ * this is where the grain is brought back into line with it: the bytes
+ * a truncate left above the old len are not the object's content and
+ * §4 requires the extension that covers them to read as zeros, so the
+ * block is composed afresh, into a fresh grain — the old one still
+ * carries the published state until this commit is durable (§3.5).
+ * Shrinking changes no byte the store may ever serve again, so it is a
+ * re-hash and nothing more, which is what keeps a truncate a
+ * space-freeing commit that §6's reserved tail can carry.
  */
 static int
-relast(Upd *u, Omap *mold, uchar *buf)
+reblk(Upd *u, Omap *mold, ulong blk, uchar *buf)
 {
 	Store *s;
-	ulong blk, oldn, newn, k, g;
+	ulong oldn, newn, k, g, ng;
 	uchar dig[Blkdlen];
 
 	s = u->s;
-	if(u->nblk == 0)
+	if(blk >= u->nblk)
 		return 0;
-	blk = u->nblk - 1;
 	g = blk < u->oldnblk ? mapgrain(mold, blk) : 0;
 	if(g == 0)
 		return 0;			/* clause 4 recomputes a hole */
 	for(k = 0; k < u->nmap; k++)
 		if(u->map[k].blk == blk)
 			return 0;		/* already named */
-	oldn = 0;
-	if((uvlong)blk*s->sb.blksz < u->e.len){
-		oldn = s->sb.blksz;
-		if((uvlong)(blk+1)*s->sb.blksz > u->e.len)
-			oldn = u->e.len - (uvlong)blk*s->sb.blksz;
-	}
-	newn = s->sb.blksz;
-	if((uvlong)(blk+1)*s->sb.blksz > u->newlen)
-		newn = u->newlen - (uvlong)blk*s->sb.blksz;
+	oldn = blkcover(s, u->e.len, blk);
+	newn = blkcover(s, u->newlen, blk);
 	if(oldn == newn)
 		return 0;
-	if(readblk(s, mold, blk, buf) < 0)
+	if(readblk(s, mold, blk, buf, u->e.len) < 0)
 		return -1;
 	blkdigest(buf, newn, dig);
-	return addmap(u, blk, g, dig);
+	if(newn < oldn)
+		return addmap(u, blk, g, dig);
+	qlock(&s->qlstate);
+	if(grainalloc(s, &ng) < 0){
+		qunlock(&s->qlstate);
+		werrstr("disk full");
+		return -1;
+	}
+	qunlock(&s->qlstate);
+	if(grainwrite(s, buf, ng) < 0){
+		qlock(&s->qlstate);
+		grainstageclr(s, ng);
+		qunlock(&s->qlstate);
+		return -1;
+	}
+	if(addfree(u, g) < 0)
+		return -1;
+	return addmap(u, blk, ng, dig);
+}
+
+/*
+ * The blocks whose covered length an update can change without naming
+ * them are the block holding the old len and the block holding the new
+ * one: an extend across a boundary makes the old final block whole and
+ * a truncate makes the new final block short.  Everything between them
+ * is either wholly covered both times or cleared by clause 5.  Naming
+ * only the block that holds the *new* len publishes a csum that is not
+ * the csum of the content whenever an object grows past a partial
+ * final block — the map and the csum agree with each other and
+ * disagree with the bytes, so verify reports arraybad=0 with one bad
+ * block and §8 sends the object to a block repair it does not need.
+ */
+static int
+relast(Upd *u, Omap *mold, uchar *buf)
+{
+	if(u->oldnblk > 0 && reblk(u, mold, u->oldnblk - 1, buf) < 0)
+		return -1;
+	if(u->nblk > 0 && u->nblk != u->oldnblk
+	&& reblk(u, mold, u->nblk - 1, buf) < 0)
+		return -1;
+	return 0;
 }
 
 /* free every grain at or beyond the new nblk (§2.4, §4) */
