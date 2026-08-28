@@ -1465,16 +1465,39 @@ Only that block's digest changes; `csum` is then re-derived from the
 whole digest array, which is why the array is stored contiguously.
 
 **Changing `len` changes digests without changing bytes.** Layer-a
-§1.4 hashes the final partial block over its *actual* length, so:
+§1.4 hashes the final partial block over its *actual* length, so a
+change to `len` alone changes the digest of **at most two blocks: the
+one that held the old `len` and the one that holds the new one.**
+Every block between them is wholly covered both times, and every
+block outside them is a hole or is cleared. So:
 
 - extending `len` within the last block re-hashes that block over
   more bytes (the extension reads as zeros);
 - extending across blocks makes every wholly-new block a hole whose
   digest is the precomputed full-block zero digest, and re-hashes the
-  block containing the old `len`;
+  block that contained the old `len` — which the operation need not
+  have named, and which is exactly the case a rule that re-hashes
+  only the final block gets wrong: the map and the `csum` then agree
+  with each other and disagree with the bytes;
 - truncating re-hashes the block containing the new `len` over fewer
   bytes, frees every grain beyond it, and clears every map entry at
   or beyond the new `nblk` (§2.4).
+
+**The bytes above `len` are not the object's content.** A read clamps
+to `len`, so they read as zeros — but a truncate within a block
+leaves the old bytes in the grain, because the cheap truncate below
+rewrites no data. Two rules follow and both are needed. Wherever the
+store composes or hashes a block it takes the bytes at and beyond the
+block's covered length as the zeros they read as, so a partial write
+above a truncated length cannot merge the old bytes back into the
+object. And an extension that grows a block's covered length writes
+that block **afresh, into a fresh grain**, rather than re-hashing what
+the grain holds — the digest would otherwise say zeros while the
+grain served the old bytes. The grain has to be a fresh one for
+§3.5's reason: the published state still points at the old one until
+this commit is durable. So a truncate within a block costs a read and
+no write, and the extension that later covers those bytes costs a
+read and one write.
 
 A truncate that lands on a block boundary therefore costs no data
 read and no data write: it is an `Eobj` with `nfree` naming the
@@ -2676,14 +2699,18 @@ publisher and its durability orderings, §5 step 10's condemnation
 after — and only after — replay and again when a damaged extent map
 is first read, §2.6's exhaustion dropping one peer's records on the
 live path and on replay alike, §3.2's refusal to start without a
-flush channel, and a store opened, written and replayed at a `blksz`
-four times the device's `Wunit`), `objtest` (§2.7's extent-map slot
+flush channel, §4's re-hashing over every shape of write that changes
+a block's covered length, and a store opened, written and replayed at
+a `blksz` four times the device's `Wunit`), `objtest` (§2.7's extent-map slot
 rule over all three transitions and both the crash and the re-replay
 schedules, §2.4's invariant on the shrinking side, §3.5's deferred
-reuse of grains and of slots under a held batch, §3.6's stage lifetimes and
-bounds, §6's four exhaustions with delete working throughout on the
-reserved tail, R7's dirty records across a restart, tombstones, and
-the key-preserving `corrupt` flag) and `committest` (§3.2's flush
+reuse of grains and of slots under a held batch, §3.6's stage lifetimes,
+bounds and `final=1` arbitration including D14's corrupt receiver,
+§6's four exhaustions with delete working throughout on the reserved
+tail, R7's dirty records across a restart and on every write-path
+commit, layer-a §1.2's `object too large` at the bounds where a sum
+would wrap, layer-a §2.6's tombstone errors and §1.5's create over a
+tombstone, and the key-preserving `corrupt` flag) and `committest` (§3.2's flush
 placement read off the device trace, the torn-header sweep over a
 whole sector, short counts on every call, §3.4's crash matrix at
 every point × every operation shape, several laps of the log
@@ -2695,7 +2722,10 @@ flight, a checkpoint page write that fails followed by a second
 checkpoint, §0's `interrupted` completed and `Echange` refused, §13's
 own named points, §6's reserved tail against an `Edirty`, §2.8's
 reclaim rule run both ways, the checkpoint mark against a concurrent
-publish, and `qid.path` across restarts).
+publish and under a held batch, a group commit at the largest record
+replay accepts, a multi-sector record at the region boundary, a
+header naming more sectors than that record, durable-before-ack for a
+batch's members, and `qid.path` across restarts).
 
 Against the list below that is T1.1–T1.8, T1.10–T1.14, T1.16,
 T1.18–T1.20 and T1.22–T1.26. Four cases are not covered and each
@@ -2746,7 +2776,11 @@ procs.
   above it acks and a restart finds none of them. *Mutations:* wake
   waiters when their own batch returns; let the watermark pass a
   batch whose record did not land; take a waiting item out of the
-  batch that absorbed it.
+  batch that absorbed it; cap a batch at a size the record bound
+  replay enforces does not admit; answer a batch's members before its
+  post-flush returns — which needs `flush:n`, because the question is
+  what the *other* procs in a batch may do while the committer is
+  still inside the flush, and no crash point asks that.
 - **T1.9 two-slot validity (R2).** Tear a superblock copy, restart,
   commit again, tear again: the store still starts. The same for the
   monitor's map slots. *Mutation:* choose the write victim by `gen`
@@ -2770,10 +2804,19 @@ procs.
   and `stagemax` and `stagetot` are both enforced. Then the restart
   case: force a checkpoint while the stage is live, abandon it, crash,
   restart, and assert the free-grain count is the pre-transfer one —
-  a stage leaves nothing durable behind. *Mutations:* keep a stage
+  a stage leaves nothing durable behind. Then `final=1`'s
+  arbitration (§3.6): a push at a lower key and one at an equal key
+  without `force` are refused `stale version` and leave the object,
+  its key and its `csum` exactly as they were; an equal key with
+  `force=1` and a strictly greater key apply; an object this instance
+  does not hold is created by the same commit; and a copy whose
+  `corrupt` flag is set takes the push at any key (D14).
+  *Mutations:* keep a stage
   alive past its fid; allocate staged grains in the bitmap the
   checkpointer writes rather than in the staged set, which leaks them
-  across the restart; bound stages per fid only.
+  across the restart; bound stages per fid only; compare the sender's
+  key against nothing; refuse the push to a receiver whose own copy
+  contributes no key; require the object to exist.
 - **T1.13 flush sequence (R1).** From the recorded device trace,
   assert that a flush precedes the header write and another follows
   it, for every commit shape including a wrapping one and one whose
@@ -2798,11 +2841,20 @@ procs.
   changed. Include the **sparse extend across many blocks**, both
   live and after a crash-and-replay at `commit:0`: the blocks the
   commit does not name carry the zero-block digest, so `csum`
-  verifies and the object does not fail its next scrub. *Mutations:*
-  hash the final partial block over `blksz` rather than its actual
-  length; hash a hole as absent rather than as the zero bytes it
-  reads as; leave newly covered blocks' digests at sixteen zero bytes
-  when applying the commit.
+  verifies and the object does not fail its next scrub. Include also
+  every shape of write that changes a block's covered length without
+  naming it: a growth past a partial final block, by write and by
+  truncate; a growth within the block that holds `len`; a truncate
+  within a block and back up again; and a partial write above a
+  truncated length. Each is checked by comparing the stored `csum`
+  against the `csum` of the byte image the object reads back.
+  *Mutations:* hash the final partial block over `blksz` rather than
+  its actual length; hash a hole as absent rather than as the zero
+  bytes it reads as; leave newly covered blocks' digests at sixteen
+  zero bytes when applying the commit; re-hash only the block that
+  holds the new `len`; compose and hash a block from the bytes its
+  grain holds above `len` rather than from the zeros they read as;
+  re-hash a block whose coverage grew instead of writing it afresh.
 - **T1.17 corrupt digest array (§8).** Damage an extent-map entry so
   that `hash(dig[]) != csum`, and assert the repair takes the
   whole-object path. *Mutation:* accept a peer's block against the
@@ -2827,8 +2879,8 @@ procs.
   slot, with a write that does not touch block 0. Run it twice over:
   once with block 0 holding its own bytes, and once with **block 0 a
   hole** — create, truncate to `blksz`, then write past it — which is
-  the case a rule that exempts holes from `nmap` gets wrong with no
-  crash at all. Crash at `commit:0`; restart. Block 0 must read what
+  the case a rule that exempts holes from `nmap` gets wrong once
+  clause 4 is wrong as well. Crash at `commit:0`; restart. Block 0 must read what
   it held — its own bytes in the first variant, zeros in the second —
   every unwritten block must read zeros, and `verify` must pass,
   which is what catches a hole left with sixteen zero bytes for a
@@ -2839,13 +2891,29 @@ procs.
   though the entry it is applying to already carries the record's
   `emapslot`. Then the mirror: truncate a multi-block object to one
   block and assert block 0 survives the release of the slot.
-  *Mutations:* name only the blocks the write changed; exempt holes
-  from `nmap`; key the zeroing off `emapslot` differing from the
-  entry's current value rather than off the record's `Oslot`, which
-  fails only the re-replay schedule; make holes of `[old nblk, nblk)`
-  rather than of every unnamed block whose grain is 0; skip the
-  zeroing of the newly allocated entry; leave `grain0`/`dig0` unset
-  on the shrink.
+  *Mutations:* name only the blocks the write changed; make holes of
+  `[old nblk, nblk)` rather than of every unnamed block whose grain
+  is 0; and, as a **pair**, exempt holes from `nmap` together with
+  dropping clause 4.
+
+  The pair is not a convenience. Four single-clause mutations of this
+  rule — exempting holes from `nmap`, keying the zeroing off
+  `emapslot` differing from the entry's current value rather than off
+  the record's `Oslot`, skipping the zeroing of the newly allocated
+  entry, and leaving `grain0`/`dig0` unset on the shrink — are
+  **equivalent to the code they mutate under this writer**, and no
+  test can discriminate any of them. Two mechanisms each fully
+  determine the result: whenever this writer sets `Oslot` it names
+  every block below `nblk`, so clause 3 overwrites `[0, nblk)` and
+  clause 5 overwrites `[nblk, nblkmax)` — the whole map — leaving
+  clause 2's zeroing nothing to change; and a hole omitted from
+  `nmap` is restored identically by clause 4 and by the `csum` the
+  writer computes from the same rules. The redundancy is deliberate
+  and stays, because the format permits a record that sets `Oslot`
+  without naming every block and replay accepts records from any
+  build. What it is not is a discriminating test, and a plan that
+  claims otherwise sends the next implementer looking for a schedule
+  that does not exist.
 - **T1.20 dirty records across a restart (R7).** Commit writes that
   create fine-grained dirty records for several peers, crash at
   `preack`, restart, and assert every record whose write is visible is
