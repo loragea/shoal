@@ -215,8 +215,19 @@ formbatch(Store *s, int *full, int *oom)
 	freeing = 1;
 	for(it = s->pend; it != nil; it = next){
 		next = it->next;
-		if(b->items != nil && bytes + it->nbyte > s->sb.blksz)
-			break;			/* one blksz of record body */
+		/*
+		 * One bound, and it is the one replay enforces: a batch's
+		 * record must be no larger than the largest record this
+		 * geometry can hold and replay accept (§2.7).  A separate
+		 * batch cap is a second bound that says nothing about the
+		 * first — a batch of enough small items makes a record that
+		 * is written, flushed and acked, and then refused by replay,
+		 * which stops there and discards it and everything after it.
+		 * logcommit has already refused a single item that does not
+		 * fit, so the head of the queue always does.
+		 */
+		if(b->items != nil && bytes + it->nbyte > maxrecbytes(&s->sb))
+			break;
 		nsec = (bytes + it->nbyte + s->sb.secsz - 1)/s->sb.secsz;
 		room = s->sb.logsecs - s->logtail;
 		consume = nsec <= room ? nsec : room + nsec;

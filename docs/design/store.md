@@ -1874,20 +1874,27 @@ member of one, and there is no separate assigner or writer proc:
 1. It takes `qllog`. If a batch is forming, it appends its entries to
    the pending queue, sleeps on a `Rendez`, and is now a member. If
    not, it becomes the committer: it absorbs whatever is already
-   pending into its batch — as much as fits one `blksz` of record
-   body — stamps the batch with the next `seq` and the next log
-   offset, and releases the lock. The lock is held for microseconds
-   and never across I/O.
+   pending into its batch — as much as fits **§2.7's maximal
+   record**, which is the largest record this geometry can hold and
+   replay will accept — stamps the batch with the next `seq` and the
+   next log offset, and releases the lock. The lock is held for
+   microseconds and never across I/O. There is exactly one bound on a
+   record's size and every part of the store computes it the same
+   way: a batch cap of its own would be a second bound that says
+   nothing about the first, and a batch of enough small items would
+   make a record that is written, flushed and acked and then refused
+   by replay, which stops there and discards it and every commit
+   after it. A single operation whose entries already exceed the
+   maximal record is refused before it joins a queue, so the head of
+   the pending queue always fits.
 2. It writes the batch's body sectors, asks the flusher for a flush,
    writes the header sector, and asks for another (§3.2). A record
-   larger than `blksz` is a batch of one, written in
-   `ceil(nsec*secsz/blksz)` pieces, each of which the device layer
-   splits again if `blksz` exceeds the unit's `Wunit` (§0). The
-   bound is `blksz` and not `Wunit` for §2.1's reason — what a
-   store does must not turn on a build constant — and it costs
-   nothing: the batch rule is about latency, not about correctness,
-   and §3.2's argument is indifferent to how many requests a record
-   takes.
+   larger than `blksz` is written in `ceil(nsec*secsz/blksz)` pieces,
+   each of which the device layer splits again if `blksz` exceeds the
+   unit's `Wunit` (§0). The write is split at `blksz` and not at
+   `Wunit` for §2.1's reason — what a store does must not turn on a
+   build constant — and it costs nothing: how many requests a record
+   takes is not something §3.2's argument depends on.
 3. When its post-flush returns and every lower-numbered batch has
    been applied, it applies its whole batch under `qlstate` (§3.2) —
    over pinned extent maps, so no part of the apply faults —

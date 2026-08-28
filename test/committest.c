@@ -781,6 +781,181 @@ tgroup(void)
 }
 
 /*
+ * T1.8 and §2.7: a batch's record is bounded by the largest record
+ * this geometry can hold and replay will accept, and by nothing else.
+ * A batch cap of its own is a second bound that says nothing about
+ * the first: at the geometry mk test formats, one blksz of record
+ * body is four times the maximal record, so a batch of enough small
+ * items makes a record that is written, flushed and acked — and then
+ * refused by replay, which stops there and discards it and every
+ * commit after it.
+ *
+ * The schedule forces the batch rather than hoping for it.  §13's
+ * batch:n holds the first batch; logdepth-1 more start and park
+ * waiting for it; every writer after those has already put its
+ * entries on the pending queue before it sleeps for room.  Releasing
+ * the hold wakes one of them, and it absorbs the whole queue.
+ */
+static void
+tmaxbatch(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Writer *w;
+	Objinfo oi;
+	uchar o[Oidmax];
+	char name[16];
+	uvlong seq0;
+	int i, k;
+
+	enum { Nw = 20 };
+
+	d = newdisk();
+	if((s = openstore(d)) == nil){
+		fail("a maximal group commit: storeopen: %r");
+		devclose(d);
+		return;
+	}
+	if((w = mallocz(Nw*sizeof *w, 1)) == nil)
+		sysfatal("mallocz: %r");
+	for(i = 0; i < Nw; i++){
+		snprint(name, sizeof name, "b%d", i);
+		mk(s, name);
+		w[i].s = s;
+		strcpy(w[i].name, name);
+		w[i].ver = 50;
+		w[i].nwrite = 1;
+	}
+	storestat(s, &st);
+	seq0 = st.seqnext;
+	storehook(s, "batch", st.seqnext);
+	for(i = 0; i < Nw; i++)
+		if(spawnproc(writerproc, &w[i]) < 0)
+			fail("spawn: %r");
+	sleep(300);
+	storehook(s, "batch", 0);
+	for(k = 0; k < 20000; k++){
+		for(i = 0; i < Nw && w[i].done; i++)
+			;
+		if(i == Nw)
+			break;
+		sleep(1);
+	}
+	checks++;
+	for(i = 0; i < Nw; i++)
+		if(!w[i].done || w[i].err){
+			fail("writer %d did not finish cleanly", i);
+			break;
+		}
+	storestat(s, &st);
+	checks++;
+	if(st.seqnext - seq0 >= Nw)
+		fail("the writers were never grouped: %llud batches for %d "
+			"writers", st.seqnext - seq0, Nw);
+	istrue("every batch was applied", st.watermark + 1 == st.seqnext);
+	storeclose(s);
+
+	if((s = openstore(d)) == nil){
+		fail("a maximal group commit, replayed: storeopen: %r");
+		devclose(d);
+		free(w);
+		return;
+	}
+	for(i = 0; i < Nw; i++){
+		snprint(name, sizeof name, "b%d", i);
+		oidof(o, name);
+		if(objstat(s, o, strlen(name), &oi) < 0)
+			fail("objstat %s: %r", name);
+		else
+			eqv("a maximal group commit replays", oi.ver, 50);
+		mustverify(s, name, "a maximal group commit, replayed");
+	}
+	storeclose(s);
+	devclose(d);
+	free(w);
+}
+
+/*
+ * T1.2 again, and this time nsec is a memory-safety bound before it
+ * is anything else: replay sizes one buffer at maxrecbytes and reads
+ * nsec*secsz bytes into it, so a header naming more sectors than the
+ * geometry's maximal record MUST be refused before the read and not
+ * after it.  A torn header can carry any nsec at all, and this one is
+ * otherwise perfectly plausible — right magic, right version, the
+ * expected successor for a sequence number, and a checksum that
+ * verifies over the whole range it names.
+ */
+static void
+tbignsec(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Super sb;
+	Sbsel sel;
+	Lrec r;
+	Snap before, got;
+	uchar *buf, *rec;
+	uvlong rel, nsec;
+	vlong off;
+
+	d = newdisk();
+	if((s = mustopen(d, "an oversized nsec")) == nil)
+		return;
+	buf = mkbuf(64, 73);
+	mk(s, "n");
+	if(wr(s, "n", buf, 64, 0, 2) < 0)
+		fail("objwrite: %r");
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	snap(s, "n", &before);
+	storestat(s, &st);
+	storeclose(s);
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	sb = sel.sb[sel.start];
+	rel = st.cklogoff - sb.logoff;
+	nsec = sb.logsecs - rel;
+	if(nsec > 64)
+		nsec = 64;
+	checks++;
+	if(nsec*sb.secsz <= maxrecbytes(&sb)){
+		fail("the log leaves no room for a record above maxrecbytes");
+		free(buf);
+		devclose(d);
+		return;
+	}
+	if((rec = mallocz(nsec*sb.secsz, 1)) == nil)
+		sysfatal("mallocz: %r");
+	memset(&r, 0, sizeof r);
+	r.vers = Storevers;
+	r.nsec = nsec;
+	r.seq = st.ckseq + 1;
+	r.time = 0;
+	r.nent = 0;
+	r.flags = 0;
+	lrecpack(rec, &r, sb.secsz);
+	off = (vlong)st.cklogoff*sb.secsz;
+	simpoke(d, off, rec, nsec*sb.secsz);
+	free(rec);
+	if((s = openstore(d)) == nil)
+		fail("a record naming more sectors than the maximal record "
+			"must not stop the store starting: %r");
+	else{
+		storestat(s, &st);
+		eqv("and it is not replayed", st.nreplay, 0);
+		snap(s, "n", &got);
+		checks++;
+		if(!sameas(&got, &before))
+			fail("an oversized record changed the store");
+		storeclose(s);
+	}
+	free(buf);
+	devclose(d);
+}
+
+/*
  * T1.8's other half, and it needs no crash.  A batch whose record did
  * not become durable MUST NOT let a later batch ack: replay stops at
  * the first record that is not there, so an acked write above it is
@@ -1442,6 +1617,8 @@ main(int argc, char **argv)
 	tmatrix();
 	twrap();
 	tgroup();
+	tmaxbatch();
+	tbignsec();
 	tfailed();
 	tckptfail();
 	tintr();
