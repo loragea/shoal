@@ -593,11 +593,11 @@ tbadmap(void)
 	Store *s;
 	Storestat st;
 	Shadow sh;
-	Objinfo oi;
+	Objinfo oi, oi2;
 	Sbsel sel;
 	Super sup;
 	uchar *buf, rd[64], junk[8], oid[Oidmax];
-	ulong slot;
+	ulong slot, gf, sf;
 
 	memset(&sh, 0, sizeof sh);
 	d = newdisk();
@@ -642,8 +642,51 @@ tbadmap(void)
 	eqv("the slot the damaged map belongs to is condemned", st.nlost, 1);
 	eqv("and it is named", storelost(s, 0), oi.slot);
 	checks++;
-	if(objstat(s, oid, 4, &oi) >= 0)
+	if(objstat(s, oid, 4, &oi2) >= 0)
 		fail("a condemned slot is still served");
+
+	/*
+	 * The condemnation has to survive a restart, or step 10's "its
+	 * slot is not reused" holds for one run only.  The entry here is
+	 * intact — the damage is in the extent map — so the checkpoint
+	 * writes it back as it stands; writing it back free would hand
+	 * the slot out again, leave the object's grains set in the bitmap
+	 * with nothing naming them, and lose the store's only record that
+	 * it ever held the object.  storecondemn does not itself dirty
+	 * the index page, so a second object is what gets it written.
+	 */
+	mkobj(s, "narrow", 1);
+	wr(s, "narrow", &sh, buf, 64, 0, 2);
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	storestat(s, &st);
+	gf = st.grainfree;
+	sf = st.slotfree;
+	storeclose(s);
+	if((s = mustopen(d, "a damaged extent map, restarted")) == nil){
+		devclose(d);
+		free(buf);
+		free(sh.p);
+		return;
+	}
+	storestat(s, &st);
+	eqv("the condemned slot is still allocated after a restart",
+		st.slotfree, sf);
+	eqv("and its grains are still accounted for", st.grainfree, gf);
+	checks++;
+	if(objstat(s, oid, 4, &oi2) < 0)
+		fail("a condemned slot lost its object across a restart: %r");
+	else{
+		eqv("the restarted slot keeps its key", oi2.ver, 2);
+		eqv("and its length", oi2.len, 3*Blk);
+	}
+	eqv("start condemns nothing: replay never read the entry",
+		st.nlost, 0);
+	checks++;
+	if(objread(s, oid, 4, rd, sizeof rd, 0) >= 0)
+		fail("a damaged extent map was served after a restart");
+	storestat(s, &st);
+	eqv("and the next read condemns the slot again", st.nlost, 1);
 	storeclose(s);
 	devclose(d);
 	free(buf);

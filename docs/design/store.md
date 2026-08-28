@@ -1612,7 +1612,16 @@ lose arbitration against everything including absence.
     damage: it is listed in `/lost` with `kind=corrupt`, its slot is
     not reused, and it is not served. The same list takes the slots
     step 9's rule condemns later, when a damaged extent-map entry is
-    first read. The line carries `slot=<n>`
+    first read. The two differ in what the next checkpoint writes
+    back. An entry that could not be read is written back as a free
+    entry — there are no bytes worth preserving. An entry condemned
+    for a damaged extent map is intact, and is written back as it
+    stands: its slot stays allocated across a restart, the grains the
+    object holds stay accounted for, and the object keeps its oid, its
+    key and its `qid.path`. Its `/lost` line is not restored at start,
+    because step 9 reads only the entries replay touched; the next
+    read of the object re-establishes it by the same rule that found
+    the damage. The line carries `slot=<n>`
     and **omits `oid=`**, rather than printing 128 bytes the store
     does not trust or inventing an oid layer-a §1.2's grammar would
     not admit; §14(15) records the deviation from layer-a §2.2's

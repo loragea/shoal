@@ -601,12 +601,19 @@ ientpack(Store *s, ulong slot, uchar *p)
 	e = &s->idx[slot];
 	memset(&d, 0, sizeof d);
 	d.vers = Storevers;
-	if(e->state == Sfree || e->bad){
+	if(e->state == Sfree){
 		/*
-		 * §2.3: a free entry is a valid record, not zeroes.  A
-		 * condemned slot is written free too — §5 step 10 keeps it
-		 * out of the free list in memory, and the damaged bytes on
-		 * the disk are not worth preserving.
+		 * §2.3: a free entry is a valid record, not zeroes.  A slot
+		 * condemned because its own entry failed its csum128 is one
+		 * of these — readindex leaves it Sfree — and writing a valid
+		 * free record over bytes that could not be read preserves
+		 * nothing.  A slot condemned by §5 step 9's later rule is
+		 * not: its entry is intact and only the extent map it names
+		 * is damaged, so it is written back as it stands.  Erasing
+		 * it would free the slot at the next start, leak every grain
+		 * the object held, and lose the store's only record that it
+		 * ever held that object — §5 step 10's "not reused" would
+		 * hold for one run.
 		 */
 		idxpack(p, &d);
 		return;
