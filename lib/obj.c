@@ -336,7 +336,17 @@ updopen(Upd *u, Store *s, uchar *oid, int oidlen, uvlong newlen, int wanttomb)
 	e = &s->idx[slot];
 	if(e->state != Slive && !(wanttomb && e->state == Stomb)){
 		qunlock(&s->qlstate);
-		werrstr("no such object");
+		/*
+		 * layer-a §2.6's set is prefix-free by design and these two
+		 * are different facts: `object deleted' is access to a
+		 * tombstone, `no such object' an id a completed currency
+		 * check found nowhere.  Folding them leaves the server no
+		 * way to tell them apart without a second, racy objstat,
+		 * and a client that sees `no such object' for a tombstoned
+		 * id may re-create it.
+		 */
+		werrstr(e->state == Stomb ? "object deleted"
+			: "no such object");
 		return -1;
 	}
 	u->slot = slot;
@@ -676,6 +686,22 @@ objcreate(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 		 * extent-map slot and no grain, so there is nothing here
 		 * to free.
 		 */
+		/*
+		 * layer-a §1.5: the fresh object's ver is one greater than
+		 * the tombstone's, so as long as the tombstone exists no
+		 * older copy can outrank the new object.  Taking the
+		 * caller's value would lose exactly the guarantee the rule
+		 * is for: a straggler still holding the tombstone at
+		 * (1, 6) outranks a live object created at (1, 2) and
+		 * re-deletes it.  The decision is made here, under
+		 * qlstate, because that is where the tombstone's own key
+		 * is known not to be racing a commit.
+		 */
+		if(ver != e->ver + 1 || wepoch < e->wepoch){
+			qunlock(&s->qlstate);
+			werrstr("out of sequence");
+			return -1;
+		}
 		reuse = 1;
 		u.slot = slot;
 		u.e = *e;
@@ -751,7 +777,7 @@ objwrite(Store *s, uchar *oid, int oidlen, void *a, long n, uvlong off,
 	if(objstat(s, oid, oidlen, &oi) < 0)
 		return -1;
 	if(oi.state != Slive){
-		werrstr("no such object");
+		werrstr(oi.state == Stomb ? "object deleted" : "no such object");
 		return -1;
 	}
 	newlen = oi.len;
@@ -954,8 +980,9 @@ objread(Store *s, uchar *oid, int oidlen, void *a, long n, uvlong off)
 	}
 	qlock(&s->qlstate);
 	if((slot = ientfind(s, oid, oidlen)) < 0 || s->idx[slot].state != Slive){
+		werrstr(slot >= 0 && s->idx[slot].state == Stomb
+			? "object deleted" : "no such object");
 		qunlock(&s->qlstate);
-		werrstr("no such object");
 		return -1;
 	}
 	e = s->idx[slot];

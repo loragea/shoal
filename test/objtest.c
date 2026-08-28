@@ -128,6 +128,22 @@ zeroes(char *what, uchar *p, long n)
 		}
 }
 
+/* a call that must fail, with layer-a §2.6's prefix */
+static void
+refused(char *what, int r, char *want)
+{
+	char e[ERRMAX];
+
+	checks++;
+	if(r >= 0){
+		fail("%s was accepted", what);
+		return;
+	}
+	rerrstr(e, sizeof e);
+	if(strncmp(e, want, strlen(want)) != 0)
+		fail("%s: %s, want %s", what, e, want);
+}
+
 /*
  * §2.7's extent-map slot rule, in the three transitions it covers.  A
  * slot released by a deleted object still holds that object's map —
@@ -833,9 +849,49 @@ ttomb(void)
 	storestat(s, &st);
 	eqv("a tombstone releases its content", st.grainfree, g0);
 
+	/*
+	 * layer-a §2.6: access to a tombstone is `object deleted'.  The
+	 * set is prefix-free by design and this is a different fact from
+	 * `no such object', which is an id a completed currency check
+	 * found nowhere; layer-a §5.2's machinery distinguishes them.
+	 */
 	oidof(oid, "t");
+	refused("a read of a tombstone", objread(s, oid, 1, buf, 16, 0),
+		"object deleted");
+	refused("a write to a tombstone",
+		objwrite(s, oid, 1, buf, 16, 0, 4, 1, nil, 0),
+		"object deleted");
+	refused("a truncate of a tombstone", objtrunc(s, oid, 1, 16, 4, 1),
+		"object deleted");
+	refused("a delete of a tombstone", objremove(s, oid, 1, 4, 1),
+		"object deleted");
+	refused("a read of an id nothing holds",
+		objread(s, (uchar*)"zz", 2, buf, 16, 0), "no such object");
+
+	/*
+	 * layer-a §1.5: a create of a tombstoned id produces a fresh
+	 * live object with ver one greater than the tombstone's, so as
+	 * long as the tombstone exists no older copy can outrank the new
+	 * object.  A straggler still holding this tombstone at ver 3
+	 * would outrank a live object created at ver 2 and re-delete it,
+	 * so the store enforces the value rather than trusting it.
+	 */
+	refused("a create over a tombstone at the tombstone's own ver",
+		objcreate(s, oid, 1, 3, 1, nil), "out of sequence");
+	refused("a create over a tombstone below its ver",
+		objcreate(s, oid, 1, 2, 1, nil), "out of sequence");
+	refused("a create over a tombstone two above its ver",
+		objcreate(s, oid, 1, 5, 1, nil), "out of sequence");
+	refused("a create over a tombstone below its wepoch",
+		objcreate(s, oid, 1, 4, 0, nil), "out of sequence");
+	if(ostat(s, "t", &oi2) < 0)
+		fail("objstat: %r");
+	eqv("a refused create leaves the tombstone a tombstone", oi2.state,
+		Stomb);
+
 	if(objcreate(s, oid, 1, 4, 1, &oi2) < 0)
 		fail("create over a tombstone: %r");
+	eqv("the create takes the tombstone's ver plus one", oi2.ver, 4);
 	eqv("a create over a tombstone keeps the qid.path", oi2.qidpath, path);
 	eqv("and its slot", oi2.slot, oi.slot);
 	storeclose(s);
@@ -909,21 +965,6 @@ tcorrupt(void)
  * layer-a §1.2 makes the answer normative: `object too large', and
  * never a silent truncation.
  */
-static void
-refused(char *what, int r, char *want)
-{
-	char e[ERRMAX];
-
-	checks++;
-	if(r >= 0){
-		fail("%s was accepted", what);
-		return;
-	}
-	rerrstr(e, sizeof e);
-	if(strncmp(e, want, strlen(want)) != 0)
-		fail("%s: %s, want %s", what, e, want);
-}
-
 static void
 tbounds(void)
 {
