@@ -1626,7 +1626,10 @@ the entry's `mtime`, which is why the tombstone keeps one.
 **The log's reserved tail.** The last `logresv` sectors of free log
 space (policy, default one sixteenth of `logsecs`) are usable only by
 commits that free space: an `Eobj` that releases grains without
-allocating any — delete, truncate, tombstone — and an `Eslot`. The
+allocating any — delete, truncate, tombstone — and an `Eslot`. An
+`Edirty` is not one of them in either direction: adding or removing a
+fine-grained dirty record frees no log space, so a remove may no more
+draw on the reserve than an add may. The
 reservation is a property of a *record*, and §7 batches many commits
 into one record, so the rule is on the batch: a batch that draws on
 the reserve MUST contain only space-freeing commits, and an ordinary

@@ -957,15 +957,16 @@ dirtycommit(Store *s, uchar *oid, int oidlen, char *peer, uvlong epoch, int op)
 	memset(&it, 0, sizeof it);
 	it.dirty = &d;
 	it.ndirty = 1;
-	it.freeing = op == 0;
-	if(logcommit(s, &it) < 0)
-		return -1;
-	if(op != 0){
-		qlock(&s->qlstate);
-		addpeer(s, d.peer, d.peerlen);
-		qunlock(&s->qlstate);
-	}
-	return 0;
+	/*
+	 * §6's reserved tail is for commits that release space and take
+	 * none — an Eobj that frees grains, and an Eslot.  An Edirty
+	 * frees no log space in either direction, so neither an add nor
+	 * a remove may draw on the reserve: the reserve exists to keep
+	 * the traffic that cannot relieve exhaustion out of the last
+	 * sectors of the log.
+	 */
+	it.freeing = 0;
+	return logcommit(s, &it);
 }
 
 int
