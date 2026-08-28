@@ -664,6 +664,119 @@ tstage(void)
  * delete that would have relieved the slot exhaustion and the two
  * lock each other in the direction that removes the escape.
  */
+/*
+ * §3.6's two bounds and §0's error classes together: a chunk whose
+ * grain write fails must leave the handle exactly as it found it.
+ * `interrupted' is an ordinary outcome of any device call, not media
+ * damage, and T1's stagetot is 12 and its stagemax 8 — so twelve
+ * failed chunks are exactly enough to spend the store's whole stage
+ * budget, and eight are exactly enough to spend one /repl fid's, if a
+ * failure charges.  The other half is the rewrite: releasing the
+ * block's old grain before the replacement lands would leave the
+ * handle naming a grain the allocator has taken back, and stagefinal
+ * publishes that grain under this object's oid.
+ */
+static void
+tstagefault(void)
+{
+	Dev *d;
+	Store *s;
+	Stage *g;
+	Storestat st, st2;
+	uchar *buf, *got, o[Oidmax];
+	int i;
+
+	d = newdisk();
+	if((s = mustopen(d, "a chunk that fails")) == nil)
+		return;
+	buf = mkbuf(2*Blk, 41);
+	if((got = malloc(2*Blk)) == nil)
+		sysfatal("malloc: %r");
+	mk(s, "heal");
+	oidof(o, "heal");
+	storestat(s, &st);
+
+	/* the process-wide bound, over both classes §0 names */
+	for(i = 0; i < 12; i++){
+		if((g = stageopen(s, o, 4, Blk, 0)) == nil){
+			fail("stageopen: %r");
+			break;
+		}
+		simfault(d, i & 1 ? Sfintr : Sfeio, 1);
+		checks++;
+		if(stagewrite(g, buf, Blk, 0) == 0)
+			fail("a chunk whose grain write failed reported "
+				"success");
+		simfault(d, Sfnone, 0);
+		stagediscard(g);
+	}
+	storestat(s, &st2);
+	eqv("a failed chunk leaves nothing staged", st2.staged, 0);
+	eqv("and gives back the grain it allocated", st2.grainfree,
+		st.grainfree);
+	if((g = stageopen(s, o, 4, Blk, 0)) == nil)
+		fail("stageopen: %r");
+	else{
+		checks++;
+		if(stagewrite(g, buf, Blk, 0) < 0)
+			fail("twelve failed chunks spent stagetot: %r");
+		stagediscard(g);
+	}
+
+	/* ... and the per-fid one, on a single handle */
+	if((g = stageopen(s, o, 4, 2*Blk, 0)) == nil)
+		fail("stageopen: %r");
+	else{
+		for(i = 0; i < 8; i++){
+			simfault(d, Sfintr, 1);
+			checks++;
+			if(stagewrite(g, buf, Blk, 0) == 0)
+				fail("a chunk whose grain write failed "
+					"reported success");
+			simfault(d, Sfnone, 0);
+		}
+		checks++;
+		if(stagewrite(g, buf, Blk, 0) < 0)
+			fail("eight failed chunks spent the handle's "
+				"stagemax: %r");
+		stagediscard(g);
+	}
+
+	/* the rewrite: the grain the handle still names stays reserved */
+	if((g = stageopen(s, o, 4, 2*Blk, 0)) == nil)
+		fail("stageopen: %r");
+	else{
+		if(stagewrite(g, buf, Blk, 0) < 0)
+			fail("stagewrite: %r");
+		storestat(s, &st2);
+		eqv("a good chunk stages one grain", st2.staged, 1);
+		simfault(d, Sfintr, 1);
+		checks++;
+		if(stagewrite(g, buf, Blk, 0) == 0)
+			fail("a rewrite whose grain write failed reported "
+				"success");
+		simfault(d, Sfnone, 0);
+		storestat(s, &st2);
+		eqv("a failed rewrite keeps the block's grain reserved",
+			st2.staged, 1);
+		if(stagewrite(g, buf + Blk, Blk, Blk) < 0)
+			fail("stagewrite: %r");
+		if(stagefinal(g, 9, 1, nil, 0) < 0)
+			fail("stagefinal after a failed rewrite: %r");
+		else{
+			rd(s, "heal", got, 2*Blk, 0, "after a failed rewrite");
+			checks++;
+			if(memcmp(got, buf, 2*Blk) != 0)
+				fail("after a failed rewrite: content differs");
+			mustverify(s, "heal", "after a failed rewrite");
+		}
+	}
+	storeclose(s);
+	devclose(d);
+	free(buf);
+	free(got);
+}
+
 static void
 texhaust(void)
 {
@@ -1329,6 +1442,7 @@ main(int argc, char **argv)
 	tdeferred('g');
 	tdeferred('s');
 	tstage();
+	tstagefault();
 	texhaust();
 	tdirty();
 	tfull();

@@ -1304,13 +1304,17 @@ stagewrite(Stage *g, void *a, long n, uvlong off)
 			werrstr("disk full");
 			return -1;
 		}
-		if(g->grain[blk] != 0)
-			grainstageclr(s, g->grain[blk]);
-		else{
-			g->ngrain++;
-			s->nstagegrain++;
-		}
 		qunlock(&s->qlstate);
+		/*
+		 * §3.6's two bounds are charged, and the block's previous
+		 * grain released, only once the replacement is on the
+		 * platter.  A chunk that fails — `interrupted' is an
+		 * ordinary outcome here (§0) — must leave the handle exactly
+		 * as it found it: a charge the discard cannot see (it counts
+		 * g->grain[i], and this block's is still 0) would be
+		 * permanent, and a release before the write would leave the
+		 * handle naming a grain the allocator has taken back.
+		 */
 		if(grainwrite(s, buf, gr) < 0){
 			qlock(&s->qlstate);
 			grainstageclr(s, gr);
@@ -1318,6 +1322,14 @@ stagewrite(Stage *g, void *a, long n, uvlong off)
 			free(buf);
 			return -1;
 		}
+		qlock(&s->qlstate);
+		if(g->grain[blk] != 0)
+			grainstageclr(s, g->grain[blk]);
+		else{
+			g->ngrain++;
+			s->nstagegrain++;
+		}
+		qunlock(&s->qlstate);
 		g->grain[blk] = gr;
 		k = s->sb.blksz;
 		if((uvlong)(blk+1)*s->sb.blksz > g->len)
