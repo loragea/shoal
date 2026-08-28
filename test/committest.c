@@ -501,6 +501,232 @@ twrap(void)
 }
 
 /*
+ * A geometry whose maximal record is four sectors.  At the small
+ * geometry's two, a record that does not fit the tail always leaves
+ * exactly one sector free, so the modular continuation rule reaches
+ * the region start whether or not Fwrap is honoured and Fwrap is
+ * never the only thing that gets replay there — which is why the
+ * three mutations about a multi-sector record at the region boundary
+ * need a geometry of their own.
+ */
+static Dev*
+wrapdisk(void)
+{
+	Dev *d;
+	Super s;
+	Fmtcfg c;
+
+	if((d = simopen(Tsecsz, Tnsec, Tseed)) == nil)
+		sysfatal("simopen: %r");
+	smallcfg(&c);
+	c.objmax = 4*65536;		/* 64 blocks, so 64 map triples */
+	c.nslots = 32;
+	c.nemap = 16;
+	if(geometry(&s, &c, d->size) < 0)
+		sysfatal("geometry: %r");
+	if(fmtstore(d, &s) < 0)
+		sysfatal("fmtstore: %r");
+	return d;
+}
+
+/* the last log write, and the last flush, in the recorded trace */
+static void
+lastlog(Dev *d, vlong lo, vlong hi, int *lastw, int *lastf)
+{
+	Simop *t;
+	long n, i;
+
+	*lastw = -1;
+	*lastf = -1;
+	n = simtrace(d, &t);
+	for(i = 0; i < n; i++){
+		if(t[i].op == Sopwrite && t[i].off >= lo && t[i].off < hi)
+			*lastw = i;
+		if(t[i].op == Sopflush)
+			*lastf = i;
+	}
+}
+
+/*
+ * T1.11 at the region boundary, where a record needs more sectors
+ * than the tail has left.  Three things are true there and none of
+ * them is true by arithmetic:
+ *
+ * - the writer emits a one-sector Fwrap record and places the real
+ *   record at the region start, rather than letting it straddle the
+ *   end and run into the index region;
+ * - that wrap record rides *before* the batch's post-flush, so one
+ *   flush makes both durable — written after it, it is a link in the
+ *   log's own continuity that a crash can drop, and replay would
+ *   continue at +nsec into the index region and discard every commit
+ *   since;
+ * - replay honours Fwrap rather than continuing at +nsec, which here
+ *   is a sector short of the region end and so is not the region
+ *   start.
+ *
+ * The schedule parks the tail two sectors from the end with the
+ * checkpoint mark just behind it, and then commits a four-sector
+ * record.
+ */
+static void
+twrapbig(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Super sb;
+	Sbsel sel;
+	Objinfo oi;
+	uchar *small, *big, o[Oidmax];
+	char name[32];
+	uvlong ver[4], seq0, p;
+	vlong lo, hi;
+	int i, j, k, wraps, lastw, lastf;
+
+	d = wrapdisk();
+	if((s = openstore(d)) == nil){
+		fail("the wrap geometry: storeopen: %r");
+		devclose(d);
+		return;
+	}
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	sb = sel.sb[sel.start];
+	lo = (vlong)sb.logoff*sb.secsz;
+	hi = lo + (vlong)sb.logsecs*sb.secsz;
+	checks++;
+	if(maxrecbytes(&sb) <= 2*(uvlong)sb.secsz)
+		fail("the wrap geometry's maximal record is %llud bytes, "
+			"which is not more than two sectors",
+			maxrecbytes(&sb));
+	small = mkbuf(64, 127);
+	big = mkbuf(64*Blk, 131);
+	for(j = 0; j < 4; j++){
+		snprint(name, sizeof name, "x%d", j);
+		mk(s, name);
+		ver[j] = 1;
+	}
+
+	/*
+	 * Several laps with a mix of one-sector and four-sector records,
+	 * so the tail meets the region end in every configuration.
+	 */
+	wraps = 0;
+	for(i = 0; i < 120; i++){
+		j = i % 4;
+		snprint(name, sizeof name, "x%d", j);
+		storestat(s, &st);
+		seq0 = st.seqnext;
+		simtracereset(d);
+		ver[j]++;
+		if(i % 5 == 4){
+			if(wr(s, name, big, 64*Blk, 0, ver[j]) < 0)
+				fail("big write %d: %r", i);
+		}else if(wr(s, name, small, 64, 0, ver[j]) < 0)
+			fail("small write %d: %r", i);
+		storestat(s, &st);
+		if(st.seqnext - seq0 == 2){
+			wraps++;
+			lastlog(d, lo, hi, &lastw, &lastf);
+			checks++;
+			if(lastw < 0 || lastf < 0 || lastw > lastf)
+				fail("a log write follows the batch's "
+					"post-flush: the wrap record is not "
+					"covered by it");
+		}
+		if(i % 10 == 9 && storecheckpoint(s) < 0)
+			fail("storecheckpoint: %r");
+	}
+	for(j = 0; j < 4; j++){
+		snprint(name, sizeof name, "x%d", j);
+		mustverify(s, name, "after several laps of the wrap geometry");
+	}
+
+	/*
+	 * Park the tail two sectors from the region end.  A checkpoint
+	 * with nothing in flight leaves cklogoff at the tail, so the
+	 * distance is known; the mark then sits just behind the wrap,
+	 * which is what puts the wrap in replay's path.
+	 */
+	for(k = 0; k < 20; k++){
+		if(storecheckpoint(s) < 0)
+			fail("storecheckpoint: %r");
+		storestat(s, &st);
+		p = st.cklogoff - sb.logoff;
+		if(sb.logsecs - p <= 48)
+			break;
+		for(i = 0; i < 40; i++){
+			ver[0]++;
+			if(wr(s, "x0", small, 64, 0, ver[0]) < 0)
+				fail("parking write: %r");
+		}
+	}
+	checks++;
+	if(sb.logsecs - p > 48 || p + 2 > sb.logsecs)
+		fail("the tail could not be parked near the region end "
+			"(%llud of %lud sectors)", p, sb.logsecs);
+	while(p + 2 < sb.logsecs){
+		ver[1]++;
+		if(wr(s, "x1", small, 64, 0, ver[1]) < 0){
+			fail("parking write: %r");
+			break;
+		}
+		p++;
+	}
+	storestat(s, &st);
+	seq0 = st.seqnext;
+	simtracereset(d);
+	ver[2]++;
+	if(wr(s, "x2", big, 64*Blk, 0, ver[2]) < 0)
+		fail("the record at the region boundary: %r");
+	storestat(s, &st);
+	checks++;
+	if(st.seqnext - seq0 != 2)
+		fail("a four-sector record two sectors from the region end "
+			"did not emit a wrap record");
+	else{
+		wraps++;
+		lastlog(d, lo, hi, &lastw, &lastf);
+		checks++;
+		if(lastw < 0 || lastf < 0 || lastw > lastf)
+			fail("the wrap record was written after the batch's "
+				"post-flush");
+	}
+	istrue("a wrap record was emitted and its placement read off the "
+		"trace", wraps > 0);
+
+	/* commits after the wrap, at the region start, all acked */
+	for(i = 0; i < 3; i++){
+		ver[3]++;
+		if(wr(s, "x3", small, 64, 0, ver[3]) < 0)
+			fail("write after the wrap: %r");
+	}
+	storeclose(s);
+
+	if((s = openstore(d)) == nil){
+		fail("after a record at the region boundary: storeopen: %r");
+		devclose(d);
+		free(small);
+		free(big);
+		return;
+	}
+	for(j = 0; j < 4; j++){
+		snprint(name, sizeof name, "x%d", j);
+		oidof(o, name);
+		if(objstat(s, o, strlen(name), &oi) < 0)
+			fail("objstat %s: %r", name);
+		else
+			eqv("every acked write across the wrap replays",
+				oi.ver, ver[j]);
+		mustverify(s, name, "after a record at the region boundary");
+	}
+	storeclose(s);
+	devclose(d);
+	free(small);
+	free(big);
+}
+
+/*
  * T1.8, the durable watermark.  A batch's members are woken only when
  * that batch's post-flush has returned, every lower-numbered batch's
  * has, and the batch has been applied.  Without the ordering, a crash
@@ -1718,6 +1944,7 @@ main(int argc, char **argv)
 	tshort();
 	tmatrix();
 	twrap();
+	twrapbig();
 	tgroup();
 	tmaxbatch();
 	tbignsec();
