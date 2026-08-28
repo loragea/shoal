@@ -2649,7 +2649,9 @@ ordered start-up: the tolerant index read, replay and its
 idempotence, §2.5's replay-coverage rule in all three of the
 cases it exists to tell apart, the automatic bitmap rebuild, §2.2's
 publisher and its durability orderings, §5 step 10's condemnation
-after — and only after — replay, §3.2's refusal to start without a
+after — and only after — replay and again when a damaged extent map
+is first read, §2.6's exhaustion dropping one peer's records on the
+live path and on replay alike, §3.2's refusal to start without a
 flush channel, and a store opened, written and replayed at a `blksz`
 four times the device's `Wunit`), `objtest` (§2.7's extent-map slot
 rule over all three transitions and both the crash and the re-replay
@@ -2662,9 +2664,14 @@ placement read off the device trace, the torn-header sweep over a
 whole sector, short counts on every call, §3.4's crash matrix at
 every point × every operation shape, several laps of the log
 including its wrap record, eight concurrent committers and the
-durable watermark under a held batch, §2.8's reclaim rule run both
-ways, the checkpoint mark against a concurrent publish, and
-`qid.path` across restarts).
+durable watermark under a held batch, the pending queue under §6's
+wait — an item absorbed while it waits, and the wait elapsing under a
+running batch — a log write that fails while later batches are in
+flight, a checkpoint page write that fails followed by a second
+checkpoint, §0's `interrupted` completed and `Echange` refused, §13's
+own named points, §6's reserved tail against an `Edirty`, §2.8's
+reclaim rule run both ways, the checkpoint mark against a concurrent
+publish, and `qid.path` across restarts).
 
 Against the list below that is T1.1–T1.8, T1.10–T1.14, T1.16,
 T1.18–T1.20 and T1.22–T1.26. Four cases are not covered and each

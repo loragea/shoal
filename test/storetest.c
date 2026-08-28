@@ -548,6 +548,137 @@ tcondemn(void)
 }
 
 /*
+ * §5 step 9 and step 10 at run time.  An extent-map entry that fails
+ * its csum128 and that replay did not touch is media damage the log
+ * does not cover: the slot goes to /lost with kind=corrupt and is not
+ * served.  Step 9 reads only the entries replay touched, so nothing
+ * is condemned at start — it is the first read of the object that
+ * finds it, and serving that read from the damaged bytes is exactly
+ * the silent corruption the step exists to prevent.
+ */
+static void
+tbadmap(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Shadow sh;
+	Objinfo oi;
+	Sbsel sel;
+	Super sup;
+	uchar *buf, rd[64], junk[8], oid[Oidmax];
+	ulong slot;
+
+	memset(&sh, 0, sizeof sh);
+	d = newdisk();
+	if((s = mustopen(d, "a damaged extent map")) == nil)
+		return;
+	mkobj(s, "wide", 1);
+	buf = mkbuf(3*Blk, 21);
+	wr(s, "wide", &sh, buf, 3*Blk, 0, 2);
+	oidof(oid, "wide");
+	if(objstat(s, oid, 4, &oi) < 0)
+		fail("objstat wide: %r");
+	slot = oi.emapslot;
+	istrue("a three-block object has an extent-map slot", slot != 0);
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	storeclose(s);
+
+	/*
+	 * Damage a digest rather than a grain number, so that a store
+	 * that served the entry would answer with real bytes: what is
+	 * being tested is that it does not serve it at all.
+	 */
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	sup = sel.sb[sel.start];
+	memset(junk, 0xa5, sizeof junk);
+	simpoke(d, emapentoff(&sup, slot) + sup.emapsz - sizeof junk, junk,
+		sizeof junk);
+
+	if((s = mustopen(d, "a damaged extent map, replayed")) == nil){
+		devclose(d);
+		free(buf);
+		free(sh.p);
+		return;
+	}
+	storestat(s, &st);
+	eqv("start condemns nothing: replay never read the entry", st.nlost, 0);
+	checks++;
+	if(objread(s, oid, 4, rd, sizeof rd, 0) >= 0)
+		fail("an extent map that failed its checksum was served");
+	storestat(s, &st);
+	eqv("the slot the damaged map belongs to is condemned", st.nlost, 1);
+	eqv("and it is named", storelost(s, 0), oi.slot);
+	checks++;
+	if(objstat(s, oid, 4, &oi) >= 0)
+		fail("a condemned slot is still served");
+	storeclose(s);
+	devclose(d);
+	free(buf);
+	free(sh.p);
+}
+
+/*
+ * §2.6: ndirty is an implementation limit in exactly layer-a §7.1's
+ * sense.  When it is exhausted the store discards every fine-grained
+ * record for the peer with the most records and marks that peer
+ * fullsync — the records are dropped, not the write.  It is done in
+ * the apply, so §3.2's commit path and §5's replay answer the same
+ * thing: a full region the live path refused and replay ignored is a
+ * store whose memory differs from what its own log rebuilds, and the
+ * refusal itself arrives after the record is already durable.
+ */
+static void
+tdirtyfull(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	uchar oid[Oidmax];
+	char name[32];
+	ulong i, n;
+
+	d = newdisk();
+	if((s = mustopen(d, "a full dirty region")) == nil)
+		return;
+	n = 0;
+	for(i = 0; i < 64; i++){
+		snprint(name, sizeof name, "dp%lud", i);
+		oidof(oid, name);
+		if(dirtyadd(s, oid, strlen(name), "peer.a", 7 + i) < 0)
+			break;
+		n++;
+	}
+	eqv("the dirty region holds ndirty records", dirtycount(s), n);
+	istrue("the small geometry's region was filled", n >= 64);
+
+	oidof(oid, "dq");
+	checks++;
+	if(dirtyadd(s, oid, 2, "peer.b", 9) < 0)
+		fail("a full dirty region failed a durable write instead of "
+			"dropping a peer's records: %r");
+	storestat(s, &st);
+	istrue("the store still commits", st.broken == 0);
+	eqv("the peer with the most records lost them", dirtycount(s), 1);
+	istrue("that peer is marked fullsync", storefullsync(s, "peer.a"));
+	istrue("and the new record is the one that is there",
+		dirtyhas(s, oid, 2, "peer.b"));
+
+	/* replay reaches the same set, by the same rule */
+	storeclose(s);
+	if((s = mustopen(d, "a full dirty region, replayed")) == nil){
+		devclose(d);
+		return;
+	}
+	eqv("replay reaches the same dirty set", dirtycount(s), 1);
+	istrue("with the same record in it", dirtyhas(s, oid, 2, "peer.b"));
+	storeclose(s);
+	devclose(d);
+}
+
+/*
  * §3.2's flush channel.  If it cannot be opened the store MUST NOT
  * start, unless the operator passes -w, which asserts that the unit
  * is write-through or its write cache disabled.  -w is a claim, not
@@ -659,6 +790,8 @@ main(int argc, char **argv)
 	trebuild();
 	tpublish();
 	tcondemn();
+	tbadmap();
+	tdirtyfull();
 	tflushchan();
 	tbigblk();
 	if(fails > 0){

@@ -538,6 +538,132 @@ writerproc(void *a)
 	w->done = 1;
 }
 
+/*
+ * §6's wait, and the pending queue under it.  A commit with no log
+ * space waits for the checkpointer with its item still on the pending
+ * queue, so a committer may absorb that item at any moment — the
+ * expected end of the wait.  The wait must therefore re-check the
+ * item's state under the lock before it gives up, or it unlinks an
+ * item that is by then a link in a batch's list: the entries after it
+ * are in the durable record and are never applied and never woken,
+ * and the item's own commit is answered `disk full' though it is on
+ * the platter and published.  §13's fullwait point stages both
+ * interleavings, so the schedule is the same on every run.
+ */
+static void
+tabsorb(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Writer *w;
+	Objinfo oi;
+	uchar o[Oidmax];
+	int i, k;
+
+	d = newdisk();
+	if((s = mustopen(d, "absorbed during the wait")) == nil)
+		return;
+	/*
+	 * On the heap, not on this proc's stack: §7's T1 procs share the
+	 * data and bss segments and not the stack, and every proc's
+	 * stack is at the same virtual address, so a writer would set a
+	 * done flag its parent cannot see.
+	 */
+	if((w = mallocz(2*sizeof *w, 1)) == nil)
+		sysfatal("mallocz: %r");
+	mk(s, "a0");
+	mk(s, "a1");
+
+	/* park one commit in the wait, its item still pending */
+	for(i = 0; i < 2; i++){
+		w[i].s = s;
+		snprint(w[i].name, sizeof w[i].name, "a%d", i);
+		w[i].ver = 30;
+		w[i].nwrite = 1;
+	}
+	storehook(s, "fullwait", 1);
+	if(spawnproc(writerproc, &w[0]) < 0)
+		fail("spawn: %r");
+	for(k = 0; k < 4000; k++){
+		storestat(s, &st);
+		if(st.logwait > 0)
+			break;
+		sleep(1);
+	}
+	istrue("a commit with no log space waits for the checkpointer",
+		st.logwait > 0);
+
+	/* a committer absorbs it, and the batch is durable and applied */
+	if(spawnproc(writerproc, &w[1]) < 0)
+		fail("spawn: %r");
+	for(k = 0; k < 4000 && !w[1].done; k++)
+		sleep(1);
+	istrue("the committer took the waiting item with it", w[1].done);
+	storehook(s, "fullwait", 0);
+	for(k = 0; k < 4000 && !w[0].done; k++)
+		sleep(1);
+	istrue("the waiting writer returned", w[0].done);
+	checks++;
+	if(w[0].err)
+		fail("a commit that became durable during the wait was "
+			"answered `disk full'");
+
+	/*
+	 * And again with the batch still running when the wait elapses:
+	 * the item is batched, so it waits for its batch rather than
+	 * being taken out of the middle of it.
+	 */
+	memset(w, 0, 2*sizeof *w);
+	for(i = 0; i < 2; i++){
+		w[i].s = s;
+		snprint(w[i].name, sizeof w[i].name, "a%d", i);
+		w[i].ver = 31;
+		w[i].nwrite = 1;
+	}
+	storestat(s, &st);
+	storehook(s, "batch", st.seqnext);
+	storehook(s, "fullwait", 1);
+	if(spawnproc(writerproc, &w[0]) < 0)
+		fail("spawn: %r");
+	for(k = 0; k < 4000; k++){
+		storestat(s, &st);
+		if(st.logwait > 0)
+			break;
+		sleep(1);
+	}
+	if(spawnproc(writerproc, &w[1]) < 0)
+		fail("spawn: %r");
+	for(k = 0; k < 4000; k++){
+		storestat(s, &st);
+		if(st.seqnext > st.watermark + 1)
+			break;
+		sleep(1);
+	}
+	storehook(s, "fullwait", 0);
+	sleep(100);
+	storehook(s, "batch", 0);
+	for(k = 0; k < 4000 && !(w[0].done && w[1].done); k++)
+		sleep(1);
+	istrue("the wait elapsing under a running batch severs nobody",
+		w[0].done && w[1].done);
+	checks++;
+	if(w[0].err || w[1].err)
+		fail("a commit in a running batch was answered `disk full'");
+	for(i = 0; i < 2; i++){
+		snprint(w[i].name, sizeof w[i].name, "a%d", i);
+		oidof(o, w[i].name);
+		if(objstat(s, o, strlen(w[i].name), &oi) < 0)
+			fail("objstat %s: %r", w[i].name);
+		else
+			eqv("every entry in the batch was applied", oi.ver, 31);
+		mustverify(s, w[i].name, "absorbed during the wait");
+	}
+	storeclose(s);
+	devclose(d);
+	free(w);
+}
+
 static void
 tgroup(void)
 {
@@ -651,6 +777,427 @@ tgroup(void)
 	storeclose(s);
 	devclose(d);
 	free(w);
+	tabsorb();
+}
+
+/*
+ * T1.8's other half, and it needs no crash.  A batch whose record did
+ * not become durable MUST NOT let a later batch ack: replay stops at
+ * the first record that is not there, so an acked write above it is
+ * lost.  A device error on one log write while §7's logdepth batches
+ * are in flight is enough to reach it — §0 makes `interrupted' an
+ * ordinary outcome of any device call, so this is a Tflush away — and
+ * the store must condemn itself for commits rather than ack.
+ */
+static void
+tfailed(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Writer *w;
+	Objinfo oi;
+	Sbsel sel;
+	Super sb;
+	uchar *buf, o[Oidmax];
+	uvlong wm;
+	vlong lo;
+	int i, k;
+
+	d = newdisk();
+	if((s = mustopen(d, "a failed log write")) == nil)
+		return;
+	if((w = mallocz(2*sizeof *w, 1)) == nil)
+		sysfatal("mallocz: %r");
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	sb = sel.sb[sel.start];
+	lo = (vlong)sb.logoff*sb.secsz;
+	buf = mkbuf(64, 103);
+	mk(s, "b0");
+	mk(s, "b1");
+	if(wr(s, "b0", buf, 64, 0, 2) < 0 || wr(s, "b1", buf, 64, 0, 2) < 0)
+		fail("setup write: %r");
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	storestat(s, &st);
+	wm = st.watermark;
+
+	/* hold batch n, let batch n+1 land and park behind it */
+	for(i = 0; i < 2; i++){
+		w[i].s = s;
+		snprint(w[i].name, sizeof w[i].name, "b%d", i);
+		w[i].ver = 40;
+		w[i].nwrite = 1;
+	}
+	storehook(s, "batch", st.seqnext);
+	if(spawnproc(writerproc, &w[0]) < 0)
+		fail("spawn: %r");
+	for(k = 0; k < 4000; k++){
+		storestat(s, &st);
+		if(st.seqnext > st.watermark + 1)
+			break;
+		sleep(1);
+	}
+	if(spawnproc(writerproc, &w[1]) < 0)
+		fail("spawn: %r");
+	for(k = 0; k < 4000; k++){
+		storestat(s, &st);
+		if(st.seqnext > st.watermark + 2)
+			break;
+		sleep(1);
+	}
+	sleep(100);
+
+	/* now batch n's own header write fails */
+	simfaultat(d, Sfeio, 1, lo, (vlong)sb.logsecs*sb.secsz);
+	storehook(s, "batch", 0);
+	for(k = 0; k < 4000 && !(w[0].done && w[1].done); k++)
+		sleep(1);
+	simfault(d, Sfnone, 0);
+	istrue("both writers returned", w[0].done && w[1].done);
+	istrue("the batch whose log write failed fails", w[0].err != 0);
+	istrue("and so does the batch above it, which replay would discard",
+		w[1].err != 0);
+	storestat(s, &st);
+	istrue("the store commits no more", st.broken != 0);
+	eqv("the watermark did not pass a batch that did not land",
+		st.watermark, wm);
+	checks++;
+	if(wr(s, "b0", buf, 64, 0, 50) >= 0)
+		fail("a condemned store accepted another commit");
+	storeclose(s);
+
+	if((s = mustopen(d, "after a failed log write")) == nil){
+		devclose(d);
+		free(buf);
+		free(w);
+		return;
+	}
+	for(i = 0; i < 2; i++){
+		snprint(w[i].name, sizeof w[i].name, "b%d", i);
+		oidof(o, w[i].name);
+		if(objstat(s, o, strlen(w[i].name), &oi) < 0)
+			fail("objstat %s: %r", w[i].name);
+		else
+			eqv("no write above the failed batch survived", oi.ver,
+				2);
+		mustverify(s, w[i].name, "after a failed log write");
+	}
+	storeclose(s);
+	devclose(d);
+	free(buf);
+	free(w);
+}
+
+/*
+ * §2.8: a checkpoint page whose write failed stays dirty.  Clearing
+ * the mark and then failing is not an aborted checkpoint but a silent
+ * one — the page is clean, so the next checkpoint skips it and
+ * publishes a ckseq and a cklogoff past the records that dirtied it,
+ * and reclaims their log space.  The committed state is then in
+ * neither the log nor the region, with no crash anywhere.
+ */
+static void
+tckptfail(void)
+{
+	Dev *d;
+	Store *s;
+	Objinfo oi;
+	Sbsel sel;
+	Super sb;
+	uchar *buf, o[Oidmax];
+	ulong slot;
+
+	d = newdisk();
+	if((s = mustopen(d, "a failed checkpoint page")) == nil)
+		return;
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	sb = sel.sb[sel.start];
+	buf = mkbuf(3*Blk, 107);
+	mk(s, "c0");
+	if(wr(s, "c0", buf, 64, 0, 2) < 0)
+		fail("objwrite: %r");
+
+	/* the index page holding slot 0 */
+	simfaultat(d, Sfeio, 1, (vlong)sb.idxoff*sb.secsz, sb.blksz);
+	checks++;
+	if(storecheckpoint(s) >= 0)
+		fail("a checkpoint whose page write failed reported success");
+	simfault(d, Sfnone, 0);
+	if(storecheckpoint(s) < 0)
+		fail("the checkpoint after a failed one: %r");
+	storeclose(s);
+	if((s = mustopen(d, "after a failed index page")) == nil){
+		devclose(d);
+		free(buf);
+		return;
+	}
+	oidof(o, "c0");
+	checks++;
+	if(objstat(s, o, 2, &oi) < 0)
+		fail("an object whose index page write failed is gone: %r");
+	else
+		eqv("and it is the version that was acked", oi.ver, 2);
+
+	/*
+	 * The same for an extent-map entry, which is taken off the dirty
+	 * list as well as unmarked, so a failed write-back has to put the
+	 * entry back to have anything left to write.
+	 */
+	mk(s, "c1");
+	if(wr(s, "c1", buf, 3*Blk, 0, 2) < 0)
+		fail("objwrite: %r");
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	oidof(o, "c1");
+	if(objstat(s, o, 2, &oi) < 0)
+		fail("objstat c1: %r");
+	slot = oi.emapslot;
+	istrue("a three-block object has an extent-map slot", slot != 0);
+	if(wr(s, "c1", buf, 3*Blk, 0, 3) < 0)
+		fail("objwrite: %r");
+	simfaultat(d, Sfeio, 1, (vlong)emapentoff(&sb, slot), sb.emapsz);
+	checks++;
+	if(storecheckpoint(s) >= 0)
+		fail("a checkpoint whose extent-map write failed reported "
+			"success");
+	simfault(d, Sfnone, 0);
+	if(storecheckpoint(s) < 0)
+		fail("the checkpoint after a failed extent-map write: %r");
+	storeclose(s);
+	if((s = mustopen(d, "after a failed extent-map write")) == nil){
+		devclose(d);
+		free(buf);
+		return;
+	}
+	mustverify(s, "c1", "after a failed extent-map write");
+	storeclose(s);
+	devclose(d);
+	free(buf);
+}
+
+/*
+ * §0's error classes, used rather than merely told apart.
+ * `interrupted' means reqqueueflush aborted the system call this proc
+ * was in: it is not media damage, and §7 has a worker already inside
+ * a commit complete that commit — a record half in the log is a
+ * record whose successor can never be acked.  Treating it as an Eio
+ * would let an ordinary client interrupt condemn the store.
+ */
+static void
+tintr(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Objinfo oi;
+	Sbsel sel;
+	Super sb;
+	Waitmsg *wm;
+	uchar *buf, o[Oidmax];
+	vlong lo, len;
+	int fd;
+
+	d = newdisk();
+	if((s = mustopen(d, "an interrupted log write")) == nil)
+		return;
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	sb = sel.sb[sel.start];
+	lo = (vlong)sb.logoff*sb.secsz;
+	len = (vlong)sb.logsecs*sb.secsz;
+	buf = mkbuf(64, 109);
+	mk(s, "i0");
+	simfaultat(d, Sfintr, 1, lo, len);
+	checks++;
+	if(wr(s, "i0", buf, 64, 0, 2) < 0)
+		fail("an interrupted log write was not completed: %r");
+	simfault(d, Sfnone, 0);
+	storestat(s, &st);
+	istrue("an interrupted log write does not condemn the store",
+		st.broken == 0);
+	mustverify(s, "i0", "after an interrupted log write");
+	storeclose(s);
+	if((s = mustopen(d, "an interrupted log write, replayed")) == nil){
+		devclose(d);
+		free(buf);
+		return;
+	}
+	oidof(o, "i0");
+	if(objstat(s, o, 2, &oi) < 0)
+		fail("objstat i0: %r");
+	else
+		eqv("and the write it carried is durable", oi.ver, 2);
+
+	/*
+	 * Echange is the class the store cannot carry on from: the
+	 * unit's partitions were re-declared under the fid, so every
+	 * offset it holds may now name something else.  "MUST NOT keep
+	 * serving on a stale fid" means the proc does not come back,
+	 * which is what a child proc is for.
+	 */
+	simfaultat(d, Sfechange, 1, lo, len);
+	/*
+	 * RFFDG as well as RFMEM: the child gets its own file
+	 * descriptors, so quietening the exit line does not quieten this
+	 * program's own.
+	 */
+	switch(rfork(RFPROC|RFMEM|RFFDG)){
+	case -1:
+		fail("rfork: %r");
+		break;
+	case 0:
+		if((fd = open("/dev/null", OWRITE)) >= 0){
+			dup(fd, 2);	/* the exit line is the point, not noise */
+			close(fd);
+		}
+		wr(s, "i0", buf, 64, 0, 3);
+		exits("served on");
+	default:
+		checks++;
+		if((wm = wait()) == nil)
+			fail("wait: %r");
+		else{
+			if(wm->msg[0] == '\0')
+				fail("a device that reported Echange was served "
+					"on");
+			free(wm);
+		}
+	}
+	simfault(d, Sfnone, 0);
+	storeclose(s);
+	devclose(d);
+	free(buf);
+}
+
+/*
+ * §13's named points mean what they say.  body:n is "after n body
+ * sectors", so the common one-sector commit — whose body is empty —
+ * has none: a schedule arming body:1 must not be crashed after the
+ * commit point instead of before it.  precommit and commit are two
+ * points and not one, and the pre-flush is what lies between them.
+ */
+static void
+tpoints(void)
+{
+	Dev *d;
+	Store *s;
+	Simop *t;
+	Sbsel sel;
+	Super sb;
+	uchar *buf;
+	vlong lo, hi;
+	long n, i, lw, lf;
+
+	d = newdisk();
+	if((s = mustopen(d, "the named points")) == nil)
+		return;
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	sb = sel.sb[sel.start];
+	lo = (vlong)sb.logoff*sb.secsz;
+	hi = lo + (vlong)sb.logsecs*sb.secsz;
+	buf = mkbuf(16*Blk, 113);
+	mk(s, "p0");
+
+	simcrashdead(d, 1);
+	simcrashmode(d, Scdrop);
+	simarm(d, "body", 1);
+	checks++;
+	if(wr(s, "p0", buf, 64, 0, 2) < 0)
+		fail("body:1 fired on a record with no body sectors: %r");
+	simarm(d, nil, 0);
+
+	/*
+	 * The pre-flush follows the precommit point, so at that point
+	 * none has been issued for this record.  It takes a record with
+	 * body sectors to say so: at this geometry that is a rewrite of a
+	 * whole maximal object, whose entry names sixteen blocks and
+	 * frees sixteen grains.
+	 */
+	if(wr(s, "p0", buf, 16*Blk, 0, 3) < 0)
+		fail("objwrite: %r");
+	simtracereset(d);
+	simarm(d, "precommit", 0);
+	wr(s, "p0", buf, 16*Blk, 0, 4);
+	simarm(d, nil, 0);
+	n = simtrace(d, &t);
+	lw = -1;
+	lf = -1;
+	for(i = 0; i < n; i++){
+		if(t[i].n < 0)
+			continue;
+		if(t[i].op == Sopwrite && t[i].off >= lo && t[i].off < hi)
+			lw = i;
+		else if(t[i].op == Sopflush)
+			lf = i;
+	}
+	checks++;
+	if(lw < 0 || lf > lw)
+		fail("the pre-flush was issued before §13's precommit point");
+	simrevive(d);
+	storeclose(s);
+	devclose(d);
+	free(buf);
+}
+
+/*
+ * §6's reserved tail is for commits that free space: an Eobj that
+ * releases grains without allocating any, and an Eslot.  An Edirty
+ * frees no log space in either direction, so neither an add nor a
+ * remove may draw on the reserve — otherwise the reserve is spent by
+ * exactly the traffic it exists to exclude, and the delete that would
+ * relieve the exhaustion is the commit that cannot be written.
+ */
+static void
+tresv(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Sbsel sel;
+	Super sb;
+	uchar *buf, o[Oidmax];
+	uvlong resv;
+	int i;
+
+	d = newdisk();
+	if((s = mustopen(d, "the reserved tail")) == nil)
+		return;
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	sb = sel.sb[sel.start];
+	resv = sb.logsecs/Logresvdiv;
+	if(resv < 1)
+		resv = 1;
+	buf = mkbuf(64, 127);
+	mk(s, "r0");
+	oidof(o, "r0");
+	if(dirtyadd(s, o, 2, "peer.0", 7) < 0)
+		fail("dirtyadd: %r");
+
+	/* fill the log down to the reserve */
+	for(i = 0; i < 400; i++){
+		storestat(s, &st);
+		if(st.logfree <= resv)
+			break;
+		if(wr(s, "r0", buf, 64, 0, 3 + i) < 0)
+			break;
+	}
+	storestat(s, &st);
+	istrue("the log is down to its reserved tail", st.logfree <= resv);
+
+	checks++;
+	if(dirtydel(s, o, 2, "peer.0") >= 0)
+		fail("an Edirty drew on §6's reserved tail");
+	checks++;
+	if(objremove(s, o, 2, 900, 1) < 0)
+		fail("delete does not always work on the reserved tail: %r");
+	storeclose(s);
+	devclose(d);
+	free(buf);
 }
 
 /*
@@ -895,6 +1442,11 @@ main(int argc, char **argv)
 	tmatrix();
 	twrap();
 	tgroup();
+	tfailed();
+	tckptfail();
+	tintr();
+	tpoints();
+	tresv();
 	treclaim(0);
 	treclaim(1);
 	tckmark();
