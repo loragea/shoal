@@ -1105,6 +1105,151 @@ tmaxbatch(void)
 }
 
 /*
+ * T1.1 and T1.8: **durable before ack** holds for every member of a
+ * batch and not only for the proc that did the writing.  T1.1's crash
+ * matrix is single-proc, so every commit there is its own committer
+ * and no crash schedule ever has a batch-mate to ack; moving the
+ * post-flush out of the record write and past the batch's member
+ * wake-ups is invisible to all of it.
+ *
+ * A crash point cannot ask this question — it asks what is on the
+ * platter, and the answer here is about what the *other* procs in the
+ * batch are allowed to do while the committer is still inside the
+ * flush.  §13's flush:n holds that flush instead: with the post-flush
+ * held, no member may have been answered.
+ */
+typedef struct Acker Acker;
+struct Acker
+{
+	Store	*s;
+	char	name[16];
+	uvlong	ver;
+	int	done;
+	int	err;
+	char	e[ERRMAX];
+};
+
+static void
+ackproc(void *a)
+{
+	Acker *k;
+	uchar *buf, o[Oidmax];
+
+	k = a;
+	buf = mkbuf(64, 137);
+	oidof(o, k->name);
+	if(objwrite(k->s, o, strlen(k->name), buf, 64, 0, k->ver, 1, nil, 0) < 0){
+		rerrstr(k->e, sizeof k->e);
+		k->err = 1;
+	}
+	free(buf);
+	k->done = 1;
+}
+
+static void
+tackflush(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Acker *k;
+	Objinfo oi;
+	uchar *buf, o[Oidmax];
+	int i, j;
+
+	d = newdisk();
+	if((s = openstore(d)) == nil){
+		fail("durable before ack: storeopen: %r");
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(64, 139);
+	mk(s, "y0");
+	mk(s, "y1");
+	if((k = mallocz(2*sizeof *k, 1)) == nil)
+		sysfatal("mallocz: %r");
+	for(i = 0; i < 2; i++){
+		k[i].s = s;
+		snprint(k[i].name, sizeof k[i].name, "y%d", i);
+		k[i].ver = 20;
+	}
+
+	/*
+	 * One batch with two members.  The first writer parks in §6's
+	 * wait with its entries on the pending queue (fullwait); the
+	 * second absorbs them into its own batch and is held before the
+	 * record write (batch:n); clearing fullwait then leaves the first
+	 * writer an ordinary member of that batch, asleep until it
+	 * completes.
+	 */
+	storehook(s, "fullwait", 1);
+	if(spawnproc(ackproc, &k[0]) < 0)
+		fail("spawn: %r");
+	for(j = 0; j < 4000; j++){
+		storestat(s, &st);
+		if(st.logwait >= 1)
+			break;
+		sleep(1);
+	}
+	istrue("the first writer parked with its entries pending",
+		st.logwait >= 1);
+	storestat(s, &st);
+	storehook(s, "batch", st.seqnext);
+	if(spawnproc(ackproc, &k[1]) < 0)
+		fail("spawn: %r");
+	for(j = 0; j < 4000; j++){
+		storestat(s, &st);
+		if(st.seqnext > st.watermark + 1)
+			break;
+		sleep(1);
+	}
+	istrue("the batch carrying both is stamped",
+		st.seqnext > st.watermark + 1);
+	storehook(s, "fullwait", 0);
+	sleep(100);
+
+	/* the pre-flush goes through; the post-flush is held */
+	storehook(s, "flush", 2);
+	storehook(s, "batch", 0);
+	sleep(300);
+	checks++;
+	if(k[0].done || k[1].done)
+		fail("a batch member was answered before the record's "
+			"post-flush returned");
+	storehook(s, "flush", 0);
+	for(j = 0; j < 4000 && !(k[0].done && k[1].done); j++)
+		sleep(1);
+	istrue("both writers returned once the post-flush completed",
+		k[0].done && k[1].done);
+	for(i = 0; i < 2; i++){
+		checks++;
+		if(k[i].err)
+			fail("writer %d failed: %s", i, k[i].e);
+	}
+	storeclose(s);
+
+	if((s = openstore(d)) == nil){
+		fail("durable before ack, replayed: storeopen: %r");
+		devclose(d);
+		free(buf);
+		free(k);
+		return;
+	}
+	for(i = 0; i < 2; i++){
+		oidof(o, k[i].name);
+		if(objstat(s, o, strlen(k[i].name), &oi) < 0)
+			fail("objstat %s: %r", k[i].name);
+		else
+			eqv("every member's write is durable", oi.ver, 20);
+		mustverify(s, k[i].name, "durable before ack, replayed");
+	}
+	storeclose(s);
+	devclose(d);
+	free(buf);
+	free(k);
+}
+
+/*
  * T1.4 and §2.8: the checkpoint mark is bound to the *durable*
  * watermark and not to the next sequence number.  A checkpoint taken
  * while a batch is in flight is the case that tells them apart: the
@@ -1949,6 +2094,7 @@ main(int argc, char **argv)
 	tmaxbatch();
 	tbignsec();
 	tckptmark();
+	tackflush();
 	tfailed();
 	tckptfail();
 	tintr();

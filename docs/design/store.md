@@ -2599,17 +2599,22 @@ record is written and then a byte-wise mixture of its old and its new
 header bytes is placed on the platter, which is what a torn write
 leaves and what the sweep must be exhaustive over.
 
-Four of §13's points are *mutations* or schedules rather than crashes,
+Five of §13's points are *mutations* or schedules rather than crashes,
 and are built into the store as hooks that are inert unless a test
 asks for them: `reclaim` (reclaim log space before the checkpoint's
 superblock write returns), `publish` (force an `epochhigh` publish
 after the *n*'th checkpoint page write, so it can be combined with
 `ckpt:n`), `batch:n` (hold batch *n*'s record write and let *n+1*
-complete), and `fullwait` (park the next commit in §6's wait for log
+complete), `fullwait` (park the next commit in §6's wait for log
 space, with its entries still on the pending queue, until the hook is
 cleared — which is what makes the interleaving where a committer
 absorbs a waiting item, and the wait then elapses under it, the same
-on every run). Each T1 test names the requirement it discriminates
+on every run), and `flush:n` (hold the *n*'th device flush issued
+since the hook was set, until it is cleared, so a test can ask what a
+proc may answer between the header write and the post-flush that
+makes the record durable — a crash point cannot ask that, because the
+question is about what the *other* procs in a batch are allowed to do
+while the committer is still inside the flush). Each T1 test names the requirement it discriminates
 and the mutation that must break it; **each mutation is run**, per
 `AGENTS.md`.
 

@@ -103,6 +103,16 @@ flushnow(Store *s)
 		if(!s->flbusy){
 			round = s->flasked;
 			s->flbusy = 1;
+			/*
+			 * §13's flush:n — hold the n'th flush issued since
+			 * the hook was set, which is how a test asks what is
+			 * visible between the header write and the post-flush
+			 * that makes the record durable.
+			 */
+			s->flcount++;
+			while(s->flhold != 0 && s->flcount == s->flhold
+			&& !s->stop)
+				rsleep(&s->flrz);
 			qunlock(&s->fllk);
 			r = devflushretry(s->d);
 			qlock(&s->fllk);

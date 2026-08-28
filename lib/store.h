@@ -233,6 +233,7 @@ struct Store
 	Rendez	flrz;			/* on fllk: a flush completed */
 	Rendez	flwork;			/* on fllk: work for the flusher */
 	uvlong	flasked, fldone;
+	uvlong	flhold, flcount;	/* §13's flush:n hold */
 	int	flerr, flbusy, flproc;
 
 	/* the checkpointer, §2.8 */

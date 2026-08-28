@@ -86,6 +86,12 @@ storehook(Store *s, char *name, uvlong n)
 		s->fullwait = n != 0;
 		rwakeupall(&s->roomrz);
 		qunlock(&s->qllog);
+	}else if(strcmp(name, "flush") == 0){
+		qlock(&s->fllk);
+		s->flcount = 0;
+		s->flhold = n;
+		rwakeupall(&s->flrz);
+		qunlock(&s->fllk);
 	}else if(strcmp(name, "reclaim") == 0)
 		s->reclaimearly = n != 0;
 	else if(strcmp(name, "publish") == 0)
@@ -874,6 +880,9 @@ storeclose(Store *s)
 	rwakeupall(&s->donerz);
 	rwakeupall(&s->relrz);
 	qunlock(&s->qllog);
+	qlock(&s->fllk);
+	rwakeupall(&s->flrz);
+	qunlock(&s->fllk);
 	qlock(&s->proclk);
 	while(s->nproc > 0)
 		rsleep(&s->procrz);
