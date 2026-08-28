@@ -60,10 +60,29 @@ deverr(void)
  * Echange means the unit's partitions were re-declared under an open
  * fid.  It is not media damage and MUST NOT be treated as
  * corruption, and there is nothing to unwind to: every offset the
- * store holds may now name something else, so it reports the
- * condition and exits non-zero rather than writing object data where
- * something else now lives.
+ * store holds may now name something else.
+ *
+ * It condemns the *fid*, not the proc.  §7 makes every device call
+ * from a proc that holds ordering state — a committer inside its
+ * batch, the checkpointer — and exits() there ends that proc alone,
+ * leaving nflight raised and relseq never advanced, so every other
+ * committer waits for ever and storeclose never returns: a hang,
+ * which is the one failure §0's rule exists to avoid.  Refusing
+ * every later access instead fails the batch in flight, which
+ * broken's the store and wakes every waiter (§3.2), and fails every
+ * read and every checkpoint after it — so the condition reaches the
+ * caller, which is the one that can exit non-zero.
  */
+static int
+condemned(Dev *d)
+{
+	if(!d->changed)
+		return 0;
+	werrstr("%s: the unit's partitions have been re-declared under an "
+		"open fid; refusing to serve on a stale fid", d->name);
+	return 1;
+}
+
 int
 devclass(Dev *d)
 {
@@ -71,9 +90,7 @@ devclass(Dev *d)
 
 	e = deverr();
 	if(e == Dechange)
-		sysfatal("%s: the unit's partitions have been re-declared "
-			"under an open fid; refusing to serve on a stale fid",
-			d->name);
+		d->changed = 1;
 	return e;
 }
 
@@ -148,6 +165,8 @@ devread(Dev *d, void *a, long n, vlong off)
 		werrstr("%s: read %ld at %lld out of range", d->name, n, off);
 		return -1;
 	}
+	if(condemned(d))
+		return -1;
 	p = a;
 	while(n > 0){
 		m = (*d->ops->read)(d, p, n, off);
@@ -179,6 +198,8 @@ devwrite(Dev *d, void *a, long n, vlong off)
 			n, off);
 		return -1;
 	}
+	if(condemned(d))
+		return -1;
 	if(n % d->secsz != 0 || off % d->secsz != 0){
 		/*
 		 * §0: every write's length is a sector multiple, because
@@ -219,6 +240,8 @@ devwrite(Dev *d, void *a, long n, vlong off)
 int
 devflush(Dev *d)
 {
+	if(condemned(d))
+		return -1;
 	return (*d->ops->flush)(d);
 }
 

@@ -1756,10 +1756,8 @@ tintr(void)
 	Objinfo oi;
 	Sbsel sel;
 	Super sb;
-	Waitmsg *wm;
-	uchar *buf, o[Oidmax];
+	uchar *buf, rd[64], o[Oidmax];
 	vlong lo, len;
-	int fd;
 
 	d = newdisk();
 	if((s = mustopen(d, "an interrupted log write")) == nil)
@@ -1796,41 +1794,123 @@ tintr(void)
 	 * Echange is the class the store cannot carry on from: the
 	 * unit's partitions were re-declared under the fid, so every
 	 * offset it holds may now name something else.  "MUST NOT keep
-	 * serving on a stale fid" means the proc does not come back,
-	 * which is what a child proc is for.
+	 * serving on a stale fid" is the *fid* being condemned, not the
+	 * proc being exited — the commit fails, which condemns the store
+	 * through the same broken flag a lost log write does, and every
+	 * later access on that fid fails too, including after the
+	 * injected fault has been disarmed.
 	 */
 	simfaultat(d, Sfechange, 1, lo, len);
-	/*
-	 * RFFDG as well as RFMEM: the child gets its own file
-	 * descriptors, so quietening the exit line does not quieten this
-	 * program's own.
-	 */
-	switch(rfork(RFPROC|RFMEM|RFFDG)){
-	case -1:
-		fail("rfork: %r");
-		break;
-	case 0:
-		if((fd = open("/dev/null", OWRITE)) >= 0){
-			dup(fd, 2);	/* the exit line is the point, not noise */
-			close(fd);
-		}
-		wr(s, "i0", buf, 64, 0, 3);
-		exits("served on");
-	default:
-		checks++;
-		if((wm = wait()) == nil)
-			fail("wait: %r");
-		else{
-			if(wm->msg[0] == '\0')
-				fail("a device that reported Echange was served "
-					"on");
-			free(wm);
-		}
-	}
+	checks++;
+	if(wr(s, "i0", buf, 64, 0, 3) >= 0)
+		fail("a device that reported Echange was served on");
 	simfault(d, Sfnone, 0);
+	storestat(s, &st);
+	istrue("Echange condemns the store", st.broken != 0);
+	checks++;
+	if(objread(s, o, 2, rd, sizeof rd, 0) >= 0)
+		fail("a read was served on a stale fid");
+	checks++;
+	if(storecheckpoint(s) >= 0)
+		fail("a checkpoint was written to a stale fid");
 	storeclose(s);
 	devclose(d);
 	free(buf);
+}
+
+/*
+ * D4: the same class, from a proc that holds ordering state.  §7
+ * makes every device call from a committer inside its batch or from
+ * the checkpointer, so ending that proc — which is what sysfatal does
+ * — leaves nflight raised and relseq never advanced, and every other
+ * committer waits on it for ever while storeclose never returns.  The
+ * assertion is not that the batch fails but that the batch above it
+ * comes *back*: a hang is the failure layer-a §5.4.1 forbids, and it
+ * is not one a failing check can report.
+ */
+static void
+techange(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Writer *w;
+	Sbsel sel;
+	Super sb;
+	uchar *buf;
+	vlong lo;
+	int i, k;
+
+	d = newdisk();
+	if((s = mustopen(d, "Echange under a batch")) == nil)
+		return;
+	if((w = mallocz(2*sizeof *w, 1)) == nil)
+		sysfatal("mallocz: %r");
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	sb = sel.sb[sel.start];
+	lo = (vlong)sb.logoff*sb.secsz;
+	buf = mkbuf(64, 113);
+	mk(s, "e0");
+	mk(s, "e1");
+	if(wr(s, "e0", buf, 64, 0, 2) < 0 || wr(s, "e1", buf, 64, 0, 2) < 0)
+		fail("setup write: %r");
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	storestat(s, &st);
+
+	/* hold batch n, let batch n+1 land and park behind it */
+	for(i = 0; i < 2; i++){
+		w[i].s = s;
+		snprint(w[i].name, sizeof w[i].name, "e%d", i);
+		w[i].ver = 40;
+		w[i].nwrite = 1;
+	}
+	storehook(s, "batch", st.seqnext);
+	if(spawnproc(writerproc, &w[0]) < 0)
+		fail("spawn: %r");
+	for(k = 0; k < 4000; k++){
+		storestat(s, &st);
+		if(st.seqnext > st.watermark + 1)
+			break;
+		sleep(1);
+	}
+	if(spawnproc(writerproc, &w[1]) < 0)
+		fail("spawn: %r");
+	for(k = 0; k < 4000; k++){
+		storestat(s, &st);
+		if(st.seqnext > st.watermark + 2)
+			break;
+		sleep(1);
+	}
+	sleep(100);
+
+	/* the held batch's own log write reports Echange */
+	simfaultat(d, Sfechange, 1, lo, (vlong)sb.logsecs*sb.secsz);
+	storehook(s, "batch", 0);
+	for(k = 0; k < 4000 && !(w[0].done && w[1].done); k++)
+		sleep(1);
+	simfault(d, Sfnone, 0);
+	istrue("the committer that saw Echange returned", w[0].done);
+	istrue("and so does the one parked behind it: it fails, it does "
+		"not wait", w[1].done);
+	if(!(w[0].done && w[1].done)){
+		/*
+		 * A committer is still inside its batch: closing the store
+		 * would wait on it for ever, so leave both to the exit.
+		 */
+		free(buf);
+		return;
+	}
+	istrue("the batch whose log write reported Echange fails",
+		w[0].err != 0);
+	istrue("and so does the batch above it", w[1].err != 0);
+	storestat(s, &st);
+	istrue("the store commits no more", st.broken != 0);
+	storeclose(s);
+	devclose(d);
+	free(buf);
+	free(w);
 }
 
 /*
@@ -2210,6 +2290,7 @@ main(int argc, char **argv)
 	tfailed();
 	tckptfail();
 	tintr();
+	techange();
 	tpoints();
 	tresv();
 	treclaim(0);

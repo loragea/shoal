@@ -267,8 +267,8 @@ serving(Store *s)
  * exit — the stage is discarded and nothing durable was touched — so
  * it is reported as it is and never retried, unlike the commit
  * record's own writes, which MUST complete (§3.2).  Echange is the
- * class neither of them can carry on from, and devclass does not
- * return on it.
+ * class neither of them can carry on from: devclass condemns the fid,
+ * so this read or write and every later one fail (§0).
  */
 static int
 grainread(Store *s, uchar *buf, ulong g)

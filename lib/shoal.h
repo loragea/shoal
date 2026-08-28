@@ -124,6 +124,7 @@ struct Dev
 	ulong	wunit;		/* §0's Wunit: the largest single write */
 	int	flushmode;
 	int	rdonly;
+	int	changed;	/* Echange was seen on this fid (§0) */
 	void	*aux;
 };
 
@@ -143,7 +144,7 @@ int	devflush(Dev*);
 int	devzero(Dev*, vlong off, vlong n, ulong unit);
 void	devclose(Dev*);
 int	deverr(void);
-int	devclass(Dev*);		/* deverr, exiting on Echange (§0) */
+int	devclass(Dev*);		/* deverr, condemning the fid on Echange (§0) */
 int	devwriteretry(Dev*, void*, long, vlong);
 int	devflushretry(Dev*);
 

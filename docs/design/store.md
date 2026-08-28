@@ -112,9 +112,18 @@ it has one.
   partitions — an operator re-running `diskparts` is enough
   (`docs/platform/9front-storage.md` §5). The store MUST distinguish
   it from a media error, MUST NOT treat it as corruption, and MUST
-  NOT keep serving on a stale fid: it reports the condition and exits
-  non-zero, because the alternative is writing object data at offsets
-  that now mean something else.
+  NOT keep serving on a stale fid, because the alternative is writing
+  object data at offsets that now mean something else. The fid is
+  what is condemned: every later read, write and flush on it fails
+  with that condition, so the batch in flight fails and condemns the
+  store through §3.2's `broken`, waking every waiter; every read and
+  every checkpoint after it fails; and the condition reaches the
+  caller, which is the one that reports it and exits non-zero. The
+  device layer does not exit the process itself: §7 makes every
+  device call from a proc that holds ordering state — a committer
+  inside its batch, the checkpointer — and ending that proc alone
+  would leave the batch in flight and every other committer waiting
+  on it for ever.
 - **Every persistent record carries a checksum**, and it is
   BLAKE2s-128 — a 16-byte unkeyed BLAKE2s digest, the same primitive
   and the same length as a block digest (D7, layer-a §1.4). Chosen
