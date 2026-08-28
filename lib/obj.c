@@ -668,8 +668,16 @@ objwrite(Store *s, uchar *oid, int oidlen, void *a, long n, uvlong off,
 		werrstr("negative write");
 		return -1;
 	}
-	if(off + n > s->sb.objmax){
-		/* R10: a write past objmax fails `object too large' */
+	/*
+	 * R10 and layer-a §1.2: a write whose offset+count would exceed
+	 * objmax MUST fail `object too large', and MUST NOT be silently
+	 * truncated.  The bound is a difference and not a sum because off
+	 * is a client's or a peer's u64 and off+n wraps: at off = 2^64-4
+	 * and n = 4 the sum is 0, which passes every later test and stages
+	 * a block index of 4.5e15 into a record the commit path then has
+	 * to refuse.
+	 */
+	if(off > s->sb.objmax || (uvlong)n > s->sb.objmax - off){
 		werrstr("object too large");
 		return -1;
 	}
@@ -873,6 +881,10 @@ objread(Store *s, uchar *oid, int oidlen, void *a, long n, uvlong off)
 
 	if(!serving(s))
 		return -1;
+	if(n < 0){
+		werrstr("negative read");
+		return -1;
+	}
 	qlock(&s->qlstate);
 	if((slot = ientfind(s, oid, oidlen)) < 0 || s->idx[slot].state != Slive){
 		qunlock(&s->qlstate);
@@ -1078,7 +1090,14 @@ stagewrite(Stage *g, void *a, long n, uvlong off)
 	long left;
 
 	s = g->s;
-	if(off + n > g->len){
+	/*
+	 * §3.6: off is a peer's u64 straight off a /repl fid, so the
+	 * bound is a difference — off+n wraps at off = 2^64-4, and the
+	 * grain array this indexes has g->nblk elements and no more.  A
+	 * negative count is refused in its own right rather than by that
+	 * same accident.
+	 */
+	if(n < 0 || off > g->len || (uvlong)n > g->len - off){
 		werrstr("chunk past the declared length");
 		return -1;
 	}

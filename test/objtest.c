@@ -856,6 +856,110 @@ tcorrupt(void)
 	free(buf);
 }
 
+/*
+ * Every offset and length bound the object and the stage APIs make,
+ * tested where a bound written as a sum stops being one.  off is a
+ * client's or a peer's u64: off+n wraps at 2^64-4, so a sum admits
+ * the call and what follows is a block index of 4.5e15 — an
+ * out-of-range grain-array index in the stage, and on the write path
+ * a record whose range checks can only fail after it is written.
+ * layer-a §1.2 makes the answer normative: `object too large', and
+ * never a silent truncation.
+ */
+static void
+refused(char *what, int r, char *want)
+{
+	char e[ERRMAX];
+
+	checks++;
+	if(r >= 0){
+		fail("%s was accepted", what);
+		return;
+	}
+	rerrstr(e, sizeof e);
+	if(strncmp(e, want, strlen(want)) != 0)
+		fail("%s: %s, want %s", what, e, want);
+}
+
+static void
+tbounds(void)
+{
+	Dev *d;
+	Store *s;
+	Stage *g;
+	Storestat st, st2;
+	Objinfo oi;
+	uchar *buf, o[Oidmax];
+	uvlong objmax;
+
+	d = newdisk();
+	if((s = mustopen(d, "bounds")) == nil)
+		return;
+	objmax = 65536;			/* t1.h's small geometry */
+	buf = mkbuf(Blk, 61);
+	mk(s, "w");
+	oidof(o, "w");
+	storestat(s, &st);
+
+	refused("a write of 4 bytes at 2^64-4",
+		objwrite(s, o, 1, buf, 4, ~0ULL - 3, 2, 1, nil, 0),
+		"object too large");
+	refused("a write one byte past objmax",
+		objwrite(s, o, 1, buf, 1, objmax, 2, 1, nil, 0),
+		"object too large");
+	refused("a write straddling objmax",
+		objwrite(s, o, 1, buf, 2, objmax - 1, 2, 1, nil, 0),
+		"object too large");
+	refused("a truncate past objmax",
+		objtrunc(s, o, 1, objmax + 1, 2, 1), "object too large");
+	refused("a read of a negative count",
+		objread(s, o, 1, buf, -1, 0), "negative read");
+
+	/*
+	 * The refusal is the whole of what happened: no record was
+	 * written, no grain was taken and the object is as it was.
+	 */
+	storestat(s, &st2);
+	eqv("a refused write takes no grain", st2.grainfree, st.grainfree);
+	eqv("a refused write writes no record", st2.logfree, st.logfree);
+	eqv("the store is not condemned", st2.nlost, 0);
+	if(objstat(s, o, 1, &oi) < 0)
+		fail("objstat: %r");
+	eqv("and the object is untouched", oi.len, 0);
+
+	/* the last byte objmax admits is still an ordinary write */
+	checks++;
+	if(objwrite(s, o, 1, buf, 1, objmax - 1, 2, 1, nil, 0) < 0)
+		fail("a write of the last byte objmax admits: %r");
+	mustverify(s, "w", "after the refusals");
+
+	/* §3.6's chunk bound, from the same u64 on a /repl fid */
+	if((g = stageopen(s, o, 1, 2*Blk, 0)) == nil)
+		fail("stageopen: %r");
+	else{
+		refused("a chunk of 4 bytes at 2^64-4",
+			stagewrite(g, buf, 4, ~0ULL - 3),
+			"chunk past the declared length");
+		refused("a chunk of a negative count",
+			stagewrite(g, buf, -1, 0),
+			"chunk past the declared length");
+		refused("a chunk one byte past the declared length",
+			stagewrite(g, buf, 1, 2*Blk),
+			"chunk past the declared length");
+		storestat(s, &st2);
+		eqv("a refused chunk stages nothing", st2.staged, 0);
+		stagediscard(g);
+	}
+	checks++;
+	if((g = stageopen(s, o, 1, objmax + 1, 0)) != nil){
+		fail("a stage longer than objmax was accepted");
+		stagediscard(g);
+	}
+	storeclose(s);
+	devclose(d);
+	free(buf);
+}
+
 void
 main(int argc, char **argv)
 {
@@ -873,6 +977,7 @@ main(int argc, char **argv)
 	tdirty();
 	ttomb();
 	tcorrupt();
+	tbounds();
 	if(fails > 0){
 		fprint(2, "objtest: %d of %d checks failed\n", fails, checks);
 		exits("failed");
