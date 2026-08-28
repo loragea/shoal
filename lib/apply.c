@@ -31,6 +31,13 @@
  * against the entry instead is one a half-written checkpoint disarms
  * silently.
  *
+ * There is one exception, and it is forced: clause 2's *release*
+ * branch reads the entry's own emapslot, because the record carries
+ * no field naming the slot being released.  It is still idempotent —
+ * releasing a slot twice is releasing it — and §5 step 11 rebuilds
+ * both slot free lists from the entries themselves, so a release
+ * replay cannot see leaks nothing across a restart.
+ *
  * One function, two callers: the commit path of §3.2 and the replay
  * of §5 step 7.  The two disagreeing about an unnamed block or an
  * inherited grain number is a bug that appears only after a crash,
