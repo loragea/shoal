@@ -472,6 +472,7 @@ done:
 	free(buf);
 	s->logtail = rel;
 	s->watermark = s->nreplay > 0 ? s->replayhigh : s->sb.ckseq;
+	s->relseq = s->watermark;
 	s->wateroff = rel;
 	s->seqnext = s->watermark + 1;
 	if(emapreclaim(s) < 0)
@@ -687,7 +688,7 @@ storeopen(Dev *d, Storecfg *cfg)
 	setdefaults(&s->cfg);
 	s->emaprz.l = &s->qlemap;
 	s->roomrz.l = &s->qllog;
-	s->waterrz.l = &s->qllog;
+	s->relrz.l = &s->qllog;
 	s->donerz.l = &s->qllog;
 	s->holdrz.l = &s->qllog;
 	s->flrz.l = &s->fllk;
@@ -870,7 +871,7 @@ storeclose(Store *s)
 	rwakeupall(&s->holdrz);
 	rwakeupall(&s->roomrz);
 	rwakeupall(&s->donerz);
-	rwakeupall(&s->waterrz);
+	rwakeupall(&s->relrz);
 	qunlock(&s->qllog);
 	qlock(&s->proclk);
 	while(s->nproc > 0)
@@ -896,6 +897,8 @@ storestat(Store *s, Storestat *st)
 	st->watermark = s->watermark;
 	st->seqnext = s->seqnext;
 	st->logfree = logfree(s);
+	st->logwait = s->nlogwait;
+	st->broken = s->broken;
 	qunlock(&s->qllog);
 	qlock(&s->qlstate);
 	st->grainfree = s->grainfree;

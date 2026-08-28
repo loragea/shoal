@@ -1228,6 +1228,41 @@ nothing is cached. Everything else is unchanged, and T1.13, which
 asserts flush *placement*, does not apply to a `-w` store: there are
 no flushes to place.
 
+**A log write that fails condemns the store for commits.** The store
+is then `broken`: the failing batch and every batch above it fail
+with that device error, nothing above it acks, and no later commit is
+accepted — in this process, ever. In-memory state is exactly the last
+durable record's, because a batch that did not land is not applied
+and neither is any batch above it, so reads go on being served and
+they answer what a restart would answer. **There is no in-process
+recovery**: the store is made whole by being closed and opened again,
+which replays the log from the last checkpoint. That is a deliberate
+choice over retrying — the failure is a device error on the one
+structure whose ordering the whole design rests on, and a store that
+kept committing over it would be writing records whose predecessors
+are missing.
+
+`interrupted` is not that failure. §0 makes it an ordinary outcome of
+any device call, and §7 has a worker already inside a commit complete
+that commit rather than unwind out of it, so the commit path
+**re-issues** a log write or a flush that reports it — writing the
+same bytes at the same offset again is idempotent — and only a real
+device error fails the batch. Treating it as one would let an
+ordinary client `Tflush` condemn the store and lose the next writer's
+acked write.
+
+**The apply cannot fail after the record is durable.** Everything the
+apply can refuse — §2.7's range checks, the pinned-map rule of clause
+2, the index entry's oid buffer and the dirty set's records — is
+checked and allocated before the item joins a batch, which is before
+any of its record is written, and a refusal there is an ordinary
+error return with nothing durable and no sequence number spent. A
+refusal *after* the post-flush would be a durable record the store
+has chosen not to believe and the next start believes, which is the
+one disagreement between memory and disk this design cannot arbitrate;
+if one happens anyway the store stops answering reads as well as
+writes, because it can no longer vouch for either.
+
 **One apply function, two callers.** When the post-flush returns, the
 committing proc applies **the whole batch's entries** — its own and
 its batch-mates' — to in-memory state through the same apply function
@@ -1838,7 +1873,20 @@ batch's post-flush has returned, **every lower-numbered batch's has**,
 and the batch has been applied to in-memory state. Without the
 ordering, a crash after batch *n+1* landed and batch *n* did not would
 leave replay stopping at *n* and discarding *n+1* — an acked write
-lost. With it, *n+1* was never acked. Including the apply in the
+lost. With it, *n+1* was never acked.
+
+The same argument holds with no crash in it, and that is the failure
+case: if batch *n*'s record does not become durable — one device
+error on one log write — replay stops at *n*, so *n+1* is discarded
+however well its own bytes landed. So a batch whose write failed
+records the lowest sequence number that did not land **before** it
+releases the ordering, and every batch at or above that number fails
+with that device error rather than acking (§3.2's `broken` store).
+Two counters carry it: a **release order** every batch advances when
+it is done with, whether it landed or not, and the durable watermark,
+which only a batch that landed and was applied advances. §2.8 binds
+`ckseq` to the second, so no checkpoint can publish a mark past a
+record that never became durable. Including the apply in the
 watermark is what lets §2.8 bind `ckseq` to it: a checkpoint may
 materialise state for record *n* only if record *n*'s effects are in
 the memory it is materialising from. Batch membership is fixed before
@@ -2613,8 +2661,13 @@ procs.
   *Mutation:* return freed grains to the allocator at commit time
   rather than at flush completion.
 - **T1.8 group-commit watermark (R1).** Eight concurrent writers,
-  crash at `batch:n`; no acked write is missing after restart.
-  *Mutation:* wake waiters when their own batch returns.
+  crash at `batch:n`; no acked write is missing after restart. Then
+  the same shape with no crash at all: a device error on one batch's
+  log write while later batches are in flight, after which no batch
+  above it acks and a restart finds none of them. *Mutations:* wake
+  waiters when their own batch returns; let the watermark pass a
+  batch whose record did not land; take a waiting item out of the
+  batch that absorbed it.
 - **T1.9 two-slot validity (R2).** Tear a superblock copy, restart,
   commit again, tear again: the store still starts. The same for the
   monitor's map slots. *Mutation:* choose the write victim by `gen`

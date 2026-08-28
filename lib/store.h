@@ -200,7 +200,8 @@ struct Store
 
 	/* the log and group commit, §3.2 and §7 */
 	uvlong	seqnext;
-	uvlong	watermark;		/* highest applied seq */
+	uvlong	relseq;			/* highest seq released, §7 */
+	uvlong	watermark;		/* highest durably applied seq */
 	uvlong	wateroff;		/* log sector after its record */
 	uvlong	logtail;		/* sector, relative to logoff */
 	uvlong	logstart;		/* the reclaim point, relative */
@@ -208,13 +209,18 @@ struct Store
 	ulong	logdepth, nflight;
 	Item	*pend, *pendtail;
 	Rendez	roomrz;			/* on qllog: room, or absorbed */
-	Rendez	waterrz;		/* on qllog: the watermark moved */
+	Rendez	relrz;			/* on qllog: the release order moved */
 	Rendez	donerz;			/* on qllog: a batch completed */
 	Rendez	holdrz;			/* on qllog: §13's batch:n hold */
 	uvlong	holdseq;
+	uvlong	nlogwait;		/* commits parked in §6's wait */
 	int	broken;			/* a log write failed: commit no more */
+	uvlong	failseq;		/* the first batch that did not land */
+	char	failerr[ERRMAX];	/* the device error that broke it */
+	int	fatal;			/* memory no longer matches the log */
 	int	reclaimearly;		/* §13's reclaim point */
 	uvlong	pubatpage;		/* §13's publish point */
+	int	fullwait;		/* §13's fullwait point */
 
 	/* the flusher, §3.2: one flush satisfies every waiter */
 	QLock	fllk;

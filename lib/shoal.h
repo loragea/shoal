@@ -624,6 +624,8 @@ struct Storestat
 	uvlong	grainfree, staged;
 	uvlong	slotfree, emapfree;
 	uvlong	logfree;		/* sectors */
+	uvlong	logwait;		/* commits in §6's wait for log space */
+	int	broken;			/* a log write failed: §3.2 */
 	uvlong	nlive, ntomb, nlost;
 	uvlong	ndirty, ndirtydrop;
 	uvlong	nreplay, pmax;

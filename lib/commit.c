@@ -41,6 +41,25 @@
  * would leave replay stopping at n and discarding n+1 — an acked
  * write lost.  Including the apply is what lets §2.8 bind ckseq to
  * the watermark.
+ *
+ * **A batch that did not land condemns every batch above it.**  The
+ * same argument holds with no crash at all: if batch n's record does
+ * not become durable, replay stops at n, so n+1 is discarded however
+ * well its own bytes landed.  So a failed log write records failseq
+ * — the lowest seq that did not land — under qllog *before* it
+ * releases the ordering, and every batch at or above failseq fails
+ * with that device error instead of acking.  The store is then
+ * `broken': it commits no more, in this process, ever.  Reads go on
+ * being served, because in-memory state is exactly the last durable
+ * record's — the failed batch and everything above it was never
+ * applied — and the store is made whole by being closed and opened
+ * again, which replays the log from the last checkpoint.
+ *
+ * Two counters, not one: relseq is the release order every batch
+ * advances, and watermark is the highest *durably applied* seq, which
+ * only a batch that landed advances.  §2.8 binds ckseq to the second,
+ * so a checkpoint can never publish a mark past a record that never
+ * became durable.
  */
 
 /*
@@ -397,12 +416,14 @@ runbatch(Store *s, Batch *b)
 	uchar *p;
 	Lrec r;
 	ulong bytes, nent;
+	char e[ERRMAX];
 	int err;
 
 	bytes = Lrechdrsz;
 	for(m = b->items; m != nil; m = m->next)
 		bytes += m->nbyte;
 	err = 0;
+	strecpy(e, e + sizeof e, "log record could not be built");
 	if((p = mallocz(b->nsec*s->sb.secsz, 1)) == nil)
 		err = -1;
 	if(err == 0
@@ -423,19 +444,37 @@ runbatch(Store *s, Batch *b)
 		while(s->holdseq != 0 && s->holdseq == b->seqhi && !s->stop)
 			rsleep(&s->holdrz);
 		qunlock(&s->qllog);
-		if(writerec(s, b, p) < 0)
+		if(writerec(s, b, p) < 0){
 			err = -1;
+			rerrstr(e, sizeof e);
+		}
 	}
 	free(p);
-	if(err < 0){
-		seterr(b, "log write failed");
-		s->broken = 1;
-	}
 
+	/*
+	 * A batch that did not become durable condemns the store and
+	 * every batch above it: replay stops at the first record that is
+	 * not there, so an acked write above it would be lost.  failseq
+	 * is recorded before the release order moves, so a higher batch
+	 * parked below cannot slip past it.
+	 */
 	qlock(&s->qllog);
-	while(s->watermark + 1 != b->seqlo)
-		rsleep(&s->waterrz);
+	if(err < 0){
+		s->broken = 1;
+		if(s->failseq == 0 || b->seqlo < s->failseq){
+			s->failseq = b->seqlo;
+			strecpy(s->failerr, s->failerr + sizeof s->failerr, e);
+		}
+	}
+	while(s->relseq + 1 != b->seqlo)
+		rsleep(&s->relrz);
+	if(err == 0 && s->failseq != 0 && b->seqhi >= s->failseq){
+		err = -1;
+		strecpy(e, e + sizeof e, s->failerr);
+	}
 	qunlock(&s->qllog);
+	if(err < 0)
+		seterr(b, e);
 
 	if(err == 0){
 		qlock(&s->qlstate);
@@ -447,15 +486,18 @@ runbatch(Store *s, Batch *b)
 	}
 
 	qlock(&s->qllog);
-	s->watermark = b->seqhi;
-	s->wateroff = b->endoff;
+	if(err == 0){
+		s->watermark = b->seqhi;
+		s->wateroff = b->endoff;
+	}
+	s->relseq = b->seqhi;
 	s->nflight--;
 	for(m = b->items; m != nil; m = next){
 		next = m->next;
 		m->state = Idone;
 		m->next = nil;
 	}
-	rwakeupall(&s->waterrz);
+	rwakeupall(&s->relrz);
 	rwakeupall(&s->donerz);
 	rwakeupall(&s->roomrz);
 	qunlock(&s->qllog);
@@ -488,7 +530,8 @@ logcommit(Store *s, Item *it)
 	qlock(&s->qllog);
 	if(s->broken){
 		qunlock(&s->qllog);
-		werrstr("store condemned by an earlier log failure");
+		werrstr("%s", s->failerr[0] != '\0' ? s->failerr
+			: "store condemned by an earlier log failure");
 		return -1;
 	}
 	if(s->pendtail != nil)
