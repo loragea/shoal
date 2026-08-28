@@ -243,6 +243,35 @@ updcommit(Upd *u, int state, uvlong ver, uvlong wepoch, vlong mtime,
 }
 
 /*
+ * Every grain access goes through these two.  §0: `interrupted' on
+ * one of them is a flushed request and unwinds into §3.3's step-7
+ * exit — the stage is discarded and nothing durable was touched — so
+ * it is reported as it is and never retried, unlike the commit
+ * record's own writes, which MUST complete (§3.2).  Echange is the
+ * class neither of them can carry on from, and devclass does not
+ * return on it.
+ */
+static int
+grainread(Store *s, uchar *buf, ulong g)
+{
+	if(devread(s->d, buf, s->sb.blksz, grainoff(&s->sb, g)) < 0){
+		devclass(s->d);
+		return -1;
+	}
+	return 0;
+}
+
+static int
+grainwrite(Store *s, uchar *buf, ulong g)
+{
+	if(devwrite(s->d, buf, s->sb.blksz, grainoff(&s->sb, g)) < 0){
+		devclass(s->d);
+		return -1;
+	}
+	return 0;
+}
+
+/*
  * Start an update of an existing object: take a copy of the entry,
  * work out which extent-map slot the new length needs, and pin both
  * the map being read and the map the apply will change.
@@ -338,7 +367,7 @@ readblk(Store *s, Omap *m, ulong i, uchar *buf)
 		werrstr("grain %lud out of range", g);
 		return -1;
 	}
-	return devread(s->d, buf, s->sb.blksz, grainoff(&s->sb, g));
+	return grainread(s, buf, g);
 }
 
 /*
@@ -374,7 +403,7 @@ stageblk(Upd *u, Omap *mold, ulong blk, uchar *src, ulong boff, ulong bn,
 		return -1;
 	}
 	qunlock(&s->qlstate);
-	if(devwrite(s->d, buf, s->sb.blksz, grainoff(&s->sb, g)) < 0){
+	if(grainwrite(s, buf, g) < 0){
 		qlock(&s->qlstate);
 		grainstageclr(s, g);
 		qunlock(&s->qlstate);
@@ -837,8 +866,7 @@ objread(Store *s, uchar *oid, int oidlen, void *a, long n, uvlong off)
 				emapunpin(s, c);
 				return -1;
 			}
-			if(devread(s->d, buf, s->sb.blksz,
-				grainoff(&s->sb, g)) < 0){
+			if(grainread(s, buf, g) < 0){
 				free(buf);
 				emapunpin(s, c);
 				return -1;
@@ -914,8 +942,7 @@ objverify(Store *s, uchar *oid, int oidlen, Vfy *v)
 			/* a hole is verified against the zero digest */
 			zerodigest(s, e.len, i, dig);
 		}else{
-			if(devread(s->d, buf, s->sb.blksz,
-				grainoff(&s->sb, g)) < 0){
+			if(grainread(s, buf, g) < 0){
 				free(buf);
 				free(digs);
 				emapunpin(s, c);
@@ -1021,8 +1048,7 @@ stagewrite(Stage *g, void *a, long n, uvlong off)
 		else{
 			memset(buf, 0, s->sb.blksz);
 			if(g->grain[blk] != 0
-			&& devread(s->d, buf, s->sb.blksz,
-				grainoff(&s->sb, g->grain[blk])) < 0){
+			&& grainread(s, buf, g->grain[blk]) < 0){
 				free(buf);
 				return -1;
 			}
@@ -1049,7 +1075,7 @@ stagewrite(Stage *g, void *a, long n, uvlong off)
 			s->nstagegrain++;
 		}
 		qunlock(&s->qlstate);
-		if(devwrite(s->d, buf, s->sb.blksz, grainoff(&s->sb, gr)) < 0){
+		if(grainwrite(s, buf, gr) < 0){
 			qlock(&s->qlstate);
 			grainstageclr(s, gr);
 			qunlock(&s->qlstate);

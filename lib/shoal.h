@@ -143,6 +143,9 @@ int	devflush(Dev*);
 int	devzero(Dev*, vlong off, vlong n, ulong unit);
 void	devclose(Dev*);
 int	deverr(void);
+int	devclass(Dev*);		/* deverr, exiting on Echange (§0) */
+int	devwriteretry(Dev*, void*, long, vlong);
+int	devflushretry(Dev*);
 
 /*
  * A fault-injection point (store.md §13).  Inert on every device but

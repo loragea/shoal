@@ -85,7 +85,7 @@ flushnow(Store *s)
 			round = s->flasked;
 			s->flbusy = 1;
 			qunlock(&s->fllk);
-			r = devflush(s->d);
+			r = devflushretry(s->d);
 			qlock(&s->fllk);
 			if(round > s->fldone){
 				s->fldone = round;
@@ -288,7 +288,7 @@ logwrite(Store *s, uchar *p, ulong n, uvlong sec)
 		m = n - done;
 		if(m > s->sb.blksz)
 			m = s->sb.blksz;
-		if(devwrite(s->d, p + done, m, off + done) < 0)
+		if(devwriteretry(s->d, p + done, m, off + done) < 0)
 			return -1;
 		devpoint(s->d, "body", (done + m)/s->sb.secsz);
 	}

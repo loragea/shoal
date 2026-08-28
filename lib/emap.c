@@ -208,7 +208,7 @@ emapwrite(Store *s, ulong slot, uchar *p)
 		m = s->sb.emapsz - n;
 		if(m > s->sb.blksz)
 			m = s->sb.blksz;
-		if(devwrite(s->d, p + n, m, off + n) < 0)
+		if(devwriteretry(s->d, p + n, m, off + n) < 0)
 			return -1;
 	}
 	return 0;

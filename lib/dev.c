@@ -54,6 +54,76 @@ deverr(void)
 	return Deio;
 }
 
+/*
+ * Classify the error a device call the store just made left behind,
+ * and take the one class the store cannot carry on from.  §0:
+ * Echange means the unit's partitions were re-declared under an open
+ * fid.  It is not media damage and MUST NOT be treated as
+ * corruption, and there is nothing to unwind to: every offset the
+ * store holds may now name something else, so it reports the
+ * condition and exits non-zero rather than writing object data where
+ * something else now lives.
+ */
+int
+devclass(Dev *d)
+{
+	int e;
+
+	e = deverr();
+	if(e == Dechange)
+		sysfatal("%s: the unit's partitions have been re-declared "
+			"under an open fid; refusing to serve on a stale fid",
+			d->name);
+	return e;
+}
+
+/*
+ * The store's own write and flush, for the paths that MUST complete:
+ * the commit record (§3.2), the checkpoint's pages and the
+ * superblock.  A note posted by reqqueueflush aborts whatever system
+ * call the proc is in, and §0 says that is not an I/O error — the
+ * request has been flushed.  A commit already writing its record
+ * cannot be unwound, though: a record half in the log is a record
+ * whose successor can never be acked, so §7 has the committer
+ * complete the commit and perform only the invalidate half of §3.3's
+ * step 7.  Re-issuing the same bytes at the same offset is what
+ * completing it means, and it is idempotent.  The count is a bound
+ * rather than a policy: a proc noted Nintr times running is not
+ * being flushed by a client.
+ */
+enum
+{
+	Nintr	= 16,
+};
+
+int
+devwriteretry(Dev *d, void *a, long n, vlong off)
+{
+	int i;
+
+	for(i = 0; i <= Nintr; i++){
+		if(devwrite(d, a, n, off) == 0)
+			return 0;
+		if(devclass(d) != Deintr)
+			break;
+	}
+	return -1;
+}
+
+int
+devflushretry(Dev *d)
+{
+	int i;
+
+	for(i = 0; i <= Nintr; i++){
+		if(devflush(d) == 0)
+			return 0;
+		if(devclass(d) != Deintr)
+			break;
+	}
+	return -1;
+}
+
 char*
 flushname(int mode)
 {
