@@ -160,12 +160,19 @@ unlink(Store *s, Item *it)
 {
 	Item **pp, *t;
 
+	/*
+	 * Only an item this call actually removed from the queue has its
+	 * link cleared.  An item that is no longer pending is a link in
+	 * some batch's item list, and clearing it there severs the
+	 * batch: the entries after it are in the durable record and
+	 * would never be applied or woken (§7).
+	 */
 	for(pp = &s->pend; (t = *pp) != nil; pp = &t->next)
 		if(t == it){
 			*pp = t->next;
+			it->next = nil;
 			break;
 		}
-	it->next = nil;
 	s->pendtail = nil;
 	for(t = s->pend; t != nil; t = t->next)
 		s->pendtail = t;
@@ -182,10 +189,12 @@ unlink(Store *s, Item *it)
  * than waited on: "delete always works" is true only if a delete
  * further down the queue can still be committed.
  *
- * Returns nil, with *full set, when no pending item can be committed.
+ * Returns nil, with *full set, when no pending item can be committed,
+ * and nil with *oom set when it could not allocate — which is not a
+ * wait for anything, so the caller must not sleep on it.
  */
 static Batch*
-formbatch(Store *s, int *full)
+formbatch(Store *s, int *full, int *oom)
 {
 	Batch *b;
 	Item *it, *next, *last;
@@ -194,10 +203,13 @@ formbatch(Store *s, int *full)
 	int freeing;
 
 	*full = 0;
+	*oom = 0;
 	if(s->pend == nil)
 		return nil;
-	if((b = mallocz(sizeof *b, 1)) == nil)
+	if((b = mallocz(sizeof *b, 1)) == nil){
+		*oom = 1;
 		return nil;
+	}
 	last = nil;
 	bytes = Lrechdrsz;
 	freeing = 1;
@@ -380,6 +392,15 @@ seterr(Batch *b, char *e)
  * Apply the whole batch's entries — the committer's own and its
  * batch-mates' — through the same function §5's replay uses, over
  * extent maps the stages pinned, so no part of the apply faults.
+ *
+ * **The apply cannot fail here.**  Everything applyrec, applydirty
+ * and applyslot can refuse — every range check, the pinned-map rule
+ * of §2.7 clause 2, the entry's oid buffer and the dirty set's
+ * records — is checked and allocated by itemok/itemprep before the
+ * item joins a batch, which is before any of the record is written.
+ * That is the whole reason those checks are there and not here: a
+ * refusal after the post-flush is a durable record the store has
+ * chosen not to believe, and the next start believes it.
  */
 static int
 applybatch(Store *s, Batch *b)
@@ -392,7 +413,8 @@ applybatch(Store *s, Batch *b)
 		if(it->obj != nil && applyrec(s, it->obj, it->emap) < 0)
 			r = -1;
 		for(i = 0; i < it->ndirty; i++)
-			if(applydirty(s, &it->dirty[i], nil) < 0)
+			if(applydirty(s, &it->dirty[i],
+				it->spare != nil ? &it->spare[i] : nil) < 0)
 				r = -1;
 		if(it->haseslot && applyslot(s, it->eslot) < 0)
 			r = -1;
@@ -479,14 +501,22 @@ runbatch(Store *s, Batch *b)
 	if(err == 0){
 		qlock(&s->qlstate);
 		if(applybatch(s, b) < 0){
-			seterr(b, "apply failed");
+			/*
+			 * Unreachable: itemok and itemprep ran before the
+			 * record was written.  If it happens anyway, memory
+			 * no longer describes what a restart would produce,
+			 * so the store stops serving what it cannot vouch
+			 * for and must be opened again.
+			 */
+			s->fatal = 1;
 			s->broken = 1;
+			seterr(b, "apply failed after the record was durable");
 		}
 		qunlock(&s->qlstate);
 	}
 
 	qlock(&s->qllog);
-	if(err == 0){
+	if(err == 0 && !s->fatal){
 		s->watermark = b->seqhi;
 		s->wateroff = b->endoff;
 	}
@@ -505,31 +535,173 @@ runbatch(Store *s, Batch *b)
 }
 
 /*
+ * §3.2: everything the apply can refuse is refused here, before the
+ * item is stamped into a batch — because from the moment it is
+ * stamped its entries are going into a record whose seq the next
+ * record depends on, and a batch that is not written is a gap replay
+ * stops at.  So the range checks §2.7 makes and the pinned-map rule
+ * of clause 2 are tested on the caller's own error return, where a
+ * refusal costs nothing.
+ */
+static int
+itemok(Store *s, Item *it)
+{
+	Objrec *o;
+	int i;
+
+	if((o = it->obj) != nil){
+		if(objrecok(s, o) < 0)
+			return -1;
+		if(o->emapslot != 0
+		&& (it->emap == nil || it->emap->slot != o->emapslot)){
+			werrstr("Eobj: slot %lud: no pinned map for emapslot "
+				"%lud", o->slot, o->emapslot);
+			return -1;
+		}
+	}
+	for(i = 0; i < it->ndirty; i++)
+		if(dirtyrecok(s, &it->dirty[i]) < 0)
+			return -1;
+	if(it->haseslot && it->eslot >= s->sb.nslots){
+		werrstr("Eslot: slot %lud, nslots %lud", it->eslot,
+			s->sb.nslots);
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * ... and everything the apply must allocate is allocated here, for
+ * the same reason: the entry's oid buffer, which only a record whose
+ * oid differs from the slot's needs, and one dirty-set record per
+ * Edirty the item carries.  Growing the buffer leaves its contents
+ * alone, so the index hash still finds the object it holds now.
+ */
+static int
+itemprep(Store *s, Item *it)
+{
+	Objrec *o;
+	Ient *e;
+	uchar *p;
+	int i;
+
+	if((o = it->obj) != nil){
+		qlock(&s->qlstate);
+		e = &s->idx[o->slot];
+		if(e->oidcap < o->oidlen){
+			if((p = malloc(o->oidlen)) == nil){
+				qunlock(&s->qlstate);
+				return -1;
+			}
+			if(e->oid != nil)
+				memmove(p, e->oid, e->oidlen);
+			free(e->oid);
+			e->oid = p;
+			e->oidcap = o->oidlen;
+		}
+		qunlock(&s->qlstate);
+	}
+	if(it->ndirty > 0){
+		if((it->spare = mallocz(it->ndirty*sizeof *it->spare, 1)) == nil)
+			return -1;
+		for(i = 0; i < it->ndirty; i++)
+			if((it->spare[i] = mallocz(sizeof **it->spare, 1)) == nil)
+				return -1;
+	}
+	return 0;
+}
+
+/*
+ * A queued item is the store's own, not the caller's, and this is the
+ * whole reason for the copy below.  A caller builds its Item and its
+ * Eobj on its own stack; §7's procs are rfork(RFPROC|RFMEM) procs in
+ * a T1 program and proccreate procs in the server, and the first kind
+ * share the data and bss segments and **not** the stack.  Worse than
+ * unshared: every proc's stack is mapped at the same virtual address,
+ * so a pending queue of pointers into callers' stacks does not fault,
+ * it *aliases* — a second committer following s->pend lands on its
+ * own item, links that item to itself, and then walks the list for
+ * ever while its batch-mates sleep on a batch that will never
+ * complete.  So the queue holds nodes allocated where every proc can
+ * see them, carrying a copy of the caller's Eobj and of its Edirty
+ * entries.  What the copy need not reach is the map and freed arrays
+ * an Eobj names: those are already in the caller's heap, and the
+ * caller is inside logcommit until its batch has been applied.
+ */
+static Item*
+itemnew(Store *s, Item *ci)
+{
+	Item *it;
+
+	if((it = mallocz(sizeof *it, 1)) == nil)
+		return nil;
+	it->state = Ipending;
+	it->freeing = ci->freeing;
+	it->emap = ci->emap;
+	it->eslot = ci->eslot;
+	it->haseslot = ci->haseslot;
+	it->ndirty = ci->ndirty;
+	if(ci->obj != nil){
+		it->objb = *ci->obj;
+		it->obj = &it->objb;
+	}
+	if(ci->ndirty > 0){
+		if((it->dirty = mallocz(ci->ndirty*sizeof *it->dirty, 1)) == nil){
+			free(it);
+			return nil;
+		}
+		memmove(it->dirty, ci->dirty, ci->ndirty*sizeof *it->dirty);
+	}
+	it->nbyte = itembytes(s, it);
+	return it;
+}
+
+static void
+itemfree(Item *it)
+{
+	int i;
+
+	if(it == nil)
+		return;
+	for(i = 0; it->spare != nil && i < it->ndirty; i++)
+		free(it->spare[i]);
+	free(it->spare);
+	free(it->dirty);
+	free(it);
+}
+
+/*
  * Commit one operation's entries.  The caller is either the committer
  * of the batch that carries them or a member of it; either way it
  * returns only once that batch is durable and applied.
  */
 int
-logcommit(Store *s, Item *it)
+logcommit(Store *s, Item *ci)
 {
+	Item *it;
 	Batch *b;
 	vlong t0;
-	int full;
+	int full, oom, forced, r;
 
-	it->state = Ipending;
-	it->batch = nil;
-	it->err[0] = '\0';
-	it->next = nil;
-	it->nbyte = itembytes(s, it);
-	if(Lrechdrsz + it->nbyte > maxrecbytes(&s->sb)){
+	ci->err[0] = '\0';
+	if(Lrechdrsz + itembytes(s, ci) > maxrecbytes(&s->sb)){
 		werrstr("commit record of %lud bytes exceeds the geometry's "
-			"maximum", Lrechdrsz + it->nbyte);
+			"maximum", Lrechdrsz + itembytes(s, ci));
+		return -1;
+	}
+	if(itemok(s, ci) < 0)
+		return -1;
+	if((it = itemnew(s, ci)) == nil || itemprep(s, it) < 0){
+		itemfree(it);
+		werrstr("out of memory");
 		return -1;
 	}
 
+	forced = 0;
 	qlock(&s->qllog);
 	if(s->broken){
 		qunlock(&s->qllog);
+		itemfree(it);
 		werrstr("%s", s->failerr[0] != '\0' ? s->failerr
 			: "store condemned by an earlier log failure");
 		return -1;
@@ -551,33 +723,82 @@ logcommit(Store *s, Item *it)
 			rsleep(&s->roomrz);
 			continue;
 		}
-		if((b = formbatch(s, &full)) == nil){
-			if(!full){
+		b = nil;
+		full = 0;
+		oom = 0;
+		if(s->fullwait == 1 || forced){
+			/*
+			 * §13's fullwait point: one commit takes §6's wait
+			 * whether or not the log is full, and stays in it
+			 * until the test releases it — the schedule where a
+			 * committer absorbs a waiting item and the wait then
+			 * elapses under it.
+			 */
+			s->fullwait = 2;
+			forced = 1;
+			full = 1;
+		}else
+			b = formbatch(s, &full, &oom);
+		if(b != nil){
+			s->nflight++;
+			rwakeupall(&s->roomrz);
+			qunlock(&s->qllog);
+			runbatch(s, b);
+			qlock(&s->qllog);
+			continue;
+		}
+		if(oom){
+			unlink(s, it);
+			qunlock(&s->qllog);
+			itemfree(it);
+			werrstr("out of memory");
+			return -1;
+		}
+		if(!full){
+			rsleep(&s->roomrz);
+			continue;
+		}
+		/*
+		 * §6: no free log space.  Wait for the checkpointer,
+		 * bounded by ckwaitms, and then answer `disk full', which
+		 * is §3.3's step-7 exit.  The item stays on the pending
+		 * queue for the whole wait, so a committer may absorb it
+		 * at any moment — the expected end of the wait: its state
+		 * is re-checked under the lock after every sleep and
+		 * before the elapsed test, so a commit that became durable
+		 * while it waited returns success rather than an error for
+		 * a write that is on the platter and published, and one
+		 * that is in a running batch waits for that batch rather
+		 * than being unlinked out of the middle of it.
+		 */
+		s->nlogwait++;
+		if(forced)
+			while(s->fullwait != 0 && !s->stop)
 				rsleep(&s->roomrz);
-				continue;
-			}
+		else{
 			qunlock(&s->qllog);
 			askcheckpoint(s);
 			sleep(1);
 			qlock(&s->qllog);
-			if((nsec() - t0)/1000000 < (vlong)s->cfg.ckwaitms)
-				continue;
-			unlink(s, it);
-			qunlock(&s->qllog);
-			werrstr("disk full");
-			return -1;
 		}
-		s->nflight++;
-		rwakeupall(&s->roomrz);
+		s->nlogwait--;
+		if(it->state != Ipending)
+			continue;
+		if(!forced && (nsec() - t0)/1000000 < (vlong)s->cfg.ckwaitms)
+			continue;
+		unlink(s, it);
 		qunlock(&s->qllog);
-		runbatch(s, b);
-		qlock(&s->qllog);
+		itemfree(it);
+		werrstr("disk full");
+		return -1;
 	}
 	qunlock(&s->qllog);
 	devpoint(s->d, "preack", 0);
+	r = 0;
 	if(it->err[0] != '\0'){
 		werrstr("%s", it->err);
-		return -1;
+		r = -1;
 	}
-	return 0;
+	itemfree(it);
+	return r;
 }

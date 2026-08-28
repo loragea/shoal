@@ -53,6 +53,7 @@ struct Ient
 	uvlong	cur;			/* R5: in memory only, never on disk */
 	ulong	hashnext;
 	uchar	oidlen;
+	uchar	oidcap;			/* bytes oid holds; §3.2's pre-allocation */
 	uchar	state;
 	uchar	flags;
 	uchar	bad;			/* condemned by §5 step 10 */
@@ -96,11 +97,13 @@ struct Item
 	int	state;
 	int	freeing;		/* draws on §6's reserved log tail */
 	Objrec	*obj;			/* one Eobj, or nil */
+	Objrec	objb;			/* ... which a queued item holds here */
 	Dirtyrec *dirty;		/* ndirty Edirty entries */
 	int	ndirty;
 	ulong	eslot;			/* an Eslot's slot */
 	int	haseslot;
 	ulong	nbyte;			/* entry bytes this item contributes */
+	Dirtent	**spare;		/* ndirty pre-allocated dirty records */
 	Emape	*emap;			/* the pinned map the apply mutates */
 	Batch	*batch;
 	char	err[ERRMAX];

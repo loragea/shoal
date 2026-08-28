@@ -81,6 +81,11 @@ storehook(Store *s, char *name, uvlong n)
 		s->holdseq = n;
 		rwakeupall(&s->holdrz);
 		qunlock(&s->qllog);
+	}else if(strcmp(name, "fullwait") == 0){
+		qlock(&s->qllog);
+		s->fullwait = n != 0;
+		rwakeupall(&s->roomrz);
+		qunlock(&s->qllog);
 	}else if(strcmp(name, "reclaim") == 0)
 		s->reclaimearly = n != 0;
 	else if(strcmp(name, "publish") == 0)
@@ -231,6 +236,7 @@ readindex(Store *s)
 			}
 			memmove(e->oid, d.oid, d.oidlen);
 			e->oidlen = d.oidlen;
+			e->oidcap = d.oidlen;
 			e->state = d.state;
 			e->flags = d.flags;
 			e->emapslot = d.emapslot;

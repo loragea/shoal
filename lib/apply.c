@@ -267,9 +267,20 @@ applyrec(Store *s, Objrec *o, Emape *c)
 	ientunhash(s, o->slot);
 	if(e->oidlen != o->oidlen || e->oid == nil
 	|| memcmp(e->oid, o->oid, o->oidlen) != 0){
-		free(e->oid);
-		if((e->oid = malloc(o->oidlen)) == nil)
-			return -1;
+		/*
+		 * §3.2's commit path grew this buffer before the record
+		 * was written, so the allocation below is replay's alone
+		 * — and there a failure stops the replay, which is a
+		 * refusal to start rather than a half-applied record.
+		 */
+		if(e->oid == nil || e->oidcap < o->oidlen){
+			free(e->oid);
+			if((e->oid = malloc(o->oidlen)) == nil){
+				e->oidcap = 0;
+				return -1;
+			}
+			e->oidcap = o->oidlen;
+		}
 		memmove(e->oid, o->oid, o->oidlen);
 	}
 	if(e->state == Slive)

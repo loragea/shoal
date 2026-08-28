@@ -1298,6 +1298,17 @@ instance holds `(E, ver)`; and a `Tflush` that arrives after the
 commit is already durable, where the discard half is vacuous but the
 invalidate half is not (§14(10)).
 
+**A commit that became durable while it waited is not an exit at
+all.** §6's wait for log space keeps the operation's entries on the
+pending queue, so a committer may absorb them at any moment — the
+expected end of the wait — and the wait re-tests that before it gives
+up. An entry that is in a running batch waits for that batch, and one
+that is already applied answers success. Answering `disk full` for a
+write that is on the platter and published would make layer-a §5.4
+step 7's "same content, same key, same `csum`" false, and taking the
+entry back out of the batch it is in would strand its batch-mates
+mid-record.
+
 ### 3.4 Crash points
 
 The invariant is R2: the published four-tuple is the old one or the
@@ -1679,7 +1690,10 @@ escape.
 
 **The wait, and its bound.** Waiting is right because log exhaustion
 is normally transient: the checkpointer is already running and the
-space is already reclaimable. The bound is `ckwaitms` (policy,
+space is already reclaimable. The waiting operation's entries stay on
+§7's pending queue for the whole wait, so the ordinary end of the
+wait is another committer absorbing them; §3.3 states what that means
+for the answer. The bound is `ckwaitms` (policy,
 default 5000), and it is derived from what a checkpoint costs rather
 than from `replms`, which a checkpoint cannot be made to fit inside.
 What makes it meetable is §2.8's incremental checkpoint: the work is
@@ -1812,6 +1826,20 @@ Three rules make that discipline checkable rather than aspirational:
    takes it to snapshot `/obj` and to render `/status`, so a
    `qlstate` held across an 8.4 ms write would block `/status`,
    `/ctl` and `Tflush` — the failure layer-a §5.4.1 forbids.
+3. **Everything a shared structure points at is in shared memory.**
+   The engine's procs are `proccreate` procs in the server and
+   `rfork(RFPROC|RFMEM)` procs in a T1 program, and the second kind
+   share the data and bss segments and **not** the stack. That is
+   worse than unshared: every proc's stack is mapped at the same
+   virtual address, so a shared list holding a pointer into one
+   proc's stack does not fault when another proc follows it — it
+   lands on that proc's *own* object at the same address. A pending
+   queue built from callers' stack-allocated items therefore aliases
+   silently: the second committer links an item to itself and walks
+   that list for ever while its batch-mates sleep on a batch that
+   never completes. So the pending queue's items and the entries they
+   carry are the store's own allocations, and a caller passes a
+   template that is copied into one.
 
 The extent-map cache is where rule 2 needs a mechanism rather than a
 promise. A miss inserts an entry marked *loading* under `qlemap` and
@@ -2572,14 +2600,19 @@ record is written and then a byte-wise mixture of its old and its new
 header bytes is placed on the platter, which is what a torn write
 leaves and what the sweep must be exhaustive over.
 
-Three of §13's points are *mutations* rather than crashes, and are
-built into the store as hooks that are inert unless a test asks for
-them: `reclaim` (reclaim log space before the checkpoint's superblock
-write returns), `publish` (force an `epochhigh` publish after the
-*n*'th checkpoint page write, so it can be combined with `ckpt:n`),
-and `batch:n` (hold batch *n*'s record write and let *n+1* complete).
-Each T1 test names the requirement it discriminates and the mutation
-that must break it; **each mutation is run**, per `AGENTS.md`.
+Four of §13's points are *mutations* or schedules rather than crashes,
+and are built into the store as hooks that are inert unless a test
+asks for them: `reclaim` (reclaim log space before the checkpoint's
+superblock write returns), `publish` (force an `epochhigh` publish
+after the *n*'th checkpoint page write, so it can be combined with
+`ckpt:n`), `batch:n` (hold batch *n*'s record write and let *n+1*
+complete), and `fullwait` (park the next commit in §6's wait for log
+space, with its entries still on the pending queue, until the hook is
+cleared — which is what makes the interleaving where a committer
+absorbs a waiting item, and the wait then elapses under it, the same
+on every run). Each T1 test names the requirement it discriminates
+and the mutation that must break it; **each mutation is run**, per
+`AGENTS.md`.
 
 T1 formats a **small geometry** — a partition image of a few MiB with
 `-n` and `-e` in the hundreds — so that `mk test` stays within

@@ -243,6 +243,23 @@ updcommit(Upd *u, int state, uvlong ver, uvlong wepoch, vlong mtime,
 }
 
 /*
+ * §3.2: a store whose apply failed after its record was durable is
+ * serving in-memory state that its own log no longer describes, so it
+ * answers nothing until it has been opened again and replayed.  The
+ * commit path refuses through the same flag (broken).
+ */
+static int
+serving(Store *s)
+{
+	if(s->fatal){
+		werrstr("store condemned: in-memory state no longer matches "
+			"the log; open it again");
+		return 0;
+	}
+	return 1;
+}
+
+/*
  * Every grain access goes through these two.  §0: `interrupted' on
  * one of them is a flushed request and unwinds into §3.3's step-7
  * exit — the stage is discarded and nothing durable was touched — so
@@ -534,6 +551,8 @@ objstat(Store *s, uchar *oid, int oidlen, Objinfo *oi)
 	long slot;
 	Ient *e;
 
+	if(!serving(s))
+		return -1;
 	qlock(&s->qlstate);
 	if((slot = ientfind(s, oid, oidlen)) < 0){
 		qunlock(&s->qlstate);
@@ -852,6 +871,8 @@ objread(Store *s, uchar *oid, int oidlen, void *a, long n, uvlong off)
 	ulong blk, boff, g;
 	long slot;
 
+	if(!serving(s))
+		return -1;
 	qlock(&s->qlstate);
 	if((slot = ientfind(s, oid, oidlen)) < 0 || s->idx[slot].state != Slive){
 		qunlock(&s->qlstate);
@@ -930,6 +951,8 @@ objverify(Store *s, uchar *oid, int oidlen, Vfy *v)
 	long slot;
 
 	memset(v, 0, sizeof *v);
+	if(!serving(s))
+		return -1;
 	qlock(&s->qlstate);
 	if((slot = ientfind(s, oid, oidlen)) < 0){
 		qunlock(&s->qlstate);
