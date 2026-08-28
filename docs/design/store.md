@@ -1770,8 +1770,9 @@ its properties are load-bearing:
 
 **Shared in-memory state, and the locks over it.** Deleting the
 per-object lock does not delete the need to protect the structures
-every proc touches. Four `QLock`s cover all of it — beside the one
-`Reqqueue` keeps for its own queue, which the store does not touch:
+every proc touches. Four `QLock`s cover the shared *state* — beside
+the one `Reqqueue` keeps for its own queue, which the store does not
+touch:
 
 | Lock | Covers | Taken by |
 |---|---|---|
@@ -1780,14 +1781,28 @@ every proc touches. Four `QLock`s cover all of it — beside the one
 | `qllog` | the log tail and free space, the pending-commit queue, batch numbering and the durable watermark | every committer |
 | `qlsuper` | the five publishable superblock fields and the publish itself (§2.2) | the checkpointer, a `qidnext` batch advance, the first `monid` pin, an `epochhigh` advance |
 
-Two rules make that discipline checkable rather than aspirational:
+Three more `QLock`s are not over state but over one activity each,
+and they are **leaves**: they serialise a thing being done, and
+nothing is ever taken under them.
 
-1. **No proc holds two of them at once.** There is therefore no lock
-   order to get wrong, and no deadlock to reason about. The commit
-   path is the one that looks like it needs nesting and does not: it
-   takes `qllog` to join a batch, releases it, does its I/O, then
-   takes `qlstate` to apply — and the extent maps the apply mutates
-   are pinned, not held under `qlemap` (below).
+| Lock | Covers |
+|---|---|
+| the flush lock | the coalescing flusher's ticket counters (§3.2): who is issuing the one device flush and who is waiting for it |
+| the checkpoint lock | the checkpointer's request and completion counters, and its wake-up. The checkpoint itself runs with it released |
+| the proc lock | the count of procs the store has started, so `storeclose` can wait for them |
+
+Three rules make that discipline checkable rather than aspirational:
+
+1. **No proc holds two of the four state locks at once**, and the
+   only nesting anywhere is `qlsuper` over the flush lock — which is
+   forced, because the publisher's write must be serialised against
+   other publishers *and* its flush must go through the one flusher
+   (§2.2, §3.2). Nothing takes `qlsuper`, or any state lock, under a
+   leaf. There is therefore one edge in the whole lock order and no
+   cycle. The commit path is the one that looks like it needs nesting
+   and does not: it takes `qllog` to join a batch, releases it, does
+   its I/O, then takes `qlstate` to apply — and the extent maps the
+   apply mutates are pinned, not held under `qlemap` (below).
 2. **None is held across a device I/O, a flush wait or a `Rendez`
    sleep**, with exactly one exception: `qlsuper` *is* held across
    the superblock write and its flush, because serialising that write

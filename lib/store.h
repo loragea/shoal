@@ -148,7 +148,10 @@ struct Store
 	uchar	*zeroblk;		/* blksz zero bytes */
 	uchar	zerodig[Blkdlen];	/* the full-block zero digest */
 
-	/* §7's four QLocks.  No proc holds two of them at once. */
+	/*
+	 * §7's four state locks.  No proc holds two of them at once;
+	 * fllk, cklk and proclk below are leaves.
+	 */
 	QLock	qlstate;
 	QLock	qlemap;
 	QLock	qllog;
