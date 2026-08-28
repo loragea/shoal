@@ -913,6 +913,8 @@ objtrunc(Store *s, uchar *oid, int oidlen, uvlong len, uvlong ver,
 	Omap mold;
 	uchar *buf;
 
+	if(!serving(s))
+		return -1;
 	if(len > s->sb.objmax){
 		werrstr("object too large");
 		return -1;
@@ -954,6 +956,8 @@ objremove(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 	Upd u;
 	Omap mold;
 
+	if(!serving(s))
+		return -1;
 	if(updopen(&u, s, oid, oidlen, 0, 0) < 0)
 		return -1;
 	mapopen(s, &mold, &u.e, u.cold);
@@ -1029,6 +1033,8 @@ objdiscard(Store *s, uchar *oid, int oidlen)
 	Item it;
 	long slot;
 
+	if(!serving(s))
+		return -1;
 	qlock(&s->qlstate);
 	if((slot = ientfind(s, oid, oidlen)) < 0){
 		qunlock(&s->qlstate);
@@ -1272,6 +1278,8 @@ stagewrite(Stage *g, void *a, long n, uvlong off)
 	long left;
 
 	s = g->s;
+	if(!serving(s))
+		return -1;
 	/*
 	 * §3.6: off is a peer's u64 straight off a /repl fid, so the
 	 * bound is a difference — off+n wraps at off = 2^64-4, and the
@@ -1444,6 +1452,8 @@ stagefinal(Stage *g, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 	int absent, corrupt, c;
 
 	s = g->s;
+	if(!serving(s))
+		return stagefail(g);
 	qlock(&s->qlstate);
 	slot = ientfind(s, g->oid, g->oidlen);
 	absent = slot < 0 || s->idx[slot].state == Sfree;

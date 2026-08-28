@@ -2666,7 +2666,7 @@ record is written and then a byte-wise mixture of its old and its new
 header bytes is placed on the platter, which is what a torn write
 leaves and what the sweep must be exhaustive over.
 
-Five of §13's points are *mutations* or schedules rather than crashes,
+Six of §13's points are *mutations* or schedules rather than crashes,
 and are built into the store as hooks that are inert unless a test
 asks for them: `reclaim` (reclaim log space before the checkpoint's
 superblock write returns), `publish` (force an `epochhigh` publish
@@ -2681,7 +2681,11 @@ since the hook was set, until it is cleared, so a test can ask what a
 proc may answer between the header write and the post-flush that
 makes the record durable — a crash point cannot ask that, because the
 question is about what the *other* procs in a batch are allowed to do
-while the committer is still inside the flush). Each T1 test names the requirement it discriminates
+while the committer is still inside the flush), and `fatal` (put the
+store into §3.2's condemned state, which the commit path itself
+reaches only from an apply that failed after its record was durable —
+a case §3.2 makes unreachable, so a test cannot arrive at it any
+other way). Each T1 test names the requirement it discriminates
 and the mutation that must break it; **each mutation is run**, per
 `AGENTS.md`.
 

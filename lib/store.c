@@ -92,6 +92,20 @@ storehook(Store *s, char *name, uvlong n)
 		s->flhold = n;
 		rwakeupall(&s->flrz);
 		qunlock(&s->fllk);
+	}else if(strcmp(name, "fatal") == 0){
+		/*
+		 * §3.2's condemnation, which the commit path reaches only
+		 * from an apply that failed after its record was durable —
+		 * a case itemok and itemprep are there to make unreachable.
+		 * The hook is how §13 drives what the store answers once it
+		 * is in that state.
+		 */
+		qlock(&s->qlstate);
+		s->fatal = n != 0;
+		qunlock(&s->qlstate);
+		qlock(&s->qllog);
+		s->broken = n != 0;
+		qunlock(&s->qllog);
 	}else if(strcmp(name, "reclaim") == 0)
 		s->reclaimearly = n != 0;
 	else if(strcmp(name, "publish") == 0)

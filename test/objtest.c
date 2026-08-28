@@ -777,6 +777,62 @@ tstagefault(void)
 	free(got);
 }
 
+/*
+ * §3.2: a store whose apply failed after its record was durable is
+ * serving in-memory state that its own log no longer describes, so it
+ * "answers nothing until it has been opened again".  Nothing is
+ * every entry point, not the read ones alone: the update calls run
+ * updopen, read extent maps and can condemn a slot on the way before
+ * the commit path refuses them with a device error rather than with
+ * §3.2's reason.
+ */
+static void
+tcondemned(void)
+{
+	Dev *d;
+	Store *s;
+	Stage *g;
+	Objinfo oi;
+	uchar *buf, o[Oidmax];
+	char *w;
+
+	d = newdisk();
+	if((s = mustopen(d, "a condemned store")) == nil)
+		return;
+	buf = mkbuf(Blk, 67);
+	mk(s, "z");
+	oidof(o, "z");
+	mustwr(s, "z", buf, Blk, 0);
+	if((g = stageopen(s, o, 1, Blk, 0)) == nil){
+		fail("stageopen: %r");
+		storeclose(s);
+		devclose(d);
+		free(buf);
+		return;
+	}
+	storehook(s, "fatal", 1);
+	w = "store condemned";
+	refused("objstat on a condemned store", objstat(s, o, 1, &oi), w);
+	refused("objread on a condemned store",
+		objread(s, o, 1, buf, Blk, 0), w);
+	refused("objwrite on a condemned store",
+		objwrite(s, o, 1, buf, Blk, 0, 3, 1, nil, 0), w);
+	refused("objtrunc on a condemned store",
+		objtrunc(s, o, 1, 0, 3, 1, nil, 0), w);
+	refused("objremove on a condemned store",
+		objremove(s, o, 1, 3, 1, nil, 0), w);
+	refused("objdiscard on a condemned store", objdiscard(s, o, 1), w);
+	refused("objcorrupt on a condemned store",
+		objcorrupt(s, o, 1, 1, nil, 0), w);
+	refused("stagewrite on a condemned store",
+		stagewrite(g, buf, Blk, 0), w);
+	refused("stagefinal on a condemned store",
+		stagefinal(g, 9, 1, nil, 0), w);
+	storeclose(s);
+	devclose(d);
+	free(buf);
+}
+
 static void
 texhaust(void)
 {
@@ -1466,6 +1522,7 @@ main(int argc, char **argv)
 	tdeferred('s');
 	tstage();
 	tstagefault();
+	tcondemned();
 	texhaust();
 	tdirty();
 	tfull();
