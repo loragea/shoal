@@ -168,24 +168,34 @@ itembytes(Store *s, Item *it)
 static void
 unlink(Store *s, Item *it)
 {
-	Item **pp, *t;
+	Item **pp, *t, *prev;
 
 	/*
 	 * Only an item this call actually removed from the queue has its
 	 * link cleared.  An item that is no longer pending is a link in
 	 * some batch's item list, and clearing it there severs the
 	 * batch: the entries after it are in the durable record and
-	 * would never be applied or woken (§7).
+	 * would never be applied or woken (§7).  It is also why the tail
+	 * is left alone in that case rather than recomputed: the queue
+	 * did not change.
+	 *
+	 * The predecessor is carried along the one walk the removal needs
+	 * anyway.  formbatch unlinks every item it absorbs, so a second
+	 * walk per item to find the tail again would make forming a batch
+	 * quadratic in the queue's length — and the queue is as long as
+	 * the number of committers §7's pool can put on it.
 	 */
-	for(pp = &s->pend; (t = *pp) != nil; pp = &t->next)
+	prev = nil;
+	for(pp = &s->pend; (t = *pp) != nil; pp = &t->next){
 		if(t == it){
 			*pp = t->next;
+			if(s->pendtail == it)
+				s->pendtail = prev;
 			it->next = nil;
-			break;
+			return;
 		}
-	s->pendtail = nil;
-	for(t = s->pend; t != nil; t = t->next)
-		s->pendtail = t;
+		prev = t;
+	}
 }
 
 /*
