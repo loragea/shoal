@@ -1418,9 +1418,25 @@ time of the last chunk. It is owned by the fid.
   way and its reservations must not outlive it — and where the reason
   is the comparison the error is layer-a §5.5's `stale version`.
 
+  **A tombstone is a key, and an `op=full` may resurrect it.** A
+  tombstone arbitrates normally (layer-a §1.5), so it is not one of
+  the two receivers below: the comparison is made against its key
+  exactly as against a live object's, and a push at a strictly
+  greater key — or an equal one with `force=1` — replaces it with a
+  live object at the key the push carries, reusing the tombstone's
+  index slot and `qid.path`. That is deliberately weaker than §1.5's
+  rule for a *client* create over a tombstone, which this store
+  enforces as `ver` exactly one greater. The two are not in tension:
+  a create's version is this instance's to choose, so the rule that
+  no older copy may outrank the new object can be enforced by
+  choosing it, while an `op=full` carries a version assigned
+  elsewhere that a receiver MUST adopt verbatim (§5.5) and can
+  therefore defend only by arbitration. A version that is merely
+  greater is what arbitration asks for and all it can ask for.
+
   **Two receivers have no key to defend, and the push applies to
-  both whatever it carries.** The first is an object this instance
-  does not hold: absence is not a key (layer-a §1.3), and it is the
+  both whatever it carries.** Neither is a tombstone. The first is
+  an object this instance does not hold: absence is not a key (layer-a §1.3), and it is the
   common case for a heal. The same `Eobj` carries the create — this
   commit reserves the index slot and the `qid.path` — because
   creating the object first and staging into it afterwards would
