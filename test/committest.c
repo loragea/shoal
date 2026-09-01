@@ -1917,8 +1917,11 @@ techange(void)
  * §13's named points mean what they say.  body:n is "after n body
  * sectors", so the common one-sector commit — whose body is empty —
  * has none: a schedule arming body:1 must not be crashed after the
- * commit point instead of before it.  precommit and commit are two
- * points and not one, and the pre-flush is what lies between them.
+ * commit point instead of before it.  A point that never fires is a
+ * schedule that passes vacuously, so the same value is then armed
+ * against a record that does have a body sector and must crash there.
+ * precommit and commit are two points and not one, and the pre-flush
+ * is what lies between them.
  */
 static void
 tpoints(void)
@@ -1950,6 +1953,27 @@ tpoints(void)
 	if(wr(s, "p0", buf, 64, 0, 2) < 0)
 		fail("body:1 fired on a record with no body sectors: %r");
 	simarm(d, nil, 0);
+
+	/*
+	 * ... and the same point on a record that has one.  A rewrite of
+	 * the whole maximal object names sixteen blocks and frees
+	 * sixteen grains, which is a two-sector record: one body sector,
+	 * written as one piece, so body:1 is the value this geometry
+	 * emits.  The crash stops the device, so the commit fails.
+	 */
+	simarm(d, "body", 1);
+	checks++;
+	if(wr(s, "p0", buf, 16*Blk, 0, 3) >= 0)
+		fail("body:1 did not fire on a record with a body sector");
+	simarm(d, nil, 0);
+	simrevive(d);
+	storeclose(s);
+	if((s = mustopen(d, "the named points, after body:1")) == nil){
+		devclose(d);
+		free(buf);
+		return;
+	}
+	simcrashdead(d, 1);
 
 	/*
 	 * The pre-flush follows the precommit point, so at that point

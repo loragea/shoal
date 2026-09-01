@@ -2675,7 +2675,15 @@ models what the real one is allowed to do:
 Points: `stage` (after the last staged grain write), `body:n` (after
 *n* of the record's **body** sectors — the wrap record and the header
 sector are not body, so the common one-sector record has none of
-these points at all), `precommit` (after the body write and **before**
+these points at all; and *n* counts sectors but is emitted per
+**device write**, because that is the granularity at which the body
+can be interrupted: §3.2 issues the body in `blksz`-bounded pieces,
+the point fires after each piece carrying the body sectors written so
+far, and a body that fits one piece therefore emits only its own
+total. A schedule that arms a value between two piece boundaries
+never fires, so a test that arms `body:n` must assert that the crash
+it expected actually happened rather than reading a completed
+operation as a pass), `precommit` (after the body write and **before**
 the pre-flush), `commit` (after the pre-flush and immediately before
 the header write, so the commit point is not reached), `postwrite`
 (after the header write returns, before the post-flush), `preack`,

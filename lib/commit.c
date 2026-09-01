@@ -333,6 +333,10 @@ packbatch(Store *s, Batch *b, uchar *p, long max, ulong *nent)
  * body marks the one call that writes the record's body sectors:
  * §13's body:n is "after n body sectors", so the wrap record and the
  * header sector — which is the commit point itself — do not emit it.
+ * The point fires per piece and not per sector, carrying the body
+ * sectors written so far: a piece is one device write, so it is the
+ * finest granularity at which the body can honestly be said to have
+ * been interrupted.  §13 states which values of n that leaves.
  */
 static int
 logwrite(Store *s, uchar *p, ulong n, uvlong sec, int body)
