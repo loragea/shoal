@@ -1483,6 +1483,32 @@ tbounds(void)
 		objread(s, o, 1, buf, -1, 0), "negative read");
 
 	/*
+	 * §3.7: an oid outside layer-a §1.1's 1*128 bound is that
+	 * section's `bad object name' and not a string of this store's
+	 * own, because the 9P server returns what the store hands it and
+	 * §2.6's set is what a client parses.
+	 */
+	refused("a create of a zero-length oid",
+		objcreate(s, o, 0, 1, 1, nil, 0, nil), "bad object name");
+	refused("a create of an oid past Oidmax",
+		objcreate(s, o, Oidmax + 1, 1, 1, nil, 0, nil),
+		"bad object name");
+	checks++;
+	if((g = stageopen(s, o, 0, Blk, 0)) != nil){
+		fail("a stage of a zero-length oid was accepted");
+		stagediscard(g);
+	}else{
+		char e[ERRMAX];
+
+		rerrstr(e, sizeof e);
+		istrue("a stage of a zero-length oid says bad object name",
+			strncmp(e, "bad object name", 15) == 0);
+	}
+	/* ... and a discard of something that is not a tombstone */
+	refused("a discard of a live object", objdiscard(s, o, 1),
+		"not discardable");
+
+	/*
 	 * The refusal is the whole of what happened: no record was
 	 * written, no grain was taken and the object is as it was.
 	 */
@@ -1528,14 +1554,11 @@ tbounds(void)
 		fail("stageopen: %r");
 	else{
 		refused("a chunk of 4 bytes at 2^64-4",
-			stagewrite(g, buf, 4, ~0ULL - 3),
-			"chunk past the declared length");
+			stagewrite(g, buf, 4, ~0ULL - 3), "bad ctl");
 		refused("a chunk of a negative count",
-			stagewrite(g, buf, -1, 0),
-			"chunk past the declared length");
+			stagewrite(g, buf, -1, 0), "negative chunk");
 		refused("a chunk one byte past the declared length",
-			stagewrite(g, buf, 1, 2*Blk),
-			"chunk past the declared length");
+			stagewrite(g, buf, 1, 2*Blk), "bad ctl");
 		storestat(s, &st2);
 		eqv("a refused chunk stages nothing", st2.staged, 0);
 		stagediscard(g);

@@ -250,8 +250,9 @@ updcommit(Upd *u, int state, uvlong ver, uvlong wepoch, vlong mtime,
  * answers nothing until it has been opened again and replayed.  The
  * commit path refuses through the same flag (broken).  Both are
  * qllog's, which is where the batch that condemns the store sets them
- * and where §3.2's failseq is read beside them; qllog is a leaf here,
- * taken and released before any other lock this call needs (§7 rule 1).
+ * and where §3.2's failseq is read beside them.  It is taken alone and
+ * released before this call takes any other, so §7 rule 1 — no proc
+ * holds two state locks at once — still holds as stated.
  */
 static int
 serving(Store *s)
@@ -318,7 +319,7 @@ mapread(Store *s, ulong slot, ulong emapslot)
 		qlock(&s->qlstate);
 		storecondemn(s, slot);
 		qunlock(&s->qlstate);
-		werrstr("slot %lud: extent map failed its checksum", slot);
+		werrstr("checksum mismatch: slot %lud, extent map", slot);
 		return nil;
 	}
 	return c;
@@ -372,7 +373,7 @@ updopen(Upd *u, Store *s, uchar *oid, int oidlen, uvlong newlen, int flags)
 	 */
 	if(e->bad && !(flags & Ubad)){
 		qunlock(&s->qlstate);
-		werrstr("slot %lud: extent map failed its checksum", slot);
+		werrstr("checksum mismatch: slot %lud, extent map", slot);
 		return -1;
 	}
 	u->slot = slot;
@@ -785,7 +786,7 @@ objcreate(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 	int reuse;
 
 	if(oidlen < 1 || oidlen > Oidmax){
-		werrstr("oid length %d", oidlen);
+		werrstr("bad object name: oid length %d", oidlen);
 		return -1;
 	}
 	if(ver == 0){
@@ -1105,7 +1106,7 @@ objdiscard(Store *s, uchar *oid, int oidlen)
 	}
 	if(s->idx[slot].state != Stomb){
 		qunlock(&s->qlstate);
-		werrstr("not a tombstone");
+		werrstr("not discardable: not a tombstone");
 		return -1;
 	}
 	qunlock(&s->qlstate);
@@ -1297,7 +1298,7 @@ stageopen(Store *s, uchar *oid, int oidlen, uvlong len, int force)
 	uvlong nblk;
 
 	if(oidlen < 1 || oidlen > Oidmax){
-		werrstr("oid length %d", oidlen);
+		werrstr("bad object name: oid length %d", oidlen);
 		return nil;
 	}
 	if(len > s->sb.objmax){
@@ -1349,8 +1350,12 @@ stagewrite(Stage *g, void *a, long n, uvlong off)
 	 * negative count is refused in its own right rather than by that
 	 * same accident.
 	 */
-	if(n < 0 || off > g->len || (uvlong)n > g->len - off){
-		werrstr("chunk past the declared length");
+	if(n < 0){
+		werrstr("negative chunk");
+		return -1;
+	}
+	if(off > g->len || (uvlong)n > g->len - off){
+		werrstr("bad ctl: chunk past the declared length");
 		return -1;
 	}
 	if((buf = malloc(s->sb.blksz)) == nil)

@@ -1496,6 +1496,68 @@ time of the last chunk. It is owned by the fid.
   `disk full` with the disk nearly empty. Both counters are one
   integer each.
 
+### 3.7 Error strings
+
+*The spelling of a wire error is layer-a §2.6's and normative there.
+Which of this store's refusals is a wire error is **normative**: the
+9P server hands the client what the store returns, so a condition
+§2.6 names MUST be answered with §2.6's prefix and nothing else. The
+text of an internal-invariant error is implementation policy; the
+rule that it never begins with a §2.6 prefix is normative.*
+
+This section covers every error the library API (`lib/shoal.h`)
+returns, from the write path, the read path and start-up alike, and
+it exists because there is no way to build the 9P surface without a
+mapping rule and no second place to put one.
+
+**A wire error is one layer-a §2.6 names.** The store spells it
+exactly as §2.6 spells it and MAY add detail after the prefix — §2.6's
+own `not primary: n5.0` is the pattern. Callers can act on these:
+
+| Condition | Answer |
+|---|---|
+| an id this store does not hold, on any path | `no such object` |
+| a read, write, truncate or delete of a tombstoned id | `object deleted` |
+| a create of a live id | `object exists` |
+| an oid outside layer-a §1.1's `1*128` bound | `bad object name` |
+| a write, truncate or stage past `objmax`, at either bound | `object too large` |
+| a create over a tombstone whose version is not the tombstone's plus one (layer-a §1.5) | `out of sequence` |
+| an `op=full` at a key the receiver's own key defends (§3.6) | `stale version` |
+| a create or an `op=full` at a version the object model forbids, and a chunk outside its stage's declared length | `bad ctl` |
+| a read, verify or update through an extent-map entry that failed its `csum128` (§5 step 9) | `checksum mismatch` |
+| a discard of something that is not a tombstone | `not discardable` |
+| no grain, index slot, extent-map slot, staged-grain budget, or log space after §6's bounded wait | `disk full` |
+
+**Everything else is an internal-invariant error**: a condition the
+API's contract says a caller cannot produce, or one the media
+produced. The record range checks (`Eobj:`, `Edirty:`, `Eslot:`), a
+grain number outside `ngrains` read out of a map, a negative count, a
+failed allocation, a device error carried out of the commit path, a
+geometry that does not check out at start, and the two condemnations
+— the `broken` store of §3.2 and the store whose apply failed after
+its record was durable. **None of these begins with a §2.6 prefix**,
+and that is the whole of what the server is promised: §2.6's set is
+prefix-free, so a client parsing a prefix out of one of these would
+read a bug or a media fault as an ordinary refusal. What the server
+then does with one — log it, count it, answer something of its own —
+is the server's decision and not this document's.
+
+Two consequences are worth stating, because the list does not make
+them obvious:
+
+- **The store answers `bad ctl` for values only it knows are
+  illegal.** A version of 0 is not a syntax error in a header the
+  server parsed; it is a key layer-a §1.3 forbids — `ver` starts at 1
+  and absence is not `(0, 0)` — and this is where that rule lives.
+  The prefix is still `bad ctl`, because that is what layer-a §5.5's
+  common set gives a sender for an operation it should not have sent.
+- **`checksum mismatch` is answered for local damage as well as for a
+  transfer that failed its check.** §2.6 defines it as "content fails
+  verification, or a replicated op's resulting `csum` does not match
+  the sender's"; an extent-map entry that fails its own `csum128` is
+  content that failed verification, and D14 requires such a holder to
+  say so rather than to answer as though the object were absent.
+
 ## 4. Read path, holes and re-hashing
 
 *Policy.*
@@ -2808,7 +2870,9 @@ bounds and `final=1` arbitration including D14's corrupt receiver,
 tail, R7's dirty records across a restart and on every write-path
 commit, layer-a §1.2's `object too large` at the bounds where a sum
 would wrap, layer-a §2.6's tombstone errors and §1.5's create over a
-tombstone, and the key-preserving `corrupt` flag) and `committest` (§3.2's flush
+tombstone, §3.7's rule that every refusal the API makes is either
+§2.6's prefix or plainly not one, and the key-preserving `corrupt`
+flag) and `committest` (§3.2's flush
 placement read off the device trace, the torn-header sweep over a
 whole sector, short counts on every call, §3.4's crash matrix at
 every point × every operation shape, several laps of the log

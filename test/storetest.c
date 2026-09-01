@@ -656,6 +656,7 @@ tbadmap(void)
 	Super sup;
 	Stage *g;
 	uchar *buf, *other, rd[64], junk[8], oid[Oidmax];
+	char err[ERRMAX];
 	ulong slot, gf, sf;
 	uvlong nl;
 
@@ -698,6 +699,17 @@ tbadmap(void)
 	checks++;
 	if(objread(s, oid, 4, rd, sizeof rd, 0) >= 0)
 		fail("an extent map that failed its checksum was served");
+	else{
+		/*
+		 * §3.7: local damage is answered with layer-a §2.6's
+		 * `checksum mismatch' — content that failed verification —
+		 * and not with a string of this store's own, because the
+		 * 9P server hands the client whatever the store returns.
+		 */
+		rerrstr(err, sizeof err);
+		istrue("a damaged map is refused as a checksum mismatch",
+			strncmp(err, "checksum mismatch", 17) == 0);
+	}
 	storestat(s, &st);
 	eqv("the slot the damaged map belongs to is condemned", st.nlost, 1);
 	eqv("and it is named", storelost(s, 0), oi.slot);
