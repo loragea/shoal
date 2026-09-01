@@ -228,7 +228,7 @@ checkpoint(Store *s)
 	Emape *c;
 	Bmpage bh;
 	Dirtent *t;
-	uvlong ckseq, cklogoff, bits, i;
+	uvlong ckseq, cklogoff, oldckseq, oldcklogoff, bits, i;
 	ulong j, per, slot, npage;
 	int r;
 
@@ -392,10 +392,27 @@ checkpoint(Store *s)
 		qunlock(&s->qllog);
 	}
 
+	/*
+	 * The mark becomes publishable here and not before (§2.2), and it
+	 * is put back if the publish fails — the same shape as qidalloc,
+	 * epochadopt and monidpin, and for the same reason: /status reads
+	 * the publishable image, and a mark left advanced there is one
+	 * this store would report while the disk still carries the old
+	 * one.  Leaving it advanced would also be *safe*, because step
+	 * 2's flush has already returned and the state the mark describes
+	 * is materialised, so a later publish from any of the other three
+	 * may carry it; what it would not be is the same rule as theirs.
+	 */
 	qlock(&s->qlsuper);
+	oldckseq = s->pub.ckseq;
+	oldcklogoff = s->pub.cklogoff;
 	s->pub.ckseq = ckseq;
 	s->pub.cklogoff = cklogoff;
 	r = publishlocked(s);
+	if(r < 0){
+		s->pub.ckseq = oldckseq;
+		s->pub.cklogoff = oldcklogoff;
+	}
 	qunlock(&s->qlsuper);
 	if(r < 0)
 		return -1;

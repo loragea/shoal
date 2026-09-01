@@ -515,6 +515,63 @@ tpublish(void)
 }
 
 /*
+ * §2.8's mark is publishable only once the flush has returned, and a
+ * publish that fails leaves it where it was — the same rule the other
+ * three publishers follow.  /status reads the publishable image, so a
+ * mark left advanced by a failed publish is a `ckseq` this store would
+ * report while the disk still carries the older one.
+ *
+ * §2.2 clause 3 is the deterministic way to make the publish fail:
+ * with neither copy valid the publisher MUST NOT write.  The pages
+ * and the flush before it all succeed, so what is under test is the
+ * last step alone.
+ *
+ * Mutation: drop the roll-back, and /status reports the new mark over
+ * a superblock that never took it.
+ */
+static void
+tckmark(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Shadow sh;
+	uchar *buf, junk[64];
+	uvlong ckseq, cklogoff;
+
+	memset(&sh, 0, sizeof sh);
+	d = newdisk();
+	if((s = mustopen(d, "a checkpoint that cannot publish")) == nil)
+		return;
+	buf = mkbuf(Blk, 91);
+	mkobj(s, "cm", 1);
+	wr(s, "cm", &sh, buf, Blk, 0, 2);
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	storestat(s, &st);
+	ckseq = st.ckseq;
+	cklogoff = st.cklogoff;
+	istrue("the first checkpoint published a mark", ckseq > 0);
+
+	/* more records, so the next mark would differ */
+	wr(s, "cm", &sh, buf, 64, 0, 3);
+	wr(s, "cm", &sh, buf, 64, 128, 4);
+	memset(junk, 0x5a, sizeof junk);
+	simpoke(d, 0, junk, sizeof junk);
+	simpoke(d, super1off(d), junk, sizeof junk);
+	checks++;
+	if(storecheckpoint(s) >= 0)
+		fail("a checkpoint published over two invalid superblocks");
+	storestat(s, &st);
+	eqv("a failed publish leaves ckseq where it was", st.ckseq, ckseq);
+	eqv("and cklogoff with it", st.cklogoff, cklogoff);
+	storeclose(s);
+	devclose(d);
+	free(buf);
+	free(sh.p);
+}
+
+/*
  * §5 step 10, and the order it depends on: a store that judged the
  * index before replaying would put a live object into /lost after an
  * ordinary crash, because a crashed checkpoint damages exactly the
@@ -1155,6 +1212,7 @@ main(int argc, char **argv)
 	tcoverage();
 	trebuild();
 	tpublish();
+	tckmark();
 	tcondemn();
 	tbadmap();
 	tdirtyfull();
