@@ -665,18 +665,19 @@ int	monidpin(Store*, uchar id[16]);
  * free the same grains.  The server's Reqqueue pool (§7) is what
  * orders them; a T1 program uses one proc per object.
  *
- * Every mutating call but objcreate and objdiscard takes the Edirty
- * records layer-a §5.4 step 5b asks for, because §14(2) puts them in
- * the same log record as the update they belong to: either both are
- * durable or neither.  A separate dirtyadd is a second record, and a
- * crash between the two leaves the update durable and the stale mark
- * absent — layer-a §5.4's `degraded' case, arrived at silently.
- * objdiscard is not a replicated update; objcreate is (layer-a §2.4),
- * so it has the same need and does not yet carry them.
+ * Every mutating call but objdiscard takes the Edirty records layer-a
+ * §5.4 step 5b asks for, because §14(2) puts them in the same log
+ * record as the update they belong to: either both are durable or
+ * neither.  A separate dirtyadd is a second record, and a crash
+ * between the two leaves the update durable and the stale mark absent
+ * — layer-a §5.4's `degraded' case, arrived at silently.  objcreate
+ * is in that set because layer-a §2.4 replicates a create like any
+ * other write; objdiscard is not, because a discard is not a
+ * replicated update.
  */
 int	objstat(Store*, uchar *oid, int oidlen, Objinfo*);
 int	objcreate(Store*, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
-		Objinfo*);
+		Dirtyrec *dr, int ndr, Objinfo*);
 long	objread(Store*, uchar *oid, int oidlen, void *a, long n, uvlong off);
 int	objwrite(Store*, uchar *oid, int oidlen, void *a, long n, uvlong off,
 		uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr);

@@ -120,7 +120,7 @@ mkobj(Store *s, char *name, uvlong ver)
 	uchar oid[Oidmax];
 
 	oidof(oid, name);
-	if(objcreate(s, oid, strlen(name), ver, 1, nil) < 0)
+	if(objcreate(s, oid, strlen(name), ver, 1, nil, 0, nil) < 0)
 		fail("objcreate %s: %r", name);
 }
 

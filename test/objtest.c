@@ -24,7 +24,7 @@ mk(Store *s, char *name)
 	uchar o[Oidmax];
 
 	oidof(o, name);
-	if(objcreate(s, o, strlen(name), 1, 1, nil) < 0)
+	if(objcreate(s, o, strlen(name), 1, 1, nil, 0, nil) < 0)
 		fail("objcreate %s: %r", name);
 }
 
@@ -851,7 +851,7 @@ texhaust(void)
 	for(i = 0; i < 200; i++){
 		snprint(name, sizeof name, "s%d", i);
 		oidof(o, name);
-		if(objcreate(s, o, strlen(name), 1, 1, nil) < 0){
+		if(objcreate(s, o, strlen(name), 1, 1, nil, 0, nil) < 0){
 			n = i;
 			break;
 		}
@@ -1055,6 +1055,29 @@ tdirty(void)
 		dirtyhas(s, oid, 3, "node9.3"));
 	oidof(oid, "dck");
 	istrue("a corrupt flag's stale mark is durable",
+		dirtyhas(s, oid, 3, "node9.3"));
+
+	/*
+	 * A create is replicated like any other write (layer-a §2.4), so
+	 * it can leave a peer stale in exactly the same way and needs the
+	 * mark in exactly the same record.  Registered afterwards it would
+	 * be a second record, and a crash between the two leaves a live
+	 * object here that no peer is recorded as missing.
+	 */
+	dr[0].oidlen = 3;
+	memmove(dr[0].oid, "dcr", 3);
+	oidof(oid, "dcr");
+	if(objcreate(s, oid, 3, 1, 1, dr, 1, nil) < 0)
+		fail("objcreate with a dirty record: %r");
+	eqv("the create carried its record", dirtycount(s), 5);
+	storeclose(s);
+	if((s = mustopen(d, "dirty from a create")) == nil){
+		devclose(d);
+		return;
+	}
+	eqv("which is in the same record as the create", dirtycount(s), 5);
+	oidof(oid, "dcr");
+	istrue("a create's stale mark is durable",
 		dirtyhas(s, oid, 3, "node9.3"));
 	storeclose(s);
 	devclose(d);
@@ -1304,19 +1327,19 @@ ttomb(void)
 	 * so the store enforces the value rather than trusting it.
 	 */
 	refused("a create over a tombstone at the tombstone's own ver",
-		objcreate(s, oid, 1, 3, 1, nil), "out of sequence");
+		objcreate(s, oid, 1, 3, 1, nil, 0, nil), "out of sequence");
 	refused("a create over a tombstone below its ver",
-		objcreate(s, oid, 1, 2, 1, nil), "out of sequence");
+		objcreate(s, oid, 1, 2, 1, nil, 0, nil), "out of sequence");
 	refused("a create over a tombstone two above its ver",
-		objcreate(s, oid, 1, 5, 1, nil), "out of sequence");
+		objcreate(s, oid, 1, 5, 1, nil, 0, nil), "out of sequence");
 	refused("a create over a tombstone below its wepoch",
-		objcreate(s, oid, 1, 4, 0, nil), "out of sequence");
+		objcreate(s, oid, 1, 4, 0, nil, 0, nil), "out of sequence");
 	if(ostat(s, "t", &oi2) < 0)
 		fail("objstat: %r");
 	eqv("a refused create leaves the tombstone a tombstone", oi2.state,
 		Stomb);
 
-	if(objcreate(s, oid, 1, 4, 1, &oi2) < 0)
+	if(objcreate(s, oid, 1, 4, 1, nil, 0, &oi2) < 0)
 		fail("create over a tombstone: %r");
 	eqv("the create takes the tombstone's ver plus one", oi2.ver, 4);
 	eqv("a create over a tombstone keeps the qid.path", oi2.qidpath, path);

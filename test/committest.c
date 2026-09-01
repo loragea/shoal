@@ -61,7 +61,7 @@ mk(Store *s, char *name)
 	uchar o[Oidmax];
 
 	oidof(o, name);
-	if(objcreate(s, o, strlen(name), 1, 1, nil) < 0)
+	if(objcreate(s, o, strlen(name), 1, 1, nil, 0, nil) < 0)
 		fail("objcreate %s: %r", name);
 }
 
@@ -340,7 +340,7 @@ onecrash(char *point, int mode, char *op, int expectnew)
 	simarm(d, point, 0);
 	oidof(o, "m");
 	if(strcmp(op, "create") == 0)
-		r = objcreate(s, (uchar*)"n", 1, 3, 1, nil);
+		r = objcreate(s, (uchar*)"n", 1, 3, 1, nil, 0, nil);
 	else if(strcmp(op, "whole-block write") == 0)
 		r = wr(s, "m", buf, Blk, 0, 3);
 	else if(strcmp(op, "partial write") == 0)
@@ -2271,7 +2271,7 @@ tqid(void)
 		for(i = 0; i < 8; i++){
 			snprint(name, sizeof name, "q%d.%d", j, i);
 			oidof(o, name);
-			if(objcreate(s, o, strlen(name), 1, 1, &oi) < 0){
+			if(objcreate(s, o, strlen(name), 1, 1, nil, 0, &oi) < 0){
 				fail("objcreate: %r");
 				continue;
 			}

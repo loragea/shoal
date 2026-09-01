@@ -758,7 +758,7 @@ objstat(Store *s, uchar *oid, int oidlen, Objinfo *oi)
 
 int
 objcreate(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
-	Objinfo *oi)
+	Dirtyrec *dr, int ndr, Objinfo *oi)
 {
 	Upd u;
 	Ient *e;
@@ -839,7 +839,7 @@ objcreate(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 	u.oldnblk = 0;
 	u.newslot = 0;
 	u.oslot = 0;
-	if(updcommit(&u, Slive, ver, wepoch, time(nil), 0, nil, 0) < 0){
+	if(updcommit(&u, Slive, ver, wepoch, time(nil), 0, dr, ndr) < 0){
 		updclose(&u);
 		return -1;
 	}
