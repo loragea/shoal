@@ -657,6 +657,7 @@ tbadmap(void)
 	Stage *g;
 	uchar *buf, *other, rd[64], junk[8], oid[Oidmax];
 	ulong slot, gf, sf;
+	uvlong nl;
 
 	memset(&sh, 0, sizeof sh);
 	d = newdisk();
@@ -701,6 +702,15 @@ tbadmap(void)
 	eqv("the slot the damaged map belongs to is condemned", st.nlost, 1);
 	eqv("and it is named", storelost(s, 0), oi.slot);
 	/*
+	 * Condemning a slot does not change what the object *is*.  The
+	 * index entry is intact — the damage is in the extent map — so it
+	 * stays `live', the checkpoint writes it back that way and
+	 * readindex counts it again at the next start.  A condemned copy
+	 * is reported by `nlost' and by `corrupt=1' (D14), not by
+	 * dropping out of the live count on one side of a restart.
+	 */
+	eqv("a condemned copy is still a live object", st.nlive, 1);
+	/*
 	 * D14: the copy fails local verification, so it MUST answer with
 	 * corrupt=1 and MUST NOT answer as absent — absence is a §1.5
 	 * positive confirmation this holder cannot vouch for, and /lost
@@ -740,6 +750,7 @@ tbadmap(void)
 	storestat(s, &st);
 	gf = st.grainfree;
 	sf = st.slotfree;
+	nl = st.nlive;
 	storeclose(s);
 	if((s = mustopen(d, "a damaged extent map, restarted")) == nil){
 		devclose(d);
@@ -751,6 +762,7 @@ tbadmap(void)
 	eqv("the condemned slot is still allocated after a restart",
 		st.slotfree, sf);
 	eqv("and its grains are still accounted for", st.grainfree, gf);
+	eqv("and the live count is the one it had", st.nlive, nl);
 	checks++;
 	if(objstat(s, oid, 4, &oi2) < 0)
 		fail("a condemned slot lost its object across a restart: %r");
@@ -802,6 +814,73 @@ tbadmap(void)
 	devclose(d);
 	free(buf);
 	free(sh.p);
+}
+
+/*
+ * §5 step 7: a log sector the device cannot read is not the end of
+ * the log.  Every other reason replay stops is a statement about the
+ * bytes at that offset; a device error is not, so stopping there
+ * discards whatever is past the fault — acked writes included — and
+ * then hands the tail back to be overwritten.  Steps 4, 5 and 6
+ * refuse to start on a device error and this must too.
+ *
+ * Mutation: take the read error as the end of the log, and the store
+ * starts with the objects committed past the fault silently gone.
+ */
+static void
+tlogread(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Sbsel sel;
+	Super sb;
+	Objinfo oi;
+	uchar oid[Oidmax];
+	char name[8];
+	int i;
+
+	d = newdisk();
+	if((s = mustopen(d, "an unreadable log sector")) == nil)
+		return;
+	for(i = 0; i < 5; i++){
+		snprint(name, sizeof name, "lr%d", i);
+		mkobj(s, name, 1);
+	}
+	storestat(s, &st);
+	eqv("five creates are five live objects", st.nlive, 5);
+	storeclose(s);
+
+	/*
+	 * One sector, one record in from the replay start: a create is a
+	 * one-sector record at this geometry, so the fault lands on a
+	 * record with three more committed behind it.  The fault is
+	 * sticky and aimed, so nothing outside the log region sees it.
+	 */
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	sb = sel.sb[sel.start];
+	simfaultat(d, Sfeio, 0, (vlong)(sb.cklogoff + 1)*sb.secsz, sb.secsz);
+	checks++;
+	if((s = openstore(d)) != nil){
+		fail("a store started over a log it could not read");
+		storeclose(s);
+	}
+
+	/* and with the fault gone it starts and has all five */
+	simfault(d, Sfnone, 0);
+	if((s = mustopen(d, "the log, readable again")) == nil){
+		devclose(d);
+		return;
+	}
+	storestat(s, &st);
+	eqv("replay reaches every record past the fault", st.nlive, 5);
+	oidof(oid, "lr4");
+	checks++;
+	if(objstat(s, oid, 3, &oi) < 0)
+		fail("the last object committed is gone: %r");
+	storeclose(s);
+	devclose(d);
 }
 
 /*
@@ -1215,6 +1294,7 @@ main(int argc, char **argv)
 	tckmark();
 	tcondemn();
 	tbadmap();
+	tlogread();
 	tdirtyfull();
 	tdirtytie(0);
 	tdirtytie(1);

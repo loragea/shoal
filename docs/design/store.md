@@ -1593,7 +1593,14 @@ lose arbitration against everything including absence.
    apply the entries, then continue at the region start if `Fwrap` is
    set, at the region start if `+nsec` reaches the region end, and at
    `+nsec` otherwise (§2.7). Stop at the first record that is invalid
-   or out of sequence. Applying an entry means setting absolute
+   or out of sequence. **A sector the device cannot read is not one
+   of those, and the store MUST NOT start.** Every other reason to
+   stop is a statement about the bytes at that offset and each of
+   them says the log ends there; a read error says nothing about
+   them, so treating it as the end would discard whatever is past the
+   fault — acked writes included — and then hand the tail back to be
+   overwritten. Steps 4, 5 and 6 already refuse to start on a device
+   error, and this is the same rule. Applying an entry means setting absolute
    values — this slot's four-tuple becomes these bytes, block *i*
    becomes grain *g* with digest *d*, blocks at or beyond `nblk`
    become holes, this grain becomes allocated, a record carrying

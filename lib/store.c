@@ -436,6 +436,17 @@ applyents(Store *s, uchar *p, Lrec *r)
  * at the region start if Fwrap is set, at the region start if +nsec
  * reaches the region end, and at +nsec otherwise.  Stop at the first
  * record that is invalid or out of sequence.
+ *
+ * **A sector that cannot be read is not the end of the log.**  Every
+ * other reason to stop is a statement about the bytes at rel — no
+ * valid header, the wrong sequence, a length this geometry cannot
+ * hold — and each of them says the log ends there.  A device error
+ * says nothing about them: the records past the fault may be perfectly
+ * good, and stopping would discard every one of them, acked writes
+ * included, and then hand the tail back to the allocator to overwrite.
+ * That is a silent truncation of exactly the kind §2.5's coverage rule
+ * refuses to start on, so replay refuses too — as steps 4, 5 and 6
+ * already do for the index, the bitmap and the dirty region.
  */
 static int
 replay(Store *s)
@@ -443,6 +454,8 @@ replay(Store *s)
 	uchar *hdr, *buf;
 	Lrec r, r2;
 	uvlong seq, rel, scanned, off, n, m;
+	char e[ERRMAX];
+	int ioerr;
 
 	if((hdr = malloc(s->sb.secsz)) == nil)
 		return -1;
@@ -453,13 +466,16 @@ replay(Store *s)
 	seq = s->sb.ckseq + 1;
 	rel = s->sb.cklogoff - s->sb.logoff;
 	scanned = 0;
+	ioerr = 0;
 	for(;;){
 		if(scanned >= s->sb.logsecs)
 			break;
 		off = s->sb.logoff*(uvlong)s->sb.secsz
 			+ rel*(uvlong)s->sb.secsz;
-		if(devread(s->d, hdr, s->sb.secsz, off) < 0)
+		if(devread(s->d, hdr, s->sb.secsz, off) < 0){
+			ioerr = 1;
 			break;
+		}
 		if(lrecunpack(&r, hdr) < 0)
 			break;
 		if(r.nsec < 1 || rel + r.nsec > s->sb.logsecs)
@@ -470,8 +486,10 @@ replay(Store *s)
 			m = (uvlong)r.nsec*s->sb.secsz - n;
 			if(m > Bulkio)
 				m = Bulkio;
-			if(devread(s->d, buf + n, m, off + n) < 0)
+			if(devread(s->d, buf + n, m, off + n) < 0){
+				ioerr = 1;
 				goto done;
+			}
 		}
 		if(lrecvalid(buf, s->sb.secsz, &r2, rel, s->sb.logsecs, seq) < 0)
 			break;
@@ -492,8 +510,16 @@ replay(Store *s)
 			break;
 	}
 done:
+	if(ioerr)
+		rerrstr(e, sizeof e);
 	free(hdr);
 	free(buf);
+	if(ioerr){
+		werrstr("log sector %llud: %s: the log cannot be read to its "
+			"end; shoalck, then refill from peers",
+			s->sb.logoff + rel, e);
+		return -1;
+	}
 	s->logtail = rel;
 	s->watermark = s->nreplay > 0 ? s->replayhigh : s->sb.ckseq;
 	s->relseq = s->watermark;
