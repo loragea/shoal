@@ -770,6 +770,10 @@ objcreate(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 		werrstr("oid length %d", oidlen);
 		return -1;
 	}
+	if(ver == 0){
+		werrstr("bad ctl: create at version 0");
+		return -1;
+	}
 	memset(&u, 0, sizeof u);
 	u.s = s;
 	qlock(&s->qlstate);
@@ -1494,6 +1498,21 @@ stagefinal(Stage *g, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 	s = g->s;
 	if(!serving(s))
 		return stagefail(g);
+	/*
+	 * layer-a §1.3: ver starts at 1 on create, and absence is not
+	 * (0, 0) — so a live object at version 0 is a key the contract
+	 * says cannot exist.  Nothing further down would refuse one: the
+	 * comparison is skipped entirely for a receiver with no key to
+	 * defend, which is both of §3.6's cases, so an absent or corrupt
+	 * copy would take the push and be published at (wepoch, 0).  On
+	 * the wire the version comes out of the op=full header, so a
+	 * value the model forbids is a malformed header — layer-a §5.5's
+	 * common set, `bad ctl'.
+	 */
+	if(ver == 0){
+		werrstr("bad ctl: op=full at version 0");
+		return stagefail(g);
+	}
 	qlock(&s->qlstate);
 	slot = ientfind(s, g->oid, g->oidlen);
 	absent = slot < 0 || s->idx[slot].state == Sfree;

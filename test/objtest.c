@@ -1165,6 +1165,25 @@ tfull(void)
 	istrue("the heal's stale mark rode in the same record",
 		dirtyhas(s, oid, 1, "node3.1"));
 
+	/*
+	 * layer-a §1.3: ver starts at 1 on create and absence is not
+	 * (0, 0), so a live object at version 0 is a key that cannot
+	 * exist.  The comparison below does not catch it — a receiver
+	 * with no key to defend skips the comparison altogether — so it
+	 * is refused in its own right, against an object this store does
+	 * not hold, which is exactly the case that would otherwise
+	 * publish one.
+	 */
+	if((g = fullstage(s, "z0", b, 2*Blk, 0)) != nil)
+		refused("an op=full at version 0 to an absent object",
+			stagefinal(g, 0, 2, nil, 0), "bad ctl");
+	checks++;
+	if(ostat(s, "z0", &oi) >= 0)
+		fail("an op=full at version 0 published a live (0, 0) object");
+	oidof(oid, "z1");
+	refused("a create at version 0", objcreate(s, oid, 2, 0, 2, nil, 0, nil),
+		"bad ctl");
+
 	/* layer-a §5.5's comparison, made against that key */
 	if((g = fullstage(s, "f", b, 2*Blk, 0)) != nil)
 		refused("an op=full at a lower key", stagefinal(g, 3, 2, nil, 0),
