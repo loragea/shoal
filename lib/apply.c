@@ -288,10 +288,20 @@ applyrec(Store *s, Objrec *o, Emape *c)
 	if(e->oidlen != o->oidlen || e->oid == nil
 	|| memcmp(e->oid, o->oid, o->oidlen) != 0){
 		/*
-		 * §3.2's commit path grew this buffer before the record
-		 * was written, so the allocation below is replay's alone
-		 * — and there a failure stops the replay, which is a
-		 * refusal to start rather than a half-applied record.
+		 * The commit path never reaches the allocation below, and
+		 * it takes two rules to say why.  itemprep grew the buffer
+		 * to o->oidlen before the record was written; the one
+		 * thing that shrinks it again is applyslot, which frees
+		 * e->oid and zeroes oidcap, and applyslot can name this
+		 * slot only for a commit that releases it.  §7's
+		 * per-object ordering keeps such a commit from being
+		 * issued beside this one, and §3.5's deferred-reuse rule
+		 * keeps the released slot out of the allocator until that
+		 * commit has been applied, so no batch in between can
+		 * leave the buffer smaller than itemprep left it.  The
+		 * allocation is therefore replay's alone, and there a
+		 * failure stops the replay, which is a refusal to start
+		 * rather than a half-applied record.
 		 */
 		if(e->oid == nil || e->oidcap < o->oidlen){
 			free(e->oid);
