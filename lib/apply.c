@@ -422,11 +422,20 @@ applyrec(Store *s, Objrec *o, Emape *c)
 
 /*
  * The peer set, §2.6.  A peer is remembered as soon as one of its
- * fine-grained records exists, because the exhaustion rule below has
- * to be able to name the peer whose records it drops.  fullsync is
- * never persisted: it is set for every peer at start (§5 step 12).
+ * fine-grained records exists, so that storefullsync can answer for it
+ * by name.  fullsync is never persisted: it is set for every peer at
+ * start (§5 step 12).
+ *
+ * **Registering a peer may fail, and that is not an error.**  The list
+ * is memory only, nothing durable names it, and the one question it
+ * answers is storefullsync's — which answers 1, behind, for a peer it
+ * does not know, exactly as it would for a peer it knew and had
+ * marked fullsync.  So a mallocz that fails here costs the safe answer
+ * and nothing else, and the callers have nothing to do with a return
+ * value.  The exhaustion rule below used to need the list to be
+ * complete and no longer does: it counts the records themselves.
  */
-Peer*
+void
 addpeer(Store *s, uchar *name, int n)
 {
 	Peer *p;
@@ -434,15 +443,14 @@ addpeer(Store *s, uchar *name, int n)
 	for(p = s->peers; p != nil; p = p->next)
 		if(strlen(p->name) == (ulong)n
 		&& memcmp(p->name, name, n) == 0)
-			return p;
+			return;
 	if((p = mallocz(sizeof *p, 1)) == nil)
-		return nil;
+		return;
 	memmove(p->name, name, n);
 	p->name[n] = '\0';
 	p->fullsync = 1;
 	p->next = s->peers;
 	s->peers = p;
-	return p;
 }
 
 static int
@@ -461,13 +469,36 @@ peerowns(Dirtent *t, Peer *p)
  * keeps §3.2's commit path and §5's replay answering the same thing:
  * a full region that the live path refused and replay ignored would
  * be a store whose memory differs from what its own log rebuilds.
+ *
+ * That argument makes two demands on *which* peer is dropped, and
+ * neither is met by taking the peer list as it comes.
+ *
+ * **Ties go to the lowest name.**  The list's order is not the same
+ * twice: live it is first-apply order, after a restart it is
+ * readdirty's slot order reversed.  A tie broken by list order
+ * therefore drops one peer live and another on replay from the very
+ * same records — permitted by layer-a §7.1, which lets any peer's
+ * records go, but it is the divergence this function exists to
+ * avoid.  strcmp of the names does not depend on either order.
+ *
+ * **A peer no record's name can be found under still owns records.**
+ * addpeer allocates, so a peer that could not be registered owns
+ * records the loop below counts for nobody; if every record in a full
+ * region were one of those, a peer-driven search would find no victim
+ * and applydirty would refuse — after its own record is durable,
+ * which §3.2 cannot afford.  So the fallback names the victim from a
+ * record instead of from the list.  The unregistered peer stays
+ * unregistered, which storefullsync answers as behind: the same
+ * answer marking it would give.
  */
 static int
 dropworstpeer(Store *s)
 {
 	Dirtent *t;
 	Peer *p, *worst;
+	uchar peer[Peermax];
 	ulong i, n, best;
+	int peerlen;
 
 	worst = nil;
 	best = 0;
@@ -476,21 +507,36 @@ dropworstpeer(Store *s)
 		for(i = 0; i < s->sb.ndirty; i++)
 			if((t = s->dirt[i]) != nil && peerowns(t, p))
 				n++;
-		if(n > best){
+		if(n == 0)
+			continue;
+		if(worst == nil || n > best
+		|| (n == best && strcmp(p->name, worst->name) < 0)){
 			best = n;
 			worst = p;
 		}
 	}
-	if(worst == nil)
-		return -1;
+	if(worst != nil){
+		peerlen = strlen(worst->name);
+		memmove(peer, worst->name, peerlen);
+		worst->fullsync = 1;
+	}else{
+		for(i = 0; i < s->sb.ndirty; i++)
+			if(s->dirt[i] != nil)
+				break;
+		if(i >= s->sb.ndirty)
+			return -1;	/* nothing to drop: the region is empty */
+		t = s->dirt[i];
+		peerlen = t->peerlen;
+		memmove(peer, t->peer, peerlen);
+	}
 	for(i = 0; i < s->sb.ndirty; i++)
-		if((t = s->dirt[i]) != nil && peerowns(t, worst)){
+		if((t = s->dirt[i]) != nil && t->peerlen == peerlen
+		&& memcmp(t->peer, peer, peerlen) == 0){
 			free(t);
 			s->dirt[i] = nil;
 			s->ndirtused--;
 			dirtdirty(s, i);
 		}
-	worst->fullsync = 1;
 	return 0;
 }
 
@@ -551,8 +597,14 @@ applydirty(Store *s, Dirtyrec *d, Dirtent **spare)
 				break;
 		if(i < s->sb.ndirty)
 			break;
+		/*
+		 * Reached only with every slot occupied, and dropworstpeer
+		 * refuses only an *empty* region — so this refusal needs a
+		 * region of no slots at all, which itemok rejects before
+		 * the record is written and replay is entitled to stop at.
+		 */
 		if(dropworstpeer(s) < 0){
-			werrstr("dirty region full");
+			werrstr("Edirty: the geometry has no dirty region");
 			return -1;
 		}
 	}

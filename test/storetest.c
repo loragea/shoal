@@ -806,6 +806,102 @@ tdirtyfull(void)
 }
 
 /*
+ * §2.6's tie, which is where the exhaustion rule's own argument is
+ * won or lost.  The rule keeps the live path and replay answering the
+ * same thing, so which peer it drops must be a function of the
+ * records and of nothing else — and the peer list is not that: it is
+ * first-apply order while the store runs and readdirty's slot order
+ * reversed after a restart.
+ *
+ * The two orders are made to differ here: peer.a's records are added
+ * first and then deleted, so peer.b's take the low slots and peer.a
+ * is still the peer the running store heard of first.  A running
+ * store therefore has [b, a] and a restarted one [a, b], over exactly
+ * the same 32 records each.  Both must drop peer.a, which is the
+ * lower name.
+ *
+ * Mutation: break the tie by list order (`n > best` alone), and the
+ * live store drops peer.b where the restarted one drops peer.a.
+ */
+static void
+tdirtytie(int restart)
+{
+	Dev *d;
+	Store *s;
+	uchar oid[Oidmax];
+	char name[32];
+	ulong i;
+	int ok;
+
+	d = newdisk();
+	if((s = mustopen(d, "a tie in the dirty region")) == nil)
+		return;
+	ok = 1;
+	for(i = 0; i < 32; i++){
+		snprint(name, sizeof name, "ta%lud", i);
+		oidof(oid, name);
+		if(dirtyadd(s, oid, strlen(name), "peer.a", 7) < 0)
+			ok = 0;
+	}
+	for(i = 0; i < 32; i++){
+		snprint(name, sizeof name, "ta%lud", i);
+		oidof(oid, name);
+		if(dirtydel(s, oid, strlen(name), "peer.a") < 0)
+			ok = 0;
+	}
+	if(storecheckpoint(s) < 0)
+		ok = 0;
+	for(i = 0; i < 32; i++){
+		snprint(name, sizeof name, "tb%lud", i);
+		oidof(oid, name);
+		if(dirtyadd(s, oid, strlen(name), "peer.b", 7) < 0)
+			ok = 0;
+	}
+	if(storecheckpoint(s) < 0)
+		ok = 0;
+	for(i = 0; i < 32; i++){
+		snprint(name, sizeof name, "tc%lud", i);
+		oidof(oid, name);
+		if(dirtyadd(s, oid, strlen(name), "peer.a", 7) < 0)
+			ok = 0;
+	}
+	if(storecheckpoint(s) < 0)
+		ok = 0;
+	istrue("the two peers filled the region between them", ok);
+	eqv("with half the records each", dirtycount(s), 64);
+
+	/*
+	 * The restart is what re-derives the peer list from the region
+	 * itself; the checkpoint above is what leaves replay nothing to
+	 * add to it in first-apply order.
+	 */
+	if(restart){
+		storeclose(s);
+		if((s = mustopen(d, "a tie, after a restart")) == nil){
+			devclose(d);
+			return;
+		}
+		eqv("the restarted store holds the same records",
+			dirtycount(s), 64);
+	}
+
+	oidof(oid, "tz");
+	checks++;
+	if(dirtyadd(s, oid, 2, "peer.c", 9) < 0)
+		fail("a tied region failed a durable write: %r");
+	oidof(oid, "tc0");
+	istrue("the lower name's records are the ones dropped",
+		!dirtyhas(s, oid, 3, "peer.a"));
+	oidof(oid, "tb0");
+	istrue("and the higher name's are the ones kept",
+		dirtyhas(s, oid, 3, "peer.b"));
+	eqv("32 of them, and the record that displaced them",
+		dirtycount(s), 33);
+	storeclose(s);
+	devclose(d);
+}
+
+/*
  * §3.2's flush channel.  If it cannot be opened the store MUST NOT
  * start, unless the operator passes -w, which asserts that the unit
  * is write-through or its write cache disabled.  -w is a claim, not
@@ -1062,6 +1158,8 @@ main(int argc, char **argv)
 	tcondemn();
 	tbadmap();
 	tdirtyfull();
+	tdirtytie(0);
+	tdirtytie(1);
 	tflushchan();
 	tbigblk();
 	if(fails > 0){

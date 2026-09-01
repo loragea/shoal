@@ -580,6 +580,10 @@ itemok(Store *s, Item *it)
 			return -1;
 		}
 	}
+	if(it->ndirty > 0 && s->sb.ndirty == 0){
+		werrstr("Edirty: the geometry has no dirty region");
+		return -1;
+	}
 	for(i = 0; i < it->ndirty; i++)
 		if(dirtyrecok(s, &it->dirty[i]) < 0)
 			return -1;

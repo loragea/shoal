@@ -317,7 +317,7 @@ int	applyrec(Store*, Objrec*, Emape*);
 int	objrecok(Store*, Objrec*);
 int	applydirty(Store*, Dirtyrec*, Dirtent**);
 int	dirtyrecok(Store*, Dirtyrec*);
-Peer*	addpeer(Store*, uchar*, int);
+void	addpeer(Store*, uchar*, int);
 int	applyslot(Store*, ulong slot);
 void	mapopen(Store*, Omap*, Ient*, Emape*);
 ulong	mapgrain(Omap*, ulong i);

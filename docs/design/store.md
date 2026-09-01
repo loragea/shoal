@@ -785,7 +785,16 @@ more than the field holds; the store MUST reject `peerlen > 72` and
 `ndirty` is an implementation limit in exactly layer-a §7.1's sense.
 When it is exhausted the store discards every fine-grained record for
 the peer with the most records and marks that peer `fullsync`, which
-layer-a §7.1 explicitly permits.
+layer-a §7.1 explicitly permits. **Ties go to the lowest peer name,
+and the count is taken over the records rather than over the peers
+the store has heard of.** Both are needed for the drop to be a
+function of the region's contents alone. The order the store learned
+its peers in is first-apply order while it runs and the region's own
+slot order after a restart, so a tie broken by that order would drop
+one peer's marks on the live path and another's when the same records
+are replayed; and a peer whose name the store failed to register at
+all still owns records, which a count taken over peers attributes to
+nobody.
 
 The region is read at start (§5) and the in-memory set is built from
 it before replay, whose `Edirty` entries then add to and remove from
