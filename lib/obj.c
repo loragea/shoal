@@ -591,9 +591,22 @@ stageblk(Upd *u, Omap *mold, ulong blk, uchar *src, ulong boff, ulong bn,
 		qunlock(&s->qlstate);
 		return -1;
 	}
-	if(addfree(u, mapgrain(mold, blk)) < 0)
+	/*
+	 * Until addmap names it, this grain is reserved and unreferenced:
+	 * updabort walks u->map to release what the update staged, so a
+	 * failure between the write and the naming would leave the
+	 * reservation held for the life of the process.  The grain is
+	 * released here instead, which is the same thing updabort would
+	 * have done for it.
+	 */
+	if(addfree(u, mapgrain(mold, blk)) < 0
+	|| addmap(u, blk, g, dig) < 0){
+		qlock(&s->qlstate);
+		grainstageclr(s, g);
+		qunlock(&s->qlstate);
 		return -1;
-	return addmap(u, blk, g, dig);
+	}
+	return 0;
 }
 
 /*
@@ -686,9 +699,14 @@ reblk(Upd *u, Omap *mold, ulong blk, uchar *buf)
 		qunlock(&s->qlstate);
 		return -1;
 	}
-	if(addfree(u, g) < 0)
+	/* the same window as stageblk's, and released the same way */
+	if(addfree(u, g) < 0 || addmap(u, blk, ng, dig) < 0){
+		qlock(&s->qlstate);
+		grainstageclr(s, ng);
+		qunlock(&s->qlstate);
 		return -1;
-	return addmap(u, blk, ng, dig);
+	}
+	return 0;
 }
 
 /*
