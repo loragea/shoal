@@ -1473,6 +1473,15 @@ time of the last chunk. It is owned by the fid.
   Were reservations written into the bitmap, a checkpoint taken while
   a stage was live would leak 32 MiB per abandoned maximal transfer
   across every subsequent restart.
+  **These are the triggers for a stage whose `final=1` has not been
+  attempted, and for no other.** `final=1` consumes the handle on
+  every outcome — a comparison that refused the push, a commit that
+  could not be made, and a commit that succeeded alike — because the
+  transfer is over either way and its reservations must not outlive
+  it. So whatever owns the fid MUST forget the handle at `final=1`,
+  before it knows whether the push was taken: a `Tclunk` behind a
+  refused `final=1` would otherwise discard a stage that has already
+  been discarded.
 - **Bound, per fid and per process.** At most `stagemax` grains may
   be staged on one `/repl` fid (policy, default 2048, i.e. two
   maximal objects), and at most `stagetot` grains across the whole
