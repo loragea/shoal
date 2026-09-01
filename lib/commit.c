@@ -256,7 +256,6 @@ formbatch(Store *s, int *full, int *oom)
 		else
 			b->items = it;
 		last = it;
-		it->batch = b;
 		it->state = Ibatched;
 		bytes += it->nbyte;
 		if(!it->freeing)
@@ -447,12 +446,19 @@ applybatch(Store *s, Batch *b)
 	return r;
 }
 
+/*
+ * §6's wait asks for a checkpoint and then sleeps: the checkpointer
+ * runs on a tick of its own (§2.8), so a request is a counter it reads
+ * at the top of that tick and not a wake-up.  The wait is bounded by
+ * ckwaitms and the tick is milliseconds, so the lag is in the noise —
+ * but it is a lag, and a Rendez here would only look like it removed
+ * one, since the tick is what the checkpointer's own triggers need.
+ */
 static void
 askcheckpoint(Store *s)
 {
 	qlock(&s->cklk);
 	s->ckreq++;
-	rwakeupall(&s->ckwork);
 	qunlock(&s->cklk);
 }
 

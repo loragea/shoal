@@ -732,7 +732,7 @@ storeopen(Dev *d, Storecfg *cfg)
 	Sbsel sel;
 	Peer *p;
 	uvlong bits, hi;
-	ulong i, n;
+	ulong i;
 
 	if((s = mallocz(sizeof *s, 1)) == nil)
 		return nil;
@@ -745,9 +745,7 @@ storeopen(Dev *d, Storecfg *cfg)
 	s->donerz.l = &s->qllog;
 	s->holdrz.l = &s->qllog;
 	s->flrz.l = &s->fllk;
-	s->flwork.l = &s->fllk;
 	s->ckrz.l = &s->cklk;
-	s->ckwork.l = &s->cklk;
 	s->procrz.l = &s->proclk;
 
 	/*
@@ -912,7 +910,6 @@ storeclose(Store *s)
 		return;
 	qlock(&s->cklk);
 	s->stop = 1;
-	rwakeupall(&s->ckwork);
 	rwakeupall(&s->ckrz);
 	qunlock(&s->cklk);
 	qlock(&s->qllog);

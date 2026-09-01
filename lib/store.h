@@ -105,7 +105,6 @@ struct Item
 	ulong	nbyte;			/* entry bytes this item contributes */
 	Dirtent	**spare;		/* ndirty pre-allocated dirty records */
 	Emape	*emap;			/* the pinned map the apply mutates */
-	Batch	*batch;
 	char	err[ERRMAX];
 	Item	*next;
 };
@@ -231,7 +230,6 @@ struct Store
 	/* the flusher, §3.2: one flush satisfies every waiter */
 	QLock	fllk;
 	Rendez	flrz;			/* on fllk: a flush completed */
-	Rendez	flwork;			/* on fllk: work for the flusher */
 	uvlong	flasked, fldone;
 	uvlong	flhold, flcount;	/* §13's flush:n hold */
 	int	flerr, flbusy, flproc;
@@ -239,7 +237,6 @@ struct Store
 	/* the checkpointer, §2.8 */
 	QLock	cklk;
 	Rendez	ckrz;			/* on cklk: a checkpoint completed */
-	Rendez	ckwork;			/* on cklk: work for the checkpointer */
 	uvlong	ckreq, ckdone;
 	int	ckerr, ckbusy, ckproc;
 	vlong	cklast;

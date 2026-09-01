@@ -54,6 +54,16 @@
  * so there is still an entry to put back.
  */
 
+/*
+ * The checkpointer proc runs on a tick and not on a wake-up: two of
+ * §2.8's three triggers are the log's fill and the clock, so it has to
+ * look at intervals whatever a requester does, and a Rendez beside
+ * that would remove no sleep — it would only make the request appear
+ * to be delivered rather than polled.  A request is therefore a
+ * counter under cklk that the tick reads, and it is observed within
+ * Cktickms.  Completion is the other way about: storecheckpoint sleeps
+ * on ckrz, which the proc wakes.
+ */
 enum
 {
 	Cktickms	= 5,	/* how often the checkpointer looks */
@@ -490,7 +500,6 @@ storecheckpoint(Store *s)
 	}
 	qlock(&s->cklk);
 	gen = ++s->ckreq;
-	rwakeupall(&s->ckwork);
 	while(s->ckdone < gen)
 		rsleep(&s->ckrz);
 	r = s->ckerr;
