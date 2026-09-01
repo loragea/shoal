@@ -248,12 +248,20 @@ updcommit(Upd *u, int state, uvlong ver, uvlong wepoch, vlong mtime,
  * §3.2: a store whose apply failed after its record was durable is
  * serving in-memory state that its own log no longer describes, so it
  * answers nothing until it has been opened again and replayed.  The
- * commit path refuses through the same flag (broken).
+ * commit path refuses through the same flag (broken).  Both are
+ * qllog's, which is where the batch that condemns the store sets them
+ * and where §3.2's failseq is read beside them; qllog is a leaf here,
+ * taken and released before any other lock this call needs (§7 rule 1).
  */
 static int
 serving(Store *s)
 {
-	if(s->fatal){
+	int f;
+
+	qlock(&s->qllog);
+	f = s->fatal;
+	qunlock(&s->qllog);
+	if(f){
 		werrstr("store condemned: in-memory state no longer matches "
 			"the log; open it again");
 		return 0;

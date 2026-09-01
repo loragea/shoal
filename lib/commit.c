@@ -480,7 +480,7 @@ runbatch(Store *s, Batch *b)
 	Lrec r;
 	ulong bytes, nent;
 	char e[ERRMAX];
-	int err;
+	int err, fatal;
 
 	bytes = Lrechdrsz;
 	for(m = b->items; m != nil; m = m->next)
@@ -539,24 +539,31 @@ runbatch(Store *s, Batch *b)
 	if(err < 0)
 		seterr(b, e);
 
+	/*
+	 * Unreachable: itemok and itemprep ran before the record was
+	 * written.  If it happens anyway, memory no longer describes what
+	 * a restart would produce, so the store stops serving what it
+	 * cannot vouch for and must be opened again.  The condemnation is
+	 * recorded under qllog and not under the qlstate the apply itself
+	 * runs under: fatal and broken are read there, beside failseq, and
+	 * a flag written under one lock and read under another is ordered
+	 * by nothing this code states.
+	 */
+	fatal = 0;
 	if(err == 0){
 		qlock(&s->qlstate);
-		if(applybatch(s, b) < 0){
-			/*
-			 * Unreachable: itemok and itemprep ran before the
-			 * record was written.  If it happens anyway, memory
-			 * no longer describes what a restart would produce,
-			 * so the store stops serving what it cannot vouch
-			 * for and must be opened again.
-			 */
-			s->fatal = 1;
-			s->broken = 1;
-			seterr(b, "apply failed after the record was durable");
-		}
+		if(applybatch(s, b) < 0)
+			fatal = 1;
 		qunlock(&s->qlstate);
+		if(fatal)
+			seterr(b, "apply failed after the record was durable");
 	}
 
 	qlock(&s->qllog);
+	if(fatal){
+		s->fatal = 1;
+		s->broken = 1;
+	}
 	if(err == 0 && !s->fatal){
 		s->watermark = b->seqhi;
 		s->wateroff = b->endoff;

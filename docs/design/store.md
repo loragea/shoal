@@ -1883,7 +1883,7 @@ touch:
 |---|---|---|
 | `qlstate` | the index array, the oid arena and hash table (§9), the index-slot and extent-map-slot free lists, the free-grain bitmap and its cursor, the staged set (§6), and the dirty set | every queue proc (stage, apply), the committer applying a batch, the checkpointer, the scrubber's commits, and the service loop taking an enumeration snapshot |
 | `qlemap` | the extent-map cache: which entries are present, their loading state and pin counts, and the LRU (§9) — not a pinned entry's contents, which its pin covers | every queue proc, on a map read, a pin and an unpin |
-| `qllog` | the log tail and free space, the pending-commit queue, batch numbering and the durable watermark | every committer |
+| `qllog` | the log tail and free space, the pending-commit queue, batch numbering, the durable watermark, and the two flags that condemn the store — `broken` and the failed-apply flag beside it (§3.2) | every committer, and every entry point that refuses on a condemned store |
 | `qlsuper` | the five publishable superblock fields and the publish itself (§2.2) | the checkpointer, a `qidnext` batch advance, the first `monid` pin, an `epochhigh` advance |
 
 Three more `QLock`s are not over state but over one activity each,

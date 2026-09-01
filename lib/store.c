@@ -100,10 +100,8 @@ storehook(Store *s, char *name, uvlong n)
 		 * The hook is how §13 drives what the store answers once it
 		 * is in that state.
 		 */
-		qlock(&s->qlstate);
-		s->fatal = n != 0;
-		qunlock(&s->qlstate);
 		qlock(&s->qllog);
+		s->fatal = n != 0;
 		s->broken = n != 0;
 		qunlock(&s->qllog);
 	}else if(strcmp(name, "reclaim") == 0)

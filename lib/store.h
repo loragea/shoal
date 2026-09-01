@@ -222,7 +222,9 @@ struct Store
 	int	broken;			/* a log write failed: commit no more */
 	uvlong	failseq;		/* the first batch that did not land */
 	char	failerr[ERRMAX];	/* the device error that broke it */
-	int	fatal;			/* memory no longer matches the log */
+	int	fatal;			/* memory no longer matches the log;
+					 * qllog's, like broken beside it,
+					 * however the apply that sets it runs */
 	int	reclaimearly;		/* §13's reclaim point */
 	uvlong	pubatpage;		/* §13's publish point */
 	int	fullwait;		/* §13's fullwait point */
