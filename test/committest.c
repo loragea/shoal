@@ -1009,6 +1009,132 @@ tgroup(void)
 }
 
 /*
+ * §7's pending queue under the one schedule in which unlink's tail
+ * fix-up can be wrong: formbatch absorbs a *prefix* of the queue and
+ * then breaks, because the next item would take the record past
+ * maxrecbytes.  The items are inflated with op=0 Edirty entries so
+ * two or three of them fill the geometry's largest record, and six
+ * committers keep the queue long enough that the absorb ends
+ * mid-queue.  There a tail fix-up that takes the tail back
+ * unconditionally leaves pendtail naming an absorbed item: the next
+ * enqueue links behind a node that is no longer on the queue, no
+ * committer ever sees it, and its worker sleeps forever — under
+ * ordinary one-at-a-time absorption the suite never produces the
+ * shape, so this is its one witness.
+ *
+ * Mutation: `s->pendtail = prev' without the `s->pendtail == it'
+ * test in unlink, and a worker below is orphaned after a few hundred
+ * commits.
+ */
+enum
+{
+	Qw	= 6,
+	Qdr	= 24,
+	Qwr	= 150,
+};
+
+typedef struct Warg Warg;
+struct Warg
+{
+	Store	*s;
+	int	id;
+};
+
+static Warg warg[Qw];
+static int wdone[Qw];
+
+static void
+qworker(void *a)
+{
+	Warg *g;
+	Dirtyrec dr[Qdr];
+	uchar *buf, oid[Oidmax];
+	char name[16];
+	int i, k;
+
+	g = a;
+	snprint(name, sizeof name, "q%d", g->id);
+	oidof(oid, name);
+	buf = mkbuf(Blk, g->id + 1);
+	memset(dr, 0, sizeof dr);
+	for(k = 0; k < Qdr; k++){
+		dr[k].op = 0;
+		dr[k].peerlen = 6;
+		memmove(dr[k].peer, "node.x", 6);
+		dr[k].oidlen = 4;
+		dr[k].oid[0] = 'z';
+		dr[k].oid[1] = '0' + g->id;
+		dr[k].oid[2] = '0' + k/10;
+		dr[k].oid[3] = '0' + k%10;
+	}
+	for(i = 0; i < Qwr; i++)
+		if(objwrite(g->s, oid, strlen(name), buf, Blk, 0, 2 + i, 1,
+			dr, Qdr) < 0){
+			fail("absorb-break worker %d, write %d: %r", g->id, i);
+			break;
+		}
+	free(buf);
+	wdone[g->id] = 1;
+}
+
+static void
+tabsorbbreak(void)
+{
+	Dev *d;
+	Store *s;
+	char name[16];
+	int i, k;
+
+	d = newdisk();
+	if((s = openstoreck(d)) == nil){
+		fail("absorb-break: storeopen: %r");
+		devclose(d);
+		return;
+	}
+	for(i = 0; i < Qw; i++){
+		snprint(name, sizeof name, "q%d", i);
+		mk(s, name);
+	}
+	/*
+	 * simslow stretches every device operation with a yield, so
+	 * batches stay in flight long enough for the queue to build and
+	 * the absorb to end mid-queue — without it the sim commits in
+	 * microseconds and the six workers rarely overlap.
+	 */
+	simslow(d, 1);
+	for(i = 0; i < Qw; i++){
+		warg[i].s = s;
+		warg[i].id = i;
+		wdone[i] = 0;
+		if(spawnproc(qworker, &warg[i]) < 0)
+			fail("spawn: %r");
+	}
+	for(k = 0; k < 600; k++){
+		for(i = 0; i < Qw; i++)
+			if(!wdone[i])
+				break;
+		if(i == Qw)
+			break;
+		sleep(100);
+	}
+	checks++;
+	if(k >= 600){
+		for(i = 0; i < Qw; i++)
+			if(!wdone[i])
+				fail("absorb-break: worker %d is orphaned", i);
+		/*
+		 * An orphaned worker holds the store: storeclose would wait
+		 * on it forever, so the failing run leaks the store and the
+		 * device instead and lets the suite report.
+		 */
+		return;
+	}
+	simslow(d, 0);
+	storeclose(s);
+	devclose(d);
+}
+
+/*
  * T1.8 and §2.7: a batch's record is bounded by the largest record
  * this geometry can hold and replay will accept, and by nothing else.
  * A batch cap of its own is a second bound that says nothing about
@@ -2309,6 +2435,7 @@ main(int argc, char **argv)
 	twrap();
 	twrapbig();
 	tgroup();
+	tabsorbbreak();
 	tmaxbatch();
 	tbignsec();
 	tinlinemap();
