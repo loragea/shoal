@@ -901,6 +901,11 @@ objwrite(Store *s, uchar *oid, int oidlen, void *a, long n, uvlong off,
 		werrstr("object too large");
 		return -1;
 	}
+	/* objcreate's rule: a publish at version 0 is a caller bug */
+	if(ver == 0){
+		werrstr("write at version 0");
+		return -1;
+	}
 	if(objstat(s, oid, oidlen, &oi) < 0)
 		return -1;
 	if(oi.state != Slive){
@@ -982,6 +987,11 @@ objtrunc(Store *s, uchar *oid, int oidlen, uvlong len, uvlong ver,
 		werrstr("object too large");
 		return -1;
 	}
+	/* objcreate's rule: a publish at version 0 is a caller bug */
+	if(ver == 0){
+		werrstr("truncate at version 0");
+		return -1;
+	}
 	if(updopen(&u, s, oid, oidlen, len, 0) < 0)
 		return -1;
 	mapopen(s, &mold, &u.e, u.cold);
@@ -1021,6 +1031,17 @@ objremove(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 
 	if(!serving(s))
 		return -1;
+	/*
+	 * objcreate's rule, and here it is the sharp one: a delete bumps
+	 * (wepoch, ver) like any write (layer-a §1.5), so a tombstone's
+	 * ver is always >= 2 — a tombstone published at (E, 0) forces the
+	 * re-create to ver 1, and a straggler live copy at (E, 1) with
+	 * different content then ties it (layer-a §1.3's I3).
+	 */
+	if(ver == 0){
+		werrstr("delete at version 0");
+		return -1;
+	}
 	if(updopen(&u, s, oid, oidlen, 0, 0) < 0)
 		return -1;
 	mapopen(s, &mold, &u.e, u.cold);

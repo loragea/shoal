@@ -1483,6 +1483,25 @@ tbounds(void)
 		objread(s, o, 1, buf, -1, 0), "negative read");
 
 	/*
+	 * layer-a §1.3 forbids version 0, and every publishing path
+	 * refuses it — not objcreate and stagefinal alone.  objremove is
+	 * the sharp one: a delete bumps (wepoch, ver) like any write
+	 * (§1.5), so a tombstone at (E, 0) would force the re-create to
+	 * ver 1, and a straggler live copy at (E, 1) with different
+	 * content then ties it — layer-a §1.3's I3.  The spelling is
+	 * §3.7's internal kind: on these paths the version is this
+	 * instance's own to choose, so a 0 is a caller bug and carries
+	 * no §2.6 prefix.
+	 */
+	refused("a write at version 0",
+		objwrite(s, o, 1, buf, 16, 0, 0, 1, nil, 0),
+		"write at version 0");
+	refused("a truncate at version 0",
+		objtrunc(s, o, 1, 0, 0, 1, nil, 0), "truncate at version 0");
+	refused("a delete at version 0",
+		objremove(s, o, 1, 0, 1, nil, 0), "delete at version 0");
+
+	/*
 	 * §3.7: an oid outside layer-a §1.1's 1*128 bound is that
 	 * section's `bad object name' and not a string of this store's
 	 * own, because the 9P server returns what the store hands it and
