@@ -1833,7 +1833,12 @@ delete time — the `Eobj` that sets `state=tomb` carries `len=0`,
 `emapslot=0`, so the extent-map slot is released with the content.
 What survives is the 256-byte index entry. Layer-a §1.5's discard,
 once its three cluster-wide conditions hold, commits an `Eslot` and
-the slot returns to the free list. `tombdays` is evaluated against
+the slot returns to the free list. The discard names the tombstone's
+key and the caller's current map epoch, and the store re-checks
+§1.5's two receiver conditions atomically inside the call — the
+record is a tombstone at exactly that key, its `wepoch` strictly
+below the epoch — answering `not discardable` otherwise (§3.7).
+`tombdays` is evaluated against
 the entry's `mtime`, which is why the tombstone keeps one.
 
 **Disk full.** Four distinct exhaustions, mapped deliberately:

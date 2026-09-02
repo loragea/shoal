@@ -672,8 +672,17 @@ int	monidpin(Store*, uchar id[16]);
  * between the two leaves the update durable and the stale mark absent
  * — layer-a §5.4's `degraded' case, arrived at silently.  objcreate
  * is in that set because layer-a §2.4 replicates a create like any
- * other write; objdiscard is not, because a discard is not a
- * replicated update.
+ * other write; objdiscard is not, because a discard leaves no peer
+ * behind to mark: layer-a §1.5 has the primary remove its own record
+ * *last*, after every holder has answered ok, and retry the whole
+ * discard otherwise.
+ *
+ * objdiscard names the tombstone's key (ver, wepoch) and the caller's
+ * current map epoch, and refuses `not discardable' unless its record
+ * is a tombstone at exactly that key with wepoch strictly below the
+ * epoch — layer-a §1.5's receiver checks, made atomically inside the
+ * call so no concurrent delete can swap the tombstone between the
+ * check and the drop.
  */
 int	objstat(Store*, uchar *oid, int oidlen, Objinfo*);
 int	objcreate(Store*, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
@@ -685,7 +694,8 @@ int	objtrunc(Store*, uchar *oid, int oidlen, uvlong len, uvlong ver,
 		uvlong wepoch, Dirtyrec *dr, int ndr);
 int	objremove(Store*, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 		Dirtyrec *dr, int ndr);
-int	objdiscard(Store*, uchar *oid, int oidlen);
+int	objdiscard(Store*, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
+		uvlong epoch);
 int	objcorrupt(Store*, uchar *oid, int oidlen, int set, Dirtyrec *dr,
 		int ndr);
 

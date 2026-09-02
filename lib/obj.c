@@ -1142,15 +1142,26 @@ objcorrupt(Store *s, uchar *oid, int oidlen, int set, Dirtyrec *dr, int ndr)
 }
 
 /*
- * layer-a §1.5's discard: once the cluster-wide conditions hold, the
- * tombstone's index slot returns to the free list.  One Eslot, and
- * §3.5 is what keeps the slot out of the allocator until the commit
- * that freed it is durable.
+ * layer-a §1.5's discard.  The primary establishes the cluster-wide
+ * conditions; the receiver re-checks, locally, the two that bear on
+ * its own safety — its record is a tombstone whose key is exactly the
+ * one the discard names, and that tombstone's wepoch is strictly
+ * below the receiver's current map epoch.  Both checks are made here,
+ * inside the call and under one hold of qlstate, because a separate
+ * objstat is a second read of a record an op=delete can replace in
+ * between: the tombstone the caller inspected is then not the one
+ * dropped, and the replacement goes unconfirmed — §1.5's resurrection
+ * hole, through the API.  Once the checks hold, the tombstone's index
+ * slot returns to the free list: one Eslot, and §3.5 is what keeps
+ * the slot out of the allocator until the commit that freed it is
+ * durable.
  */
 int
-objdiscard(Store *s, uchar *oid, int oidlen)
+objdiscard(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
+	uvlong epoch)
 {
 	Item it;
+	Ient *e;
 	long slot;
 
 	if(!serving(s))
@@ -1158,12 +1169,27 @@ objdiscard(Store *s, uchar *oid, int oidlen)
 	qlock(&s->qlstate);
 	if((slot = ientfind(s, oid, oidlen)) < 0){
 		qunlock(&s->qlstate);
+		/* an absent id is §5.6's `no such object', not check (i); §3.7 */
 		werrstr("no such object");
 		return -1;
 	}
-	if(s->idx[slot].state != Stomb){
+	e = &s->idx[slot];
+	if(e->state != Stomb){
 		qunlock(&s->qlstate);
 		werrstr("not discardable: not a tombstone");
+		return -1;
+	}
+	if(e->wepoch != wepoch || e->ver != ver){
+		qunlock(&s->qlstate);
+		werrstr("not discardable: tombstone at (%llud, %llud), "
+			"discard names (%llud, %llud)", e->wepoch, e->ver,
+			wepoch, ver);
+		return -1;
+	}
+	if(e->wepoch >= epoch){
+		qunlock(&s->qlstate);
+		werrstr("not discardable: wepoch %llud not below epoch %llud",
+			e->wepoch, epoch);
 		return -1;
 	}
 	qunlock(&s->qlstate);

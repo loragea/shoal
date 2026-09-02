@@ -377,7 +377,8 @@ heldwrite(void *a)
 			h->err = 1;
 	}else{
 		oidof(o, "gone");
-		if(objdiscard(h->s, o, 4) < 0)
+		/* the tombstone rmv left is at (wepoch 1, ver 2) */
+		if(objdiscard(h->s, o, 4, 2, 1, 2) < 0)
 			h->err = 1;
 	}
 	free(buf);
@@ -890,6 +891,49 @@ tsweepfinal(void)
 }
 
 /*
+ * layer-a §1.5's receiver checks, made inside objdiscard: the record
+ * must be a tombstone at exactly the key the discard names, with
+ * wepoch strictly below the given epoch.  Checked in the call rather
+ * than by a separate objstat because the two-step is not atomic: an
+ * op=delete between them replaces the tombstone, and the replacement
+ * would be dropped unconfirmed — §1.5's resurrection hole.
+ */
+static void
+tdiscard(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	uchar oid[Oidmax];
+
+	d = newdisk();
+	if((s = mustopen(d, "tombstone discard")) == nil)
+		return;
+	mk(s, "dd");
+	oidof(oid, "dd");
+	if(objremove(s, oid, 2, 3, 1, nil, 0) < 0)
+		fail("objremove: %r");
+	/* the tombstone is at (wepoch 1, ver 3) */
+	refused("a discard naming the wrong ver",
+		objdiscard(s, oid, 2, 2, 1, 5), "not discardable");
+	refused("a discard naming the wrong wepoch",
+		objdiscard(s, oid, 2, 3, 2, 5), "not discardable");
+	refused("a discard at an epoch the tombstone's wepoch reaches",
+		objdiscard(s, oid, 2, 3, 1, 1), "not discardable");
+	refused("a discard of an id nothing holds",
+		objdiscard(s, (uchar*)"zz", 2, 3, 1, 5), "no such object");
+	storestat(s, &st);
+	eqv("a refused discard keeps the tombstone", st.ntomb, 1);
+	checks++;
+	if(objdiscard(s, oid, 2, 3, 1, 5) < 0)
+		fail("a discard naming the key exactly: %r");
+	storestat(s, &st);
+	eqv("the discard freed the tombstone", st.ntomb, 0);
+	storeclose(s);
+	devclose(d);
+}
+
+/*
  * §3.2: a store whose apply failed after its record was durable is
  * serving in-memory state that its own log no longer describes, so it
  * "answers nothing until it has been opened again".  Nothing is
@@ -933,7 +977,8 @@ tcondemned(void)
 		objtrunc(s, o, 1, 0, 3, 1, nil, 0), w);
 	refused("objremove on a condemned store",
 		objremove(s, o, 1, 3, 1, nil, 0), w);
-	refused("objdiscard on a condemned store", objdiscard(s, o, 1), w);
+	refused("objdiscard on a condemned store",
+		objdiscard(s, o, 1, 2, 1, 2), w);
 	refused("objcorrupt on a condemned store",
 		objcorrupt(s, o, 1, 1, nil, 0), w);
 	refused("stagewrite on a condemned store",
@@ -980,7 +1025,7 @@ texhaust(void)
 	oidof(o, name);
 	if(objremove(s, o, strlen(name), 2, 1, nil, 0) < 0)
 		fail("delete under slot exhaustion: %r");
-	if(objdiscard(s, o, strlen(name)) < 0)
+	if(objdiscard(s, o, strlen(name), 2, 1, 2) < 0)
 		fail("tombstone discard under slot exhaustion: %r");
 	storestat(s, &st);
 	eqv("the discard returned the slot", st.slotfree, 1);
@@ -1645,7 +1690,7 @@ tbounds(void)
 			strncmp(e, "bad object name", 15) == 0);
 	}
 	/* ... and a discard of something that is not a tombstone */
-	refused("a discard of a live object", objdiscard(s, o, 1),
+	refused("a discard of a live object", objdiscard(s, o, 1, 2, 1, 2),
 		"not discardable");
 
 	/*
@@ -1728,6 +1773,7 @@ main(int argc, char **argv)
 	tstage();
 	tstagefault();
 	tsweepfinal();
+	tdiscard();
 	tcondemned();
 	texhaust();
 	tdirty();
