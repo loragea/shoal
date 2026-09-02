@@ -778,6 +778,118 @@ tstagefault(void)
 }
 
 /*
+ * §3.6: the sweep's triggers are for a stage whose final=1 has not
+ * been attempted, and for no other.  A final=1 parked in the commit —
+ * held here at §13's batch hook, as it would be waiting on a
+ * checkpoint — gets older than stagems by nothing but bad luck, and a
+ * sweep that still saw the handle would return its grains to the
+ * allocator under the commit that is about to publish them: another
+ * object can be handed the same grain (two objects sharing a grain,
+ * undetectable by arbitration), and the committing proc then
+ * double-frees.  stagefinal therefore takes the handle off the sweep's
+ * list before it drops qlstate.
+ */
+typedef struct Fin Fin;
+struct Fin
+{
+	Stage	*g;
+	int	done;
+	int	err;
+};
+
+static Fin fin;
+
+static void
+finproc(void *a)
+{
+	Fin *f;
+
+	f = a;
+	if(stagefinal(f->g, 9, 1, nil, 0) < 0)
+		f->err = 1;
+	f->done = 1;
+}
+
+static void
+tsweepfinal(void)
+{
+	Dev *d;
+	Store *s;
+	Stage *g;
+	Storestat st;
+	uchar *buf, *got, o[Oidmax];
+	uvlong seq, before;
+	int i;
+
+	d = newdisk();
+	if((s = mustopen(d, "a sweep against a parked final")) == nil)
+		return;
+	buf = mkbuf(2*Blk, 73);
+	if((got = malloc(2*Blk)) == nil)
+		sysfatal("malloc: %r");
+	oidof(o, "sw");
+	storestat(s, &st);
+	before = st.grainfree;
+	seq = st.seqnext;
+	if((g = stageopen(s, o, 2, 2*Blk, 0)) == nil){
+		fail("stageopen: %r");
+		storeclose(s);
+		devclose(d);
+		free(buf);
+		free(got);
+		return;
+	}
+	if(stagewrite(g, buf, 2*Blk, 0) < 0)
+		fail("stagewrite: %r");
+	storestat(s, &st);
+	eqv("two grains are staged", st.staged, 2);
+
+	/* park the final's commit, let the stage age past stagems, sweep */
+	storehook(s, "batch", seq);
+	fin.g = g;
+	fin.done = 0;
+	fin.err = 0;
+	if(spawnproc(finproc, &fin) < 0){
+		fail("spawn: %r");
+		storehook(s, "batch", 0);
+		storeclose(s);
+		devclose(d);
+		free(buf);
+		free(got);
+		return;
+	}
+	for(i = 0; i < 4000; i++){
+		storestat(s, &st);
+		if(st.seqnext > seq)
+			break;
+		sleep(1);
+	}
+	sleep(80);			/* t1.h's stagems is 50 */
+	stagesweep(s, nsec());
+	storestat(s, &st);
+	eqv("the sweep leaves a parked final's grains reserved",
+		st.grainfree, before - 2);
+
+	storehook(s, "batch", 0);
+	for(i = 0; i < 4000 && !fin.done; i++)
+		sleep(1);
+	istrue("the parked final completed", fin.done && !fin.err);
+	storestat(s, &st);
+	eqv("and its grains were published, not released", st.grainfree,
+		before - 2);
+	eqv("nothing is left staged", st.staged, 0);
+	rd(s, "sw", got, 2*Blk, 0, "after the sweep");
+	checks++;
+	if(memcmp(got, buf, 2*Blk) != 0)
+		fail("a swept final's content differs");
+	mustverify(s, "sw", "after the sweep");
+	storeclose(s);
+	devclose(d);
+	free(buf);
+	free(got);
+}
+
+/*
  * §3.2: a store whose apply failed after its record was durable is
  * serving in-memory state that its own log no longer describes, so it
  * "answers nothing until it has been opened again".  Nothing is
@@ -1615,6 +1727,7 @@ main(int argc, char **argv)
 	tdeferred('s');
 	tstage();
 	tstagefault();
+	tsweepfinal();
 	tcondemned();
 	texhaust();
 	tdirty();

@@ -1559,7 +1559,9 @@ keycmp(uvlong we, uvlong ver, uvlong we2, uvlong ver2)
  * that refuses the push has ended the transfer, and so has a commit
  * that could not be made, so the handle is spent either way and its
  * reservations must not outlive it.  The caller's error is preserved
- * across the release.
+ * across the release.  A grain the handle has already handed to the
+ * update (below) is not the handle's any more, so the release here
+ * releases only what the handle still owns.
  */
 static int
 stagefail(Stage *g)
@@ -1570,6 +1572,31 @@ stagefail(Stage *g)
 	stagediscard(g);
 	werrstr("%s", e);
 	return -1;
+}
+
+/*
+ * Hand the stage's grains below lim to the update whose map now names
+ * them: from this moment updabort is their releaser, so the handle
+ * stops counting them and stops naming them.  Ownership must transfer
+ * exactly once — after updabort has released a grain, the allocator
+ * may hand it to another proc's stage at any moment, and a second
+ * grainstageclr from stagediscard would remove *that* reservation:
+ * two objects sharing a grain, undetectable by arbitration.
+ */
+static void
+stagehandoff(Stage *g, uvlong lim)
+{
+	Store *s;
+	uvlong i;
+
+	s = g->s;
+	qlock(&s->qlstate);
+	for(i = 0; i < lim; i++)
+		if(g->grain[i] != 0){
+			g->grain[i] = 0;
+			s->nstagegrain--;
+		}
+	qunlock(&s->qlstate);
 }
 
 int
@@ -1584,6 +1611,20 @@ stagefinal(Stage *g, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 	int absent, corrupt, c;
 
 	s = g->s;
+	/*
+	 * The handle leaves s->stages before anything here drops qlstate:
+	 * stagesweep frees any handle whose last chunk is older than
+	 * stagems, and a final=1 parked in the commit — waiting on a
+	 * checkpoint, say — gets older than stagems by nothing more than
+	 * bad luck.  Swept mid-commit, the stage's grains would return to
+	 * the allocator while the commit was about to publish them.  §3.6:
+	 * the sweep's triggers are for a stage whose final=1 has not been
+	 * attempted, and for no other.  stagediscard's unlink of an
+	 * already-unlinked handle is a harmless no-op.
+	 */
+	qlock(&s->qlstate);
+	stageunlink(s, g);
+	qunlock(&s->qlstate);
 	if(!serving(s))
 		return stagefail(g);
 	/*
@@ -1651,25 +1692,25 @@ stagefinal(Stage *g, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 		else
 			zerodigest(s, g->len, i, dig);
 		if(addmap(&u, i, g->grain[i], dig) < 0){
+			/*
+			 * Grains below i are the update's — updabort releases
+			 * them, once — and grains from i on are still the
+			 * handle's, which stagefail's discard releases.
+			 */
+			stagehandoff(g, i);
 			updabort(&u);
 			updclose(&u);
 			return stagefail(g);
 		}
 	}
+	stagehandoff(g, g->nblk);
 	if(updcommit(&u, Slive, ver, wepoch, time(nil), corrupt, dr, ndr) < 0){
 		updclose(&u);
 		return stagefail(g);
 	}
 	updclose(&u);
-	qlock(&s->qlstate);
-	for(i = 0; i < g->nblk; i++)
-		if(g->grain[i] != 0)
-			s->nstagegrain--;
-	stageunlink(s, g);
-	qunlock(&s->qlstate);
-	free(g->grain);
-	free(g->dig);
-	free(g);
+	/* nothing left in the handle: this frees it and releases no grain */
+	stagediscard(g);
 	return 0;
 }
 
