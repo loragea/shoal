@@ -1349,16 +1349,19 @@ ttomb(void)
 	 * long as the tombstone exists no older copy can outrank the new
 	 * object.  A straggler still holding this tombstone at ver 3
 	 * would outrank a live object created at ver 2 and re-delete it,
-	 * so the store enforces the value rather than trusting it.
+	 * so the store enforces the value rather than trusting it.  The
+	 * spelling is layer-a §5.5's for op=create: a create is
+	 * self-contained, so the tombstone's key refusing it is `stale
+	 * version' — §2.6 keeps `out of sequence' for delta ops.
 	 */
 	refused("a create over a tombstone at the tombstone's own ver",
-		objcreate(s, oid, 1, 3, 1, nil, 0, nil), "out of sequence");
+		objcreate(s, oid, 1, 3, 1, nil, 0, nil), "stale version");
 	refused("a create over a tombstone below its ver",
-		objcreate(s, oid, 1, 2, 1, nil, 0, nil), "out of sequence");
+		objcreate(s, oid, 1, 2, 1, nil, 0, nil), "stale version");
 	refused("a create over a tombstone two above its ver",
-		objcreate(s, oid, 1, 5, 1, nil, 0, nil), "out of sequence");
+		objcreate(s, oid, 1, 5, 1, nil, 0, nil), "stale version");
 	refused("a create over a tombstone below its wepoch",
-		objcreate(s, oid, 1, 4, 0, nil, 0, nil), "out of sequence");
+		objcreate(s, oid, 1, 4, 0, nil, 0, nil), "stale version");
 	if(ostat(s, "t", &oi2) < 0)
 		fail("objstat: %r");
 	eqv("a refused create leaves the tombstone a tombstone", oi2.state,

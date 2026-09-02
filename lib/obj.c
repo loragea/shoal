@@ -831,10 +831,15 @@ objcreate(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 		 * re-deletes it.  The decision is made here, under
 		 * qlstate, because that is where the tombstone's own key
 		 * is known not to be racing a commit.
+		 *
+		 * The spelling is layer-a §5.5's table for op=create:
+		 * a create is self-contained, so the tombstone's key
+		 * refusing it is `stale version' — §2.6 defines `out of
+		 * sequence' for delta ops only.
 		 */
 		if(ver != e->ver + 1 || wepoch < e->wepoch){
 			qunlock(&s->qlstate);
-			werrstr("out of sequence");
+			werrstr("stale version");
 			return -1;
 		}
 		reuse = 1;
