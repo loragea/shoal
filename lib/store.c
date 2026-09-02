@@ -1014,6 +1014,15 @@ storelost(Store *s, ulong i)
 	return slot;
 }
 
+/*
+ * §2.6's coarse flag, half-built: everything that sets it exists —
+ * start-up marks every peer, and the dirty-region exhaustion drop
+ * marks its victim — and nothing yet clears it, because the clearing
+ * belongs to the reconcile pass the heal work will bring.  So today
+ * this answers 1 for every peer, known or not, and the exhaustion
+ * drop's safety argument leans on exactly that: dropping a peer's
+ * records can never make this answer less cautious.
+ */
 int
 storefullsync(Store *s, char *peer)
 {

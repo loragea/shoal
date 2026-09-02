@@ -1025,7 +1025,12 @@ tdirtyfull(void)
 	storestat(s, &st);
 	istrue("the store still commits", st.broken == 0);
 	eqv("the peer with the most records lost them", dirtycount(s), 1);
-	istrue("that peer is marked fullsync", storefullsync(s, "peer.a"));
+	/*
+	 * The drop also marks peer.a fullsync, but asserting it through
+	 * storefullsync catches nothing today: nothing clears the flag yet
+	 * (§2.6), so the answer is 1 for every peer, marked or not.  The
+	 * assertion belongs to the heal work that makes the flag real.
+	 */
 	istrue("and the new record is the one that is there",
 		dirtyhas(s, oid, 2, "peer.b"));
 

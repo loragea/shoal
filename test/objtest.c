@@ -1182,8 +1182,12 @@ tdirty(void)
 	eqv("the dirty set survived replay", dirtycount(s), 2);
 	istrue("the record names its peer", dirtyhas(s, oid, 4, "node7.1"));
 	istrue("and the other peer", dirtyhas(s, oid, 4, "node8.2"));
-	istrue("every peer is fullsync after a restart",
-		storefullsync(s, "node7.1"));
+	/*
+	 * Start-up also marks every peer fullsync, but storefullsync
+	 * cannot witness it: nothing clears the flag yet (store.md §2.6),
+	 * so it answers 1 for every peer.  The assertion belongs to the
+	 * heal work that makes the flag real.
+	 */
 
 	/* checkpoint, restart: now the region itself is the source */
 	if(storecheckpoint(s) < 0)

@@ -816,6 +816,13 @@ after which the primary has no record that the peer is behind. The
 restart flag covers exactly that window, so §14(2) proposes the
 layer-a amendment and the restart obligation together.
 
+The flag is half-built infrastructure today: everything that sets it
+exists — start-up marks every peer, the exhaustion drop marks its
+victim — and **nothing yet clears it**, because clearing belongs to
+the reconcile pass the heal work will bring (layer-a §7.2). Until
+that lands, `storefullsync` answers *behind* for every peer, known or
+unknown, and only the fine-grained records carry information.
+
 ### 2.7 Log region and record format
 
 *Format.* A circular region of `logsecs` sectors. It carries every
