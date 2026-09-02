@@ -1438,7 +1438,8 @@ time of the last chunk. It is owned by the fid.
   live object at the key the push carries, reusing the tombstone's
   index slot and `qid.path`. That is deliberately weaker than §1.5's
   rule for a *client* create over a tombstone, which this store
-  enforces as `ver` exactly one greater. The two are not in tension:
+  enforces as `ver` exactly one greater and `wepoch` no lower than
+  the tombstone's. The two are not in tension:
   a create's version is this instance's to choose, so the rule that
   no older copy may outrank the new object can be enforced by
   choosing it, while an `op=full` carries a version assigned
@@ -1448,7 +1449,8 @@ time of the last chunk. It is owned by the fid.
 
   **Two receivers have no key to defend, and the push applies to
   both whatever it carries.** Neither is a tombstone. The first is
-  an object this instance does not hold: absence is not a key (layer-a §1.3), and it is the
+  an object this instance does not hold: absence is not a key
+  (layer-a §1.3), and it is the
   common case for a heal. The same `Eobj` carries the create — this
   commit reserves the index slot and the `qid.path` — because
   creating the object first and staging into it afterwards would
