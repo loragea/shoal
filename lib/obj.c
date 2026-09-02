@@ -800,6 +800,14 @@ objcreate(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 	uvlong qid;
 	int reuse;
 
+	/*
+	 * First, like every other mutating entry point: a condemned store
+	 * answers nothing (§3.2), and without this a create would read
+	 * s->idx below and answer `object exists' — a §2.6 wire error —
+	 * out of memory the store itself has declared untrustworthy.
+	 */
+	if(!serving(s))
+		return -1;
 	if(oidlen < 1 || oidlen > Oidmax){
 		werrstr("bad object name: oid length %d", oidlen);
 		return -1;

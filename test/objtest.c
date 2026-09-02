@@ -968,6 +968,47 @@ tcondemned(void)
 	}
 	storehook(s, "fatal", 1);
 	w = "store condemned";
+	/*
+	 * objcreate must refuse through serving() like every other
+	 * mutating entry point — asserted against serving()'s full text,
+	 * because the commit path's own refusal also begins `store
+	 * condemned' and a prefix match cannot tell them apart: without
+	 * the serving() call a create of a new name would read the index,
+	 * reach logcommit and answer the *commit* path's refusal, and a
+	 * create of an existing name would answer `object exists' — a
+	 * §2.6 wire error — out of memory the store itself has declared
+	 * untrustworthy.
+	 */
+	{
+		char e[ERRMAX];
+		uchar on[Oidmax];
+		char *full = "store condemned: in-memory state no longer "
+			"matches the log; open it again";
+
+		oidof(on, "znew");
+		checks++;
+		if(objcreate(s, on, 4, 3, 1, nil, 0, nil) >= 0)
+			fail("objcreate of a new id on a condemned store was "
+				"accepted");
+		else{
+			rerrstr(e, sizeof e);
+			checks++;
+			if(strcmp(e, full) != 0)
+				fail("objcreate (new id) on a condemned store: "
+					"%s, want serving()'s refusal", e);
+		}
+		checks++;
+		if(objcreate(s, o, 1, 3, 1, nil, 0, nil) >= 0)
+			fail("objcreate of a live id on a condemned store was "
+				"accepted");
+		else{
+			rerrstr(e, sizeof e);
+			checks++;
+			if(strcmp(e, full) != 0)
+				fail("objcreate (live id) on a condemned store: "
+					"%s, want serving()'s refusal", e);
+		}
+	}
 	refused("objstat on a condemned store", objstat(s, o, 1, &oi), w);
 	refused("objread on a condemned store",
 		objread(s, o, 1, buf, Blk, 0), w);
