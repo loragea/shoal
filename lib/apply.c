@@ -507,6 +507,16 @@ dropworstpeer(Store *s)
 		for(i = 0; i < s->sb.ndirty; i++)
 			if((t = s->dirt[i]) != nil && peerowns(t, p))
 				n++;
+		/*
+		 * Load-bearing, though T1 cannot falsify it: without it the
+		 * `worst == nil ||' arm below takes the first listed peer
+		 * even at a count of zero, so a full region whose records
+		 * all belong to peers addpeer failed to register would name
+		 * a victim that owns nothing — zero slots freed, and
+		 * applydirty's retry loop spins forever after its record is
+		 * durable.  Reaching that needs addpeer's mallocz to fail,
+		 * which T1 cannot stage without allocator injection.
+		 */
 		if(n == 0)
 			continue;
 		if(worst == nil || n > best
