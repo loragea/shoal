@@ -896,6 +896,94 @@ tlogread(void)
 }
 
 /*
+ * §5 step 7's other refusal: a record that cannot be *applied* is not
+ * the end of the log either.  applyents reaches the device — emapget
+ * reads the extent-map region — so a transient read error there
+ * during replay used to read as end-of-log: the store started,
+ * silently dropped every record from the fault on, acked creates
+ * included, resumed committing over the log it had discarded, and the
+ * next checkpoint made the loss permanent, with no error anywhere.
+ *
+ * Mutation: take an applyents failure as the end of the log
+ * (`if(applyents(...) < 0) break;`), and the store below starts over
+ * the fault with nlive=1 instead of refusing.
+ */
+static void
+treplayapply(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Sbsel sel;
+	Super sb;
+	Objinfo oi;
+	uchar *buf, oid[Oidmax];
+	char name[8];
+	int i;
+
+	d = newdisk();
+	if((s = mustopen(d, "an unappliable log record")) == nil)
+		return;
+	buf = mkbuf(2*Blk, 11);
+	mkobj(s, "e0", 1);
+	oidof(oid, "e0");
+	if(objwrite(s, oid, 2, buf, 2*Blk, 0, 2, 1, nil, 0) < 0)
+		fail("objwrite: %r");
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	/* the record replay will need the extent map to apply */
+	if(objwrite(s, oid, 2, buf, Blk, 0, 3, 1, nil, 0) < 0)
+		fail("objwrite again: %r");
+	for(i = 1; i <= 3; i++){
+		snprint(name, sizeof name, "e%d", i);
+		mkobj(s, name, 1);
+	}
+	storestat(s, &st);
+	eqv("four objects are acked and durable", st.nlive, 4);
+	storeclose(s);
+
+	/* a sticky read fault over the extent-map region alone */
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	sb = sel.sb[sel.start];
+	simfaultat(d, Sfeio, 0, (vlong)sb.emapoff*sb.secsz,
+		(vlong)sb.emapsecs*sb.secsz);
+	checks++;
+	if((s = openstore(d)) != nil){
+		fail("a store started over a log record it could not apply");
+		storeclose(s);
+	}
+
+	/* the fault was transient: with it gone, everything is there */
+	simfault(d, Sfnone, 0);
+	if((s = mustopen(d, "the extent maps, readable again")) == nil){
+		devclose(d);
+		free(buf);
+		return;
+	}
+	storestat(s, &st);
+	eqv("replay reaches every record past the bad apply", st.nlive, 4);
+	oidof(oid, "e0");
+	checks++;
+	if(objstat(s, oid, 2, &oi) < 0)
+		fail("objstat e0: %r");
+	else{
+		eqv("the acked rewrite is applied", oi.ver, 3);
+		eqv("at its length", oi.len, 2*Blk);
+	}
+	for(i = 1; i <= 3; i++){
+		snprint(name, sizeof name, "e%d", i);
+		oidof(oid, name);
+		checks++;
+		if(objstat(s, oid, 2, &oi) < 0)
+			fail("acked create %s is gone: %r", name);
+	}
+	storeclose(s);
+	devclose(d);
+	free(buf);
+}
+
+/*
  * §2.6: ndirty is an implementation limit in exactly layer-a §7.1's
  * sense.  When it is exhausted the store discards every fine-grained
  * record for the peer with the most records and marks that peer
@@ -1307,6 +1395,7 @@ main(int argc, char **argv)
 	tcondemn();
 	tbadmap();
 	tlogread();
+	treplayapply();
 	tdirtyfull();
 	tdirtytie(0);
 	tdirtytie(1);

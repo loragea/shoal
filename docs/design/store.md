@@ -1687,7 +1687,15 @@ lose arbitration against everything including absence.
    them, so treating it as the end would discard whatever is past the
    fault — acked writes included — and then hand the tail back to be
    overwritten. Steps 4, 5 and 6 already refuse to start on a device
-   error, and this is the same rule. Applying an entry means setting absolute
+   error, and this is the same rule. **A record that cannot be
+   applied refuses the start the same way**: the apply fails on a
+   device error under an extent map, on an allocation failure, or on
+   an entry §2.7's range checks refuse — which no conforming writer
+   produces, because the commit path checks them before writing
+   (§3.2). None of those says the log ends at a record that is
+   checksummed and in sequence; and, entries being applied one at a
+   time, stopping there would also leave the store on a half-applied
+   record no crash could produce. Applying an entry means setting absolute
    values — this slot's four-tuple becomes these bytes, block *i*
    becomes grain *g* with digest *d*, blocks at or beyond `nblk`
    become holes, this grain becomes allocated, a record carrying

@@ -1257,6 +1257,12 @@ tackflush(void)
  * produces one; replay accepts records from any build, and the entry
  * such a record would leave has objverify reading through the nil an
  * inline map returns for every block but the first.
+ *
+ * The refusal is §5 step 7's: the record is checksummed and in
+ * sequence, so nothing about its bytes says the log ends there, and
+ * a store that started over it would silently drop it and every
+ * record after it — so the record is not applied *and* the store
+ * does not start.
  */
 static void
 tinlinemap(void)
@@ -1316,17 +1322,14 @@ tinlinemap(void)
 		lrecpack(rec, &r, sb.secsz);
 		off = (vlong)st.cklogoff*sb.secsz;
 		simpoke(d, off, rec, sb.secsz);
-		if((s = openstore(d)) == nil)
-			fail("a record naming an inline map for two blocks "
-				"must not stop the store starting: %r");
-		else{
-			storestat(s, &st);
-			eqv("and it is not applied", st.nreplay, 0);
+		checks++;
+		if((s = openstore(d)) != nil){
+			fail("a store started over a record whose Eobj fails "
+				"its range check");
 			checks++;
 			if(objstat(s, (uchar*)"q1", 2, &oi) == 0)
 				fail("a record naming an inline map for two "
 					"blocks was applied");
-			mustverify(s, "q0", "after a refused record");
 			storeclose(s);
 		}
 	}

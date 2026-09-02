@@ -447,15 +447,23 @@ applyents(Store *s, uchar *p, Lrec *r)
  * That is a silent truncation of exactly the kind §2.5's coverage rule
  * refuses to start on, so replay refuses too — as steps 4, 5 and 6
  * already do for the index, the bitmap and the dirty region.
+ *
+ * **Neither is a record that cannot be applied.**  applyents fails on
+ * a device error under an extent map (emapget reads the extent-map
+ * region; emapreclaim writes it) and on an allocation failure, and
+ * both say nothing about the bytes at rel: the record is valid,
+ * checksummed and in sequence.  Worse than the truncation, applyents
+ * applies entries one at a time, so a mid-record failure leaves the
+ * store on a half-applied record no crash could produce.  Both refuse
+ * the start, exactly as a read error does.
  */
 static int
 replay(Store *s)
 {
 	uchar *hdr, *buf;
 	Lrec r, r2;
-	uvlong seq, rel, scanned, off, n, m;
+	uvlong seq, rel, scanned, off, n, m, bad;
 	char e[ERRMAX];
-	int ioerr;
 
 	if((hdr = malloc(s->sb.secsz)) == nil)
 		return -1;
@@ -466,15 +474,14 @@ replay(Store *s)
 	seq = s->sb.ckseq + 1;
 	rel = s->sb.cklogoff - s->sb.logoff;
 	scanned = 0;
-	ioerr = 0;
 	for(;;){
 		if(scanned >= s->sb.logsecs)
 			break;
 		off = s->sb.logoff*(uvlong)s->sb.secsz
 			+ rel*(uvlong)s->sb.secsz;
 		if(devread(s->d, hdr, s->sb.secsz, off) < 0){
-			ioerr = 1;
-			break;
+			bad = s->sb.logoff + rel;
+			goto refuse;
 		}
 		if(lrecunpack(&r, hdr) < 0)
 			break;
@@ -487,17 +494,20 @@ replay(Store *s)
 			if(m > Bulkio)
 				m = Bulkio;
 			if(devread(s->d, buf + n, m, off + n) < 0){
-				ioerr = 1;
-				goto done;
+				bad = s->sb.logoff + rel;
+				goto refuse;
 			}
 		}
 		if(lrecvalid(buf, s->sb.secsz, &r2, rel, s->sb.logsecs, seq) < 0)
 			break;
-		if(applyents(s, buf, &r2) < 0)
-			break;
+		if(applyents(s, buf, &r2) < 0){
+			bad = s->sb.logoff + rel;
+			goto refuse;
+		}
 		s->replayhigh = seq;
 		s->nreplay++;
 		seq++;
+		bad = s->sb.logoff + rel;	/* the record just applied */
 		scanned += r2.nsec;
 		if(r2.flags & Fwrap)
 			rel = 0;
@@ -507,19 +517,10 @@ replay(Store *s)
 				rel = 0;
 		}
 		if(s->nemapc > s->emapcap && emapreclaim(s) < 0)
-			break;
+			goto refuse;
 	}
-done:
-	if(ioerr)
-		rerrstr(e, sizeof e);
 	free(hdr);
 	free(buf);
-	if(ioerr){
-		werrstr("log sector %llud: %s: the log cannot be read to its "
-			"end; shoalck, then refill from peers",
-			s->sb.logoff + rel, e);
-		return -1;
-	}
 	s->logtail = rel;
 	s->watermark = s->nreplay > 0 ? s->replayhigh : s->sb.ckseq;
 	s->relseq = s->watermark;
@@ -528,6 +529,14 @@ done:
 	if(emapreclaim(s) < 0)
 		return -1;
 	return 0;
+
+refuse:
+	rerrstr(e, sizeof e);
+	free(hdr);
+	free(buf);
+	werrstr("log sector %llud: %s: the log cannot be replayed to its "
+		"end; shoalck, then refill from peers", bad, e);
+	return -1;
 }
 
 /*
