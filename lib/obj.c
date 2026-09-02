@@ -60,8 +60,17 @@ addmap(Upd *u, ulong blk, ulong grain, uchar *dig)
 
 	if(u->nmap == u->amap){
 		u->amap = u->amap ? 2*u->amap : 8;
-		if((m = realloc(u->map, u->amap*sizeof *m)) == nil)
+		/*
+		 * The allocator leaves errstr alone on failure, so every
+		 * failed allocation on these paths says so itself — an
+		 * untouched return would answer with whatever this proc
+		 * last said, which under §7's Reqqueue pool can be another
+		 * request's §2.6 wire error (§3.7).
+		 */
+		if((m = realloc(u->map, u->amap*sizeof *m)) == nil){
+			werrstr("out of memory");
 			return -1;
+		}
 		u->map = m;
 	}
 	m = &u->map[u->nmap++];
@@ -83,8 +92,10 @@ addfree(Upd *u, ulong grain)
 		return 0;
 	if(u->nfree == u->afree){
 		u->afree = u->afree ? 2*u->afree : 8;
-		if((f = realloc(u->freed, u->afree*sizeof *f)) == nil)
+		if((f = realloc(u->freed, u->afree*sizeof *f)) == nil){
+			werrstr("out of memory");
 			return -1;
+		}
 		u->freed = f;
 	}
 	u->freed[u->nfree++] = grain;
@@ -131,8 +142,10 @@ updcsum(Upd *u, Omap *mold, uchar csum[Csumlen])
 		csumdigests(nil, 0, csum);
 		return 0;
 	}
-	if((digs = malloc(u->nblk*Blkdlen)) == nil)
+	if((digs = malloc(u->nblk*Blkdlen)) == nil){
+		werrstr("out of memory");
 		return -1;
+	}
 	for(i = 0; i < u->nblk; i++)
 		digof(u, mold, i, digs + i*Blkdlen);
 	csumdigests(digs, u->nblk, csum);
@@ -381,6 +394,7 @@ updopen(Upd *u, Store *s, uchar *oid, int oidlen, uvlong newlen, int flags)
 	u->e.oid = malloc(e->oidlen);
 	if(u->e.oid == nil){
 		qunlock(&s->qlstate);
+		werrstr("out of memory");
 		return -1;
 	}
 	memmove(u->e.oid, e->oid, e->oidlen);
@@ -484,6 +498,7 @@ updnew(Upd *u, Store *s, uchar *oid, int oidlen, uvlong newlen)
 	u->oslot = u->newslot != 0;
 	if((u->e.oid = malloc(oidlen)) == nil){
 		updabort(u);
+		werrstr("out of memory");
 		return -1;
 	}
 	memmove(u->e.oid, oid, oidlen);
@@ -855,8 +870,14 @@ objcreate(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 		memset(&u.e, 0, sizeof u.e);
 	}
 	qunlock(&s->qlstate);
-	if((u.e.oid = malloc(oidlen)) == nil)
+	if((u.e.oid = malloc(oidlen)) == nil){
+		qlock(&s->qlstate);
+		if(u.slotresv)
+			slotresvclr(s, u.slot);
+		qunlock(&s->qlstate);
+		werrstr("out of memory");
 		return -1;
+	}
 	memmove(u.e.oid, oid, oidlen);
 	u.e.oidlen = oidlen;
 	if(!reuse){
@@ -948,6 +969,7 @@ objwrite(Store *s, uchar *oid, int oidlen, void *a, long n, uvlong off,
 	if((buf = malloc(s->sb.blksz)) == nil){
 		updabort(&u);
 		updclose(&u);
+		werrstr("out of memory");
 		return -1;
 	}
 	src = a;
@@ -1011,6 +1033,7 @@ objtrunc(Store *s, uchar *oid, int oidlen, uvlong len, uvlong ver,
 	if((buf = malloc(s->sb.blksz)) == nil){
 		updabort(&u);
 		updclose(&u);
+		werrstr("out of memory");
 		return -1;
 	}
 	if(freetail(&u, &mold) < 0
@@ -1190,6 +1213,7 @@ objread(Store *s, uchar *oid, int oidlen, void *a, long n, uvlong off)
 	mapopen(s, &m, &e, c);
 	if((buf = malloc(s->sb.blksz)) == nil){
 		emapunpin(s, c);
+		werrstr("out of memory");
 		return -1;
 	}
 	dst = a;
@@ -1270,12 +1294,14 @@ objverify(Store *s, uchar *oid, int oidlen, Vfy *v)
 		free(buf);
 		free(digs);
 		emapunpin(s, c);
+		werrstr("out of memory");
 		return -1;
 	}
 	if(nblk > 0 && (v->bad = malloc(nblk*sizeof *v->bad)) == nil){
 		free(buf);
 		free(digs);
 		emapunpin(s, c);
+		werrstr("out of memory");
 		return -1;
 	}
 	for(i = 0; i < nblk; i++){
@@ -1340,8 +1366,10 @@ stageopen(Store *s, uchar *oid, int oidlen, uvlong len, int force)
 		return nil;
 	}
 	nblk = blkcount(len, s->sb.blksz);
-	if((g = mallocz(sizeof *g, 1)) == nil)
+	if((g = mallocz(sizeof *g, 1)) == nil){
+		werrstr("out of memory");
 		return nil;
+	}
 	g->s = s;
 	memmove(g->oid, oid, oidlen);
 	g->oidlen = oidlen;
@@ -1356,6 +1384,7 @@ stageopen(Store *s, uchar *oid, int oidlen, uvlong len, int force)
 			free(g->grain);
 			free(g->dig);
 			free(g);
+			werrstr("out of memory");
 			return nil;
 		}
 	}
@@ -1392,8 +1421,10 @@ stagewrite(Stage *g, void *a, long n, uvlong off)
 		werrstr("bad ctl: chunk past the declared length");
 		return -1;
 	}
-	if((buf = malloc(s->sb.blksz)) == nil)
+	if((buf = malloc(s->sb.blksz)) == nil){
+		werrstr("out of memory");
 		return -1;
+	}
 	src = a;
 	left = n;
 	blk = off / s->sb.blksz;
