@@ -494,7 +494,8 @@ replay(Store *s)
 			if(m > Bulkio)
 				m = Bulkio;
 			if(devread(s->d, buf + n, m, off + n) < 0){
-				bad = s->sb.logoff + rel;
+				/* the sector the failed read began at */
+				bad = s->sb.logoff + rel + n/s->sb.secsz;
 				goto refuse;
 			}
 		}
