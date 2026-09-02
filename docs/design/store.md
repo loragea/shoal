@@ -27,10 +27,15 @@ it has one.
   document; a section of `docs/design/layer-a.md` is always written
   `layer-a §n`. The two numbering schemes overlap (both documents
   have a §2.2 and a §3.4), so the prefix is not decoration.
-- **The whole of this document is implementation policy in D1's
-  sense**: D1 marks "everything about how a node stores its objects
-  locally" as the part a conforming reimplementation may do
-  differently. Nothing here is on any wire.
+- **This document is implementation policy in D1's sense**: D1 marks
+  "everything about how a node stores its objects locally" as the
+  part a conforming reimplementation may do differently. Nothing here
+  is on any wire, with one carve-out: *which* of this store's
+  refusals answers with a layer-a §2.6 wire error is client-visible
+  through the 9P server, so §3.7's mapping rule is **normative** — a
+  reimplementation must answer §2.6's string where §3.7's table names
+  one, and must keep §2.6's prefixes off everything else. The text of
+  every other error, like everything else here, is free to differ.
 - **Within this implementation the on-disk format is a format
   boundary**, and is written that way: byte-exact layouts, MUST/SHOULD
   language, a version field in every header, and a crash-consistency
@@ -1506,11 +1511,12 @@ time of the last chunk. It is owned by the fid.
 ### 3.7 Error strings
 
 *The spelling of a wire error is layer-a §2.6's and normative there.
-Which of this store's refusals is a wire error is **normative**: the
-9P server hands the client what the store returns, so a condition
-§2.6 names MUST be answered with §2.6's prefix and nothing else. The
-text of an internal-invariant error is implementation policy; the
-rule that it never begins with a §2.6 prefix is normative.*
+Which of this store's refusals is a wire error is **normative** — the
+carve-out §0 makes: the 9P server hands the client what the store
+returns, so a condition §2.6 names MUST be answered with §2.6's
+prefix and nothing else. The text of an internal-invariant error is
+implementation policy; the rule that it never begins with a §2.6
+prefix is normative.*
 
 This section covers every error the library API (`lib/shoal.h`)
 returns, from the write path, the read path and start-up alike, and
@@ -1528,17 +1534,19 @@ own `not primary: n5.0` is the pattern. Callers can act on these:
 | a create of a live id | `object exists` |
 | an oid outside layer-a §1.1's `1*128` bound | `bad object name` |
 | a write, truncate or stage past `objmax`, at either bound | `object too large` |
-| a create over a tombstone whose version is not the tombstone's plus one (layer-a §1.5) | `out of sequence` |
+| a create over a tombstone whose version is not the tombstone's plus one, or whose `wepoch` is below the tombstone's (layer-a §5.5's table for `op=create`: a create is self-contained and arbitrates) | `stale version` |
 | an `op=full` at a key the receiver's own key defends (§3.6) | `stale version` |
-| a create or an `op=full` at a version the object model forbids, and a chunk outside its stage's declared length | `bad ctl` |
+| an `op=full` at a version the object model forbids, and a chunk outside its stage's declared length | `bad ctl` |
 | a read, verify or update through an extent-map entry that failed its `csum128` (§5 step 9) | `checksum mismatch` |
-| a discard of something that is not a tombstone | `not discardable` |
+| a discard whose record fails layer-a §1.5's receiver checks: not a tombstone, not at exactly the named key, or its `wepoch` not strictly below the given epoch | `not discardable` |
 | no grain, index slot, extent-map slot, staged-grain budget, or log space after §6's bounded wait | `disk full` |
 
 **Everything else is an internal-invariant error**: a condition the
 API's contract says a caller cannot produce, or one the media
 produced. The record range checks (`Eobj:`, `Edirty:`, `Eslot:`), a
 grain number outside `ngrains` read out of a map, a negative count, a
+version of 0 on a path whose version this instance chooses (create,
+write, truncate, delete), a
 failed allocation, a device error carried out of the commit path, a
 geometry that does not check out at start, and the two condemnations
 — the `broken` store of §3.2 and the store whose apply failed after
@@ -1549,15 +1557,24 @@ read a bug or a media fault as an ordinary refusal. What the server
 then does with one — log it, count it, answer something of its own —
 is the server's decision and not this document's.
 
-Two consequences are worth stating, because the list does not make
+Three consequences are worth stating, because the list does not make
 them obvious:
 
-- **The store answers `bad ctl` for values only it knows are
-  illegal.** A version of 0 is not a syntax error in a header the
-  server parsed; it is a key layer-a §1.3 forbids — `ver` starts at 1
-  and absence is not `(0, 0)` — and this is where that rule lives.
-  The prefix is still `bad ctl`, because that is what layer-a §5.5's
-  common set gives a sender for an operation it should not have sent.
+- **A version of 0 is refused on every publishing path, and only
+  `op=full`'s refusal is a wire error.** The key is one layer-a §1.3
+  forbids — `ver` starts at 1 and absence is not `(0, 0)` — and this
+  is where that rule lives. On the stage path the version arrives in
+  an `op=full` header, so the refusal is `bad ctl`: layer-a §5.5's
+  common set, for an operation a conforming sender cannot send. On
+  create, write, truncate and delete the version is this instance's
+  own to choose (layer-a §5.4 step 3), so a 0 there is a caller bug
+  and the refusal carries no §2.6 prefix.
+- **`no such object` for a discard of an id this store does not
+  hold.** layer-a §1.5's receiver rule reads as making absence fail
+  its check (i) — `not discardable` — while §5.6's table lists
+  `no such object` among `op=discard`'s errors; the two pull in
+  different directions and layer-a does not say which wins. This
+  store follows §5.6's table.
 - **`checksum mismatch` is answered for local damage as well as for a
   transfer that failed its check.** §2.6 defines it as "content fails
   verification, or a replicated op's resulting `csum` does not match
