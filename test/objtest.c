@@ -1180,9 +1180,15 @@ tfull(void)
 	checks++;
 	if(ostat(s, "z0", &oi) >= 0)
 		fail("an op=full at version 0 published a live (0, 0) object");
+	/*
+	 * The same rule on objcreate is §3.7's internal kind — a client
+	 * create's version is this instance's own to choose, so a 0 is a
+	 * caller bug and carries no §2.6 prefix (unlike the op=full's
+	 * above, whose version arrives in a wire header).
+	 */
 	oidof(oid, "z1");
 	refused("a create at version 0", objcreate(s, oid, 2, 0, 2, nil, 0, nil),
-		"bad ctl");
+		"create at version 0");
 
 	/* layer-a §5.5's comparison, made against that key */
 	if((g = fullstage(s, "f", b, 2*Blk, 0)) != nil)

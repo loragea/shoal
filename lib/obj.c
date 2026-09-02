@@ -789,8 +789,16 @@ objcreate(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 		werrstr("bad object name: oid length %d", oidlen);
 		return -1;
 	}
+	/*
+	 * layer-a §1.3 forbids the key: ver starts at 1 and absence is not
+	 * (0, 0).  Unlike stagefinal's, this refusal is §3.7's internal
+	 * kind and carries no §2.6 prefix — a client create's version is
+	 * this instance's own to choose (layer-a §5.4 step 3), and the
+	 * op=create receiver arbitrates rather than calling here (§3.6) —
+	 * so a version of 0 on this path is a caller bug.
+	 */
 	if(ver == 0){
-		werrstr("bad ctl: create at version 0");
+		werrstr("create at version 0");
 		return -1;
 	}
 	memset(&u, 0, sizeof u);
