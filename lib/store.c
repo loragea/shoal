@@ -473,6 +473,7 @@ replay(Store *s)
 	}
 	seq = s->sb.ckseq + 1;
 	rel = s->sb.cklogoff - s->sb.logoff;
+	bad = s->sb.cklogoff;		/* until a record is applied */
 	scanned = 0;
 	for(;;){
 		if(scanned >= s->sb.logsecs)
@@ -520,6 +521,14 @@ replay(Store *s)
 		if(s->nemapc > s->emapcap && emapreclaim(s) < 0)
 			goto refuse;
 	}
+	/*
+	 * The final write-back can fail exactly as the in-loop one above
+	 * and refuses the same way; bad still names the last record
+	 * applied — or the checkpoint mark, when there was none — whose
+	 * maps are among the entries being written.
+	 */
+	if(emapreclaim(s) < 0)
+		goto refuse;
 	free(hdr);
 	free(buf);
 	s->logtail = rel;
@@ -527,8 +536,6 @@ replay(Store *s)
 	s->relseq = s->watermark;
 	s->wateroff = rel;
 	s->seqnext = s->watermark + 1;
-	if(emapreclaim(s) < 0)
-		return -1;
 	return 0;
 
 refuse:

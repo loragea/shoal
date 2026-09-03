@@ -1081,6 +1081,83 @@ treclaimfault(void)
 }
 
 /*
+ * The other write-back, after the loop: replay's last act is to flush
+ * the extent-map entries the applied records installed, and a failure
+ * there refuses the start for exactly the reason the in-loop one does.
+ * What is pinned here is the refusal's *text*: the operator meets this
+ * failure with a store that will not open, so it must name the sector
+ * and the way out, like every other refusal on this path, and not the
+ * bare device error.
+ *
+ * The fault is sticky, and the cache is the default, so the in-loop
+ * write-back never runs and the post-loop one takes it; the records
+ * install fresh maps, so nothing reads the region either.
+ *
+ * Mutation: return -1 bare from the post-loop reclaim, as before, and
+ * the refusal below arrives with neither sector nor remedy.
+ */
+static void
+tpostreclaim(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Super sb;
+	Sbsel sel;
+	uchar *buf, oid[Oidmax];
+	char err[ERRMAX];
+	int i;
+	static char *nm[3] = { "p0", "p1", "p2" };
+
+	d = newdisk();
+	if((s = mustopen(d, "a failing post-loop reclaim")) == nil){
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(2*Blk, 89);
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	for(i = 0; i < 3; i++){
+		oidof(oid, nm[i]);
+		if(objcreate(s, oid, 2, 1, 1, nil, 0, nil) < 0)
+			fail("objcreate %s: %r", nm[i]);
+		/* 0 -> 2 blocks in one commit: Oslot, so replay reads no map */
+		if(objwrite(s, oid, 2, buf, 2*Blk, 0, 2, 1, nil, 0) < 0)
+			fail("objwrite %s: %r", nm[i]);
+	}
+	storeclose(s);
+
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	sb = sel.sb[sel.start];
+	simfaultat(d, Sfeio, 0, (vlong)sb.emapoff*sb.secsz,
+		(vlong)sb.emapsecs*sb.secsz);
+	checks++;
+	if((s = openstore(d)) != nil){
+		storestat(s, &st);
+		fail("the store started over a failed post-loop emapreclaim "
+			"(nlive=%llud)", st.nlive);
+		storeclose(s);
+	}else{
+		rerrstr(err, sizeof err);
+		istrue("the post-loop refusal carries the remedy",
+			strstr(err, "shoalck, then refill from peers") != nil);
+		istrue("and names the log sector it stopped on",
+			strstr(err, "log sector") != nil);
+	}
+	simfault(d, Sfnone, 0);
+
+	if((s = mustopen(d, "the map region, writable again")) != nil){
+		storestat(s, &st);
+		eqv("every object is there once the map is writable",
+			st.nlive, 3);
+		storeclose(s);
+	}
+	free(buf);
+	devclose(d);
+}
+
+/*
  * §2.6: ndirty is an implementation limit in exactly layer-a §7.1's
  * sense.  When it is exhausted the store discards every fine-grained
  * record for the peer with the most records and marks that peer
@@ -1499,6 +1576,7 @@ main(int argc, char **argv)
 	tlogread();
 	treplayapply();
 	treclaimfault();
+	tpostreclaim();
 	tdirtyfull();
 	tdirtytie(0);
 	tdirtytie(1);
