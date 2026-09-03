@@ -680,9 +680,11 @@ int	monidpin(Store*, uchar id[16]);
  * objdiscard names the tombstone's key (ver, wepoch) and the caller's
  * current map epoch, and refuses `not discardable' unless its record
  * is a tombstone at exactly that key with wepoch strictly below the
- * epoch — layer-a §1.5's receiver checks, made atomically inside the
- * call so no concurrent delete can swap the tombstone between the
- * check and the drop.
+ * epoch — layer-a §1.5's receiver checks.  The three checks are
+ * atomic among themselves (one hold of the state lock), so they judge
+ * one record and a separate objstat could not; the window between
+ * the checks and the commit is the caller's per-oid queue's to close,
+ * exactly as for every other mutation above.
  */
 int	objstat(Store*, uchar *oid, int oidlen, Objinfo*);
 int	objcreate(Store*, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,

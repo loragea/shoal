@@ -1891,9 +1891,14 @@ What survives is the 256-byte index entry. Layer-a §1.5's discard,
 once its three cluster-wide conditions hold, commits an `Eslot` and
 the slot returns to the free list. The discard names the tombstone's
 key and the caller's current map epoch, and the store re-checks
-§1.5's two receiver conditions atomically inside the call — the
+§1.5's two receiver conditions inside the call, under one hold of the
+state lock — the
 record is a tombstone at exactly that key, its `wepoch` strictly
-below the epoch — answering `not discardable` otherwise (§3.7).
+below the epoch — answering `not discardable` otherwise (§3.7). The
+checks are atomic among themselves, so they judge one record where a
+separate stat-then-discard could race an `op=delete`; the window
+between the checks and the `Eslot` commit is closed by the caller's
+per-object queue (§7), as for every mutation.
 `tombdays` is evaluated against
 the entry's `mtime`, which is why the tombstone keeps one.
 
