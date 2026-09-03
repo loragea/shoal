@@ -726,4 +726,10 @@ int	stagewrite(Stage*, void *a, long n, uvlong off);
 int	stagefinal(Stage*, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr);
 			/* consumes the stage, whether it succeeds or not */
 void	stagediscard(Stage*);
+/*
+ * The idle sweep (§3.6).  It releases an expired stage's reservations
+ * but never frees the handle, which is the fid's: a later chunk or
+ * final=1 on one is refused `stage expired', and the fid's own clunk
+ * still calls stagediscard, which then finds nothing left to release.
+ */
 void	stagesweep(Store*, vlong now);

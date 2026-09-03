@@ -524,6 +524,11 @@ tstage(void)
 	stagesweep(s, nsec());
 	storestat(s, &st2);
 	eqv("a stage that has gone quiet is swept", st2.grainfree, before);
+	/* the sweep strips the handle; the owner still frees it */
+	stagediscard(g);
+	storestat(s, &st2);
+	eqv("discarding a swept stage releases nothing twice",
+		st2.grainfree, before);
 
 	/*
 	 * The restart case: a checkpoint while the stage is live, then
@@ -888,6 +893,237 @@ tsweepfinal(void)
 	devclose(d);
 	free(buf);
 	free(got);
+}
+
+/*
+ * §3.6's own words for the sweep's idle trigger: a stage is swept when
+ * no chunk has *arrived* for stagems.  A peer that pauses past stagems
+ * and then resumes — no clunk, no flush — sends a chunk into a stage
+ * whose g->last is still the previous chunk's, and a sweep firing
+ * while that chunk is in flight would return every grain the handle
+ * names to the allocator and strip the arrays stagewrite is still
+ * indexing: reservations released mid-write, then a fault, with the
+ * writer holding qlstate — the whole store wedged.  So stagewrite
+ * refreshes the clock at entry, under qlstate, and pins the handle
+ * busy for the chunk's flight, and the sweep skips both.
+ *
+ * The chunk is made slow (simslow plus one device op per block) and
+ * the sweep is issued from this proc while it runs, which is the
+ * probe shape that faulted before the fix; the failing form here is a
+ * FAIL — the writer never returns, or the counters moved — never a
+ * suite hang, because nothing below touches the store until the
+ * writer has been seen to finish.
+ *
+ * Mutation: drop the entry pin (call stagewrite1 directly) and let
+ * stagesweep free a swept handle as it used to; the writer dies
+ * mid-chunk and this test FAILs instead of passing.
+ */
+enum
+{
+	Swblk	= 256,			/* blocks in the staged object */
+};
+
+typedef struct Sw Sw;
+struct Sw
+{
+	Stage	*g;
+	uchar	*buf;
+	int	started;
+	int	done;
+	int	r;
+};
+
+static Sw sw;
+
+static void
+swproc(void *a)
+{
+	Sw *p;
+
+	p = a;
+	p->started = 1;
+	/* offset 1: every block of the declared length is touched */
+	p->r = stagewrite(p->g, p->buf, Swblk*Blk - 1, 1);
+	p->done = 1;
+}
+
+static void
+tsweepchunk(void)
+{
+	Dev *d;
+	Store *s;
+	Stage *g;
+	Storecfg c;
+	Fmtcfg fc;
+	Super sb;
+	Storestat st;
+	uchar *buf, o[Oidmax];
+	uvlong g0;
+	int i, mid;
+
+	/* a geometry wide enough for a long chunk: 256 blocks, 16 MiB */
+	if((d = simopen(512, 32768, 0x5ea1)) == nil)
+		sysfatal("simopen: %r");
+	memset(&fc, 0, sizeof fc);
+	fc.secsz = 512;
+	fc.blksz = Blk;
+	fc.objmax = (uvlong)Swblk*Blk;
+	fc.nslots = 128;
+	fc.nemap = 32;
+	fc.ndirty = 64;
+	fc.logbytes = 256*1024;
+	fc.csumalg = Csumblake2s;
+	if(geometry(&sb, &fc, d->size) < 0)
+		sysfatal("geometry: %r");
+	if(fmtstore(d, &sb) < 0)
+		sysfatal("fmtstore: %r");
+	tcfg(&c);
+	c.stagemax = 4*Swblk;
+	c.stagetot = 8*Swblk;
+	if((s = storeopen(d, &c)) == nil){
+		fail("a sweep against a chunk in flight: storeopen: %r");
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(Swblk*Blk, 31);
+	oidof(o, "swc");
+	storestat(s, &st);
+	g0 = st.grainfree;
+	if((g = stageopen(s, o, 3, (uvlong)Swblk*Blk, 0)) == nil){
+		fail("stageopen: %r");
+		storeclose(s);
+		devclose(d);
+		free(buf);
+		return;
+	}
+	/*
+	 * The stage goes quiet past stagems (t1.h's is 50): nothing
+	 * clunks or flushes the fid, the peer is merely slow, and
+	 * g->last is still the stageopen time when the chunk arrives.
+	 */
+	sleep(80);
+	simslow(d, 1);
+	sw.g = g;
+	sw.buf = buf;
+	sw.started = 0;
+	sw.done = 0;
+	sw.r = -1;
+	if(spawnproc(swproc, &sw) < 0){
+		fail("spawn: %r");
+		stagediscard(g);
+		storeclose(s);
+		devclose(d);
+		free(buf);
+		return;
+	}
+	for(i = 0; i < 2000 && !sw.started; i++)
+		sleep(1);
+	sleep(3);			/* let it get into the loop */
+	mid = sw.done;
+	stagesweep(s, nsec());
+	for(i = 0; i < 10000 && !sw.done; i++)
+		sleep(1);
+	checks++;
+	if(!sw.done){
+		/*
+		 * Nothing below may touch the store or the buffer: the
+		 * writer may hold qlstate, so a storestat here would turn
+		 * this FAIL into a suite hang.  The store, the device and
+		 * the buffer are leaked so the suite can report.
+		 */
+		fail("the chunk the sweep raced never returned (faulted?)");
+		return;
+	}
+	simslow(d, 0);
+	istrue("the sweep ran while the chunk was in flight", !mid);
+	istrue("the chunk reported success", sw.r == 0);
+	storestat(s, &st);
+	eqv("every grain the chunk staged is still reserved", st.staged,
+		Swblk);
+	eqv("and charged against the free count", st.grainfree, g0 - Swblk);
+	stagediscard(g);
+	storestat(s, &st);
+	eqv("the discard releases them all, once", st.grainfree, g0);
+	eqv("and empties the staged set", st.staged, 0);
+	storeclose(s);
+	devclose(d);
+	free(buf);
+}
+
+/*
+ * The other half of the sweep's contract: a handle it has swept is
+ * stripped, not freed — the memory is the owner's (store.h), and the
+ * fid that owns it will still write, final or clunk it.  A chunk into
+ * a swept stage must refuse (its predecessors are gone, so finishing
+ * the transfer would publish holes in their place); a final=1 must
+ * refuse the same way and consume the handle; and the clunk's discard
+ * must find nothing left to release, or the sweep and the clunk free
+ * the same reservation twice — removing whichever reservation the
+ * allocator handed out in between.
+ *
+ * Mutation: the tsweepchunk one (stagesweep frees) — the discard and
+ * the write below then run over freed memory and the counters move.
+ */
+static void
+tsweepexpire(void)
+{
+	Dev *d;
+	Store *s;
+	Stage *g;
+	Storestat st;
+	Objinfo oi;
+	uchar *buf, o[Oidmax];
+	uvlong g0;
+
+	d = newdisk();
+	if((s = mustopen(d, "a swept handle's later calls")) == nil)
+		return;
+	buf = mkbuf(2*Blk, 43);
+	oidof(o, "se");
+	storestat(s, &st);
+	g0 = st.grainfree;
+
+	/* a later chunk refuses, and the clunk's discard releases nothing */
+	if((g = stageopen(s, o, 2, 2*Blk, 0)) == nil)
+		fail("stageopen: %r");
+	else{
+		if(stagewrite(g, buf, 2*Blk, 0) < 0)
+			fail("stagewrite: %r");
+		sleep(80);
+		stagesweep(s, nsec());
+		storestat(s, &st);
+		eqv("the sweep released the stage's grains", st.grainfree, g0);
+		eqv("and emptied the staged set", st.staged, 0);
+		refused("a chunk into a swept stage",
+			stagewrite(g, buf, Blk, 0), "stage expired");
+		storestat(s, &st);
+		eqv("the refused chunk staged nothing", st.staged, 0);
+		stagediscard(g);
+		storestat(s, &st);
+		eqv("the discard of a swept stage releases nothing twice",
+			st.grainfree, g0);
+	}
+
+	/* and a final=1 on a swept handle refuses and consumes it */
+	if((g = stageopen(s, o, 2, 2*Blk, 0)) == nil)
+		fail("stageopen: %r");
+	else{
+		if(stagewrite(g, buf, 2*Blk, 0) < 0)
+			fail("stagewrite: %r");
+		sleep(80);
+		stagesweep(s, nsec());
+		refused("a final=1 on a swept stage",
+			stagefinal(g, 9, 1, nil, 0), "stage expired");
+		checks++;
+		if(ostat(s, "se", &oi) >= 0)
+			fail("a swept stage's final published the object");
+		storestat(s, &st);
+		eqv("the refused final leaves nothing staged", st.staged, 0);
+		eqv("and the free count where it was", st.grainfree, g0);
+	}
+	storeclose(s);
+	devclose(d);
+	free(buf);
 }
 
 /*
@@ -1818,6 +2054,8 @@ main(int argc, char **argv)
 	tstage();
 	tstagefault();
 	tsweepfinal();
+	tsweepchunk();
+	tsweepexpire();
 	tdiscard();
 	tcondemned();
 	texhaust();

@@ -271,6 +271,13 @@ struct Store
  * creator — the /repl fid in the server — and is discarded on clunk,
  * on a Tflush of any of its chunks, on stagems of silence and at
  * restart, which is free because nothing about it is durable.
+ *
+ * The memory is freed only by the owner: stagediscard, or the
+ * stagefinal that consumes the handle.  stagesweep *strips* an
+ * expired handle — releases its reservations, zeroes its entries,
+ * unlinks it and marks it dead so later calls refuse — but leaves
+ * the memory, because the fid still holds the pointer and a freeing
+ * sweep races every one of the owner's calls.
  */
 struct Stage
 {
@@ -279,7 +286,9 @@ struct Stage
 	int	oidlen;
 	uvlong	len;			/* the declared final length */
 	int	force;
-	vlong	last;			/* nsec() of the last chunk */
+	int	busy;			/* a chunk is in flight; qlstate */
+	int	dead;			/* swept: refuse chunks and final; qlstate */
+	vlong	last;			/* nsec() of the last chunk's arrival */
 	ulong	*grain;			/* nblk entries, 0 = untouched */
 	uchar	*dig;			/* nblk digests */
 	ulong	nblk;

@@ -1429,8 +1429,8 @@ stageopen(Store *s, uchar *oid, int oidlen, uvlong len, int force)
 	return g;
 }
 
-int
-stagewrite(Stage *g, void *a, long n, uvlong off)
+static int
+stagewrite1(Stage *g, void *a, long n, uvlong off)
 {
 	Store *s;
 	uchar *buf, *src;
@@ -1529,9 +1529,44 @@ stagewrite(Stage *g, void *a, long n, uvlong off)
 		boff = 0;
 	}
 	free(buf);
-	g->last = nsec();
 	devpoint(s->d, "stage", 0);
 	return 0;
+}
+
+/*
+ * §3.6's sweep trigger is "no chunk has *arrived* for stagems", so the
+ * clock is refreshed at entry, under qlstate, and busy pins the handle
+ * for the chunk's whole flight: the grain I/O above runs with qlstate
+ * released, and a sweep firing in one of those windows would return
+ * every grain the handle names to the allocator and strip the arrays
+ * the write is still indexing.  A handle the sweep has already
+ * stripped is spent — the chunks before this one are gone, so carrying
+ * on would publish holes in their place at final=1 — and the refusal
+ * tells the owner to discard it and restart the transfer, which is
+ * free (§3.6).
+ */
+int
+stagewrite(Stage *g, void *a, long n, uvlong off)
+{
+	Store *s;
+	int r;
+
+	s = g->s;
+	qlock(&s->qlstate);
+	if(g->dead){
+		qunlock(&s->qlstate);
+		werrstr("stage expired");
+		return -1;
+	}
+	g->busy = 1;
+	g->last = nsec();
+	qunlock(&s->qlstate);
+	r = stagewrite1(g, a, n, off);
+	qlock(&s->qlstate);
+	g->busy = 0;
+	g->last = nsec();
+	qunlock(&s->qlstate);
+	return r;
 }
 
 /* caller holds qlstate */
@@ -1556,13 +1591,23 @@ stagediscard(Stage *g)
 	if(g == nil)
 		return;
 	s = g->s;
+	/*
+	 * Unlink first, and tolerate a handle that is already off the
+	 * list: stagesweep strips an expired handle — releases its
+	 * grains, zeroes its entries and unlinks it — but the memory
+	 * stays the owner's, so the discard the clunk or flush issues
+	 * afterwards finds nothing left to release and only frees.
+	 * That is what keeps the sweep and a clunk from releasing the
+	 * same reservation twice — a double grainstageclr removes
+	 * whatever reservation the allocator has since handed out.
+	 */
 	qlock(&s->qlstate);
+	stageunlink(s, g);
 	for(i = 0; i < g->nblk; i++)
 		if(g->grain[i] != 0){
 			grainstageclr(s, g->grain[i]);
 			s->nstagegrain--;
 		}
-	stageunlink(s, g);
 	qunlock(&s->qlstate);
 	free(g->grain);
 	free(g->dig);
@@ -1647,8 +1692,8 @@ stagefinal(Stage *g, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 	s = g->s;
 	/*
 	 * The handle leaves s->stages before anything here drops qlstate:
-	 * stagesweep frees any handle whose last chunk is older than
-	 * stagems, and a final=1 parked in the commit — waiting on a
+	 * stagesweep strips any handle whose last chunk arrived more than
+	 * stagems ago, and a final=1 parked in the commit — waiting on a
 	 * checkpoint, say — gets older than stagems by nothing more than
 	 * bad luck.  Swept mid-commit, the stage's grains would return to
 	 * the allocator while the commit was about to publish them.  §3.6:
@@ -1658,6 +1703,17 @@ stagefinal(Stage *g, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 	 */
 	qlock(&s->qlstate);
 	stageunlink(s, g);
+	if(g->dead){
+		/*
+		 * The sweep stripped this handle: its chunks are gone, so
+		 * committing it would publish holes in their place.  The
+		 * handle is spent like any other final=1 outcome — the
+		 * discard below finds nothing to release and frees it.
+		 */
+		qunlock(&s->qlstate);
+		werrstr("stage expired");
+		return stagefail(g);
+	}
 	qunlock(&s->qlstate);
 	if(!serving(s))
 		return stagefail(g);
@@ -1751,29 +1807,40 @@ stagefinal(Stage *g, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 void
 stagesweep(Store *s, vlong now)
 {
-	Stage *g, *next, *dead;
+	Stage *g, *next;
 	uvlong i;
 
-	dead = nil;
 	qlock(&s->qlstate);
 	for(g = s->stages; g != nil; g = next){
 		next = g->next;
-		if(now - g->last <= (vlong)s->cfg.stagems*1000000LL)
+		/*
+		 * §3.6: the trigger is a stage no chunk has *arrived* for in
+		 * stagems.  busy is a chunk in flight right now — its arrival
+		 * refreshed g->last at entry, but a chunk can be in flight
+		 * longer than stagems, and sweeping under it frees grains a
+		 * write is still filling.
+		 */
+		if(g->busy || now - g->last <= (vlong)s->cfg.stagems*1000000LL)
 			continue;
+		/*
+		 * Strip the handle; never free it.  The memory is the owner's
+		 * (store.h) — the /repl fid still holds the pointer, and its
+		 * clunk's stagediscard is what frees it.  Freeing here is a
+		 * use-after-free the moment the owner's next call arrives.
+		 * The strip zeroes every grain entry as it releases it, so
+		 * that later discard releases nothing twice; dead is what
+		 * makes a later chunk or final=1 refuse instead of finishing
+		 * a transfer whose earlier chunks are gone.
+		 */
 		stageunlink(s, g);
 		for(i = 0; i < g->nblk; i++)
 			if(g->grain[i] != 0){
 				grainstageclr(s, g->grain[i]);
+				g->grain[i] = 0;
 				s->nstagegrain--;
 			}
-		g->next = dead;
-		dead = g;
+		g->ngrain = 0;
+		g->dead = 1;
 	}
 	qunlock(&s->qlstate);
-	for(g = dead; g != nil; g = next){
-		next = g->next;
-		free(g->grain);
-		free(g->dig);
-		free(g);
-	}
 }

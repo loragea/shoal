@@ -1487,6 +1487,20 @@ time of the last chunk. It is owned by the fid.
   Were reservations written into the bitmap, a checkpoint taken while
   a stage was live would leak 32 MiB per abandoned maximal transfer
   across every subsequent restart.
+
+  The idle trigger is *arrival*, as spelled above, and a chunk still
+  in flight is not an absence of arrivals: a maximal chunk can take
+  longer than `stagems` to land, and the reservations it is filling
+  are the ones the sweep would otherwise return to the allocator
+  while the write is still indexing them. What that sweep releases is
+  the reservations alone. The handle is the fid's — only whatever
+  owns the fid knows when the fid is done with it — so the sweep
+  marks it expired and leaves the memory, and the `Tclunk`'s discard
+  behind it finds nothing left to release. A chunk or a `final=1` on
+  an expired stage is refused `stage expired`, and carries no §2.6
+  prefix (§3.7): the chunks before it are gone, so finishing the
+  transfer would publish holes in their place, and starting it over
+  is free.
   **These are the triggers for a stage whose `final=1` has not been
   attempted, and for no other.** `final=1` consumes the handle on
   every outcome — a comparison that refused the push, a commit that
@@ -1549,7 +1563,8 @@ produced. The record range checks (`Eobj:`, `Edirty:`, `Eslot:`), a
 grain number outside `ngrains` read out of a map, a negative count, a
 version of 0 on a path whose version this instance chooses (create,
 write, truncate, delete), a
-failed allocation, a device error carried out of the commit path, a
+failed allocation, a chunk or `final=1` on a stage the idle sweep has
+expired (§3.6), a device error carried out of the commit path, a
 geometry that does not check out at start, and the two condemnations
 — the `broken` store of §3.2 and the store whose apply failed after
 its record was durable. **None of these begins with a §2.6 prefix**,
