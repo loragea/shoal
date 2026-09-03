@@ -1550,7 +1550,6 @@ own `not primary: n5.0` is the pattern. Callers can act on these:
 | a create of a live id | `object exists` |
 | an oid outside layer-a §1.1's `1*128` bound | `bad object name` |
 | a write, truncate or stage past `objmax`, at either bound | `object too large` |
-| a create over a tombstone whose version is not the tombstone's plus one, or whose `wepoch` is below the tombstone's (layer-a §5.5's table for `op=create`: a create is self-contained and arbitrates) | `stale version` |
 | an `op=full` at a key the receiver's own key defends (§3.6) | `stale version` |
 | an `op=full` at a version the object model forbids, and a chunk outside its stage's declared length | `bad ctl` |
 | a read, verify or update through an extent-map entry that failed its `csum128` (§5 step 9) | `checksum mismatch` |
@@ -1561,7 +1560,9 @@ own `not primary: n5.0` is the pattern. Callers can act on these:
 API's contract says a caller cannot produce, or one the media
 produced. The record range checks (`Eobj:`, `Edirty:`, `Eslot:`), a
 grain number outside `ngrains` read out of a map, a negative count, a
-version of 0 on a path whose version this instance chooses (create,
+version of 0 — or, over a tombstone, a version that is not the
+tombstone's plus one or a `wepoch` below the tombstone's — on a path
+whose version this instance chooses (create,
 write, truncate, delete), a
 failed allocation, a chunk or `final=1` on a stage the idle sweep has
 expired (§3.6), a device error carried out of the commit path, a
@@ -1585,7 +1586,13 @@ them obvious:
   common set, for an operation a conforming sender cannot send. On
   create, write, truncate and delete the version is this instance's
   own to choose (layer-a §5.4 step 3), so a 0 there is a caller bug
-  and the refusal carries no §2.6 prefix.
+  and the refusal carries no §2.6 prefix. The tombstone rule rides
+  the same principle: a client create over a tombstone takes the
+  tombstone's version plus one at a `wepoch` no lower (§3.6), and
+  since choosing that key is the caller's job, any other key is the
+  same internal kind of refusal. Only `stagefinal`'s arbitration —
+  where the key genuinely arrives from elsewhere — answers a
+  tombstone's defence as §2.6's `stale version`.
 - **`no such object` for a discard of an id this store does not
   hold.** layer-a §1.5's receiver rule reads as making absence fail
   its check (i) — `not discardable` — while §5.6's table lists

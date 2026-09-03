@@ -855,14 +855,21 @@ objcreate(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 		 * qlstate, because that is where the tombstone's own key
 		 * is known not to be racing a commit.
 		 *
-		 * The spelling is layer-a §5.5's table for op=create:
-		 * a create is self-contained, so the tombstone's key
-		 * refusing it is `stale version' — §2.6 defines `out of
-		 * sequence' for delta ops only.
+		 * Like the ver==0 refusal above, this is §3.7's internal
+		 * kind and carries no §2.6 prefix: objcreate is the client
+		 * create path (§3.6), on which the version is this
+		 * instance's own to choose (layer-a §5.4 step 3) — chosen
+		 * by the rule this branch enforces — so any other value is
+		 * a caller bug.  The op=create receiver arbitrates before
+		 * calling here (§3.6), and an op=full over a tombstone
+		 * arbitrates in stagefinal, where the refusal is §2.6's
+		 * `stale version'.
 		 */
 		if(ver != e->ver + 1 || wepoch < e->wepoch){
 			qunlock(&s->qlstate);
-			werrstr("stale version");
+			werrstr("create at (%llud, %llud) over a tombstone "
+				"at (%llud, %llud)", wepoch, ver, e->wepoch,
+				e->ver);
 			return -1;
 		}
 		reuse = 1;
