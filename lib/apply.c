@@ -209,24 +209,29 @@ maplimit(Store *s, Ient *e)
  * geometry does not have if it was written by a different build or
  * read from a lap this store never wrote; applying half of it and
  * then refusing is worse than refusing all of it.
+ *
+ * Against the superblock rather than the store, because the checker
+ * makes the same judgement (§12): a record replay refuses to start
+ * on is one shoalck MUST flag, and shoalck holds a geometry and no
+ * store.
  */
 int
-objrecok(Store *s, Objrec *o)
+objrecok(Super *sb, Objrec *o)
 {
 	uvlong nblk;
 	ulong i;
 
-	if(o->slot >= s->sb.nslots){
-		werrstr("Eobj: slot %lud, nslots %lud", o->slot, s->sb.nslots);
+	if(o->slot >= sb->nslots){
+		werrstr("Eobj: slot %lud, nslots %lud", o->slot, sb->nslots);
 		return -1;
 	}
-	if(o->emapslot >= s->sb.nemap){
+	if(o->emapslot >= sb->nemap){
 		werrstr("Eobj: emapslot %lud, nemap %lud", o->emapslot,
-			s->sb.nemap);
+			sb->nemap);
 		return -1;
 	}
-	if(o->len > s->sb.objmax){
-		werrstr("Eobj: len %llud, objmax %llud", o->len, s->sb.objmax);
+	if(o->len > sb->objmax){
+		werrstr("Eobj: len %llud, objmax %llud", o->len, sb->objmax);
 		return -1;
 	}
 	/*
@@ -235,7 +240,7 @@ objrecok(Store *s, Objrec *o)
 	 * 5 would then clear the entry that names it, leaking the grain
 	 * with nothing left pointing at it.
 	 */
-	nblk = blkcount(o->len, s->sb.blksz);
+	nblk = blkcount(o->len, sb->blksz);
 	/*
 	 * An object of more than one block keeps its map out of line, so
 	 * a record that claims otherwise names blocks the entry cannot
@@ -250,21 +255,21 @@ objrecok(Store *s, Objrec *o)
 		return -1;
 	}
 	for(i = 0; i < o->nmap; i++){
-		if(o->map[i].blk >= s->sb.nblkmax || o->map[i].blk >= nblk){
+		if(o->map[i].blk >= sb->nblkmax || o->map[i].blk >= nblk){
 			werrstr("Eobj: block %lud, nblk %llud, nblkmax %lud",
-				o->map[i].blk, nblk, s->sb.nblkmax);
+				o->map[i].blk, nblk, sb->nblkmax);
 			return -1;
 		}
-		if(o->map[i].grain >= s->sb.ngrains){
+		if(o->map[i].grain >= sb->ngrains){
 			werrstr("Eobj: grain %lud, ngrains %llud",
-				o->map[i].grain, s->sb.ngrains);
+				o->map[i].grain, sb->ngrains);
 			return -1;
 		}
 	}
 	for(i = 0; i < o->nfree; i++)
-		if(o->freed[i] >= s->sb.ngrains){
+		if(o->freed[i] >= sb->ngrains){
 			werrstr("Eobj: freed grain %lud, ngrains %llud",
-				o->freed[i], s->sb.ngrains);
+				o->freed[i], sb->ngrains);
 			return -1;
 		}
 	return 0;
@@ -279,7 +284,7 @@ applyrec(Store *s, Objrec *o, Emape *c)
 	ulong i, lim;
 	uchar dig[Blkdlen];
 
-	if(objrecok(s, o) < 0)
+	if(objrecok(&s->sb, o) < 0)
 		return -1;
 	e = &s->idx[o->slot];
 
@@ -288,15 +293,27 @@ applyrec(Store *s, Objrec *o, Emape *c)
 	if(e->oidlen != o->oidlen || e->oid == nil
 	|| memcmp(e->oid, o->oid, o->oidlen) != 0){
 		/*
-		 * §3.2's commit path grew this buffer before the record
-		 * was written, so the allocation below is replay's alone
-		 * — and there a failure stops the replay, which is a
-		 * refusal to start rather than a half-applied record.
+		 * The commit path never reaches the allocation below, and
+		 * it takes two rules to say why.  itemprep grew the buffer
+		 * to o->oidlen before the record was written; the one
+		 * thing that shrinks it again is applyslot, which frees
+		 * e->oid and zeroes oidcap, and applyslot can name this
+		 * slot only for a commit that releases it.  §7's
+		 * per-object ordering keeps such a commit from being
+		 * issued beside this one, and §3.5's deferred-reuse rule
+		 * keeps the released slot out of the allocator until that
+		 * commit has been applied, so no batch in between can
+		 * leave the buffer smaller than itemprep left it.  The
+		 * allocation is therefore replay's alone, and there a
+		 * failure stops the replay, which is a refusal to start
+		 * rather than a half-applied record.
 		 */
 		if(e->oid == nil || e->oidcap < o->oidlen){
 			free(e->oid);
 			if((e->oid = malloc(o->oidlen)) == nil){
 				e->oidcap = 0;
+				/* replay reports this in its refusal (§5 step 7) */
+				werrstr("out of memory");
 				return -1;
 			}
 			e->oidcap = o->oidlen;
@@ -412,11 +429,20 @@ applyrec(Store *s, Objrec *o, Emape *c)
 
 /*
  * The peer set, §2.6.  A peer is remembered as soon as one of its
- * fine-grained records exists, because the exhaustion rule below has
- * to be able to name the peer whose records it drops.  fullsync is
- * never persisted: it is set for every peer at start (§5 step 12).
+ * fine-grained records exists, so that storefullsync can answer for it
+ * by name.  fullsync is never persisted: it is set for every peer at
+ * start (§5 step 12).
+ *
+ * **Registering a peer may fail, and that is not an error.**  The list
+ * is memory only, nothing durable names it, and the one question it
+ * answers is storefullsync's — which answers 1, behind, for a peer it
+ * does not know, exactly as it would for a peer it knew and had
+ * marked fullsync.  So a mallocz that fails here costs the safe answer
+ * and nothing else, and the callers have nothing to do with a return
+ * value.  The exhaustion rule below used to need the list to be
+ * complete and no longer does: it counts the records themselves.
  */
-Peer*
+void
 addpeer(Store *s, uchar *name, int n)
 {
 	Peer *p;
@@ -424,15 +450,14 @@ addpeer(Store *s, uchar *name, int n)
 	for(p = s->peers; p != nil; p = p->next)
 		if(strlen(p->name) == (ulong)n
 		&& memcmp(p->name, name, n) == 0)
-			return p;
+			return;
 	if((p = mallocz(sizeof *p, 1)) == nil)
-		return nil;
+		return;
 	memmove(p->name, name, n);
 	p->name[n] = '\0';
 	p->fullsync = 1;
 	p->next = s->peers;
 	s->peers = p;
-	return p;
 }
 
 static int
@@ -451,13 +476,36 @@ peerowns(Dirtent *t, Peer *p)
  * keeps §3.2's commit path and §5's replay answering the same thing:
  * a full region that the live path refused and replay ignored would
  * be a store whose memory differs from what its own log rebuilds.
+ *
+ * That argument makes two demands on *which* peer is dropped, and
+ * neither is met by taking the peer list as it comes.
+ *
+ * **Ties go to the lowest name.**  The list's order is not the same
+ * twice: live it is first-apply order, after a restart it is
+ * readdirty's slot order reversed.  A tie broken by list order
+ * therefore drops one peer live and another on replay from the very
+ * same records — permitted by layer-a §7.1, which lets any peer's
+ * records go, but it is the divergence this function exists to
+ * avoid.  strcmp of the names does not depend on either order.
+ *
+ * **A peer no record's name can be found under still owns records.**
+ * addpeer allocates, so a peer that could not be registered owns
+ * records the loop below counts for nobody; if every record in a full
+ * region were one of those, a peer-driven search would find no victim
+ * and applydirty would refuse — after its own record is durable,
+ * which §3.2 cannot afford.  So the fallback names the victim from a
+ * record instead of from the list.  The unregistered peer stays
+ * unregistered, which storefullsync answers as behind: the same
+ * answer marking it would give.
  */
 static int
 dropworstpeer(Store *s)
 {
 	Dirtent *t;
 	Peer *p, *worst;
+	uchar peer[Peermax];
 	ulong i, n, best;
+	int peerlen;
 
 	worst = nil;
 	best = 0;
@@ -466,29 +514,54 @@ dropworstpeer(Store *s)
 		for(i = 0; i < s->sb.ndirty; i++)
 			if((t = s->dirt[i]) != nil && peerowns(t, p))
 				n++;
-		if(n > best){
+		/*
+		 * Load-bearing, though T1 cannot falsify it: without it the
+		 * `worst == nil ||' arm below takes the first listed peer
+		 * even at a count of zero, so a full region whose records
+		 * all belong to peers addpeer failed to register would name
+		 * a victim that owns nothing — zero slots freed, and
+		 * applydirty's retry loop spins forever after its record is
+		 * durable.  Reaching that needs addpeer's mallocz to fail,
+		 * which T1 cannot stage without allocator injection.
+		 */
+		if(n == 0)
+			continue;
+		if(worst == nil || n > best
+		|| (n == best && strcmp(p->name, worst->name) < 0)){
 			best = n;
 			worst = p;
 		}
 	}
-	if(worst == nil)
-		return -1;
+	if(worst != nil){
+		peerlen = strlen(worst->name);
+		memmove(peer, worst->name, peerlen);
+		worst->fullsync = 1;
+	}else{
+		for(i = 0; i < s->sb.ndirty; i++)
+			if(s->dirt[i] != nil)
+				break;
+		if(i >= s->sb.ndirty)
+			return -1;	/* nothing to drop: the region is empty */
+		t = s->dirt[i];
+		peerlen = t->peerlen;
+		memmove(peer, t->peer, peerlen);
+	}
 	for(i = 0; i < s->sb.ndirty; i++)
-		if((t = s->dirt[i]) != nil && peerowns(t, worst)){
+		if((t = s->dirt[i]) != nil && t->peerlen == peerlen
+		&& memcmp(t->peer, peer, peerlen) == 0){
 			free(t);
 			s->dirt[i] = nil;
 			s->ndirtused--;
 			dirtdirty(s, i);
 		}
-	worst->fullsync = 1;
 	return 0;
 }
 
 /* the field checks §2.6 makes on a record, before anything is believed */
 int
-dirtyrecok(Store *s, Dirtyrec *d)
+dirtyrecok(Super *sb, Dirtyrec *d)
 {
-	USED(s);
+	USED(sb);
 	if(d->oidlen < 1 || d->oidlen > Oidmax || d->peerlen < 1
 	|| d->peerlen > Peermax){
 		werrstr("Edirty: oidlen %d peerlen %d", d->oidlen, d->peerlen);
@@ -514,7 +587,7 @@ applydirty(Store *s, Dirtyrec *d, Dirtent **spare)
 	Dirtent *t;
 	ulong i;
 
-	if(dirtyrecok(s, d) < 0)
+	if(dirtyrecok(&s->sb, d) < 0)
 		return -1;
 	for(i = 0; i < s->sb.ndirty; i++){
 		if((t = s->dirt[i]) == nil)
@@ -541,8 +614,14 @@ applydirty(Store *s, Dirtyrec *d, Dirtent **spare)
 				break;
 		if(i < s->sb.ndirty)
 			break;
+		/*
+		 * Reached only with every slot occupied, and dropworstpeer
+		 * refuses only an *empty* region — so this refusal needs a
+		 * region of no slots at all, which itemok rejects before
+		 * the record is written and replay is entitled to stop at.
+		 */
 		if(dropworstpeer(s) < 0){
-			werrstr("dirty region full");
+			werrstr("Edirty: the geometry has no dirty region");
 			return -1;
 		}
 	}
@@ -550,8 +629,11 @@ applydirty(Store *s, Dirtyrec *d, Dirtent **spare)
 		t = *spare;
 		*spare = nil;
 		memset(t, 0, sizeof *t);
-	}else if((t = mallocz(sizeof *t, 1)) == nil)
+	}else if((t = mallocz(sizeof *t, 1)) == nil){
+		/* replay's allocation; its refusal reports this (§5 step 7) */
+		werrstr("out of memory");
 		return -1;
+	}
 	t->epoch = d->epoch;
 	t->state = 1;
 	t->oidlen = d->oidlen;

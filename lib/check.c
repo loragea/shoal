@@ -3,6 +3,7 @@
 #include <libsec.h>
 #include <fcall.h>
 #include "shoal.h"
+#include "store.h"		/* objrecok, dirtyrecok: replay's own checks */
 
 /*
  * The inspect-and-check engine behind shoalck, docs/design/store.md
@@ -176,6 +177,9 @@ ckgeom(Ck *k)
 	if(s->objmax % s->blksz != 0 || s->nblkmax != s->objmax/s->blksz)
 		problem(k, "nblkmax %lud does not match objmax %llud / blksz %lud",
 			s->nblkmax, s->objmax, s->blksz);
+	/* §2.6: a store refuses to open over ndirty == 0, and so must this */
+	if(s->ndirty == 0)
+		problem(k, "the geometry has no dirty region");
 	/*
 	 * In uvlong: nblkmax is a u32 the superblock supplies, so
 	 * 20*nblkmax reaches 2^36 and the ulong sum wraps.  A
@@ -409,50 +413,71 @@ ckdirty(Ck *k)
 	free(buf);
 }
 
+/*
+ * Decode and judge one log entry, exactly as §5 step 7's apply would:
+ * a checksummed, in-sequence record whose entries cannot be decoded
+ * or whose fields the range checks refuse is one replay refuses to
+ * start on — and the refusal's own message names shoalck as the way
+ * out, so a checker that printed the entry verbatim and counted no
+ * problem would leave the operator with a store that will not start
+ * and a report that finds nothing wrong.  Run for every entry, quiet
+ * or verbose; the dump lines are the verbose extra.
+ */
 static void
-dumpent(Ck *k, Lent *e)
+ckent(Ck *k, uvlong seq, ulong i, Lent *e)
 {
 	Objrec o;
 	Dirtyrec dr;
 	char buf[2*Csumlen + 1], ob[Oidmax + 1];
-	ulong slot, i;
+	ulong slot, j;
 
 	switch(e->kind){
 	case Kobj:
 		if(objrecunpack(&o, e->body, e->len - Lenthdrsz) < 0){
-			problem(k, "		Eobj: %r");
+			problem(k, "log seq %llud entry %lud: %r", seq, i);
 			return;
 		}
-		say(k, "		Eobj slot=%lud emapslot=%lud oflags=%#ux "
-			"oid=%s", o.slot, o.emapslot, o.oflags,
-			oidstr(ob, o.oid, o.oidlen));
-		say(k, "		     len=%llud ver=%llud wepoch=%llud "
-			"state=%d csum=%s", o.len, o.ver, o.wepoch, o.state,
-			hex(buf, o.csum, Csumlen));
-		say(k, "		     nmap=%lud nfree=%lud", o.nmap, o.nfree);
-		for(i = 0; i < o.nmap && k->c->verbose > 1; i++)
-			say(k, "		     blk %lud grain %lud",
-				o.map[i].blk, o.map[i].grain);
+		if(objrecok(k->s, &o) < 0)
+			problem(k, "log seq %llud entry %lud: %r", seq, i);
+		if(k->c->verbose){
+			say(k, "		Eobj slot=%lud emapslot=%lud oflags=%#ux "
+				"oid=%s", o.slot, o.emapslot, o.oflags,
+				oidstr(ob, o.oid, o.oidlen));
+			say(k, "		     len=%llud ver=%llud wepoch=%llud "
+				"state=%d csum=%s", o.len, o.ver, o.wepoch, o.state,
+				hex(buf, o.csum, Csumlen));
+			say(k, "		     nmap=%lud nfree=%lud", o.nmap, o.nfree);
+			for(j = 0; j < o.nmap && k->c->verbose > 1; j++)
+				say(k, "		     blk %lud grain %lud",
+					o.map[j].blk, o.map[j].grain);
+		}
 		objrecfree(&o);
 		break;
 	case Kdirty:
-		if(dirtyrecunpack(&dr, e->body, e->len - Lenthdrsz) < 0){
-			problem(k, "		Edirty: %r");
+		if(dirtyrecunpack(&dr, e->body, e->len - Lenthdrsz) < 0
+		|| dirtyrecok(k->s, &dr) < 0){
+			problem(k, "log seq %llud entry %lud: %r", seq, i);
 			return;
 		}
-		say(k, "		Edirty op=%s epoch=%llud peer=%.*s oid=%s",
-			dr.op ? "add" : "remove", dr.epoch, dr.peerlen,
-			(char*)dr.peer, oidstr(ob, dr.oid, dr.oidlen));
+		if(k->c->verbose)
+			say(k, "		Edirty op=%s epoch=%llud peer=%.*s oid=%s",
+				dr.op ? "add" : "remove", dr.epoch, dr.peerlen,
+				(char*)dr.peer, oidstr(ob, dr.oid, dr.oidlen));
 		break;
 	case Kslot:
 		if(slotrecunpack(&slot, e->body, e->len - Lenthdrsz) < 0){
-			problem(k, "		Eslot: %r");
+			problem(k, "log seq %llud entry %lud: %r", seq, i);
 			return;
 		}
-		say(k, "		Eslot slot=%lud", slot);
+		if(slot >= k->s->nslots)
+			problem(k, "log seq %llud entry %lud: Eslot: slot %lud, "
+				"nslots %lud", seq, i, slot, k->s->nslots);
+		if(k->c->verbose)
+			say(k, "		Eslot slot=%lud", slot);
 		break;
 	default:
-		problem(k, "		unknown entry kind %d", e->kind);
+		problem(k, "log seq %llud entry %lud: unknown kind %d", seq, i,
+			e->kind);
 	}
 }
 
@@ -460,8 +485,10 @@ dumpent(Ck *k, Lent *e)
  * Scan the log from the checkpoint mark, exactly as §5 step 7 replays
  * it but without applying anything: bounds-check nsec before using
  * it, verify the checksum over the range it names, check seq against
- * the expectation seeded at ckseq+1, and continue at the region start
- * when Fwrap is set or when +nsec reaches the region end.
+ * the expectation seeded at ckseq+1, judge every entry by the decode
+ * and range checks the apply itself makes (ckent), and continue at
+ * the region start when Fwrap is set or when +nsec reaches the
+ * region end.
  */
 static void
 cklog(Ck *k)
@@ -506,21 +533,21 @@ cklog(Ck *k)
 		if(lrecvalid(buf, s->secsz, &r, rel, s->logsecs, seq) < 0)
 			break;
 		nrec++;
-		if(k->c->verbose){
+		if(k->c->verbose)
 			say(k, "	seq %llud at sector %llud: %lud sectors, "
 				"%lud entries%s", r.seq, rel, r.nsec, r.nent,
 				r.flags & Fwrap ? ", Fwrap" : "");
-			p = buf + Lrechdrsz;
-			left = r.nsec*s->secsz - Lrechdrsz;
-			for(n = 0; n < r.nent; n++){
-				if(lentunpack(&e, p, left) < 0){
-					problem(k, "		entry %lud: %r", n);
-					break;
-				}
-				dumpent(k, &e);
-				p += e.len;
-				left -= e.len;
+		p = buf + Lrechdrsz;
+		left = r.nsec*s->secsz - Lrechdrsz;
+		for(n = 0; n < r.nent; n++){
+			if(lentunpack(&e, p, left) < 0){
+				problem(k, "log seq %llud entry %lud: %r",
+					r.seq, n);
+				break;
 			}
+			ckent(k, r.seq, n, &e);
+			p += e.len;
+			left -= e.len;
 		}
 		seq++;
 		if(r.flags & Fwrap)

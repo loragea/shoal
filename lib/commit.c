@@ -168,24 +168,34 @@ itembytes(Store *s, Item *it)
 static void
 unlink(Store *s, Item *it)
 {
-	Item **pp, *t;
+	Item **pp, *t, *prev;
 
 	/*
 	 * Only an item this call actually removed from the queue has its
 	 * link cleared.  An item that is no longer pending is a link in
 	 * some batch's item list, and clearing it there severs the
 	 * batch: the entries after it are in the durable record and
-	 * would never be applied or woken (§7).
+	 * would never be applied or woken (§7).  It is also why the tail
+	 * is left alone in that case rather than recomputed: the queue
+	 * did not change.
+	 *
+	 * The predecessor is carried along the one walk the removal needs
+	 * anyway.  formbatch unlinks every item it absorbs, so a second
+	 * walk per item to find the tail again would make forming a batch
+	 * quadratic in the queue's length — and the queue is as long as
+	 * the number of committers §7's pool can put on it.
 	 */
-	for(pp = &s->pend; (t = *pp) != nil; pp = &t->next)
+	prev = nil;
+	for(pp = &s->pend; (t = *pp) != nil; pp = &t->next){
 		if(t == it){
 			*pp = t->next;
+			if(s->pendtail == it)
+				s->pendtail = prev;
 			it->next = nil;
-			break;
+			return;
 		}
-	s->pendtail = nil;
-	for(t = s->pend; t != nil; t = t->next)
-		s->pendtail = t;
+		prev = t;
+	}
 }
 
 /*
@@ -256,7 +266,6 @@ formbatch(Store *s, int *full, int *oom)
 		else
 			b->items = it;
 		last = it;
-		it->batch = b;
 		it->state = Ibatched;
 		bytes += it->nbyte;
 		if(!it->freeing)
@@ -333,6 +342,10 @@ packbatch(Store *s, Batch *b, uchar *p, long max, ulong *nent)
  * body marks the one call that writes the record's body sectors:
  * §13's body:n is "after n body sectors", so the wrap record and the
  * header sector — which is the commit point itself — do not emit it.
+ * The point fires per piece and not per sector, carrying the body
+ * sectors written so far: a piece is one device write, so it is the
+ * finest granularity at which the body can honestly be said to have
+ * been interrupted.  §13 states which values of n that leaves.
  */
 static int
 logwrite(Store *s, uchar *p, ulong n, uvlong sec, int body)
@@ -443,12 +456,19 @@ applybatch(Store *s, Batch *b)
 	return r;
 }
 
+/*
+ * §6's wait asks for a checkpoint and then sleeps: the checkpointer
+ * runs on a tick of its own (§2.8), so a request is a counter it reads
+ * at the top of that tick and not a wake-up.  The wait is bounded by
+ * ckwaitms and the tick is milliseconds, so the lag is in the noise —
+ * but it is a lag, and a Rendez here would only look like it removed
+ * one, since the tick is what the checkpointer's own triggers need.
+ */
 static void
 askcheckpoint(Store *s)
 {
 	qlock(&s->cklk);
 	s->ckreq++;
-	rwakeupall(&s->ckwork);
 	qunlock(&s->cklk);
 }
 
@@ -460,7 +480,7 @@ runbatch(Store *s, Batch *b)
 	Lrec r;
 	ulong bytes, nent;
 	char e[ERRMAX];
-	int err;
+	int err, fatal;
 
 	bytes = Lrechdrsz;
 	for(m = b->items; m != nil; m = m->next)
@@ -519,24 +539,31 @@ runbatch(Store *s, Batch *b)
 	if(err < 0)
 		seterr(b, e);
 
+	/*
+	 * Unreachable: itemok and itemprep ran before the record was
+	 * written.  If it happens anyway, memory no longer describes what
+	 * a restart would produce, so the store stops serving what it
+	 * cannot vouch for and must be opened again.  The condemnation is
+	 * recorded under qllog and not under the qlstate the apply itself
+	 * runs under: fatal and broken are read there, beside failseq, and
+	 * a flag written under one lock and read under another is ordered
+	 * by nothing this code states.
+	 */
+	fatal = 0;
 	if(err == 0){
 		qlock(&s->qlstate);
-		if(applybatch(s, b) < 0){
-			/*
-			 * Unreachable: itemok and itemprep ran before the
-			 * record was written.  If it happens anyway, memory
-			 * no longer describes what a restart would produce,
-			 * so the store stops serving what it cannot vouch
-			 * for and must be opened again.
-			 */
-			s->fatal = 1;
-			s->broken = 1;
-			seterr(b, "apply failed after the record was durable");
-		}
+		if(applybatch(s, b) < 0)
+			fatal = 1;
 		qunlock(&s->qlstate);
+		if(fatal)
+			seterr(b, "apply failed after the record was durable");
 	}
 
 	qlock(&s->qllog);
+	if(fatal){
+		s->fatal = 1;
+		s->broken = 1;
+	}
 	if(err == 0 && !s->fatal){
 		s->watermark = b->seqhi;
 		s->wateroff = b->endoff;
@@ -571,7 +598,7 @@ itemok(Store *s, Item *it)
 	int i;
 
 	if((o = it->obj) != nil){
-		if(objrecok(s, o) < 0)
+		if(objrecok(&s->sb, o) < 0)
 			return -1;
 		if(o->emapslot != 0
 		&& (it->emap == nil || it->emap->slot != o->emapslot)){
@@ -580,8 +607,12 @@ itemok(Store *s, Item *it)
 			return -1;
 		}
 	}
+	if(it->ndirty > 0 && s->sb.ndirty == 0){
+		werrstr("Edirty: the geometry has no dirty region");
+		return -1;
+	}
 	for(i = 0; i < it->ndirty; i++)
-		if(dirtyrecok(s, &it->dirty[i]) < 0)
+		if(dirtyrecok(&s->sb, &it->dirty[i]) < 0)
 			return -1;
 	if(it->haseslot && it->eslot >= s->sb.nslots){
 		werrstr("Eslot: slot %lud, nslots %lud", it->eslot,

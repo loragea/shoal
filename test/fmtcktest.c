@@ -754,7 +754,99 @@ tlive(void)
 	if(report(d, nil) == 0)
 		fail("the checker passed a zero blksz");
 	said("a zero blksz", "are not a geometry");
+
+	/*
+	 * §2.6: the store refuses to open over ndirty == 0 — applydirty
+	 * would have nothing to drop for the first Edirty — so the
+	 * checker flags the geometry by the same rule.
+	 */
+	live(d, &s, &c);
+	sbpoke32(d, &s, 96, 0);			/* ndirty */
+	checks++;
+	if(report(d, nil) == 0)
+		fail("the checker passed a geometry with no dirty region");
+	said("no dirty region", "no dirty region");
 	devclose(d);
+}
+
+/*
+ * §5 step 7 refuses to start on a checksummed, in-sequence record
+ * whose entries fail the apply's own decode and range checks — and
+ * the refusal's message names shoalck as the way out, so shoalck
+ * MUST flag the very record the store refuses on.  Built on a
+ * file-backed image, as an operator would run it, and judged under
+ * -q as well: a problem is counted, not merely printed.
+ *
+ * The record carries the two §2.7 refusals a conforming writer never
+ * produces: an Eobj naming two blocks with no extent-map slot, and
+ * an Eslot at nslots.
+ *
+ * Mutation: drop cklog's entry validation (print-only, as before),
+ * and both reports below come back clean.
+ */
+static char *badpath = "/tmp/shoalckbadlog.img";
+
+static void
+tbadlog(void)
+{
+	Dev *d;
+	Super s;
+	Fmtcfg c;
+	Lrec r;
+	Objrec o;
+	uchar *rec;
+	long n;
+
+	remove(badpath);
+	if((d = fileopen(badpath, Secsz, (vlong)Nsec*Secsz, 0)) == nil)
+		sysfatal("fileopen: %r");
+	smallcfg(&c);
+	if(geometry(&s, &c, d->size) < 0 || fmtstore(d, &s) < 0)
+		sysfatal("format: %r");
+	if((rec = mallocz(s.secsz, 1)) == nil)
+		sysfatal("mallocz: %r");
+	memset(&o, 0, sizeof o);
+	o.slot = 1;
+	o.emapslot = 0;
+	o.qidpath = 99;
+	o.state = Slive;
+	o.oidlen = 2;
+	memmove(o.oid, "q1", 2);
+	o.len = 2*(uvlong)s.blksz;	/* two blocks, inline map */
+	o.ver = 1;
+	o.wepoch = 1;
+	n = objrecpack(rec + Lrechdrsz, s.secsz - Lrechdrsz, &o);
+	checks++;
+	if(n < 0)
+		fail("objrecpack: %r");
+	else if(slotrecpack(rec + Lrechdrsz + n,
+		s.secsz - Lrechdrsz - n, s.nslots) < 0)
+		fail("slotrecpack: %r");
+	else{
+		memset(&r, 0, sizeof r);
+		r.vers = Storevers;
+		r.nsec = 1;
+		r.seq = s.ckseq + 1;
+		r.nent = 2;
+		lrecpack(rec, &r, s.secsz);
+		if(devwrite(d, rec, s.secsz, (vlong)s.cklogoff*s.secsz) < 0)
+			fail("writing the bad record: %r");
+		checks++;
+		if(check(d) == 0)
+			fail("shoalck -q counted no problem on the record "
+				"replay refuses to start on");
+		checks++;
+		if(report(d, nil) == 0)
+			fail("shoalck passed the record replay refuses to "
+				"start on");
+		else{
+			said("the unappliable Eobj", "no extent-map slot");
+			said("the out-of-range Eslot", "Eslot: slot");
+		}
+	}
+	free(rec);
+	devclose(d);
+	remove(badpath);
 }
 
 static char *imgpath = "/tmp/shoalfmtcktest.img";
@@ -770,6 +862,7 @@ cleanup(void)
 {
 	remove(ckpath);
 	remove(imgpath);
+	remove(badpath);
 }
 
 void
@@ -807,6 +900,7 @@ main(int, char**)
 	treformat();
 	tcutream();
 	tlive();
+	tbadlog();
 	if(fails > 0)
 		exits("failed");
 	print("fmtcktest: %d checks ok\n", checks);

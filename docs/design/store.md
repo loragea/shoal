@@ -27,10 +27,15 @@ it has one.
   document; a section of `docs/design/layer-a.md` is always written
   `layer-a §n`. The two numbering schemes overlap (both documents
   have a §2.2 and a §3.4), so the prefix is not decoration.
-- **The whole of this document is implementation policy in D1's
-  sense**: D1 marks "everything about how a node stores its objects
-  locally" as the part a conforming reimplementation may do
-  differently. Nothing here is on any wire.
+- **This document is implementation policy in D1's sense**: D1 marks
+  "everything about how a node stores its objects locally" as the
+  part a conforming reimplementation may do differently. Nothing here
+  is on any wire, with one carve-out: *which* of this store's
+  refusals answers with a layer-a §2.6 wire error is client-visible
+  through the 9P server, so §3.7's mapping rule is **normative** — a
+  reimplementation must answer §2.6's string where §3.7's table names
+  one, and must keep §2.6's prefixes off everything else. The text of
+  every other error, like everything else here, is free to differ.
 - **Within this implementation the on-disk format is a format
   boundary**, and is written that way: byte-exact layouts, MUST/SHOULD
   language, a version field in every header, and a crash-consistency
@@ -785,7 +790,16 @@ more than the field holds; the store MUST reject `peerlen > 72` and
 `ndirty` is an implementation limit in exactly layer-a §7.1's sense.
 When it is exhausted the store discards every fine-grained record for
 the peer with the most records and marks that peer `fullsync`, which
-layer-a §7.1 explicitly permits.
+layer-a §7.1 explicitly permits. **Ties go to the lowest peer name,
+and the count is taken over the records rather than over the peers
+the store has heard of.** Both are needed for the drop to be a
+function of the region's contents alone. The order the store learned
+its peers in is first-apply order while it runs and the region's own
+slot order after a restart, so a tie broken by that order would drop
+one peer's marks on the live path and another's when the same records
+are replayed; and a peer whose name the store failed to register at
+all still owns records, which a count taken over peers attributes to
+nobody.
 
 The region is read at start (§5) and the in-memory set is built from
 it before replay, whose `Edirty` entries then add to and remove from
@@ -806,6 +820,13 @@ does not is a crash between the acker's commit and the primary's,
 after which the primary has no record that the peer is behind. The
 restart flag covers exactly that window, so §14(2) proposes the
 layer-a amendment and the restart obligation together.
+
+The flag is half-built infrastructure today: everything that sets it
+exists — start-up marks every peer, the exhaustion drop marks its
+victim — and **nothing yet clears it**, because clearing belongs to
+the reconcile pass the heal work will bring (layer-a §7.2). Until
+that lands, `storefullsync` answers *behind* for every peer, known or
+unknown, and only the fine-grained records carry information.
 
 ### 2.7 Log region and record format
 
@@ -1409,9 +1430,27 @@ time of the last chunk. It is owned by the fid.
   way and its reservations must not outlive it — and where the reason
   is the comparison the error is layer-a §5.5's `stale version`.
 
+  **A tombstone is a key, and an `op=full` may resurrect it.** A
+  tombstone arbitrates normally (layer-a §1.5), so it is not one of
+  the two receivers below: the comparison is made against its key
+  exactly as against a live object's, and a push at a strictly
+  greater key — or an equal one with `force=1` — replaces it with a
+  live object at the key the push carries, reusing the tombstone's
+  index slot and `qid.path`. That is deliberately weaker than §1.5's
+  rule for a *client* create over a tombstone, which this store
+  enforces as `ver` exactly one greater and `wepoch` no lower than
+  the tombstone's. The two are not in tension:
+  a create's version is this instance's to choose, so the rule that
+  no older copy may outrank the new object can be enforced by
+  choosing it, while an `op=full` carries a version assigned
+  elsewhere that a receiver MUST adopt verbatim (§5.5) and can
+  therefore defend only by arbitration. A version that is merely
+  greater is what arbitration asks for and all it can ask for.
+
   **Two receivers have no key to defend, and the push applies to
-  both whatever it carries.** The first is an object this instance
-  does not hold: absence is not a key (layer-a §1.3), and it is the
+  both whatever it carries.** Neither is a tombstone. The first is
+  an object this instance does not hold: absence is not a key
+  (layer-a §1.3), and it is the
   common case for a heal. The same `Eobj` carries the create — this
   commit reserves the index slot and the `qid.path` — because
   creating the object first and staging into it afterwards would
@@ -1448,6 +1487,29 @@ time of the last chunk. It is owned by the fid.
   Were reservations written into the bitmap, a checkpoint taken while
   a stage was live would leak 32 MiB per abandoned maximal transfer
   across every subsequent restart.
+
+  The idle trigger is *arrival*, as spelled above, and a chunk still
+  in flight is not an absence of arrivals: a maximal chunk can take
+  longer than `stagems` to land, and the reservations it is filling
+  are the ones the sweep would otherwise return to the allocator
+  while the write is still indexing them. What that sweep releases is
+  the reservations alone. The handle is the fid's — only whatever
+  owns the fid knows when the fid is done with it — so the sweep
+  marks it expired and leaves the memory, and the `Tclunk`'s discard
+  behind it finds nothing left to release. A chunk or a `final=1` on
+  an expired stage is refused `stage expired`, and carries no §2.6
+  prefix (§3.7): the chunks before it are gone, so finishing the
+  transfer would publish holes in their place, and starting it over
+  is free.
+  **These are the triggers for a stage whose `final=1` has not been
+  attempted, and for no other.** `final=1` consumes the handle on
+  every outcome — a comparison that refused the push, a commit that
+  could not be made, and a commit that succeeded alike — because the
+  transfer is over either way and its reservations must not outlive
+  it. So whatever owns the fid MUST forget the handle at `final=1`,
+  before it knows whether the push was taken: a `Tclunk` behind a
+  refused `final=1` would otherwise discard a stage that has already
+  been discarded.
 - **Bound, per fid and per process.** At most `stagemax` grains may
   be staged on one `/repl` fid (policy, default 2048, i.e. two
   maximal objects), and at most `stagetot` grains across the whole
@@ -1461,6 +1523,88 @@ time of the last chunk. It is owned by the fid.
   the fid is clunked, and a heal of a whole disk can answer
   `disk full` with the disk nearly empty. Both counters are one
   integer each.
+
+### 3.7 Error strings
+
+*The spelling of a wire error is layer-a §2.6's and normative there.
+Which of this store's refusals is a wire error is **normative** — the
+carve-out §0 makes: the 9P server hands the client what the store
+returns, so a condition §2.6 names MUST be answered with §2.6's
+prefix and nothing else. The text of an internal-invariant error is
+implementation policy; the rule that it never begins with a §2.6
+prefix is normative.*
+
+This section covers every error the library API (`lib/shoal.h`)
+returns, from the write path, the read path and start-up alike, and
+it exists because there is no way to build the 9P surface without a
+mapping rule and no second place to put one.
+
+**A wire error is one layer-a §2.6 names.** The store spells it
+exactly as §2.6 spells it and MAY add detail after the prefix — §2.6's
+own `not primary: n5.0` is the pattern. Callers can act on these:
+
+| Condition | Answer |
+|---|---|
+| an id this store does not hold, on any path | `no such object` |
+| a read, write, truncate or delete of a tombstoned id | `object deleted` |
+| a create of a live id | `object exists` |
+| an oid outside layer-a §1.1's `1*128` bound | `bad object name` |
+| a write, truncate or stage past `objmax`, at either bound | `object too large` |
+| an `op=full` at a key the receiver's own key defends (§3.6) | `stale version` |
+| an `op=full` at a version the object model forbids, and a chunk outside its stage's declared length | `bad ctl` |
+| a read, verify or update through an extent-map entry that failed its `csum128` (§5 step 9) | `checksum mismatch` |
+| a discard whose record fails layer-a §1.5's receiver checks: not a tombstone, not at exactly the named key, or its `wepoch` not strictly below the given epoch | `not discardable` |
+| no grain, index slot, extent-map slot, staged-grain budget, or log space after §6's bounded wait | `disk full` |
+
+**Everything else is an internal-invariant error**: a condition the
+API's contract says a caller cannot produce, or one the media
+produced. The record range checks (`Eobj:`, `Edirty:`, `Eslot:`), a
+grain number outside `ngrains` read out of a map, a negative count, a
+version of 0 — or, over a tombstone, a version that is not the
+tombstone's plus one or a `wepoch` below the tombstone's — on a path
+whose version this instance chooses (create,
+write, truncate, delete), a
+failed allocation, a chunk or `final=1` on a stage the idle sweep has
+expired (§3.6), a device error carried out of the commit path, a
+geometry that does not check out at start, and the two condemnations
+— the `broken` store of §3.2 and the store whose apply failed after
+its record was durable. **None of these begins with a §2.6 prefix**,
+and that is the whole of what the server is promised: §2.6's set is
+prefix-free, so a client parsing a prefix out of one of these would
+read a bug or a media fault as an ordinary refusal. What the server
+then does with one — log it, count it, answer something of its own —
+is the server's decision and not this document's.
+
+Three consequences are worth stating, because the list does not make
+them obvious:
+
+- **A version of 0 is refused on every publishing path, and only
+  `op=full`'s refusal is a wire error.** The key is one layer-a §1.3
+  forbids — `ver` starts at 1 and absence is not `(0, 0)` — and this
+  is where that rule lives. On the stage path the version arrives in
+  an `op=full` header, so the refusal is `bad ctl`: layer-a §5.5's
+  common set, for an operation a conforming sender cannot send. On
+  create, write, truncate and delete the version is this instance's
+  own to choose (layer-a §5.4 step 3), so a 0 there is a caller bug
+  and the refusal carries no §2.6 prefix. The tombstone rule rides
+  the same principle: a client create over a tombstone takes the
+  tombstone's version plus one at a `wepoch` no lower (§3.6), and
+  since choosing that key is the caller's job, any other key is the
+  same internal kind of refusal. Only `stagefinal`'s arbitration —
+  where the key genuinely arrives from elsewhere — answers a
+  tombstone's defence as §2.6's `stale version`.
+- **`no such object` for a discard of an id this store does not
+  hold.** layer-a §1.5's receiver rule reads as making absence fail
+  its check (i) — `not discardable` — while §5.6's table lists
+  `no such object` among `op=discard`'s errors; the two pull in
+  different directions and layer-a does not say which wins. This
+  store follows §5.6's table.
+- **`checksum mismatch` is answered for local damage as well as for a
+  transfer that failed its check.** §2.6 defines it as "content fails
+  verification, or a replicated op's resulting `csum` does not match
+  the sender's"; an extent-map entry that fails its own `csum128` is
+  content that failed verification, and D14 requires such a holder to
+  say so rather than to answer as though the object were absent.
 
 ## 4. Read path, holes and re-hashing
 
@@ -1584,7 +1728,24 @@ lose arbitration against everything including absence.
    apply the entries, then continue at the region start if `Fwrap` is
    set, at the region start if `+nsec` reaches the region end, and at
    `+nsec` otherwise (§2.7). Stop at the first record that is invalid
-   or out of sequence. Applying an entry means setting absolute
+   or out of sequence. **A sector the device cannot read is not one
+   of those, and the store MUST NOT start.** Every other reason to
+   stop is a statement about the bytes at that offset and each of
+   them says the log ends there; a read error says nothing about
+   them, so treating it as the end would discard whatever is past the
+   fault — acked writes included — and then hand the tail back to be
+   overwritten. Steps 4, 5 and 6 already refuse to start on a device
+   error, and this is the same rule. **A record that cannot be
+   applied refuses the start the same way**: the apply fails on a
+   device error under an extent map, on an allocation failure, or on
+   any entry it cannot decode or believe — an entry header or body
+   that does not parse, an entry kind this build does not know, or a
+   field §2.7's range checks refuse — none of which a conforming
+   writer produces, because the commit path packs and checks them
+   before writing (§3.2). None of those says the log ends at a record that is
+   checksummed and in sequence; and, entries being applied one at a
+   time, stopping there would also leave the store on a half-applied
+   record no crash could produce. Applying an entry means setting absolute
    values — this slot's four-tuple becomes these bytes, block *i*
    becomes grain *g* with digest *d*, blocks at or beyond `nblk`
    become holes, this grain becomes allocated, a record carrying
@@ -1730,7 +1891,17 @@ delete time — the `Eobj` that sets `state=tomb` carries `len=0`,
 `emapslot=0`, so the extent-map slot is released with the content.
 What survives is the 256-byte index entry. Layer-a §1.5's discard,
 once its three cluster-wide conditions hold, commits an `Eslot` and
-the slot returns to the free list. `tombdays` is evaluated against
+the slot returns to the free list. The discard names the tombstone's
+key and the caller's current map epoch, and the store re-checks
+§1.5's two receiver conditions inside the call, under one hold of the
+state lock — the
+record is a tombstone at exactly that key, its `wepoch` strictly
+below the epoch — answering `not discardable` otherwise (§3.7). The
+checks are atomic among themselves, so they judge one record where a
+separate stat-then-discard could race an `op=delete`; the window
+between the checks and the `Eslot` commit is closed by the caller's
+per-object queue (§7), as for every mutation.
+`tombdays` is evaluated against
 the entry's `mtime`, which is why the tombstone keeps one.
 
 **Disk full.** Four distinct exhaustions, mapped deliberately:
@@ -1874,7 +2045,7 @@ touch:
 |---|---|---|
 | `qlstate` | the index array, the oid arena and hash table (§9), the index-slot and extent-map-slot free lists, the free-grain bitmap and its cursor, the staged set (§6), and the dirty set | every queue proc (stage, apply), the committer applying a batch, the checkpointer, the scrubber's commits, and the service loop taking an enumeration snapshot |
 | `qlemap` | the extent-map cache: which entries are present, their loading state and pin counts, and the LRU (§9) — not a pinned entry's contents, which its pin covers | every queue proc, on a map read, a pin and an unpin |
-| `qllog` | the log tail and free space, the pending-commit queue, batch numbering and the durable watermark | every committer |
+| `qllog` | the log tail and free space, the pending-commit queue, batch numbering, the durable watermark, and the two flags that condemn the store — `broken` and the failed-apply flag beside it (§3.2) | every committer, and every entry point that refuses on a condemned store |
 | `qlsuper` | the five publishable superblock fields and the publish itself (§2.2) | the checkpointer, a `qidnext` batch advance, the first `monid` pin, an `epochhigh` advance |
 
 Three more `QLock`s are not over state but over one activity each,
@@ -2666,7 +2837,15 @@ models what the real one is allowed to do:
 Points: `stage` (after the last staged grain write), `body:n` (after
 *n* of the record's **body** sectors — the wrap record and the header
 sector are not body, so the common one-sector record has none of
-these points at all), `precommit` (after the body write and **before**
+these points at all; and *n* counts sectors but is emitted per
+**device write**, because that is the granularity at which the body
+can be interrupted: §3.2 issues the body in `blksz`-bounded pieces,
+the point fires after each piece carrying the body sectors written so
+far, and a body that fits one piece therefore emits only its own
+total. A schedule that arms a value between two piece boundaries
+never fires, so a test that arms `body:n` must assert that the crash
+it expected actually happened rather than reading a completed
+operation as a pass), `precommit` (after the body write and **before**
 the pre-flush), `commit` (after the pre-flush and immediately before
 the header write, so the commit point is not reached), `postwrite`
 (after the header write returns, before the post-flush), `preack`,
@@ -2759,7 +2938,9 @@ bounds and `final=1` arbitration including D14's corrupt receiver,
 tail, R7's dirty records across a restart and on every write-path
 commit, layer-a §1.2's `object too large` at the bounds where a sum
 would wrap, layer-a §2.6's tombstone errors and §1.5's create over a
-tombstone, and the key-preserving `corrupt` flag) and `committest` (§3.2's flush
+tombstone, §3.7's rule that every refusal the API makes is either
+§2.6's prefix or plainly not one, and the key-preserving `corrupt`
+flag) and `committest` (§3.2's flush
 placement read off the device trace, the torn-header sweep over a
 whole sector, short counts on every call, §3.4's crash matrix at
 every point × every operation shape, several laps of the log

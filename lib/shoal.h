@@ -665,18 +665,30 @@ int	monidpin(Store*, uchar id[16]);
  * free the same grains.  The server's Reqqueue pool (§7) is what
  * orders them; a T1 program uses one proc per object.
  *
- * Every mutating call but objcreate and objdiscard takes the Edirty
- * records layer-a §5.4 step 5b asks for, because §14(2) puts them in
- * the same log record as the update they belong to: either both are
- * durable or neither.  A separate dirtyadd is a second record, and a
- * crash between the two leaves the update durable and the stale mark
- * absent — layer-a §5.4's `degraded' case, arrived at silently.
- * objdiscard is not a replicated update; objcreate is (layer-a §2.4),
- * so it has the same need and does not yet carry them.
+ * Every mutating call but objdiscard takes the Edirty records layer-a
+ * §5.4 step 5b asks for, because §14(2) puts them in the same log
+ * record as the update they belong to: either both are durable or
+ * neither.  A separate dirtyadd is a second record, and a crash
+ * between the two leaves the update durable and the stale mark absent
+ * — layer-a §5.4's `degraded' case, arrived at silently.  objcreate
+ * is in that set because layer-a §2.4 replicates a create like any
+ * other write; objdiscard is not, because a discard leaves no peer
+ * behind to mark: layer-a §1.5 has the primary remove its own record
+ * *last*, after every holder has answered ok, and retry the whole
+ * discard otherwise.
+ *
+ * objdiscard names the tombstone's key (ver, wepoch) and the caller's
+ * current map epoch, and refuses `not discardable' unless its record
+ * is a tombstone at exactly that key with wepoch strictly below the
+ * epoch — layer-a §1.5's receiver checks.  The three checks are
+ * atomic among themselves (one hold of the state lock), so they judge
+ * one record and a separate objstat could not; the window between
+ * the checks and the commit is the caller's per-oid queue's to close,
+ * exactly as for every other mutation above.
  */
 int	objstat(Store*, uchar *oid, int oidlen, Objinfo*);
 int	objcreate(Store*, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
-		Objinfo*);
+		Dirtyrec *dr, int ndr, Objinfo*);
 long	objread(Store*, uchar *oid, int oidlen, void *a, long n, uvlong off);
 int	objwrite(Store*, uchar *oid, int oidlen, void *a, long n, uvlong off,
 		uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr);
@@ -684,7 +696,8 @@ int	objtrunc(Store*, uchar *oid, int oidlen, uvlong len, uvlong ver,
 		uvlong wepoch, Dirtyrec *dr, int ndr);
 int	objremove(Store*, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 		Dirtyrec *dr, int ndr);
-int	objdiscard(Store*, uchar *oid, int oidlen);
+int	objdiscard(Store*, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
+		uvlong epoch);
 int	objcorrupt(Store*, uchar *oid, int oidlen, int set, Dirtyrec *dr,
 		int ndr);
 
@@ -715,4 +728,10 @@ int	stagewrite(Stage*, void *a, long n, uvlong off);
 int	stagefinal(Stage*, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr);
 			/* consumes the stage, whether it succeeds or not */
 void	stagediscard(Stage*);
+/*
+ * The idle sweep (§3.6).  It releases an expired stage's reservations
+ * but never frees the handle, which is the fid's: a later chunk or
+ * final=1 on one is refused `stage expired', and the fid's own clunk
+ * still calls stagediscard, which then finds nothing left to release.
+ */
 void	stagesweep(Store*, vlong now);

@@ -60,8 +60,17 @@ addmap(Upd *u, ulong blk, ulong grain, uchar *dig)
 
 	if(u->nmap == u->amap){
 		u->amap = u->amap ? 2*u->amap : 8;
-		if((m = realloc(u->map, u->amap*sizeof *m)) == nil)
+		/*
+		 * The allocator leaves errstr alone on failure, so every
+		 * failed allocation on these paths says so itself — an
+		 * untouched return would answer with whatever this proc
+		 * last said, which under §7's Reqqueue pool can be another
+		 * request's §2.6 wire error (§3.7).
+		 */
+		if((m = realloc(u->map, u->amap*sizeof *m)) == nil){
+			werrstr("out of memory");
 			return -1;
+		}
 		u->map = m;
 	}
 	m = &u->map[u->nmap++];
@@ -83,8 +92,10 @@ addfree(Upd *u, ulong grain)
 		return 0;
 	if(u->nfree == u->afree){
 		u->afree = u->afree ? 2*u->afree : 8;
-		if((f = realloc(u->freed, u->afree*sizeof *f)) == nil)
+		if((f = realloc(u->freed, u->afree*sizeof *f)) == nil){
+			werrstr("out of memory");
 			return -1;
+		}
 		u->freed = f;
 	}
 	u->freed[u->nfree++] = grain;
@@ -131,8 +142,10 @@ updcsum(Upd *u, Omap *mold, uchar csum[Csumlen])
 		csumdigests(nil, 0, csum);
 		return 0;
 	}
-	if((digs = malloc(u->nblk*Blkdlen)) == nil)
+	if((digs = malloc(u->nblk*Blkdlen)) == nil){
+		werrstr("out of memory");
 		return -1;
+	}
 	for(i = 0; i < u->nblk; i++)
 		digof(u, mold, i, digs + i*Blkdlen);
 	csumdigests(digs, u->nblk, csum);
@@ -248,12 +261,21 @@ updcommit(Upd *u, int state, uvlong ver, uvlong wepoch, vlong mtime,
  * §3.2: a store whose apply failed after its record was durable is
  * serving in-memory state that its own log no longer describes, so it
  * answers nothing until it has been opened again and replayed.  The
- * commit path refuses through the same flag (broken).
+ * commit path refuses through the same flag (broken).  Both are
+ * qllog's, which is where the batch that condemns the store sets them
+ * and where §3.2's failseq is read beside them.  It is taken alone and
+ * released before this call takes any other, so §7 rule 1 — no proc
+ * holds two state locks at once — still holds as stated.
  */
 static int
 serving(Store *s)
 {
-	if(s->fatal){
+	int f;
+
+	qlock(&s->qllog);
+	f = s->fatal;
+	qunlock(&s->qllog);
+	if(f){
 		werrstr("store condemned: in-memory state no longer matches "
 			"the log; open it again");
 		return 0;
@@ -310,7 +332,7 @@ mapread(Store *s, ulong slot, ulong emapslot)
 		qlock(&s->qlstate);
 		storecondemn(s, slot);
 		qunlock(&s->qlstate);
-		werrstr("slot %lud: extent map failed its checksum", slot);
+		werrstr("checksum mismatch: slot %lud, extent map", slot);
 		return nil;
 	}
 	return c;
@@ -364,7 +386,7 @@ updopen(Upd *u, Store *s, uchar *oid, int oidlen, uvlong newlen, int flags)
 	 */
 	if(e->bad && !(flags & Ubad)){
 		qunlock(&s->qlstate);
-		werrstr("slot %lud: extent map failed its checksum", slot);
+		werrstr("checksum mismatch: slot %lud, extent map", slot);
 		return -1;
 	}
 	u->slot = slot;
@@ -372,6 +394,7 @@ updopen(Upd *u, Store *s, uchar *oid, int oidlen, uvlong newlen, int flags)
 	u->e.oid = malloc(e->oidlen);
 	if(u->e.oid == nil){
 		qunlock(&s->qlstate);
+		werrstr("out of memory");
 		return -1;
 	}
 	memmove(u->e.oid, e->oid, e->oidlen);
@@ -475,6 +498,7 @@ updnew(Upd *u, Store *s, uchar *oid, int oidlen, uvlong newlen)
 	u->oslot = u->newslot != 0;
 	if((u->e.oid = malloc(oidlen)) == nil){
 		updabort(u);
+		werrstr("out of memory");
 		return -1;
 	}
 	memmove(u->e.oid, oid, oidlen);
@@ -571,9 +595,9 @@ stageblk(Upd *u, Omap *mold, ulong blk, uchar *src, ulong boff, ulong bn,
 		n = u->newlen - (uvlong)blk*s->sb.blksz;
 	blkdigest(buf, n, dig);
 	qlock(&s->qlstate);
+	/* grainalloc spells its own failure: disk full, or out of memory */
 	if(grainalloc(s, &g) < 0){
 		qunlock(&s->qlstate);
-		werrstr("disk full");
 		return -1;
 	}
 	qunlock(&s->qlstate);
@@ -583,9 +607,22 @@ stageblk(Upd *u, Omap *mold, ulong blk, uchar *src, ulong boff, ulong bn,
 		qunlock(&s->qlstate);
 		return -1;
 	}
-	if(addfree(u, mapgrain(mold, blk)) < 0)
+	/*
+	 * Until addmap names it, this grain is reserved and unreferenced:
+	 * updabort walks u->map to release what the update staged, so a
+	 * failure between the write and the naming would leave the
+	 * reservation held for the life of the process.  The grain is
+	 * released here instead, which is the same thing updabort would
+	 * have done for it.
+	 */
+	if(addfree(u, mapgrain(mold, blk)) < 0
+	|| addmap(u, blk, g, dig) < 0){
+		qlock(&s->qlstate);
+		grainstageclr(s, g);
+		qunlock(&s->qlstate);
 		return -1;
-	return addmap(u, blk, g, dig);
+	}
+	return 0;
 }
 
 /*
@@ -666,9 +703,9 @@ reblk(Upd *u, Omap *mold, ulong blk, uchar *buf)
 	if(newn < oldn)
 		return addmap(u, blk, g, dig);
 	qlock(&s->qlstate);
+	/* grainalloc spells its own failure: disk full, or out of memory */
 	if(grainalloc(s, &ng) < 0){
 		qunlock(&s->qlstate);
-		werrstr("disk full");
 		return -1;
 	}
 	qunlock(&s->qlstate);
@@ -678,9 +715,14 @@ reblk(Upd *u, Omap *mold, ulong blk, uchar *buf)
 		qunlock(&s->qlstate);
 		return -1;
 	}
-	if(addfree(u, g) < 0)
+	/* the same window as stageblk's, and released the same way */
+	if(addfree(u, g) < 0 || addmap(u, blk, ng, dig) < 0){
+		qlock(&s->qlstate);
+		grainstageclr(s, ng);
+		qunlock(&s->qlstate);
 		return -1;
-	return addmap(u, blk, ng, dig);
+	}
+	return 0;
 }
 
 /*
@@ -750,7 +792,7 @@ objstat(Store *s, uchar *oid, int oidlen, Objinfo *oi)
 
 int
 objcreate(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
-	Objinfo *oi)
+	Dirtyrec *dr, int ndr, Objinfo *oi)
 {
 	Upd u;
 	Ient *e;
@@ -758,8 +800,28 @@ objcreate(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 	uvlong qid;
 	int reuse;
 
+	/*
+	 * First, like every other mutating entry point: a condemned store
+	 * answers nothing (§3.2), and without this a create would read
+	 * s->idx below and answer `object exists' — a §2.6 wire error —
+	 * out of memory the store itself has declared untrustworthy.
+	 */
+	if(!serving(s))
+		return -1;
 	if(oidlen < 1 || oidlen > Oidmax){
-		werrstr("oid length %d", oidlen);
+		werrstr("bad object name: oid length %d", oidlen);
+		return -1;
+	}
+	/*
+	 * layer-a §1.3 forbids the key: ver starts at 1 and absence is not
+	 * (0, 0).  Unlike stagefinal's, this refusal is §3.7's internal
+	 * kind and carries no §2.6 prefix — a client create's version is
+	 * this instance's own to choose (layer-a §5.4 step 3), and the
+	 * op=create receiver arbitrates rather than calling here (§3.6) —
+	 * so a version of 0 on this path is a caller bug.
+	 */
+	if(ver == 0){
+		werrstr("create at version 0");
 		return -1;
 	}
 	memset(&u, 0, sizeof u);
@@ -792,10 +854,22 @@ objcreate(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 		 * re-deletes it.  The decision is made here, under
 		 * qlstate, because that is where the tombstone's own key
 		 * is known not to be racing a commit.
+		 *
+		 * Like the ver==0 refusal above, this is §3.7's internal
+		 * kind and carries no §2.6 prefix: objcreate is the client
+		 * create path (§3.6), on which the version is this
+		 * instance's own to choose (layer-a §5.4 step 3) — chosen
+		 * by the rule this branch enforces — so any other value is
+		 * a caller bug.  The op=create receiver arbitrates before
+		 * calling here (§3.6), and an op=full over a tombstone
+		 * arbitrates in stagefinal, where the refusal is §2.6's
+		 * `stale version'.
 		 */
 		if(ver != e->ver + 1 || wepoch < e->wepoch){
 			qunlock(&s->qlstate);
-			werrstr("out of sequence");
+			werrstr("create at (%llud, %llud) over a tombstone "
+				"at (%llud, %llud)", wepoch, ver, e->wepoch,
+				e->ver);
 			return -1;
 		}
 		reuse = 1;
@@ -811,8 +885,14 @@ objcreate(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 		memset(&u.e, 0, sizeof u.e);
 	}
 	qunlock(&s->qlstate);
-	if((u.e.oid = malloc(oidlen)) == nil)
+	if((u.e.oid = malloc(oidlen)) == nil){
+		qlock(&s->qlstate);
+		if(u.slotresv)
+			slotresvclr(s, u.slot);
+		qunlock(&s->qlstate);
+		werrstr("out of memory");
 		return -1;
+	}
 	memmove(u.e.oid, oid, oidlen);
 	u.e.oidlen = oidlen;
 	if(!reuse){
@@ -831,7 +911,7 @@ objcreate(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 	u.oldnblk = 0;
 	u.newslot = 0;
 	u.oslot = 0;
-	if(updcommit(&u, Slive, ver, wepoch, time(nil), 0, nil, 0) < 0){
+	if(updcommit(&u, Slive, ver, wepoch, time(nil), 0, dr, ndr) < 0){
 		updclose(&u);
 		return -1;
 	}
@@ -870,6 +950,11 @@ objwrite(Store *s, uchar *oid, int oidlen, void *a, long n, uvlong off,
 		werrstr("object too large");
 		return -1;
 	}
+	/* objcreate's rule: a publish at version 0 is a caller bug */
+	if(ver == 0){
+		werrstr("write at version 0");
+		return -1;
+	}
 	if(objstat(s, oid, oidlen, &oi) < 0)
 		return -1;
 	if(oi.state != Slive){
@@ -899,6 +984,7 @@ objwrite(Store *s, uchar *oid, int oidlen, void *a, long n, uvlong off,
 	if((buf = malloc(s->sb.blksz)) == nil){
 		updabort(&u);
 		updclose(&u);
+		werrstr("out of memory");
 		return -1;
 	}
 	src = a;
@@ -951,12 +1037,18 @@ objtrunc(Store *s, uchar *oid, int oidlen, uvlong len, uvlong ver,
 		werrstr("object too large");
 		return -1;
 	}
+	/* objcreate's rule: a publish at version 0 is a caller bug */
+	if(ver == 0){
+		werrstr("truncate at version 0");
+		return -1;
+	}
 	if(updopen(&u, s, oid, oidlen, len, 0) < 0)
 		return -1;
 	mapopen(s, &mold, &u.e, u.cold);
 	if((buf = malloc(s->sb.blksz)) == nil){
 		updabort(&u);
 		updclose(&u);
+		werrstr("out of memory");
 		return -1;
 	}
 	if(freetail(&u, &mold) < 0
@@ -990,6 +1082,17 @@ objremove(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 
 	if(!serving(s))
 		return -1;
+	/*
+	 * objcreate's rule, and here it is the sharp one: a delete bumps
+	 * (wepoch, ver) like any write (layer-a §1.5), so a tombstone's
+	 * ver is always >= 2 — a tombstone published at (E, 0) forces the
+	 * re-create to ver 1, and a straggler live copy at (E, 1) with
+	 * different content then ties it (layer-a §1.3's I3).
+	 */
+	if(ver == 0){
+		werrstr("delete at version 0");
+		return -1;
+	}
 	if(updopen(&u, s, oid, oidlen, 0, 0) < 0)
 		return -1;
 	mapopen(s, &mold, &u.e, u.cold);
@@ -1054,15 +1157,26 @@ objcorrupt(Store *s, uchar *oid, int oidlen, int set, Dirtyrec *dr, int ndr)
 }
 
 /*
- * layer-a §1.5's discard: once the cluster-wide conditions hold, the
- * tombstone's index slot returns to the free list.  One Eslot, and
- * §3.5 is what keeps the slot out of the allocator until the commit
- * that freed it is durable.
+ * layer-a §1.5's discard.  The primary establishes the cluster-wide
+ * conditions; the receiver re-checks, locally, the two that bear on
+ * its own safety — its record is a tombstone whose key is exactly the
+ * one the discard names, and that tombstone's wepoch is strictly
+ * below the receiver's current map epoch.  Both checks are made here,
+ * inside the call and under one hold of qlstate, because a separate
+ * objstat is a second read of a record an op=delete can replace in
+ * between: the tombstone the caller inspected is then not the one
+ * dropped, and the replacement goes unconfirmed — §1.5's resurrection
+ * hole, through the API.  Once the checks hold, the tombstone's index
+ * slot returns to the free list: one Eslot, and §3.5 is what keeps
+ * the slot out of the allocator until the commit that freed it is
+ * durable.
  */
 int
-objdiscard(Store *s, uchar *oid, int oidlen)
+objdiscard(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
+	uvlong epoch)
 {
 	Item it;
+	Ient *e;
 	long slot;
 
 	if(!serving(s))
@@ -1070,12 +1184,27 @@ objdiscard(Store *s, uchar *oid, int oidlen)
 	qlock(&s->qlstate);
 	if((slot = ientfind(s, oid, oidlen)) < 0){
 		qunlock(&s->qlstate);
+		/* an absent id is §5.6's `no such object', not check (i); §3.7 */
 		werrstr("no such object");
 		return -1;
 	}
-	if(s->idx[slot].state != Stomb){
+	e = &s->idx[slot];
+	if(e->state != Stomb){
 		qunlock(&s->qlstate);
-		werrstr("not a tombstone");
+		werrstr("not discardable: not a tombstone");
+		return -1;
+	}
+	if(e->wepoch != wepoch || e->ver != ver){
+		qunlock(&s->qlstate);
+		werrstr("not discardable: tombstone at (%llud, %llud), "
+			"discard names (%llud, %llud)", e->wepoch, e->ver,
+			wepoch, ver);
+		return -1;
+	}
+	if(e->wepoch >= epoch){
+		qunlock(&s->qlstate);
+		werrstr("not discardable: wepoch %llud not below epoch %llud",
+			e->wepoch, epoch);
 		return -1;
 	}
 	qunlock(&s->qlstate);
@@ -1125,6 +1254,7 @@ objread(Store *s, uchar *oid, int oidlen, void *a, long n, uvlong off)
 	mapopen(s, &m, &e, c);
 	if((buf = malloc(s->sb.blksz)) == nil){
 		emapunpin(s, c);
+		werrstr("out of memory");
 		return -1;
 	}
 	dst = a;
@@ -1205,12 +1335,14 @@ objverify(Store *s, uchar *oid, int oidlen, Vfy *v)
 		free(buf);
 		free(digs);
 		emapunpin(s, c);
+		werrstr("out of memory");
 		return -1;
 	}
 	if(nblk > 0 && (v->bad = malloc(nblk*sizeof *v->bad)) == nil){
 		free(buf);
 		free(digs);
 		emapunpin(s, c);
+		werrstr("out of memory");
 		return -1;
 	}
 	for(i = 0; i < nblk; i++){
@@ -1267,7 +1399,7 @@ stageopen(Store *s, uchar *oid, int oidlen, uvlong len, int force)
 	uvlong nblk;
 
 	if(oidlen < 1 || oidlen > Oidmax){
-		werrstr("oid length %d", oidlen);
+		werrstr("bad object name: oid length %d", oidlen);
 		return nil;
 	}
 	if(len > s->sb.objmax){
@@ -1275,8 +1407,10 @@ stageopen(Store *s, uchar *oid, int oidlen, uvlong len, int force)
 		return nil;
 	}
 	nblk = blkcount(len, s->sb.blksz);
-	if((g = mallocz(sizeof *g, 1)) == nil)
+	if((g = mallocz(sizeof *g, 1)) == nil){
+		werrstr("out of memory");
 		return nil;
+	}
 	g->s = s;
 	memmove(g->oid, oid, oidlen);
 	g->oidlen = oidlen;
@@ -1291,6 +1425,7 @@ stageopen(Store *s, uchar *oid, int oidlen, uvlong len, int force)
 			free(g->grain);
 			free(g->dig);
 			free(g);
+			werrstr("out of memory");
 			return nil;
 		}
 	}
@@ -1301,8 +1436,8 @@ stageopen(Store *s, uchar *oid, int oidlen, uvlong len, int force)
 	return g;
 }
 
-int
-stagewrite(Stage *g, void *a, long n, uvlong off)
+static int
+stagewrite1(Stage *g, void *a, long n, uvlong off)
 {
 	Store *s;
 	uchar *buf, *src;
@@ -1319,12 +1454,18 @@ stagewrite(Stage *g, void *a, long n, uvlong off)
 	 * negative count is refused in its own right rather than by that
 	 * same accident.
 	 */
-	if(n < 0 || off > g->len || (uvlong)n > g->len - off){
-		werrstr("chunk past the declared length");
+	if(n < 0){
+		werrstr("negative chunk");
 		return -1;
 	}
-	if((buf = malloc(s->sb.blksz)) == nil)
+	if(off > g->len || (uvlong)n > g->len - off){
+		werrstr("bad ctl: chunk past the declared length");
 		return -1;
+	}
+	if((buf = malloc(s->sb.blksz)) == nil){
+		werrstr("out of memory");
+		return -1;
+	}
 	src = a;
 	left = n;
 	blk = off / s->sb.blksz;
@@ -1352,10 +1493,10 @@ stagewrite(Stage *g, void *a, long n, uvlong off)
 			werrstr("disk full");
 			return -1;
 		}
+		/* grainalloc spells its own failure: disk full, or OOM */
 		if(grainalloc(s, &gr) < 0){
 			qunlock(&s->qlstate);
 			free(buf);
-			werrstr("disk full");
 			return -1;
 		}
 		qunlock(&s->qlstate);
@@ -1395,9 +1536,44 @@ stagewrite(Stage *g, void *a, long n, uvlong off)
 		boff = 0;
 	}
 	free(buf);
-	g->last = nsec();
 	devpoint(s->d, "stage", 0);
 	return 0;
+}
+
+/*
+ * §3.6's sweep trigger is "no chunk has *arrived* for stagems", so the
+ * clock is refreshed at entry, under qlstate, and busy pins the handle
+ * for the chunk's whole flight: the grain I/O above runs with qlstate
+ * released, and a sweep firing in one of those windows would return
+ * every grain the handle names to the allocator and strip the arrays
+ * the write is still indexing.  A handle the sweep has already
+ * stripped is spent — the chunks before this one are gone, so carrying
+ * on would publish holes in their place at final=1 — and the refusal
+ * tells the owner to discard it and restart the transfer, which is
+ * free (§3.6).
+ */
+int
+stagewrite(Stage *g, void *a, long n, uvlong off)
+{
+	Store *s;
+	int r;
+
+	s = g->s;
+	qlock(&s->qlstate);
+	if(g->dead){
+		qunlock(&s->qlstate);
+		werrstr("stage expired");
+		return -1;
+	}
+	g->busy = 1;
+	g->last = nsec();
+	qunlock(&s->qlstate);
+	r = stagewrite1(g, a, n, off);
+	qlock(&s->qlstate);
+	g->busy = 0;
+	g->last = nsec();
+	qunlock(&s->qlstate);
+	return r;
 }
 
 /* caller holds qlstate */
@@ -1422,13 +1598,23 @@ stagediscard(Stage *g)
 	if(g == nil)
 		return;
 	s = g->s;
+	/*
+	 * Unlink first, and tolerate a handle that is already off the
+	 * list: stagesweep strips an expired handle — releases its
+	 * grains, zeroes its entries and unlinks it — but the memory
+	 * stays the owner's, so the discard the clunk or flush issues
+	 * afterwards finds nothing left to release and only frees.
+	 * That is what keeps the sweep and a clunk from releasing the
+	 * same reservation twice — a double grainstageclr removes
+	 * whatever reservation the allocator has since handed out.
+	 */
 	qlock(&s->qlstate);
+	stageunlink(s, g);
 	for(i = 0; i < g->nblk; i++)
 		if(g->grain[i] != 0){
 			grainstageclr(s, g->grain[i]);
 			s->nstagegrain--;
 		}
-	stageunlink(s, g);
 	qunlock(&s->qlstate);
 	free(g->grain);
 	free(g->dig);
@@ -1459,7 +1645,9 @@ keycmp(uvlong we, uvlong ver, uvlong we2, uvlong ver2)
  * that refuses the push has ended the transfer, and so has a commit
  * that could not be made, so the handle is spent either way and its
  * reservations must not outlive it.  The caller's error is preserved
- * across the release.
+ * across the release.  A grain the handle has already handed to the
+ * update (below) is not the handle's any more, so the release here
+ * releases only what the handle still owns.
  */
 static int
 stagefail(Stage *g)
@@ -1470,6 +1658,40 @@ stagefail(Stage *g)
 	stagediscard(g);
 	werrstr("%s", e);
 	return -1;
+}
+
+/*
+ * Hand the stage's grains below lim to the update whose map now names
+ * them: from this moment updabort is their releaser, so the handle
+ * stops counting them and stops naming them.  Ownership must transfer
+ * exactly once — after updabort has released a grain, the allocator
+ * may hand it to another proc's stage at any moment, and a second
+ * grainstageclr from stagediscard would remove *that* reservation:
+ * two objects sharing a grain, undetectable by arbitration.
+ *
+ * The nstagegrain charge is dropped here, but the grains stay in the
+ * staged *set* until the commit's apply moves them to the bitmap — so
+ * between handoff and apply the counter under-counts the set by this
+ * stage's grains, and concurrent chunks can briefly push the set past
+ * stagetot by that amount.  Deliberate: §3.6's bound is back-pressure
+ * on reservations, and these grains are still reserved either way, so
+ * there is no reuse risk — only a bound read low for the moments a
+ * commit is in flight.
+ */
+static void
+stagehandoff(Stage *g, uvlong lim)
+{
+	Store *s;
+	uvlong i;
+
+	s = g->s;
+	qlock(&s->qlstate);
+	for(i = 0; i < lim; i++)
+		if(g->grain[i] != 0){
+			g->grain[i] = 0;
+			s->nstagegrain--;
+		}
+	qunlock(&s->qlstate);
 }
 
 int
@@ -1484,8 +1706,48 @@ stagefinal(Stage *g, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 	int absent, corrupt, c;
 
 	s = g->s;
+	/*
+	 * The handle leaves s->stages before anything here drops qlstate:
+	 * stagesweep strips any handle whose last chunk arrived more than
+	 * stagems ago, and a final=1 parked in the commit — waiting on a
+	 * checkpoint, say — gets older than stagems by nothing more than
+	 * bad luck.  Swept mid-commit, the stage's grains would return to
+	 * the allocator while the commit was about to publish them.  §3.6:
+	 * the sweep's triggers are for a stage whose final=1 has not been
+	 * attempted, and for no other.  stagediscard's unlink of an
+	 * already-unlinked handle is a harmless no-op.
+	 */
+	qlock(&s->qlstate);
+	stageunlink(s, g);
+	if(g->dead){
+		/*
+		 * The sweep stripped this handle: its chunks are gone, so
+		 * committing it would publish holes in their place.  The
+		 * handle is spent like any other final=1 outcome — the
+		 * discard below finds nothing to release and frees it.
+		 */
+		qunlock(&s->qlstate);
+		werrstr("stage expired");
+		return stagefail(g);
+	}
+	qunlock(&s->qlstate);
 	if(!serving(s))
 		return stagefail(g);
+	/*
+	 * layer-a §1.3: ver starts at 1 on create, and absence is not
+	 * (0, 0) — so a live object at version 0 is a key the contract
+	 * says cannot exist.  Nothing further down would refuse one: the
+	 * comparison is skipped entirely for a receiver with no key to
+	 * defend, which is both of §3.6's cases, so an absent or corrupt
+	 * copy would take the push and be published at (wepoch, 0).  On
+	 * the wire the version comes out of the op=full header, so a
+	 * value the model forbids is a malformed header — layer-a §5.5's
+	 * common set, `bad ctl'.
+	 */
+	if(ver == 0){
+		werrstr("bad ctl: op=full at version 0");
+		return stagefail(g);
+	}
 	qlock(&s->qlstate);
 	slot = ientfind(s, g->oid, g->oidlen);
 	absent = slot < 0 || s->idx[slot].state == Sfree;
@@ -1536,54 +1798,65 @@ stagefinal(Stage *g, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 		else
 			zerodigest(s, g->len, i, dig);
 		if(addmap(&u, i, g->grain[i], dig) < 0){
+			/*
+			 * Grains below i are the update's — updabort releases
+			 * them, once — and grains from i on are still the
+			 * handle's, which stagefail's discard releases.
+			 */
+			stagehandoff(g, i);
 			updabort(&u);
 			updclose(&u);
 			return stagefail(g);
 		}
 	}
+	stagehandoff(g, g->nblk);
 	if(updcommit(&u, Slive, ver, wepoch, time(nil), corrupt, dr, ndr) < 0){
 		updclose(&u);
 		return stagefail(g);
 	}
 	updclose(&u);
-	qlock(&s->qlstate);
-	for(i = 0; i < g->nblk; i++)
-		if(g->grain[i] != 0)
-			s->nstagegrain--;
-	stageunlink(s, g);
-	qunlock(&s->qlstate);
-	free(g->grain);
-	free(g->dig);
-	free(g);
+	/* nothing left in the handle: this frees it and releases no grain */
+	stagediscard(g);
 	return 0;
 }
 
 void
 stagesweep(Store *s, vlong now)
 {
-	Stage *g, *next, *dead;
+	Stage *g, *next;
 	uvlong i;
 
-	dead = nil;
 	qlock(&s->qlstate);
 	for(g = s->stages; g != nil; g = next){
 		next = g->next;
-		if(now - g->last <= (vlong)s->cfg.stagems*1000000LL)
+		/*
+		 * §3.6: the trigger is a stage no chunk has *arrived* for in
+		 * stagems.  busy is a chunk in flight right now — its arrival
+		 * refreshed g->last at entry, but a chunk can be in flight
+		 * longer than stagems, and sweeping under it frees grains a
+		 * write is still filling.
+		 */
+		if(g->busy || now - g->last <= (vlong)s->cfg.stagems*1000000LL)
 			continue;
+		/*
+		 * Strip the handle; never free it.  The memory is the owner's
+		 * (store.h) — the /repl fid still holds the pointer, and its
+		 * clunk's stagediscard is what frees it.  Freeing here is a
+		 * use-after-free the moment the owner's next call arrives.
+		 * The strip zeroes every grain entry as it releases it, so
+		 * that later discard releases nothing twice; dead is what
+		 * makes a later chunk or final=1 refuse instead of finishing
+		 * a transfer whose earlier chunks are gone.
+		 */
 		stageunlink(s, g);
 		for(i = 0; i < g->nblk; i++)
 			if(g->grain[i] != 0){
 				grainstageclr(s, g->grain[i]);
+				g->grain[i] = 0;
 				s->nstagegrain--;
 			}
-		g->next = dead;
-		dead = g;
+		g->ngrain = 0;
+		g->dead = 1;
 	}
 	qunlock(&s->qlstate);
-	for(g = dead; g != nil; g = next){
-		next = g->next;
-		free(g->grain);
-		free(g->dig);
-		free(g);
-	}
 }

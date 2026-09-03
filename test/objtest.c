@@ -24,7 +24,7 @@ mk(Store *s, char *name)
 	uchar o[Oidmax];
 
 	oidof(o, name);
-	if(objcreate(s, o, strlen(name), 1, 1, nil) < 0)
+	if(objcreate(s, o, strlen(name), 1, 1, nil, 0, nil) < 0)
 		fail("objcreate %s: %r", name);
 }
 
@@ -377,7 +377,8 @@ heldwrite(void *a)
 			h->err = 1;
 	}else{
 		oidof(o, "gone");
-		if(objdiscard(h->s, o, 4) < 0)
+		/* the tombstone rmv left is at (wepoch 1, ver 2) */
+		if(objdiscard(h->s, o, 4, 2, 1, 2) < 0)
 			h->err = 1;
 	}
 	free(buf);
@@ -523,6 +524,11 @@ tstage(void)
 	stagesweep(s, nsec());
 	storestat(s, &st2);
 	eqv("a stage that has gone quiet is swept", st2.grainfree, before);
+	/* the sweep strips the handle; the owner still frees it */
+	stagediscard(g);
+	storestat(s, &st2);
+	eqv("discarding a swept stage releases nothing twice",
+		st2.grainfree, before);
 
 	/*
 	 * The restart case: a checkpoint while the stage is live, then
@@ -778,6 +784,448 @@ tstagefault(void)
 }
 
 /*
+ * §3.6: the sweep's triggers are for a stage whose final=1 has not
+ * been attempted, and for no other.  A final=1 parked in the commit —
+ * held here at §13's batch hook, as it would be waiting on a
+ * checkpoint — gets older than stagems by nothing but bad luck, and a
+ * sweep that still saw the handle would return its grains to the
+ * allocator under the commit that is about to publish them: another
+ * object can be handed the same grain (two objects sharing a grain,
+ * undetectable by arbitration), and the committing proc then
+ * double-frees.  stagefinal therefore takes the handle off the sweep's
+ * list before it drops qlstate.
+ */
+typedef struct Fin Fin;
+struct Fin
+{
+	Stage	*g;
+	int	done;
+	int	err;
+};
+
+static Fin fin;
+
+static void
+finproc(void *a)
+{
+	Fin *f;
+
+	f = a;
+	if(stagefinal(f->g, 9, 1, nil, 0) < 0)
+		f->err = 1;
+	f->done = 1;
+}
+
+static void
+tsweepfinal(void)
+{
+	Dev *d;
+	Store *s;
+	Stage *g;
+	Storestat st;
+	uchar *buf, *got, o[Oidmax];
+	uvlong seq, before;
+	int i;
+
+	d = newdisk();
+	if((s = mustopen(d, "a sweep against a parked final")) == nil)
+		return;
+	buf = mkbuf(2*Blk, 73);
+	if((got = malloc(2*Blk)) == nil)
+		sysfatal("malloc: %r");
+	oidof(o, "sw");
+	storestat(s, &st);
+	before = st.grainfree;
+	seq = st.seqnext;
+	if((g = stageopen(s, o, 2, 2*Blk, 0)) == nil){
+		fail("stageopen: %r");
+		storeclose(s);
+		devclose(d);
+		free(buf);
+		free(got);
+		return;
+	}
+	if(stagewrite(g, buf, 2*Blk, 0) < 0)
+		fail("stagewrite: %r");
+	storestat(s, &st);
+	eqv("two grains are staged", st.staged, 2);
+
+	/* park the final's commit, let the stage age past stagems, sweep */
+	storehook(s, "batch", seq);
+	fin.g = g;
+	fin.done = 0;
+	fin.err = 0;
+	if(spawnproc(finproc, &fin) < 0){
+		fail("spawn: %r");
+		storehook(s, "batch", 0);
+		storeclose(s);
+		devclose(d);
+		free(buf);
+		free(got);
+		return;
+	}
+	for(i = 0; i < 4000; i++){
+		storestat(s, &st);
+		if(st.seqnext > seq)
+			break;
+		sleep(1);
+	}
+	sleep(80);			/* t1.h's stagems is 50 */
+	stagesweep(s, nsec());
+	storestat(s, &st);
+	eqv("the sweep leaves a parked final's grains reserved",
+		st.grainfree, before - 2);
+
+	storehook(s, "batch", 0);
+	for(i = 0; i < 4000 && !fin.done; i++)
+		sleep(1);
+	istrue("the parked final completed", fin.done && !fin.err);
+	storestat(s, &st);
+	eqv("and its grains were published, not released", st.grainfree,
+		before - 2);
+	eqv("nothing is left staged", st.staged, 0);
+	rd(s, "sw", got, 2*Blk, 0, "after the sweep");
+	checks++;
+	if(memcmp(got, buf, 2*Blk) != 0)
+		fail("a swept final's content differs");
+	mustverify(s, "sw", "after the sweep");
+	storeclose(s);
+	devclose(d);
+	free(buf);
+	free(got);
+}
+
+/*
+ * §3.6's own words for the sweep's idle trigger: a stage is swept when
+ * no chunk has *arrived* for stagems.  A peer that pauses past stagems
+ * and then resumes — no clunk, no flush — sends a chunk into a stage
+ * whose g->last is still the previous chunk's, and a sweep firing
+ * while that chunk is in flight would return every grain the handle
+ * names to the allocator and strip the arrays stagewrite is still
+ * indexing: reservations released mid-write, then a fault, with the
+ * writer holding qlstate — the whole store wedged.  So stagewrite
+ * refreshes the clock at entry, under qlstate, and pins the handle
+ * busy for the chunk's flight, and the sweep skips both.
+ *
+ * The chunk is made slow (simslow plus one device op per block) and
+ * the sweep is issued from this proc while it runs, which is the
+ * probe shape that faulted before the fix; the failing form here is a
+ * FAIL — the writer never returns, or the counters moved — never a
+ * suite hang, because nothing below touches the store until the
+ * writer has been seen to finish.
+ *
+ * Mutation: drop the entry pin (call stagewrite1 directly) and let
+ * stagesweep free a swept handle as it used to; the writer dies
+ * mid-chunk and this test FAILs instead of passing.
+ */
+enum
+{
+	Swblk	= 256,			/* blocks in the staged object */
+};
+
+typedef struct Sw Sw;
+struct Sw
+{
+	Stage	*g;
+	uchar	*buf;
+	int	started;
+	int	done;
+	int	r;
+};
+
+static Sw sw;
+
+static void
+swproc(void *a)
+{
+	Sw *p;
+
+	p = a;
+	p->started = 1;
+	/* offset 1: every block of the declared length is touched */
+	p->r = stagewrite(p->g, p->buf, Swblk*Blk - 1, 1);
+	p->done = 1;
+}
+
+static void
+tsweepchunk(void)
+{
+	Dev *d;
+	Store *s;
+	Stage *g;
+	Storecfg c;
+	Fmtcfg fc;
+	Super sb;
+	Storestat st;
+	uchar *buf, o[Oidmax];
+	uvlong g0;
+	int i, mid;
+
+	/* a geometry wide enough for a long chunk: 256 blocks, 16 MiB */
+	if((d = simopen(512, 32768, 0x5ea1)) == nil)
+		sysfatal("simopen: %r");
+	memset(&fc, 0, sizeof fc);
+	fc.secsz = 512;
+	fc.blksz = Blk;
+	fc.objmax = (uvlong)Swblk*Blk;
+	fc.nslots = 128;
+	fc.nemap = 32;
+	fc.ndirty = 64;
+	fc.logbytes = 256*1024;
+	fc.csumalg = Csumblake2s;
+	if(geometry(&sb, &fc, d->size) < 0)
+		sysfatal("geometry: %r");
+	if(fmtstore(d, &sb) < 0)
+		sysfatal("fmtstore: %r");
+	tcfg(&c);
+	c.stagemax = 4*Swblk;
+	c.stagetot = 8*Swblk;
+	if((s = storeopen(d, &c)) == nil){
+		fail("a sweep against a chunk in flight: storeopen: %r");
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(Swblk*Blk, 31);
+	oidof(o, "swc");
+	storestat(s, &st);
+	g0 = st.grainfree;
+	if((g = stageopen(s, o, 3, (uvlong)Swblk*Blk, 0)) == nil){
+		fail("stageopen: %r");
+		storeclose(s);
+		devclose(d);
+		free(buf);
+		return;
+	}
+	/*
+	 * The stage goes quiet past stagems (t1.h's is 50): nothing
+	 * clunks or flushes the fid, the peer is merely slow, and
+	 * g->last is still the stageopen time when the chunk arrives.
+	 */
+	sleep(80);
+	simslow(d, 1);
+	sw.g = g;
+	sw.buf = buf;
+	sw.started = 0;
+	sw.done = 0;
+	sw.r = -1;
+	if(spawnproc(swproc, &sw) < 0){
+		fail("spawn: %r");
+		stagediscard(g);
+		storeclose(s);
+		devclose(d);
+		free(buf);
+		return;
+	}
+	for(i = 0; i < 2000 && !sw.started; i++)
+		sleep(1);
+	sleep(3);			/* let it get into the loop */
+	mid = sw.done;
+	stagesweep(s, nsec());
+	for(i = 0; i < 10000 && !sw.done; i++)
+		sleep(1);
+	checks++;
+	if(!sw.done){
+		/*
+		 * Nothing below may touch the store or the buffer: the
+		 * writer may hold qlstate, so a storestat here would turn
+		 * this FAIL into a suite hang.  The store, the device and
+		 * the buffer are leaked so the suite can report.
+		 */
+		fail("the chunk the sweep raced never returned (faulted?)");
+		return;
+	}
+	simslow(d, 0);
+	istrue("the sweep ran while the chunk was in flight", !mid);
+	istrue("the chunk reported success", sw.r == 0);
+	storestat(s, &st);
+	eqv("every grain the chunk staged is still reserved", st.staged,
+		Swblk);
+	eqv("and charged against the free count", st.grainfree, g0 - Swblk);
+	stagediscard(g);
+	storestat(s, &st);
+	eqv("the discard releases them all, once", st.grainfree, g0);
+	eqv("and empties the staged set", st.staged, 0);
+	storeclose(s);
+	devclose(d);
+	free(buf);
+}
+
+/*
+ * The other half of the sweep's contract: a handle it has swept is
+ * stripped, not freed — the memory is the owner's (store.h), and the
+ * fid that owns it will still write, final or clunk it.  A chunk into
+ * a swept stage must refuse (its predecessors are gone, so finishing
+ * the transfer would publish holes in their place); a final=1 must
+ * refuse the same way and consume the handle; and the clunk's discard
+ * must find nothing left to release, or the sweep and the clunk free
+ * the same reservation twice — removing whichever reservation the
+ * allocator handed out in between.
+ *
+ * Mutation: the tsweepchunk one (stagesweep frees) — the discard and
+ * the write below then run over freed memory and the counters move.
+ */
+static void
+tsweepexpire(void)
+{
+	Dev *d;
+	Store *s;
+	Stage *g;
+	Storestat st;
+	Objinfo oi;
+	uchar *buf, o[Oidmax];
+	uvlong g0;
+
+	d = newdisk();
+	if((s = mustopen(d, "a swept handle's later calls")) == nil)
+		return;
+	buf = mkbuf(2*Blk, 43);
+	oidof(o, "se");
+	storestat(s, &st);
+	g0 = st.grainfree;
+
+	/* a later chunk refuses, and the clunk's discard releases nothing */
+	if((g = stageopen(s, o, 2, 2*Blk, 0)) == nil)
+		fail("stageopen: %r");
+	else{
+		if(stagewrite(g, buf, 2*Blk, 0) < 0)
+			fail("stagewrite: %r");
+		sleep(80);
+		stagesweep(s, nsec());
+		storestat(s, &st);
+		eqv("the sweep released the stage's grains", st.grainfree, g0);
+		eqv("and emptied the staged set", st.staged, 0);
+		refused("a chunk into a swept stage",
+			stagewrite(g, buf, Blk, 0), "stage expired");
+		storestat(s, &st);
+		eqv("the refused chunk staged nothing", st.staged, 0);
+		stagediscard(g);
+		storestat(s, &st);
+		eqv("the discard of a swept stage releases nothing twice",
+			st.grainfree, g0);
+	}
+
+	/* and a final=1 on a swept handle refuses and consumes it */
+	if((g = stageopen(s, o, 2, 2*Blk, 0)) == nil)
+		fail("stageopen: %r");
+	else{
+		if(stagewrite(g, buf, 2*Blk, 0) < 0)
+			fail("stagewrite: %r");
+		sleep(80);
+		stagesweep(s, nsec());
+		refused("a final=1 on a swept stage",
+			stagefinal(g, 9, 1, nil, 0), "stage expired");
+		checks++;
+		if(ostat(s, "se", &oi) >= 0)
+			fail("a swept stage's final published the object");
+		storestat(s, &st);
+		eqv("the refused final leaves nothing staged", st.staged, 0);
+		eqv("and the free count where it was", st.grainfree, g0);
+	}
+	storeclose(s);
+	devclose(d);
+	free(buf);
+}
+
+/*
+ * stagefinal's updcommit-failure exit, pinned: by the time updcommit
+ * runs, stagehandoff has zeroed g->grain and dropped the staged
+ * charge, so the discard inside stagefail releases nothing — the
+ * grains' release must come from updcommit's own updabort, exactly
+ * once.  A missing release leaks them for the life of the process; a
+ * second one removes a reservation the allocator has since handed to
+ * someone else.
+ *
+ * Mutation: updcommit's logcommit-failure path calls updfree instead
+ * of updabort, and the grain below stays reserved forever.
+ */
+static void
+tfinalfault(void)
+{
+	Dev *d;
+	Store *s;
+	Stage *g;
+	Storestat st;
+	uchar *buf, o[Oidmax];
+	uvlong g0;
+
+	d = newdisk();
+	if((s = mustopen(d, "a final whose commit fails")) == nil)
+		return;
+	buf = mkbuf(Blk, 47);
+	/*
+	 * A first create, so §2.2's qid batch is already published:
+	 * otherwise the absent-object final's own qidalloc is the first
+	 * ever, its batch publish takes the armed fault, and the test
+	 * ends in updnew without ever reaching updcommit.
+	 */
+	mk(s, "warm");
+	oidof(o, "ff");
+	storestat(s, &st);
+	g0 = st.grainfree;
+	if((g = stageopen(s, o, 2, Blk, 0)) == nil)
+		fail("stageopen: %r");
+	else{
+		if(stagewrite(g, buf, Blk, 0) < 0)
+			fail("stagewrite: %r");
+		simfault(d, Sfeio, 0);		/* sticky: the log write fails */
+		checks++;
+		if(stagefinal(g, 9, 1, nil, 0) >= 0)
+			fail("a final whose log write failed reported success");
+		simfault(d, Sfnone, 0);
+		storestat(s, &st);
+		eqv("the handed-off grain is released exactly once",
+			st.grainfree, g0);
+		eqv("and nothing is left staged", st.staged, 0);
+	}
+	storeclose(s);
+	devclose(d);
+	free(buf);
+}
+
+/*
+ * layer-a §1.5's receiver checks, made inside objdiscard: the record
+ * must be a tombstone at exactly the key the discard names, with
+ * wepoch strictly below the given epoch.  Checked in the call rather
+ * than by a separate objstat because the two-step is not atomic: an
+ * op=delete between them replaces the tombstone, and the replacement
+ * would be dropped unconfirmed — §1.5's resurrection hole.
+ */
+static void
+tdiscard(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	uchar oid[Oidmax];
+
+	d = newdisk();
+	if((s = mustopen(d, "tombstone discard")) == nil)
+		return;
+	mk(s, "dd");
+	oidof(oid, "dd");
+	if(objremove(s, oid, 2, 3, 1, nil, 0) < 0)
+		fail("objremove: %r");
+	/* the tombstone is at (wepoch 1, ver 3) */
+	refused("a discard naming the wrong ver",
+		objdiscard(s, oid, 2, 2, 1, 5), "not discardable");
+	refused("a discard naming the wrong wepoch",
+		objdiscard(s, oid, 2, 3, 2, 5), "not discardable");
+	refused("a discard at an epoch the tombstone's wepoch reaches",
+		objdiscard(s, oid, 2, 3, 1, 1), "not discardable");
+	refused("a discard of an id nothing holds",
+		objdiscard(s, (uchar*)"zz", 2, 3, 1, 5), "no such object");
+	storestat(s, &st);
+	eqv("a refused discard keeps the tombstone", st.ntomb, 1);
+	checks++;
+	if(objdiscard(s, oid, 2, 3, 1, 5) < 0)
+		fail("a discard naming the key exactly: %r");
+	storestat(s, &st);
+	eqv("the discard freed the tombstone", st.ntomb, 0);
+	storeclose(s);
+	devclose(d);
+}
+
+/*
  * §3.2: a store whose apply failed after its record was durable is
  * serving in-memory state that its own log no longer describes, so it
  * "answers nothing until it has been opened again".  Nothing is
@@ -812,6 +1260,47 @@ tcondemned(void)
 	}
 	storehook(s, "fatal", 1);
 	w = "store condemned";
+	/*
+	 * objcreate must refuse through serving() like every other
+	 * mutating entry point — asserted against serving()'s full text,
+	 * because the commit path's own refusal also begins `store
+	 * condemned' and a prefix match cannot tell them apart: without
+	 * the serving() call a create of a new name would read the index,
+	 * reach logcommit and answer the *commit* path's refusal, and a
+	 * create of an existing name would answer `object exists' — a
+	 * §2.6 wire error — out of memory the store itself has declared
+	 * untrustworthy.
+	 */
+	{
+		char e[ERRMAX];
+		uchar on[Oidmax];
+		char *full = "store condemned: in-memory state no longer "
+			"matches the log; open it again";
+
+		oidof(on, "znew");
+		checks++;
+		if(objcreate(s, on, 4, 3, 1, nil, 0, nil) >= 0)
+			fail("objcreate of a new id on a condemned store was "
+				"accepted");
+		else{
+			rerrstr(e, sizeof e);
+			checks++;
+			if(strcmp(e, full) != 0)
+				fail("objcreate (new id) on a condemned store: "
+					"%s, want serving()'s refusal", e);
+		}
+		checks++;
+		if(objcreate(s, o, 1, 3, 1, nil, 0, nil) >= 0)
+			fail("objcreate of a live id on a condemned store was "
+				"accepted");
+		else{
+			rerrstr(e, sizeof e);
+			checks++;
+			if(strcmp(e, full) != 0)
+				fail("objcreate (live id) on a condemned store: "
+					"%s, want serving()'s refusal", e);
+		}
+	}
 	refused("objstat on a condemned store", objstat(s, o, 1, &oi), w);
 	refused("objread on a condemned store",
 		objread(s, o, 1, buf, Blk, 0), w);
@@ -821,7 +1310,8 @@ tcondemned(void)
 		objtrunc(s, o, 1, 0, 3, 1, nil, 0), w);
 	refused("objremove on a condemned store",
 		objremove(s, o, 1, 3, 1, nil, 0), w);
-	refused("objdiscard on a condemned store", objdiscard(s, o, 1), w);
+	refused("objdiscard on a condemned store",
+		objdiscard(s, o, 1, 2, 1, 2), w);
 	refused("objcorrupt on a condemned store",
 		objcorrupt(s, o, 1, 1, nil, 0), w);
 	refused("stagewrite on a condemned store",
@@ -851,7 +1341,7 @@ texhaust(void)
 	for(i = 0; i < 200; i++){
 		snprint(name, sizeof name, "s%d", i);
 		oidof(o, name);
-		if(objcreate(s, o, strlen(name), 1, 1, nil) < 0){
+		if(objcreate(s, o, strlen(name), 1, 1, nil, 0, nil) < 0){
 			n = i;
 			break;
 		}
@@ -868,7 +1358,7 @@ texhaust(void)
 	oidof(o, name);
 	if(objremove(s, o, strlen(name), 2, 1, nil, 0) < 0)
 		fail("delete under slot exhaustion: %r");
-	if(objdiscard(s, o, strlen(name)) < 0)
+	if(objdiscard(s, o, strlen(name), 2, 1, 2) < 0)
 		fail("tombstone discard under slot exhaustion: %r");
 	storestat(s, &st);
 	eqv("the discard returned the slot", st.slotfree, 1);
@@ -984,8 +1474,12 @@ tdirty(void)
 	eqv("the dirty set survived replay", dirtycount(s), 2);
 	istrue("the record names its peer", dirtyhas(s, oid, 4, "node7.1"));
 	istrue("and the other peer", dirtyhas(s, oid, 4, "node8.2"));
-	istrue("every peer is fullsync after a restart",
-		storefullsync(s, "node7.1"));
+	/*
+	 * Start-up also marks every peer fullsync, but storefullsync
+	 * cannot witness it: nothing clears the flag yet (store.md §2.6),
+	 * so it answers 1 for every peer.  The assertion belongs to the
+	 * heal work that makes the flag real.
+	 */
 
 	/* checkpoint, restart: now the region itself is the source */
 	if(storecheckpoint(s) < 0)
@@ -1055,6 +1549,29 @@ tdirty(void)
 		dirtyhas(s, oid, 3, "node9.3"));
 	oidof(oid, "dck");
 	istrue("a corrupt flag's stale mark is durable",
+		dirtyhas(s, oid, 3, "node9.3"));
+
+	/*
+	 * A create is replicated like any other write (layer-a §2.4), so
+	 * it can leave a peer stale in exactly the same way and needs the
+	 * mark in exactly the same record.  Registered afterwards it would
+	 * be a second record, and a crash between the two leaves a live
+	 * object here that no peer is recorded as missing.
+	 */
+	dr[0].oidlen = 3;
+	memmove(dr[0].oid, "dcr", 3);
+	oidof(oid, "dcr");
+	if(objcreate(s, oid, 3, 1, 1, dr, 1, nil) < 0)
+		fail("objcreate with a dirty record: %r");
+	eqv("the create carried its record", dirtycount(s), 5);
+	storeclose(s);
+	if((s = mustopen(d, "dirty from a create")) == nil){
+		devclose(d);
+		return;
+	}
+	eqv("which is in the same record as the create", dirtycount(s), 5);
+	oidof(oid, "dcr");
+	istrue("a create's stale mark is durable",
 		dirtyhas(s, oid, 3, "node9.3"));
 	storeclose(s);
 	devclose(d);
@@ -1141,6 +1658,31 @@ tfull(void)
 	oidof(oid, "f");
 	istrue("the heal's stale mark rode in the same record",
 		dirtyhas(s, oid, 1, "node3.1"));
+
+	/*
+	 * layer-a §1.3: ver starts at 1 on create and absence is not
+	 * (0, 0), so a live object at version 0 is a key that cannot
+	 * exist.  The comparison below does not catch it — a receiver
+	 * with no key to defend skips the comparison altogether — so it
+	 * is refused in its own right, against an object this store does
+	 * not hold, which is exactly the case that would otherwise
+	 * publish one.
+	 */
+	if((g = fullstage(s, "z0", b, 2*Blk, 0)) != nil)
+		refused("an op=full at version 0 to an absent object",
+			stagefinal(g, 0, 2, nil, 0), "bad ctl");
+	checks++;
+	if(ostat(s, "z0", &oi) >= 0)
+		fail("an op=full at version 0 published a live (0, 0) object");
+	/*
+	 * The same rule on objcreate is §3.7's internal kind — a client
+	 * create's version is this instance's own to choose, so a 0 is a
+	 * caller bug and carries no §2.6 prefix (unlike the op=full's
+	 * above, whose version arrives in a wire header).
+	 */
+	oidof(oid, "z1");
+	refused("a create at version 0", objcreate(s, oid, 2, 0, 2, nil, 0, nil),
+		"create at version 0");
 
 	/* layer-a §5.5's comparison, made against that key */
 	if((g = fullstage(s, "f", b, 2*Blk, 0)) != nil)
@@ -1301,22 +1843,27 @@ ttomb(void)
 	 * long as the tombstone exists no older copy can outrank the new
 	 * object.  A straggler still holding this tombstone at ver 3
 	 * would outrank a live object created at ver 2 and re-delete it,
-	 * so the store enforces the value rather than trusting it.
+	 * so the store enforces the value rather than trusting it.  Like
+	 * a create at version 0, the refusal is §3.7's internal kind —
+	 * on the client create path the version is this instance's own
+	 * to choose, so any other value is a caller bug and carries no
+	 * §2.6 prefix.  Only stagefinal's arbitration answers `stale
+	 * version' over a tombstone.
 	 */
 	refused("a create over a tombstone at the tombstone's own ver",
-		objcreate(s, oid, 1, 3, 1, nil), "out of sequence");
+		objcreate(s, oid, 1, 3, 1, nil, 0, nil), "create at (");
 	refused("a create over a tombstone below its ver",
-		objcreate(s, oid, 1, 2, 1, nil), "out of sequence");
+		objcreate(s, oid, 1, 2, 1, nil, 0, nil), "create at (");
 	refused("a create over a tombstone two above its ver",
-		objcreate(s, oid, 1, 5, 1, nil), "out of sequence");
+		objcreate(s, oid, 1, 5, 1, nil, 0, nil), "create at (");
 	refused("a create over a tombstone below its wepoch",
-		objcreate(s, oid, 1, 4, 0, nil), "out of sequence");
+		objcreate(s, oid, 1, 4, 0, nil, 0, nil), "create at (");
 	if(ostat(s, "t", &oi2) < 0)
 		fail("objstat: %r");
 	eqv("a refused create leaves the tombstone a tombstone", oi2.state,
 		Stomb);
 
-	if(objcreate(s, oid, 1, 4, 1, &oi2) < 0)
+	if(objcreate(s, oid, 1, 4, 1, nil, 0, &oi2) < 0)
 		fail("create over a tombstone: %r");
 	eqv("the create takes the tombstone's ver plus one", oi2.ver, 4);
 	eqv("a create over a tombstone keeps the qid.path", oi2.qidpath, path);
@@ -1441,6 +1988,51 @@ tbounds(void)
 		objread(s, o, 1, buf, -1, 0), "negative read");
 
 	/*
+	 * layer-a §1.3 forbids version 0, and every publishing path
+	 * refuses it — not objcreate and stagefinal alone.  objremove is
+	 * the sharp one: a delete bumps (wepoch, ver) like any write
+	 * (§1.5), so a tombstone at (E, 0) would force the re-create to
+	 * ver 1, and a straggler live copy at (E, 1) with different
+	 * content then ties it — layer-a §1.3's I3.  The spelling is
+	 * §3.7's internal kind: on these paths the version is this
+	 * instance's own to choose, so a 0 is a caller bug and carries
+	 * no §2.6 prefix.
+	 */
+	refused("a write at version 0",
+		objwrite(s, o, 1, buf, 16, 0, 0, 1, nil, 0),
+		"write at version 0");
+	refused("a truncate at version 0",
+		objtrunc(s, o, 1, 0, 0, 1, nil, 0), "truncate at version 0");
+	refused("a delete at version 0",
+		objremove(s, o, 1, 0, 1, nil, 0), "delete at version 0");
+
+	/*
+	 * §3.7: an oid outside layer-a §1.1's 1*128 bound is that
+	 * section's `bad object name' and not a string of this store's
+	 * own, because the 9P server returns what the store hands it and
+	 * §2.6's set is what a client parses.
+	 */
+	refused("a create of a zero-length oid",
+		objcreate(s, o, 0, 1, 1, nil, 0, nil), "bad object name");
+	refused("a create of an oid past Oidmax",
+		objcreate(s, o, Oidmax + 1, 1, 1, nil, 0, nil),
+		"bad object name");
+	checks++;
+	if((g = stageopen(s, o, 0, Blk, 0)) != nil){
+		fail("a stage of a zero-length oid was accepted");
+		stagediscard(g);
+	}else{
+		char e[ERRMAX];
+
+		rerrstr(e, sizeof e);
+		istrue("a stage of a zero-length oid says bad object name",
+			strncmp(e, "bad object name", 15) == 0);
+	}
+	/* ... and a discard of something that is not a tombstone */
+	refused("a discard of a live object", objdiscard(s, o, 1, 2, 1, 2),
+		"not discardable");
+
+	/*
 	 * The refusal is the whole of what happened: no record was
 	 * written, no grain was taken and the object is as it was.
 	 */
@@ -1486,14 +2078,11 @@ tbounds(void)
 		fail("stageopen: %r");
 	else{
 		refused("a chunk of 4 bytes at 2^64-4",
-			stagewrite(g, buf, 4, ~0ULL - 3),
-			"chunk past the declared length");
+			stagewrite(g, buf, 4, ~0ULL - 3), "bad ctl");
 		refused("a chunk of a negative count",
-			stagewrite(g, buf, -1, 0),
-			"chunk past the declared length");
+			stagewrite(g, buf, -1, 0), "negative chunk");
 		refused("a chunk one byte past the declared length",
-			stagewrite(g, buf, 1, 2*Blk),
-			"chunk past the declared length");
+			stagewrite(g, buf, 1, 2*Blk), "bad ctl");
 		storestat(s, &st2);
 		eqv("a refused chunk stages nothing", st2.staged, 0);
 		stagediscard(g);
@@ -1522,6 +2111,11 @@ main(int argc, char **argv)
 	tdeferred('s');
 	tstage();
 	tstagefault();
+	tsweepfinal();
+	tsweepchunk();
+	tsweepexpire();
+	tfinalfault();
+	tdiscard();
 	tcondemned();
 	texhaust();
 	tdirty();

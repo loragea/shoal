@@ -47,18 +47,63 @@ istrue(char *what, int ok)
  * where malloc's arena and every Store structure live — and leaves
  * the stack split, which is what makes this a proc rather than a
  * thread.
+ *
+ * Every proc a T1 program makes is made here — its own workers and,
+ * through Storecfg.spawn, the engine's — so this is the one place
+ * that can note their pids down.  A test that has to abandon a store
+ * (a worker asleep inside it can neither be woken nor freed) still
+ * MUST NOT abandon the procs: they hold their end of mk test's pipe
+ * open long after the program has reported, and every failing run
+ * adds a fresh set.  killspawned is that reaping, by pid.  Not by
+ * note group: the group is the one the program inherited from the
+ * shell that ran it, so a group note takes mk and the shell down with
+ * the workers — and the FAIL lines with them.
  */
+enum
+{
+	Nspawnpid	= 64,
+};
+
+static int spawnpid[Nspawnpid];
+static int nspawnpid;
+
 static int
 spawnproc(void (*fn)(void*), void *a)
 {
-	switch(rfork(RFPROC|RFMEM|RFNOWAIT)){
+	int pid;
+
+	switch(pid = rfork(RFPROC|RFMEM|RFNOWAIT)){
 	case -1:
 		return -1;
 	case 0:
 		(*fn)(a);
 		exits(nil);
 	}
+	if(nspawnpid < Nspawnpid)
+		spawnpid[nspawnpid++] = pid;
 	return 0;
+}
+
+/*
+ * Start the record afresh, so what killspawned reaps is this test's
+ * own procs and not a pid some earlier test's finished worker left
+ * behind.  Call before the store whose procs are to be reapable is
+ * opened, so its checkpointer is recorded too.
+ */
+static void
+spawnforget(void)
+{
+	nspawnpid = 0;
+}
+
+static void
+killspawned(void)
+{
+	int i;
+
+	for(i = 0; i < nspawnpid; i++)
+		postnote(PNPROC, spawnpid[i], "kill");
+	nspawnpid = 0;
 }
 
 enum

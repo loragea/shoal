@@ -155,6 +155,7 @@ emapget(Store *s, ulong slot, int fresh)
 	|| (c->p = mallocz(s->sb.emapsz, 1)) == nil){
 		free(c);
 		qunlock(&s->qlemap);
+		werrstr("out of memory");
 		return nil;
 	}
 	c->slot = slot;

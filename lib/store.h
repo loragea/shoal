@@ -105,7 +105,6 @@ struct Item
 	ulong	nbyte;			/* entry bytes this item contributes */
 	Dirtent	**spare;		/* ndirty pre-allocated dirty records */
 	Emape	*emap;			/* the pinned map the apply mutates */
-	Batch	*batch;
 	char	err[ERRMAX];
 	Item	*next;
 };
@@ -223,7 +222,9 @@ struct Store
 	int	broken;			/* a log write failed: commit no more */
 	uvlong	failseq;		/* the first batch that did not land */
 	char	failerr[ERRMAX];	/* the device error that broke it */
-	int	fatal;			/* memory no longer matches the log */
+	int	fatal;			/* memory no longer matches the log;
+					 * qllog's, like broken beside it,
+					 * however the apply that sets it runs */
 	int	reclaimearly;		/* §13's reclaim point */
 	uvlong	pubatpage;		/* §13's publish point */
 	int	fullwait;		/* §13's fullwait point */
@@ -231,7 +232,6 @@ struct Store
 	/* the flusher, §3.2: one flush satisfies every waiter */
 	QLock	fllk;
 	Rendez	flrz;			/* on fllk: a flush completed */
-	Rendez	flwork;			/* on fllk: work for the flusher */
 	uvlong	flasked, fldone;
 	uvlong	flhold, flcount;	/* §13's flush:n hold */
 	int	flerr, flbusy, flproc;
@@ -239,7 +239,6 @@ struct Store
 	/* the checkpointer, §2.8 */
 	QLock	cklk;
 	Rendez	ckrz;			/* on cklk: a checkpoint completed */
-	Rendez	ckwork;			/* on cklk: work for the checkpointer */
 	uvlong	ckreq, ckdone;
 	int	ckerr, ckbusy, ckproc;
 	vlong	cklast;
@@ -272,6 +271,13 @@ struct Store
  * creator — the /repl fid in the server — and is discarded on clunk,
  * on a Tflush of any of its chunks, on stagems of silence and at
  * restart, which is free because nothing about it is durable.
+ *
+ * The memory is freed only by the owner: stagediscard, or the
+ * stagefinal that consumes the handle.  stagesweep *strips* an
+ * expired handle — releases its reservations, zeroes its entries,
+ * unlinks it and marks it dead so later calls refuse — but leaves
+ * the memory, because the fid still holds the pointer and a freeing
+ * sweep races every one of the owner's calls.
  */
 struct Stage
 {
@@ -280,7 +286,9 @@ struct Stage
 	int	oidlen;
 	uvlong	len;			/* the declared final length */
 	int	force;
-	vlong	last;			/* nsec() of the last chunk */
+	int	busy;			/* a chunk is in flight; qlstate */
+	int	dead;			/* swept: refuse chunks and final; qlstate */
+	vlong	last;			/* nsec() of the last chunk's arrival */
 	ulong	*grain;			/* nblk entries, 0 = untouched */
 	uchar	*dig;			/* nblk digests */
 	ulong	nblk;
@@ -314,10 +322,10 @@ void	emapfreeall(Store*);
 
 /* apply.c — §2.7's one apply function, shared by commit and replay */
 int	applyrec(Store*, Objrec*, Emape*);
-int	objrecok(Store*, Objrec*);
+int	objrecok(Super*, Objrec*);	/* Super, not Store: shoalck judges too */
 int	applydirty(Store*, Dirtyrec*, Dirtent**);
-int	dirtyrecok(Store*, Dirtyrec*);
-Peer*	addpeer(Store*, uchar*, int);
+int	dirtyrecok(Super*, Dirtyrec*);
+void	addpeer(Store*, uchar*, int);
 int	applyslot(Store*, ulong slot);
 void	mapopen(Store*, Omap*, Ient*, Emape*);
 ulong	mapgrain(Omap*, ulong i);

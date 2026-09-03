@@ -61,7 +61,7 @@ mk(Store *s, char *name)
 	uchar o[Oidmax];
 
 	oidof(o, name);
-	if(objcreate(s, o, strlen(name), 1, 1, nil) < 0)
+	if(objcreate(s, o, strlen(name), 1, 1, nil, 0, nil) < 0)
 		fail("objcreate %s: %r", name);
 }
 
@@ -340,7 +340,7 @@ onecrash(char *point, int mode, char *op, int expectnew)
 	simarm(d, point, 0);
 	oidof(o, "m");
 	if(strcmp(op, "create") == 0)
-		r = objcreate(s, (uchar*)"n", 1, 3, 1, nil);
+		r = objcreate(s, (uchar*)"n", 1, 3, 1, nil, 0, nil);
 	else if(strcmp(op, "whole-block write") == 0)
 		r = wr(s, "m", buf, Blk, 0, 3);
 	else if(strcmp(op, "partial write") == 0)
@@ -1009,6 +1009,141 @@ tgroup(void)
 }
 
 /*
+ * §7's pending queue under the one schedule in which unlink's tail
+ * fix-up can be wrong: formbatch absorbs a *prefix* of the queue and
+ * then breaks, because the next item would take the record past
+ * maxrecbytes.  The items are inflated with op=0 Edirty entries so
+ * two or three of them fill the geometry's largest record, and six
+ * committers keep the queue long enough that the absorb ends
+ * mid-queue.  There a tail fix-up that takes the tail back
+ * unconditionally leaves pendtail naming an absorbed item: the next
+ * enqueue links behind a node that is no longer on the queue, no
+ * committer ever sees it, and its worker sleeps forever — under
+ * ordinary one-at-a-time absorption the suite never produces the
+ * shape, so this is its one witness.
+ *
+ * Mutation: `s->pendtail = prev' without the `s->pendtail == it'
+ * test in unlink, and a worker below is orphaned after a few hundred
+ * commits.
+ */
+enum
+{
+	Qw	= 6,
+	Qdr	= 24,
+	Qwr	= 150,
+};
+
+typedef struct Warg Warg;
+struct Warg
+{
+	Store	*s;
+	int	id;
+};
+
+static Warg warg[Qw];
+static int wdone[Qw];
+
+static void
+qworker(void *a)
+{
+	Warg *g;
+	Dirtyrec dr[Qdr];
+	uchar *buf, oid[Oidmax];
+	char name[16];
+	int i, k;
+
+	g = a;
+	snprint(name, sizeof name, "q%d", g->id);
+	oidof(oid, name);
+	buf = mkbuf(Blk, g->id + 1);
+	memset(dr, 0, sizeof dr);
+	for(k = 0; k < Qdr; k++){
+		dr[k].op = 0;
+		dr[k].peerlen = 6;
+		memmove(dr[k].peer, "node.x", 6);
+		dr[k].oidlen = 4;
+		dr[k].oid[0] = 'z';
+		dr[k].oid[1] = '0' + g->id;
+		dr[k].oid[2] = '0' + k/10;
+		dr[k].oid[3] = '0' + k%10;
+	}
+	for(i = 0; i < Qwr; i++)
+		if(objwrite(g->s, oid, strlen(name), buf, Blk, 0, 2 + i, 1,
+			dr, Qdr) < 0){
+			fail("absorb-break worker %d, write %d: %r", g->id, i);
+			break;
+		}
+	free(buf);
+	wdone[g->id] = 1;
+}
+
+static void
+tabsorbbreak(void)
+{
+	Dev *d;
+	Store *s;
+	char name[16];
+	int i, k;
+
+	d = newdisk();
+	spawnforget();		/* the checkpointer below is reapable too */
+	if((s = openstoreck(d)) == nil){
+		fail("absorb-break: storeopen: %r");
+		devclose(d);
+		return;
+	}
+	for(i = 0; i < Qw; i++){
+		snprint(name, sizeof name, "q%d", i);
+		mk(s, name);
+	}
+	/*
+	 * simslow stretches every device operation with a yield, so
+	 * batches stay in flight long enough for the queue to build and
+	 * the absorb to end mid-queue — without it the sim commits in
+	 * microseconds and the six workers rarely overlap.
+	 */
+	simslow(d, 1);
+	for(i = 0; i < Qw; i++){
+		warg[i].s = s;
+		warg[i].id = i;
+		wdone[i] = 0;
+		if(spawnproc(qworker, &warg[i]) < 0)
+			fail("spawn: %r");
+	}
+	for(k = 0; k < 600; k++){
+		for(i = 0; i < Qw; i++)
+			if(!wdone[i])
+				break;
+		if(i == Qw)
+			break;
+		sleep(100);
+	}
+	checks++;
+	if(k >= 600){
+		for(i = 0; i < Qw; i++)
+			if(!wdone[i])
+				fail("absorb-break: worker %d is orphaned", i);
+		/*
+		 * An orphaned worker holds the store: storeclose would wait
+		 * on it forever and storefree would pull the store from
+		 * under the sleeper, so the failing run leaks the store and
+		 * the device — but not the procs.  Left alive, six workers
+		 * and the checkpointer keep their end of mk test's pipe
+		 * open long after this program has reported, and every
+		 * failing run adds a fresh set.  killspawned kills exactly
+		 * those seven, by the pids t1.h recorded (a note to the
+		 * group would take mk and this program's own shell with
+		 * them, and the FAIL lines above never reach the report).
+		 */
+		killspawned();
+		return;
+	}
+	simslow(d, 0);
+	storeclose(s);
+	devclose(d);
+}
+
+/*
  * T1.8 and §2.7: a batch's record is bounded by the largest record
  * this geometry can hold and replay will accept, and by nothing else.
  * A batch cap of its own is a second bound that says nothing about
@@ -1257,6 +1392,12 @@ tackflush(void)
  * produces one; replay accepts records from any build, and the entry
  * such a record would leave has objverify reading through the nil an
  * inline map returns for every block but the first.
+ *
+ * The refusal is §5 step 7's: the record is checksummed and in
+ * sequence, so nothing about its bytes says the log ends there, and
+ * a store that started over it would silently drop it and every
+ * record after it — so the record is not applied *and* the store
+ * does not start.
  */
 static void
 tinlinemap(void)
@@ -1316,18 +1457,28 @@ tinlinemap(void)
 		lrecpack(rec, &r, sb.secsz);
 		off = (vlong)st.cklogoff*sb.secsz;
 		simpoke(d, off, rec, sb.secsz);
-		if((s = openstore(d)) == nil)
-			fail("a record naming an inline map for two blocks "
-				"must not stop the store starting: %r");
-		else{
-			storestat(s, &st);
-			eqv("and it is not applied", st.nreplay, 0);
+		checks++;
+		if((s = openstore(d)) != nil){
+			fail("a store started over a record whose Eobj fails "
+				"its range check");
 			checks++;
 			if(objstat(s, (uchar*)"q1", 2, &oi) == 0)
 				fail("a record naming an inline map for two "
 					"blocks was applied");
-			mustverify(s, "q0", "after a refused record");
 			storeclose(s);
+		}else{
+			char err[ERRMAX];
+
+			/*
+			 * The remedy MUST survive ERRMAX: the refusal names
+			 * the device, the sector and the range check's own
+			 * text, and on a real sd path a remedy spelled at
+			 * the tail is exactly the part that is cut.
+			 */
+			rerrstr(err, sizeof err);
+			checks++;
+			if(strstr(err, "shoalck, then refill from peers") == nil)
+				fail("the refusal lost its remedy: %s", err);
 		}
 	}
 	free(rec);
@@ -1917,8 +2068,11 @@ techange(void)
  * §13's named points mean what they say.  body:n is "after n body
  * sectors", so the common one-sector commit — whose body is empty —
  * has none: a schedule arming body:1 must not be crashed after the
- * commit point instead of before it.  precommit and commit are two
- * points and not one, and the pre-flush is what lies between them.
+ * commit point instead of before it.  A point that never fires is a
+ * schedule that passes vacuously, so the same value is then armed
+ * against a record that does have a body sector and must crash there.
+ * precommit and commit are two points and not one, and the pre-flush
+ * is what lies between them.
  */
 static void
 tpoints(void)
@@ -1950,6 +2104,27 @@ tpoints(void)
 	if(wr(s, "p0", buf, 64, 0, 2) < 0)
 		fail("body:1 fired on a record with no body sectors: %r");
 	simarm(d, nil, 0);
+
+	/*
+	 * ... and the same point on a record that has one.  A rewrite of
+	 * the whole maximal object names sixteen blocks and frees
+	 * sixteen grains, which is a two-sector record: one body sector,
+	 * written as one piece, so body:1 is the value this geometry
+	 * emits.  The crash stops the device, so the commit fails.
+	 */
+	simarm(d, "body", 1);
+	checks++;
+	if(wr(s, "p0", buf, 16*Blk, 0, 3) >= 0)
+		fail("body:1 did not fire on a record with a body sector");
+	simarm(d, nil, 0);
+	simrevive(d);
+	storeclose(s);
+	if((s = mustopen(d, "the named points, after body:1")) == nil){
+		devclose(d);
+		free(buf);
+		return;
+	}
+	simcrashdead(d, 1);
 
 	/*
 	 * The pre-flush follows the precommit point, so at that point
@@ -2247,7 +2422,7 @@ tqid(void)
 		for(i = 0; i < 8; i++){
 			snprint(name, sizeof name, "q%d.%d", j, i);
 			oidof(o, name);
-			if(objcreate(s, o, strlen(name), 1, 1, &oi) < 0){
+			if(objcreate(s, o, strlen(name), 1, 1, nil, 0, &oi) < 0){
 				fail("objcreate: %r");
 				continue;
 			}
@@ -2282,6 +2457,7 @@ main(int argc, char **argv)
 	twrap();
 	twrapbig();
 	tgroup();
+	tabsorbbreak();
 	tmaxbatch();
 	tbignsec();
 	tinlinemap();

@@ -100,10 +100,8 @@ storehook(Store *s, char *name, uvlong n)
 		 * The hook is how §13 drives what the store answers once it
 		 * is in that state.
 		 */
-		qlock(&s->qlstate);
-		s->fatal = n != 0;
-		qunlock(&s->qlstate);
 		qlock(&s->qllog);
+		s->fatal = n != 0;
 		s->broken = n != 0;
 		qunlock(&s->qllog);
 	}else if(strcmp(name, "reclaim") == 0)
@@ -181,6 +179,19 @@ geomok(Store *s, Dev *d)
 	|| (uvlong)sb->nemap*sb->emapsz > sb->emapsecs*(uvlong)sb->secsz
 	|| (uvlong)sb->ndirty*Dirtentsz > sb->dirtsecs*(uvlong)sb->secsz){
 		werrstr("a metadata region is smaller than its own count");
+		return -1;
+	}
+	/*
+	 * §2.6's region is load-bearing even when empty of records:
+	 * applydirty can drop a peer's records to make room, but a
+	 * region of no slots at all leaves it nothing to drop, so a
+	 * store opened over ndirty == 0 commits no Edirty (itemok) and
+	 * replay refuses the first record that carries one — a brick,
+	 * on the first fine-grained mark.  shoalfmt never writes such a
+	 * geometry; one that arrives anyway is refused whole, here.
+	 */
+	if(sb->ndirty == 0){
+		werrstr("the geometry has no dirty region");
 		return -1;
 	}
 	if(sb->bmapsecs % pagesecs != 0 || nbmpage(sb) == 0){
@@ -438,13 +449,37 @@ applyents(Store *s, uchar *p, Lrec *r)
  * at the region start if Fwrap is set, at the region start if +nsec
  * reaches the region end, and at +nsec otherwise.  Stop at the first
  * record that is invalid or out of sequence.
+ *
+ * **A sector that cannot be read is not the end of the log.**  Every
+ * other reason to stop is a statement about the bytes at rel — no
+ * valid header, the wrong sequence, a length this geometry cannot
+ * hold — and each of them says the log ends there.  A device error
+ * says nothing about them: the records past the fault may be perfectly
+ * good, and stopping would discard every one of them, acked writes
+ * included, and then hand the tail back to the allocator to overwrite.
+ * That is a silent truncation of exactly the kind §2.5's coverage rule
+ * refuses to start on, so replay refuses too — as steps 4, 5 and 6
+ * already do for the index, the bitmap and the dirty region.
+ *
+ * **Neither is a record that cannot be applied.**  applyents fails on
+ * a device error under an extent map (emapget reads the extent-map
+ * region; emapreclaim writes it), on an allocation failure, and on
+ * any entry it cannot decode or that its checks refuse — an entry
+ * header or body that does not parse, a kind this build does not
+ * know, a field §2.7's range checks reject — and none of those says
+ * anything about the bytes at rel: the record is valid,
+ * checksummed and in sequence.  Worse than the truncation, applyents
+ * applies entries one at a time, so a mid-record failure leaves the
+ * store on a half-applied record no crash could produce.  Both refuse
+ * the start, exactly as a read error does.
  */
 static int
 replay(Store *s)
 {
 	uchar *hdr, *buf;
 	Lrec r, r2;
-	uvlong seq, rel, scanned, off, n, m;
+	uvlong seq, rel, scanned, off, n, m, bad;
+	char e[ERRMAX];
 
 	if((hdr = malloc(s->sb.secsz)) == nil)
 		return -1;
@@ -454,14 +489,17 @@ replay(Store *s)
 	}
 	seq = s->sb.ckseq + 1;
 	rel = s->sb.cklogoff - s->sb.logoff;
+	bad = s->sb.cklogoff;		/* until a record is applied */
 	scanned = 0;
 	for(;;){
 		if(scanned >= s->sb.logsecs)
 			break;
 		off = s->sb.logoff*(uvlong)s->sb.secsz
 			+ rel*(uvlong)s->sb.secsz;
-		if(devread(s->d, hdr, s->sb.secsz, off) < 0)
-			break;
+		if(devread(s->d, hdr, s->sb.secsz, off) < 0){
+			bad = s->sb.logoff + rel;
+			goto refuse;
+		}
 		if(lrecunpack(&r, hdr) < 0)
 			break;
 		if(r.nsec < 1 || rel + r.nsec > s->sb.logsecs)
@@ -472,16 +510,22 @@ replay(Store *s)
 			m = (uvlong)r.nsec*s->sb.secsz - n;
 			if(m > Bulkio)
 				m = Bulkio;
-			if(devread(s->d, buf + n, m, off + n) < 0)
-				goto done;
+			if(devread(s->d, buf + n, m, off + n) < 0){
+				/* the sector the failed read began at */
+				bad = s->sb.logoff + rel + n/s->sb.secsz;
+				goto refuse;
+			}
 		}
 		if(lrecvalid(buf, s->sb.secsz, &r2, rel, s->sb.logsecs, seq) < 0)
 			break;
-		if(applyents(s, buf, &r2) < 0)
-			break;
+		if(applyents(s, buf, &r2) < 0){
+			bad = s->sb.logoff + rel;
+			goto refuse;
+		}
 		s->replayhigh = seq;
 		s->nreplay++;
 		seq++;
+		bad = s->sb.logoff + rel;	/* the record just applied */
 		scanned += r2.nsec;
 		if(r2.flags & Fwrap)
 			rel = 0;
@@ -491,9 +535,16 @@ replay(Store *s)
 				rel = 0;
 		}
 		if(s->nemapc > s->emapcap && emapreclaim(s) < 0)
-			break;
+			goto refuse;
 	}
-done:
+	/*
+	 * The final write-back can fail exactly as the in-loop one above
+	 * and refuses the same way; bad still names the last record
+	 * applied — or the checkpoint mark, when there was none — whose
+	 * maps are among the entries being written.
+	 */
+	if(emapreclaim(s) < 0)
+		goto refuse;
 	free(hdr);
 	free(buf);
 	s->logtail = rel;
@@ -501,9 +552,21 @@ done:
 	s->relseq = s->watermark;
 	s->wateroff = rel;
 	s->seqnext = s->watermark + 1;
-	if(emapreclaim(s) < 0)
-		return -1;
 	return 0;
+
+refuse:
+	rerrstr(e, sizeof e);
+	free(hdr);
+	free(buf);
+	/*
+	 * The remedy leads because ERRMAX cuts the tail: with a real
+	 * device path in front and a device error's own text inside,
+	 * a remedy at the end of the message is the part the operator
+	 * never sees.
+	 */
+	werrstr("the log cannot be replayed; shoalck, then refill from "
+		"peers; log sector %llud: %s", bad, e);
+	return -1;
 }
 
 /*
@@ -732,7 +795,7 @@ storeopen(Dev *d, Storecfg *cfg)
 	Sbsel sel;
 	Peer *p;
 	uvlong bits, hi;
-	ulong i, n;
+	ulong i;
 
 	if((s = mallocz(sizeof *s, 1)) == nil)
 		return nil;
@@ -745,9 +808,7 @@ storeopen(Dev *d, Storecfg *cfg)
 	s->donerz.l = &s->qllog;
 	s->holdrz.l = &s->qllog;
 	s->flrz.l = &s->fllk;
-	s->flwork.l = &s->fllk;
 	s->ckrz.l = &s->cklk;
-	s->ckwork.l = &s->cklk;
 	s->procrz.l = &s->proclk;
 
 	/*
@@ -912,7 +973,6 @@ storeclose(Store *s)
 		return;
 	qlock(&s->cklk);
 	s->stop = 1;
-	rwakeupall(&s->ckwork);
 	rwakeupall(&s->ckrz);
 	qunlock(&s->cklk);
 	qlock(&s->qllog);
@@ -983,6 +1043,15 @@ storelost(Store *s, ulong i)
 	return slot;
 }
 
+/*
+ * §2.6's coarse flag, half-built: everything that sets it exists —
+ * start-up marks every peer, and the dirty-region exhaustion drop
+ * marks its victim — and nothing yet clears it, because the clearing
+ * belongs to the reconcile pass the heal work will bring.  So today
+ * this answers 1 for every peer, known or not, and the exhaustion
+ * drop's safety argument leans on exactly that: dropping a peer's
+ * records can never make this answer less cautious.
+ */
 int
 storefullsync(Store *s, char *peer)
 {

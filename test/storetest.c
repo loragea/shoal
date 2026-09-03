@@ -120,7 +120,7 @@ mkobj(Store *s, char *name, uvlong ver)
 	uchar oid[Oidmax];
 
 	oidof(oid, name);
-	if(objcreate(s, oid, strlen(name), ver, 1, nil) < 0)
+	if(objcreate(s, oid, strlen(name), ver, 1, nil, 0, nil) < 0)
 		fail("objcreate %s: %r", name);
 }
 
@@ -515,6 +515,63 @@ tpublish(void)
 }
 
 /*
+ * §2.8's mark is publishable only once the flush has returned, and a
+ * publish that fails leaves it where it was — the same rule the other
+ * three publishers follow.  /status reads the publishable image, so a
+ * mark left advanced by a failed publish is a `ckseq` this store would
+ * report while the disk still carries the older one.
+ *
+ * §2.2 clause 3 is the deterministic way to make the publish fail:
+ * with neither copy valid the publisher MUST NOT write.  The pages
+ * and the flush before it all succeed, so what is under test is the
+ * last step alone.
+ *
+ * Mutation: drop the roll-back, and /status reports the new mark over
+ * a superblock that never took it.
+ */
+static void
+tckmark(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Shadow sh;
+	uchar *buf, junk[64];
+	uvlong ckseq, cklogoff;
+
+	memset(&sh, 0, sizeof sh);
+	d = newdisk();
+	if((s = mustopen(d, "a checkpoint that cannot publish")) == nil)
+		return;
+	buf = mkbuf(Blk, 91);
+	mkobj(s, "cm", 1);
+	wr(s, "cm", &sh, buf, Blk, 0, 2);
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	storestat(s, &st);
+	ckseq = st.ckseq;
+	cklogoff = st.cklogoff;
+	istrue("the first checkpoint published a mark", ckseq > 0);
+
+	/* more records, so the next mark would differ */
+	wr(s, "cm", &sh, buf, 64, 0, 3);
+	wr(s, "cm", &sh, buf, 64, 128, 4);
+	memset(junk, 0x5a, sizeof junk);
+	simpoke(d, 0, junk, sizeof junk);
+	simpoke(d, super1off(d), junk, sizeof junk);
+	checks++;
+	if(storecheckpoint(s) >= 0)
+		fail("a checkpoint published over two invalid superblocks");
+	storestat(s, &st);
+	eqv("a failed publish leaves ckseq where it was", st.ckseq, ckseq);
+	eqv("and cklogoff with it", st.cklogoff, cklogoff);
+	storeclose(s);
+	devclose(d);
+	free(buf);
+	free(sh.p);
+}
+
+/*
  * §5 step 10, and the order it depends on: a store that judged the
  * index before replaying would put a live object into /lost after an
  * ordinary crash, because a crashed checkpoint damages exactly the
@@ -599,7 +656,9 @@ tbadmap(void)
 	Super sup;
 	Stage *g;
 	uchar *buf, *other, rd[64], junk[8], oid[Oidmax];
+	char err[ERRMAX];
 	ulong slot, gf, sf;
+	uvlong nl;
 
 	memset(&sh, 0, sizeof sh);
 	d = newdisk();
@@ -640,9 +699,29 @@ tbadmap(void)
 	checks++;
 	if(objread(s, oid, 4, rd, sizeof rd, 0) >= 0)
 		fail("an extent map that failed its checksum was served");
+	else{
+		/*
+		 * §3.7: local damage is answered with layer-a §2.6's
+		 * `checksum mismatch' — content that failed verification —
+		 * and not with a string of this store's own, because the
+		 * 9P server hands the client whatever the store returns.
+		 */
+		rerrstr(err, sizeof err);
+		istrue("a damaged map is refused as a checksum mismatch",
+			strncmp(err, "checksum mismatch", 17) == 0);
+	}
 	storestat(s, &st);
 	eqv("the slot the damaged map belongs to is condemned", st.nlost, 1);
 	eqv("and it is named", storelost(s, 0), oi.slot);
+	/*
+	 * Condemning a slot does not change what the object *is*.  The
+	 * index entry is intact — the damage is in the extent map — so it
+	 * stays `live', the checkpoint writes it back that way and
+	 * readindex counts it again at the next start.  A condemned copy
+	 * is reported by `nlost' and by `corrupt=1' (D14), not by
+	 * dropping out of the live count on one side of a restart.
+	 */
+	eqv("a condemned copy is still a live object", st.nlive, 1);
 	/*
 	 * D14: the copy fails local verification, so it MUST answer with
 	 * corrupt=1 and MUST NOT answer as absent — absence is a §1.5
@@ -683,6 +762,7 @@ tbadmap(void)
 	storestat(s, &st);
 	gf = st.grainfree;
 	sf = st.slotfree;
+	nl = st.nlive;
 	storeclose(s);
 	if((s = mustopen(d, "a damaged extent map, restarted")) == nil){
 		devclose(d);
@@ -694,6 +774,7 @@ tbadmap(void)
 	eqv("the condemned slot is still allocated after a restart",
 		st.slotfree, sf);
 	eqv("and its grains are still accounted for", st.grainfree, gf);
+	eqv("and the live count is the one it had", st.nlive, nl);
 	checks++;
 	if(objstat(s, oid, 4, &oi2) < 0)
 		fail("a condemned slot lost its object across a restart: %r");
@@ -748,6 +829,384 @@ tbadmap(void)
 }
 
 /*
+ * §5 step 7: a log sector the device cannot read is not the end of
+ * the log.  Every other reason replay stops is a statement about the
+ * bytes at that offset; a device error is not, so stopping there
+ * discards whatever is past the fault — acked writes included — and
+ * then hands the tail back to be overwritten.  Steps 4, 5 and 6
+ * refuse to start on a device error and this must too.
+ *
+ * Mutation: take the read error as the end of the log, and the store
+ * starts with the objects committed past the fault silently gone.
+ */
+static void
+tlogread(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Sbsel sel;
+	Super sb;
+	Objinfo oi;
+	uchar oid[Oidmax];
+	char name[8];
+	int i;
+
+	d = newdisk();
+	if((s = mustopen(d, "an unreadable log sector")) == nil)
+		return;
+	for(i = 0; i < 5; i++){
+		snprint(name, sizeof name, "lr%d", i);
+		mkobj(s, name, 1);
+	}
+	storestat(s, &st);
+	eqv("five creates are five live objects", st.nlive, 5);
+	storeclose(s);
+
+	/*
+	 * One sector, one record in from the replay start: a create is a
+	 * one-sector record at this geometry, so the fault lands on a
+	 * record with three more committed behind it.  The fault is
+	 * sticky and aimed, so nothing outside the log region sees it.
+	 */
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	sb = sel.sb[sel.start];
+	simfaultat(d, Sfeio, 0, (vlong)(sb.cklogoff + 1)*sb.secsz, sb.secsz);
+	checks++;
+	if((s = openstore(d)) != nil){
+		fail("a store started over a log it could not read");
+		storeclose(s);
+	}
+
+	/* and with the fault gone it starts and has all five */
+	simfault(d, Sfnone, 0);
+	if((s = mustopen(d, "the log, readable again")) == nil){
+		devclose(d);
+		return;
+	}
+	storestat(s, &st);
+	eqv("replay reaches every record past the fault", st.nlive, 5);
+	oidof(oid, "lr4");
+	checks++;
+	if(objstat(s, oid, 3, &oi) < 0)
+		fail("the last object committed is gone: %r");
+	storeclose(s);
+	devclose(d);
+}
+
+/*
+ * §5 step 7's other refusal: a record that cannot be *applied* is not
+ * the end of the log either.  applyents reaches the device — emapget
+ * reads the extent-map region — so a transient read error there
+ * during replay used to read as end-of-log: the store started,
+ * silently dropped every record from the fault on, acked creates
+ * included, resumed committing over the log it had discarded, and the
+ * next checkpoint made the loss permanent, with no error anywhere.
+ *
+ * Mutation: take an applyents failure as the end of the log
+ * (`if(applyents(...) < 0) break;`), and the store below starts over
+ * the fault with nlive=1 instead of refusing.
+ */
+static void
+treplayapply(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Sbsel sel;
+	Super sb;
+	Objinfo oi;
+	uchar *buf, oid[Oidmax];
+	char name[8];
+	int i;
+
+	d = newdisk();
+	if((s = mustopen(d, "an unappliable log record")) == nil)
+		return;
+	buf = mkbuf(2*Blk, 11);
+	mkobj(s, "e0", 1);
+	oidof(oid, "e0");
+	if(objwrite(s, oid, 2, buf, 2*Blk, 0, 2, 1, nil, 0) < 0)
+		fail("objwrite: %r");
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	/* the record replay will need the extent map to apply */
+	if(objwrite(s, oid, 2, buf, Blk, 0, 3, 1, nil, 0) < 0)
+		fail("objwrite again: %r");
+	for(i = 1; i <= 3; i++){
+		snprint(name, sizeof name, "e%d", i);
+		mkobj(s, name, 1);
+	}
+	storestat(s, &st);
+	eqv("four objects are acked and durable", st.nlive, 4);
+	storeclose(s);
+
+	/* a sticky read fault over the extent-map region alone */
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	sb = sel.sb[sel.start];
+	simfaultat(d, Sfeio, 0, (vlong)sb.emapoff*sb.secsz,
+		(vlong)sb.emapsecs*sb.secsz);
+	checks++;
+	if((s = openstore(d)) != nil){
+		fail("a store started over a log record it could not apply");
+		storeclose(s);
+	}else{
+		char err[ERRMAX];
+
+		/*
+		 * The refusal's remedy MUST survive ERRMAX: the device path
+		 * leads and the deep error's own text is inside, so a remedy
+		 * spelled at the tail is cut on a real sd name and the
+		 * operator never learns the way out.
+		 */
+		rerrstr(err, sizeof err);
+		checks++;
+		if(strstr(err, "shoalck, then refill from peers") == nil)
+			fail("the refusal lost its remedy: %s", err);
+	}
+
+	/* the fault was transient: with it gone, everything is there */
+	simfault(d, Sfnone, 0);
+	if((s = mustopen(d, "the extent maps, readable again")) == nil){
+		devclose(d);
+		free(buf);
+		return;
+	}
+	storestat(s, &st);
+	eqv("replay reaches every record past the bad apply", st.nlive, 4);
+	oidof(oid, "e0");
+	checks++;
+	if(objstat(s, oid, 2, &oi) < 0)
+		fail("objstat e0: %r");
+	else{
+		eqv("the acked rewrite is applied", oi.ver, 3);
+		eqv("at its length", oi.len, 2*Blk);
+	}
+	for(i = 1; i <= 3; i++){
+		snprint(name, sizeof name, "e%d", i);
+		oidof(oid, name);
+		checks++;
+		if(objstat(s, oid, 2, &oi) < 0)
+			fail("acked create %s is gone: %r", name);
+	}
+	storeclose(s);
+	devclose(d);
+	free(buf);
+}
+
+/*
+ * §5 step 7's in-loop write-back: when the extent-map cache fills
+ * mid-replay, emapreclaim writes the dirty entries back to the device
+ * so replay's footprint is a function of the cache and not of the
+ * log.  A failure there says nothing about the bytes at the log
+ * offset, so it MUST refuse the start like any other apply failure —
+ * a build that read it as end-of-log would start with every record
+ * from that point silently gone, acked writes included.
+ *
+ * The fault is ONE-SHOT, not sticky: a sticky fault is caught by the
+ * post-loop write-back too, so both builds refuse and nothing is
+ * discriminated.  Consumed by the in-loop write-back, the post-loop
+ * one then succeeds — and a build that took the in-loop failure as
+ * end-of-log starts cleanly with the records after it discarded.
+ * An extent-map cache of one forces the in-loop write-back; Oslot
+ * records that install *fresh* maps keep emapget from reading the
+ * region, so the armed fault cannot fire on a read.
+ *
+ * Mutation: `if(nemapc > emapcap && emapreclaim < 0) break;' in
+ * replay, and the store below starts with two acked records gone.
+ */
+static void
+treclaimfault(void)
+{
+	Dev *d;
+	Store *s;
+	Storecfg c;
+	Storestat st;
+	Super sb;
+	Sbsel sel;
+	uchar *buf, oid[Oidmax];
+	int i;
+	static char *nm[3] = { "r0", "r1", "r2" };
+
+	d = newdisk();
+	tcfg(&c);
+	c.emapcache = 1;
+	if((s = storeopen(d, &c)) == nil){
+		fail("a failing in-loop reclaim: storeopen: %r");
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(2*Blk, 83);
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	for(i = 0; i < 3; i++){
+		oidof(oid, nm[i]);
+		if(objcreate(s, oid, 2, 1, 1, nil, 0, nil) < 0)
+			fail("objcreate %s: %r", nm[i]);
+		/* 0 -> 2 blocks in one commit: Oslot, so replay reads no map */
+		if(objwrite(s, oid, 2, buf, 2*Blk, 0, 2, 1, nil, 0) < 0)
+			fail("objwrite %s: %r", nm[i]);
+	}
+	storestat(s, &st);
+	eqv("three objects are acked and durable", st.nlive, 3);
+	storeclose(s);
+
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	sb = sel.sb[sel.start];
+	simfaultat(d, Sfeio, 1, (vlong)sb.emapoff*sb.secsz,
+		(vlong)sb.emapsecs*sb.secsz);
+	checks++;
+	if((s = storeopen(d, &c)) != nil){
+		storestat(s, &st);
+		fail("the store started over a failed in-loop emapreclaim "
+			"(nlive=%llud, nreplay=%llud)", st.nlive, st.nreplay);
+		storeclose(s);
+	}
+	simfault(d, Sfnone, 0);
+
+	/* the fault was transient: with it gone, everything is there */
+	if((s = storeopen(d, &c)) == nil)
+		fail("reopen with the fault gone: %r");
+	else{
+		storestat(s, &st);
+		eqv("every object is there once the map is writable",
+			st.nlive, 3);
+		storeclose(s);
+	}
+	free(buf);
+	devclose(d);
+}
+
+/*
+ * The other write-back, after the loop: replay's last act is to flush
+ * the extent-map entries the applied records installed, and a failure
+ * there refuses the start for exactly the reason the in-loop one does.
+ * What is pinned here is the refusal's *text*: the operator meets this
+ * failure with a store that will not open, so it must name the sector
+ * and the way out, like every other refusal on this path, and not the
+ * bare device error.
+ *
+ * The fault is sticky, and the cache is the default, so the in-loop
+ * write-back never runs and the post-loop one takes it; the records
+ * install fresh maps, so nothing reads the region either.
+ *
+ * Mutation: return -1 bare from the post-loop reclaim, as before, and
+ * the refusal below arrives with neither sector nor remedy.
+ */
+static void
+tpostreclaim(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Super sb;
+	Sbsel sel;
+	uchar *buf, oid[Oidmax];
+	char err[ERRMAX];
+	int i;
+	static char *nm[3] = { "p0", "p1", "p2" };
+
+	d = newdisk();
+	if((s = mustopen(d, "a failing post-loop reclaim")) == nil){
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(2*Blk, 89);
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	for(i = 0; i < 3; i++){
+		oidof(oid, nm[i]);
+		if(objcreate(s, oid, 2, 1, 1, nil, 0, nil) < 0)
+			fail("objcreate %s: %r", nm[i]);
+		/* 0 -> 2 blocks in one commit: Oslot, so replay reads no map */
+		if(objwrite(s, oid, 2, buf, 2*Blk, 0, 2, 1, nil, 0) < 0)
+			fail("objwrite %s: %r", nm[i]);
+	}
+	storeclose(s);
+
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	sb = sel.sb[sel.start];
+	simfaultat(d, Sfeio, 0, (vlong)sb.emapoff*sb.secsz,
+		(vlong)sb.emapsecs*sb.secsz);
+	checks++;
+	if((s = openstore(d)) != nil){
+		storestat(s, &st);
+		fail("the store started over a failed post-loop emapreclaim "
+			"(nlive=%llud)", st.nlive);
+		storeclose(s);
+	}else{
+		rerrstr(err, sizeof err);
+		istrue("the post-loop refusal carries the remedy",
+			strstr(err, "shoalck, then refill from peers") != nil);
+		istrue("and names the log sector it stopped on",
+			strstr(err, "log sector") != nil);
+	}
+	simfault(d, Sfnone, 0);
+
+	if((s = mustopen(d, "the map region, writable again")) != nil){
+		storestat(s, &st);
+		eqv("every object is there once the map is writable",
+			st.nlive, 3);
+		storeclose(s);
+	}
+	free(buf);
+	devclose(d);
+}
+
+/*
+ * §5 step 3: a geometry with no dirty region cannot serve — applydirty
+ * can drop a peer's records to make room, but ndirty == 0 leaves it
+ * nothing to drop, so such a store commits no Edirty and replay
+ * refuses the first record that carries one.  shoalfmt never writes
+ * one; a superblock claiming it is refused whole at open.
+ *
+ * Mutation: drop geomok's ndirty test, and the store below opens.
+ */
+static void
+tnodirty(void)
+{
+	Dev *d;
+	Store *s;
+	Sbsel sel;
+	uchar *sb;
+	char err[ERRMAX];
+	ulong secsz;
+	int i;
+
+	d = newdisk();
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	secsz = sel.sb[sel.start].secsz;
+	if((sb = malloc(secsz)) == nil)
+		sysfatal("malloc: %r");
+	/* poke ndirty = 0 into both copies and re-seal them */
+	for(i = 0; i < 2; i++){
+		vlong o;
+
+		o = i == 0 ? 0 : super1off(d);
+		simpeek(d, o, sb, secsz);
+		PBIT32(sb + 96, 0);		/* ndirty */
+		reccsumset(sb, secsz, 16);
+		simpoke(d, o, sb, secsz);
+	}
+	free(sb);
+	checks++;
+	if((s = openstore(d)) != nil){
+		fail("a store opened over a geometry with no dirty region");
+		storeclose(s);
+	}else{
+		rerrstr(err, sizeof err);
+		istrue("and the refusal names the missing region",
+			strstr(err, "no dirty region") != nil);
+	}
+	devclose(d);
+}
+
+/*
  * §2.6: ndirty is an implementation limit in exactly layer-a §7.1's
  * sense.  When it is exhausted the store discards every fine-grained
  * record for the peer with the most records and marks that peer
@@ -789,7 +1248,12 @@ tdirtyfull(void)
 	storestat(s, &st);
 	istrue("the store still commits", st.broken == 0);
 	eqv("the peer with the most records lost them", dirtycount(s), 1);
-	istrue("that peer is marked fullsync", storefullsync(s, "peer.a"));
+	/*
+	 * The drop also marks peer.a fullsync, but asserting it through
+	 * storefullsync catches nothing today: nothing clears the flag yet
+	 * (§2.6), so the answer is 1 for every peer, marked or not.  The
+	 * assertion belongs to the heal work that makes the flag real.
+	 */
 	istrue("and the new record is the one that is there",
 		dirtyhas(s, oid, 2, "peer.b"));
 
@@ -801,6 +1265,102 @@ tdirtyfull(void)
 	}
 	eqv("replay reaches the same dirty set", dirtycount(s), 1);
 	istrue("with the same record in it", dirtyhas(s, oid, 2, "peer.b"));
+	storeclose(s);
+	devclose(d);
+}
+
+/*
+ * §2.6's tie, which is where the exhaustion rule's own argument is
+ * won or lost.  The rule keeps the live path and replay answering the
+ * same thing, so which peer it drops must be a function of the
+ * records and of nothing else — and the peer list is not that: it is
+ * first-apply order while the store runs and readdirty's slot order
+ * reversed after a restart.
+ *
+ * The two orders are made to differ here: peer.a's records are added
+ * first and then deleted, so peer.b's take the low slots and peer.a
+ * is still the peer the running store heard of first.  A running
+ * store therefore has [b, a] and a restarted one [a, b], over exactly
+ * the same 32 records each.  Both must drop peer.a, which is the
+ * lower name.
+ *
+ * Mutation: break the tie by list order (`n > best` alone), and the
+ * live store drops peer.b where the restarted one drops peer.a.
+ */
+static void
+tdirtytie(int restart)
+{
+	Dev *d;
+	Store *s;
+	uchar oid[Oidmax];
+	char name[32];
+	ulong i;
+	int ok;
+
+	d = newdisk();
+	if((s = mustopen(d, "a tie in the dirty region")) == nil)
+		return;
+	ok = 1;
+	for(i = 0; i < 32; i++){
+		snprint(name, sizeof name, "ta%lud", i);
+		oidof(oid, name);
+		if(dirtyadd(s, oid, strlen(name), "peer.a", 7) < 0)
+			ok = 0;
+	}
+	for(i = 0; i < 32; i++){
+		snprint(name, sizeof name, "ta%lud", i);
+		oidof(oid, name);
+		if(dirtydel(s, oid, strlen(name), "peer.a") < 0)
+			ok = 0;
+	}
+	if(storecheckpoint(s) < 0)
+		ok = 0;
+	for(i = 0; i < 32; i++){
+		snprint(name, sizeof name, "tb%lud", i);
+		oidof(oid, name);
+		if(dirtyadd(s, oid, strlen(name), "peer.b", 7) < 0)
+			ok = 0;
+	}
+	if(storecheckpoint(s) < 0)
+		ok = 0;
+	for(i = 0; i < 32; i++){
+		snprint(name, sizeof name, "tc%lud", i);
+		oidof(oid, name);
+		if(dirtyadd(s, oid, strlen(name), "peer.a", 7) < 0)
+			ok = 0;
+	}
+	if(storecheckpoint(s) < 0)
+		ok = 0;
+	istrue("the two peers filled the region between them", ok);
+	eqv("with half the records each", dirtycount(s), 64);
+
+	/*
+	 * The restart is what re-derives the peer list from the region
+	 * itself; the checkpoint above is what leaves replay nothing to
+	 * add to it in first-apply order.
+	 */
+	if(restart){
+		storeclose(s);
+		if((s = mustopen(d, "a tie, after a restart")) == nil){
+			devclose(d);
+			return;
+		}
+		eqv("the restarted store holds the same records",
+			dirtycount(s), 64);
+	}
+
+	oidof(oid, "tz");
+	checks++;
+	if(dirtyadd(s, oid, 2, "peer.c", 9) < 0)
+		fail("a tied region failed a durable write: %r");
+	oidof(oid, "tc0");
+	istrue("the lower name's records are the ones dropped",
+		!dirtyhas(s, oid, 3, "peer.a"));
+	oidof(oid, "tb0");
+	istrue("and the higher name's are the ones kept",
+		dirtyhas(s, oid, 3, "peer.b"));
+	eqv("32 of them, and the record that displaced them",
+		dirtycount(s), 33);
 	storeclose(s);
 	devclose(d);
 }
@@ -1059,9 +1619,17 @@ main(int argc, char **argv)
 	tcoverage();
 	trebuild();
 	tpublish();
+	tckmark();
 	tcondemn();
 	tbadmap();
+	tlogread();
+	treplayapply();
+	treclaimfault();
+	tpostreclaim();
+	tnodirty();
 	tdirtyfull();
+	tdirtytie(0);
+	tdirtytie(1);
 	tflushchan();
 	tbigblk();
 	if(fails > 0){
