@@ -997,6 +997,90 @@ treplayapply(void)
 }
 
 /*
+ * §5 step 7's in-loop write-back: when the extent-map cache fills
+ * mid-replay, emapreclaim writes the dirty entries back to the device
+ * so replay's footprint is a function of the cache and not of the
+ * log.  A failure there says nothing about the bytes at the log
+ * offset, so it MUST refuse the start like any other apply failure —
+ * a build that read it as end-of-log would start with every record
+ * from that point silently gone, acked writes included.
+ *
+ * The fault is ONE-SHOT, not sticky: a sticky fault is caught by the
+ * post-loop write-back too, so both builds refuse and nothing is
+ * discriminated.  Consumed by the in-loop write-back, the post-loop
+ * one then succeeds — and a build that took the in-loop failure as
+ * end-of-log starts cleanly with the records after it discarded.
+ * An extent-map cache of one forces the in-loop write-back; Oslot
+ * records that install *fresh* maps keep emapget from reading the
+ * region, so the armed fault cannot fire on a read.
+ *
+ * Mutation: `if(nemapc > emapcap && emapreclaim < 0) break;' in
+ * replay, and the store below starts with two acked records gone.
+ */
+static void
+treclaimfault(void)
+{
+	Dev *d;
+	Store *s;
+	Storecfg c;
+	Storestat st;
+	Super sb;
+	Sbsel sel;
+	uchar *buf, oid[Oidmax];
+	int i;
+	static char *nm[3] = { "r0", "r1", "r2" };
+
+	d = newdisk();
+	tcfg(&c);
+	c.emapcache = 1;
+	if((s = storeopen(d, &c)) == nil){
+		fail("a failing in-loop reclaim: storeopen: %r");
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(2*Blk, 83);
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	for(i = 0; i < 3; i++){
+		oidof(oid, nm[i]);
+		if(objcreate(s, oid, 2, 1, 1, nil, 0, nil) < 0)
+			fail("objcreate %s: %r", nm[i]);
+		/* 0 -> 2 blocks in one commit: Oslot, so replay reads no map */
+		if(objwrite(s, oid, 2, buf, 2*Blk, 0, 2, 1, nil, 0) < 0)
+			fail("objwrite %s: %r", nm[i]);
+	}
+	storestat(s, &st);
+	eqv("three objects are acked and durable", st.nlive, 3);
+	storeclose(s);
+
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	sb = sel.sb[sel.start];
+	simfaultat(d, Sfeio, 1, (vlong)sb.emapoff*sb.secsz,
+		(vlong)sb.emapsecs*sb.secsz);
+	checks++;
+	if((s = storeopen(d, &c)) != nil){
+		storestat(s, &st);
+		fail("the store started over a failed in-loop emapreclaim "
+			"(nlive=%llud, nreplay=%llud)", st.nlive, st.nreplay);
+		storeclose(s);
+	}
+	simfault(d, Sfnone, 0);
+
+	/* the fault was transient: with it gone, everything is there */
+	if((s = storeopen(d, &c)) == nil)
+		fail("reopen with the fault gone: %r");
+	else{
+		storestat(s, &st);
+		eqv("every object is there once the map is writable",
+			st.nlive, 3);
+		storeclose(s);
+	}
+	free(buf);
+	devclose(d);
+}
+
+/*
  * §2.6: ndirty is an implementation limit in exactly layer-a §7.1's
  * sense.  When it is exhausted the store discards every fine-grained
  * record for the peer with the most records and marks that peer
@@ -1414,6 +1498,7 @@ main(int argc, char **argv)
 	tbadmap();
 	tlogread();
 	treplayapply();
+	treclaimfault();
 	tdirtyfull();
 	tdirtytie(0);
 	tdirtytie(1);
