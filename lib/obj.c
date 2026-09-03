@@ -1668,6 +1668,15 @@ stagefail(Stage *g)
  * may hand it to another proc's stage at any moment, and a second
  * grainstageclr from stagediscard would remove *that* reservation:
  * two objects sharing a grain, undetectable by arbitration.
+ *
+ * The nstagegrain charge is dropped here, but the grains stay in the
+ * staged *set* until the commit's apply moves them to the bitmap — so
+ * between handoff and apply the counter under-counts the set by this
+ * stage's grains, and concurrent chunks can briefly push the set past
+ * stagetot by that amount.  Deliberate: §3.6's bound is back-pressure
+ * on reservations, and these grains are still reserved either way, so
+ * there is no reuse risk — only a bound read low for the moments a
+ * commit is in flight.
  */
 static void
 stagehandoff(Stage *g, uvlong lim)
