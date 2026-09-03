@@ -1457,6 +1457,19 @@ tinlinemap(void)
 				fail("a record naming an inline map for two "
 					"blocks was applied");
 			storeclose(s);
+		}else{
+			char err[ERRMAX];
+
+			/*
+			 * The remedy MUST survive ERRMAX: the refusal names
+			 * the device, the sector and the range check's own
+			 * text, and on a real sd path a remedy spelled at
+			 * the tail is exactly the part that is cut.
+			 */
+			rerrstr(err, sizeof err);
+			checks++;
+			if(strstr(err, "shoalck, then refill from peers") == nil)
+				fail("the refusal lost its remedy: %s", err);
 		}
 	}
 	free(rec);

@@ -952,6 +952,19 @@ treplayapply(void)
 	if((s = openstore(d)) != nil){
 		fail("a store started over a log record it could not apply");
 		storeclose(s);
+	}else{
+		char err[ERRMAX];
+
+		/*
+		 * The refusal's remedy MUST survive ERRMAX: the device path
+		 * leads and the deep error's own text is inside, so a remedy
+		 * spelled at the tail is cut on a real sd name and the
+		 * operator never learns the way out.
+		 */
+		rerrstr(err, sizeof err);
+		checks++;
+		if(strstr(err, "shoalck, then refill from peers") == nil)
+			fail("the refusal lost its remedy: %s", err);
 	}
 
 	/* the fault was transient: with it gone, everything is there */

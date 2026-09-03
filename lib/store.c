@@ -535,8 +535,14 @@ refuse:
 	rerrstr(e, sizeof e);
 	free(hdr);
 	free(buf);
-	werrstr("log sector %llud: %s: the log cannot be replayed to its "
-		"end; shoalck, then refill from peers", bad, e);
+	/*
+	 * The remedy leads because ERRMAX cuts the tail: with a real
+	 * device path in front and a device error's own text inside,
+	 * a remedy at the end of the message is the part the operator
+	 * never sees.
+	 */
+	werrstr("the log cannot be replayed; shoalck, then refill from "
+		"peers; log sector %llud: %s", bad, e);
 	return -1;
 }
 
