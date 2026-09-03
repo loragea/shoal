@@ -322,9 +322,9 @@ void	emapfreeall(Store*);
 
 /* apply.c — §2.7's one apply function, shared by commit and replay */
 int	applyrec(Store*, Objrec*, Emape*);
-int	objrecok(Store*, Objrec*);
+int	objrecok(Super*, Objrec*);	/* Super, not Store: shoalck judges too */
 int	applydirty(Store*, Dirtyrec*, Dirtent**);
-int	dirtyrecok(Store*, Dirtyrec*);
+int	dirtyrecok(Super*, Dirtyrec*);
 void	addpeer(Store*, uchar*, int);
 int	applyslot(Store*, ulong slot);
 void	mapopen(Store*, Omap*, Ient*, Emape*);

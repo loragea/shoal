@@ -598,7 +598,7 @@ itemok(Store *s, Item *it)
 	int i;
 
 	if((o = it->obj) != nil){
-		if(objrecok(s, o) < 0)
+		if(objrecok(&s->sb, o) < 0)
 			return -1;
 		if(o->emapslot != 0
 		&& (it->emap == nil || it->emap->slot != o->emapslot)){
@@ -612,7 +612,7 @@ itemok(Store *s, Item *it)
 		return -1;
 	}
 	for(i = 0; i < it->ndirty; i++)
-		if(dirtyrecok(s, &it->dirty[i]) < 0)
+		if(dirtyrecok(&s->sb, &it->dirty[i]) < 0)
 			return -1;
 	if(it->haseslot && it->eslot >= s->sb.nslots){
 		werrstr("Eslot: slot %lud, nslots %lud", it->eslot,

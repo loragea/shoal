@@ -209,24 +209,29 @@ maplimit(Store *s, Ient *e)
  * geometry does not have if it was written by a different build or
  * read from a lap this store never wrote; applying half of it and
  * then refusing is worse than refusing all of it.
+ *
+ * Against the superblock rather than the store, because the checker
+ * makes the same judgement (§12): a record replay refuses to start
+ * on is one shoalck MUST flag, and shoalck holds a geometry and no
+ * store.
  */
 int
-objrecok(Store *s, Objrec *o)
+objrecok(Super *sb, Objrec *o)
 {
 	uvlong nblk;
 	ulong i;
 
-	if(o->slot >= s->sb.nslots){
-		werrstr("Eobj: slot %lud, nslots %lud", o->slot, s->sb.nslots);
+	if(o->slot >= sb->nslots){
+		werrstr("Eobj: slot %lud, nslots %lud", o->slot, sb->nslots);
 		return -1;
 	}
-	if(o->emapslot >= s->sb.nemap){
+	if(o->emapslot >= sb->nemap){
 		werrstr("Eobj: emapslot %lud, nemap %lud", o->emapslot,
-			s->sb.nemap);
+			sb->nemap);
 		return -1;
 	}
-	if(o->len > s->sb.objmax){
-		werrstr("Eobj: len %llud, objmax %llud", o->len, s->sb.objmax);
+	if(o->len > sb->objmax){
+		werrstr("Eobj: len %llud, objmax %llud", o->len, sb->objmax);
 		return -1;
 	}
 	/*
@@ -235,7 +240,7 @@ objrecok(Store *s, Objrec *o)
 	 * 5 would then clear the entry that names it, leaking the grain
 	 * with nothing left pointing at it.
 	 */
-	nblk = blkcount(o->len, s->sb.blksz);
+	nblk = blkcount(o->len, sb->blksz);
 	/*
 	 * An object of more than one block keeps its map out of line, so
 	 * a record that claims otherwise names blocks the entry cannot
@@ -250,21 +255,21 @@ objrecok(Store *s, Objrec *o)
 		return -1;
 	}
 	for(i = 0; i < o->nmap; i++){
-		if(o->map[i].blk >= s->sb.nblkmax || o->map[i].blk >= nblk){
+		if(o->map[i].blk >= sb->nblkmax || o->map[i].blk >= nblk){
 			werrstr("Eobj: block %lud, nblk %llud, nblkmax %lud",
-				o->map[i].blk, nblk, s->sb.nblkmax);
+				o->map[i].blk, nblk, sb->nblkmax);
 			return -1;
 		}
-		if(o->map[i].grain >= s->sb.ngrains){
+		if(o->map[i].grain >= sb->ngrains){
 			werrstr("Eobj: grain %lud, ngrains %llud",
-				o->map[i].grain, s->sb.ngrains);
+				o->map[i].grain, sb->ngrains);
 			return -1;
 		}
 	}
 	for(i = 0; i < o->nfree; i++)
-		if(o->freed[i] >= s->sb.ngrains){
+		if(o->freed[i] >= sb->ngrains){
 			werrstr("Eobj: freed grain %lud, ngrains %llud",
-				o->freed[i], s->sb.ngrains);
+				o->freed[i], sb->ngrains);
 			return -1;
 		}
 	return 0;
@@ -279,7 +284,7 @@ applyrec(Store *s, Objrec *o, Emape *c)
 	ulong i, lim;
 	uchar dig[Blkdlen];
 
-	if(objrecok(s, o) < 0)
+	if(objrecok(&s->sb, o) < 0)
 		return -1;
 	e = &s->idx[o->slot];
 
@@ -552,9 +557,9 @@ dropworstpeer(Store *s)
 
 /* the field checks §2.6 makes on a record, before anything is believed */
 int
-dirtyrecok(Store *s, Dirtyrec *d)
+dirtyrecok(Super *sb, Dirtyrec *d)
 {
-	USED(s);
+	USED(sb);
 	if(d->oidlen < 1 || d->oidlen > Oidmax || d->peerlen < 1
 	|| d->peerlen > Peermax){
 		werrstr("Edirty: oidlen %d peerlen %d", d->oidlen, d->peerlen);
@@ -580,7 +585,7 @@ applydirty(Store *s, Dirtyrec *d, Dirtent **spare)
 	Dirtent *t;
 	ulong i;
 
-	if(dirtyrecok(s, d) < 0)
+	if(dirtyrecok(&s->sb, d) < 0)
 		return -1;
 	for(i = 0; i < s->sb.ndirty; i++){
 		if((t = s->dirt[i]) == nil)
