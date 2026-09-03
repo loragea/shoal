@@ -1738,9 +1738,11 @@ lose arbitration against everything including absence.
    error, and this is the same rule. **A record that cannot be
    applied refuses the start the same way**: the apply fails on a
    device error under an extent map, on an allocation failure, or on
-   an entry §2.7's range checks refuse — which no conforming writer
-   produces, because the commit path checks them before writing
-   (§3.2). None of those says the log ends at a record that is
+   any entry it cannot decode or believe — an entry header or body
+   that does not parse, an entry kind this build does not know, or a
+   field §2.7's range checks refuse — none of which a conforming
+   writer produces, because the commit path packs and checks them
+   before writing (§3.2). None of those says the log ends at a record that is
    checksummed and in sequence; and, entries being applied one at a
    time, stopping there would also leave the store on a half-applied
    record no crash could produce. Applying an entry means setting absolute

@@ -463,8 +463,11 @@ applyents(Store *s, uchar *p, Lrec *r)
  *
  * **Neither is a record that cannot be applied.**  applyents fails on
  * a device error under an extent map (emapget reads the extent-map
- * region; emapreclaim writes it) and on an allocation failure, and
- * both say nothing about the bytes at rel: the record is valid,
+ * region; emapreclaim writes it), on an allocation failure, and on
+ * any entry it cannot decode or that its checks refuse — an entry
+ * header or body that does not parse, a kind this build does not
+ * know, a field §2.7's range checks reject — and none of those says
+ * anything about the bytes at rel: the record is valid,
  * checksummed and in sequence.  Worse than the truncation, applyents
  * applies entries one at a time, so a mid-record failure leaves the
  * store on a half-applied record no crash could produce.  Both refuse
