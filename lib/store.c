@@ -181,6 +181,19 @@ geomok(Store *s, Dev *d)
 		werrstr("a metadata region is smaller than its own count");
 		return -1;
 	}
+	/*
+	 * §2.6's region is load-bearing even when empty of records:
+	 * applydirty can drop a peer's records to make room, but a
+	 * region of no slots at all leaves it nothing to drop, so a
+	 * store opened over ndirty == 0 commits no Edirty (itemok) and
+	 * replay refuses the first record that carries one — a brick,
+	 * on the first fine-grained mark.  shoalfmt never writes such a
+	 * geometry; one that arrives anyway is refused whole, here.
+	 */
+	if(sb->ndirty == 0){
+		werrstr("the geometry has no dirty region");
+		return -1;
+	}
 	if(sb->bmapsecs % pagesecs != 0 || nbmpage(sb) == 0){
 		werrstr("bitmap region of %llud sectors is not whole pages",
 			sb->bmapsecs);

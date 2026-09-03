@@ -177,6 +177,9 @@ ckgeom(Ck *k)
 	if(s->objmax % s->blksz != 0 || s->nblkmax != s->objmax/s->blksz)
 		problem(k, "nblkmax %lud does not match objmax %llud / blksz %lud",
 			s->nblkmax, s->objmax, s->blksz);
+	/* §2.6: a store refuses to open over ndirty == 0, and so must this */
+	if(s->ndirty == 0)
+		problem(k, "the geometry has no dirty region");
 	/*
 	 * In uvlong: nblkmax is a u32 the superblock supplies, so
 	 * 20*nblkmax reaches 2^36 and the ulong sum wraps.  A

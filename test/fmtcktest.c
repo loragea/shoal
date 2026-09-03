@@ -754,6 +754,18 @@ tlive(void)
 	if(report(d, nil) == 0)
 		fail("the checker passed a zero blksz");
 	said("a zero blksz", "are not a geometry");
+
+	/*
+	 * §2.6: the store refuses to open over ndirty == 0 — applydirty
+	 * would have nothing to drop for the first Edirty — so the
+	 * checker flags the geometry by the same rule.
+	 */
+	live(d, &s, &c);
+	sbpoke32(d, &s, 96, 0);			/* ndirty */
+	checks++;
+	if(report(d, nil) == 0)
+		fail("the checker passed a geometry with no dirty region");
+	said("no dirty region", "no dirty region");
 	devclose(d);
 }
 

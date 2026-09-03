@@ -1158,6 +1158,55 @@ tpostreclaim(void)
 }
 
 /*
+ * §5 step 3: a geometry with no dirty region cannot serve — applydirty
+ * can drop a peer's records to make room, but ndirty == 0 leaves it
+ * nothing to drop, so such a store commits no Edirty and replay
+ * refuses the first record that carries one.  shoalfmt never writes
+ * one; a superblock claiming it is refused whole at open.
+ *
+ * Mutation: drop geomok's ndirty test, and the store below opens.
+ */
+static void
+tnodirty(void)
+{
+	Dev *d;
+	Store *s;
+	Sbsel sel;
+	uchar *sb;
+	char err[ERRMAX];
+	ulong secsz;
+	int i;
+
+	d = newdisk();
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	secsz = sel.sb[sel.start].secsz;
+	if((sb = malloc(secsz)) == nil)
+		sysfatal("malloc: %r");
+	/* poke ndirty = 0 into both copies and re-seal them */
+	for(i = 0; i < 2; i++){
+		vlong o;
+
+		o = i == 0 ? 0 : super1off(d);
+		simpeek(d, o, sb, secsz);
+		PBIT32(sb + 96, 0);		/* ndirty */
+		reccsumset(sb, secsz, 16);
+		simpoke(d, o, sb, secsz);
+	}
+	free(sb);
+	checks++;
+	if((s = openstore(d)) != nil){
+		fail("a store opened over a geometry with no dirty region");
+		storeclose(s);
+	}else{
+		rerrstr(err, sizeof err);
+		istrue("and the refusal names the missing region",
+			strstr(err, "no dirty region") != nil);
+	}
+	devclose(d);
+}
+
+/*
  * §2.6: ndirty is an implementation limit in exactly layer-a §7.1's
  * sense.  When it is exhausted the store discards every fine-grained
  * record for the peer with the most records and marks that peer
@@ -1577,6 +1626,7 @@ main(int argc, char **argv)
 	treplayapply();
 	treclaimfault();
 	tpostreclaim();
+	tnodirty();
 	tdirtyfull();
 	tdirtytie(0);
 	tdirtytie(1);
