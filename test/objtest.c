@@ -1127,6 +1127,62 @@ tsweepexpire(void)
 }
 
 /*
+ * stagefinal's updcommit-failure exit, pinned: by the time updcommit
+ * runs, stagehandoff has zeroed g->grain and dropped the staged
+ * charge, so the discard inside stagefail releases nothing — the
+ * grains' release must come from updcommit's own updabort, exactly
+ * once.  A missing release leaks them for the life of the process; a
+ * second one removes a reservation the allocator has since handed to
+ * someone else.
+ *
+ * Mutation: updcommit's logcommit-failure path calls updfree instead
+ * of updabort, and the grain below stays reserved forever.
+ */
+static void
+tfinalfault(void)
+{
+	Dev *d;
+	Store *s;
+	Stage *g;
+	Storestat st;
+	uchar *buf, o[Oidmax];
+	uvlong g0;
+
+	d = newdisk();
+	if((s = mustopen(d, "a final whose commit fails")) == nil)
+		return;
+	buf = mkbuf(Blk, 47);
+	/*
+	 * A first create, so §2.2's qid batch is already published:
+	 * otherwise the absent-object final's own qidalloc is the first
+	 * ever, its batch publish takes the armed fault, and the test
+	 * ends in updnew without ever reaching updcommit.
+	 */
+	mk(s, "warm");
+	oidof(o, "ff");
+	storestat(s, &st);
+	g0 = st.grainfree;
+	if((g = stageopen(s, o, 2, Blk, 0)) == nil)
+		fail("stageopen: %r");
+	else{
+		if(stagewrite(g, buf, Blk, 0) < 0)
+			fail("stagewrite: %r");
+		simfault(d, Sfeio, 0);		/* sticky: the log write fails */
+		checks++;
+		if(stagefinal(g, 9, 1, nil, 0) >= 0)
+			fail("a final whose log write failed reported success");
+		simfault(d, Sfnone, 0);
+		storestat(s, &st);
+		eqv("the handed-off grain is released exactly once",
+			st.grainfree, g0);
+		eqv("and nothing is left staged", st.staged, 0);
+	}
+	storeclose(s);
+	devclose(d);
+	free(buf);
+}
+
+/*
  * layer-a §1.5's receiver checks, made inside objdiscard: the record
  * must be a tombstone at exactly the key the discard names, with
  * wepoch strictly below the given epoch.  Checked in the call rather
@@ -2058,6 +2114,7 @@ main(int argc, char **argv)
 	tsweepfinal();
 	tsweepchunk();
 	tsweepexpire();
+	tfinalfault();
 	tdiscard();
 	tcondemned();
 	texhaust();
