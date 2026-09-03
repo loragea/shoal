@@ -1086,6 +1086,7 @@ tabsorbbreak(void)
 	int i, k;
 
 	d = newdisk();
+	spawnforget();		/* the checkpointer below is reapable too */
 	if((s = openstoreck(d)) == nil){
 		fail("absorb-break: storeopen: %r");
 		devclose(d);
@@ -1124,9 +1125,17 @@ tabsorbbreak(void)
 				fail("absorb-break: worker %d is orphaned", i);
 		/*
 		 * An orphaned worker holds the store: storeclose would wait
-		 * on it forever, so the failing run leaks the store and the
-		 * device instead and lets the suite report.
+		 * on it forever and storefree would pull the store from
+		 * under the sleeper, so the failing run leaks the store and
+		 * the device — but not the procs.  Left alive, six workers
+		 * and the checkpointer keep their end of mk test's pipe
+		 * open long after this program has reported, and every
+		 * failing run adds a fresh set.  killspawned kills exactly
+		 * those seven, by the pids t1.h recorded (a note to the
+		 * group would take mk and this program's own shell with
+		 * them, and the FAIL lines above never reach the report).
 		 */
+		killspawned();
 		return;
 	}
 	simslow(d, 0);
