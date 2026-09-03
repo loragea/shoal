@@ -312,6 +312,8 @@ applyrec(Store *s, Objrec *o, Emape *c)
 			free(e->oid);
 			if((e->oid = malloc(o->oidlen)) == nil){
 				e->oidcap = 0;
+				/* replay reports this in its refusal (§5 step 7) */
+				werrstr("out of memory");
 				return -1;
 			}
 			e->oidcap = o->oidlen;
@@ -627,8 +629,11 @@ applydirty(Store *s, Dirtyrec *d, Dirtent **spare)
 		t = *spare;
 		*spare = nil;
 		memset(t, 0, sizeof *t);
-	}else if((t = mallocz(sizeof *t, 1)) == nil)
+	}else if((t = mallocz(sizeof *t, 1)) == nil){
+		/* replay's allocation; its refusal reports this (§5 step 7) */
+		werrstr("out of memory");
 		return -1;
+	}
 	t->epoch = d->epoch;
 	t->state = 1;
 	t->oidlen = d->oidlen;

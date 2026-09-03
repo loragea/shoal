@@ -254,8 +254,15 @@ objrecunpack(Objrec *o, uchar *p, long n)
 		werrstr("Eobj: nmap %lud runs off the entry", o->nmap);
 		return -1;
 	}
-	if(o->nmap > 0 && (o->map = malloc(o->nmap*sizeof *o->map)) == nil)
+	/*
+	 * The allocator leaves errstr alone, and replay reports these
+	 * failures verbatim in its refusal (§5 step 7), so an untouched
+	 * errstr there would name whatever this proc last said.
+	 */
+	if(o->nmap > 0 && (o->map = malloc(o->nmap*sizeof *o->map)) == nil){
+		werrstr("out of memory");
 		return -1;
+	}
 	for(i = 0; i < o->nmap; i++){
 		o->map[i].blk = GBIT32(q + 0);
 		o->map[i].grain = GBIT32(q + 4);
@@ -272,8 +279,10 @@ objrecunpack(Objrec *o, uchar *p, long n)
 		werrstr("Eobj: nfree %lud runs off the entry", o->nfree);
 		goto bad;
 	}
-	if(o->nfree > 0 && (o->freed = malloc(o->nfree*sizeof *o->freed)) == nil)
+	if(o->nfree > 0 && (o->freed = malloc(o->nfree*sizeof *o->freed)) == nil){
+		werrstr("out of memory");
 		goto bad;
+	}
 	for(i = 0; i < o->nfree; i++){
 		o->freed[i] = GBIT32(q);
 		q += 4;
