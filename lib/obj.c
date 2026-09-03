@@ -595,9 +595,9 @@ stageblk(Upd *u, Omap *mold, ulong blk, uchar *src, ulong boff, ulong bn,
 		n = u->newlen - (uvlong)blk*s->sb.blksz;
 	blkdigest(buf, n, dig);
 	qlock(&s->qlstate);
+	/* grainalloc spells its own failure: disk full, or out of memory */
 	if(grainalloc(s, &g) < 0){
 		qunlock(&s->qlstate);
-		werrstr("disk full");
 		return -1;
 	}
 	qunlock(&s->qlstate);
@@ -703,9 +703,9 @@ reblk(Upd *u, Omap *mold, ulong blk, uchar *buf)
 	if(newn < oldn)
 		return addmap(u, blk, g, dig);
 	qlock(&s->qlstate);
+	/* grainalloc spells its own failure: disk full, or out of memory */
 	if(grainalloc(s, &ng) < 0){
 		qunlock(&s->qlstate);
-		werrstr("disk full");
 		return -1;
 	}
 	qunlock(&s->qlstate);
@@ -1493,10 +1493,10 @@ stagewrite1(Stage *g, void *a, long n, uvlong off)
 			werrstr("disk full");
 			return -1;
 		}
+		/* grainalloc spells its own failure: disk full, or OOM */
 		if(grainalloc(s, &gr) < 0){
 			qunlock(&s->qlstate);
 			free(buf);
-			werrstr("disk full");
 			return -1;
 		}
 		qunlock(&s->qlstate);

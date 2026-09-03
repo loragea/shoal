@@ -104,8 +104,17 @@ stagedadd(Store *s, ulong g)
 
 	if((n = s->stagefree) != nil)
 		s->stagefree = n->next;
-	else if((n = malloc(sizeof *n)) == nil)
+	else if((n = malloc(sizeof *n)) == nil){
+		/*
+		 * §3.7: a failed allocation is an internal error and never
+		 * a §2.6 `disk full' — the disk may be nearly empty.  The
+		 * allocator leaves errstr alone on failure, so it is set
+		 * here, where exhaustion and OOM part ways, and grainalloc's
+		 * callers rely on the distinction being already spelled.
+		 */
+		werrstr("out of memory");
 		return -1;
+	}
 	n->g = g;
 	n->next = s->stagebuck[g % s->nstagebuck];
 	s->stagebuck[g % s->nstagebuck] = n;
@@ -137,6 +146,11 @@ stageddel(Store *s, ulong g)
  * commit has released without its post-flush having returned (§3.5 —
  * a commit's frees are part of applying it, and a batch is applied
  * only after its post-flush), and none another stage has reserved.
+ *
+ * Every failure return sets errstr itself — `disk full' for the two
+ * exhaustion exits, `out of memory' from stagedadd — and callers MUST
+ * NOT overwrite it: folding OOM into `disk full' answers a memory
+ * failure with a §2.6 wire error (§3.7).
  */
 int
 grainalloc(Store *s, ulong *gp)
