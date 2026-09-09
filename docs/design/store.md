@@ -1564,7 +1564,7 @@ own `not primary: n5.0` is the pattern. Callers can act on these:
 | a write, truncate or stage past `objmax`, at either bound | `object too large` |
 | an `op=full` at a key the receiver's own key defends (§3.6) | `stale version` |
 | an `op=full` at a version the object model forbids, and a chunk outside its stage's declared length | `bad ctl` |
-| a read, verify or update through an extent-map entry that failed its `csum128` (§5 step 9); a read, write or truncate of a copy whose `corrupt` flag is set (§8); a block repair whose bytes do not hash to the stored `dig[i]` | `checksum mismatch` |
+| a read, verify or update through an extent-map entry that failed its `csum128` (§5 step 9) — block repair excepted, below; a read, write or truncate of a copy whose `corrupt` flag is set (§8); a block repair whose bytes do not hash to the stored `dig[i]` | `checksum mismatch` |
 | a discard whose record fails layer-a §1.5's receiver checks: not a tombstone, not at exactly the named key, or its `wepoch` not strictly below the given epoch | `not discardable` |
 | no grain, index slot, extent-map slot, staged-grain budget, or log space after §6's bounded wait | `disk full` |
 
@@ -1578,8 +1578,10 @@ whose version this instance chooses (create,
 write, truncate, delete), a
 failed allocation, a chunk or `final=1` on a stage the idle sweep has
 expired (§3.6), a block repair asked for on an object whose digest
-array fails its `csum`, at a block the object does not have, or at a
-count that is not that block's covered length (§8), a slot cursor's
+array fails its `csum` or through an extent-map entry that failed its
+own `csum128`, at a block the object does not have, at a count that is
+not that block's covered length, or at a block whose bytes already
+hash to their stored digest (§8), a slot cursor's
 index outside `nslots`, a device error carried out of the commit
 path, a
 geometry that does not check out at start, and the two condemnations
@@ -1624,11 +1626,15 @@ them obvious:
   copy whose `corrupt` flag is set is that same statement made
   durably, so client access to it is answered the same way (§8), a
   count-0 write included — it commits nothing, but answering it `ok`
-  is client access served. The other block-repair refusal is
+  is client access served. The other block-repair refusals are
   deliberately *not* this one: a repair asked for on an object whose
-  digest array does not hash to its `csum` is a caller that ignored
-  §8's two kinds of mismatch, and it is an internal-invariant error
-  below.
+  digest array does not hash to its `csum`, or through an extent-map
+  entry that failed its own `csum128`, is a caller that ignored §8's
+  two kinds of mismatch. Those are one condition told two ways — in
+  both, the stored `dig[i]` is not an acceptance test and the repair
+  is `op=full` — so they are spelled as one family of
+  internal-invariant error, `block repair: slot N: …`, rather than
+  splitting on which structure carried the damage.
 
 ## 4. Read path, holes and re-hashing
 
@@ -2327,14 +2333,21 @@ through and the peer fetch — is the server's, and is not built yet
   from a holder at the same key. It refuses unless `hash(dig[]) ==
   csum` — the acceptance test's own precondition, and a caller that
   asks here for an object whose array fails is a server bug, so that
-  refusal is §3.7's internal kind and carries no §2.6 prefix — and
-  then accepts the bytes only against the stored `dig[i]`, answering
-  `checksum mismatch` if they do not hash to it. On acceptance one
-  `Eobj` publishes the block with the four-tuple unchanged, freeing
-  the grain it replaced under §3.5 like any other commit. It does
-  **not** clear the flag: one block matching says nothing about the
-  others, and the clearing belongs to the verify that finds every
-  block matching.
+  refusal is §3.7's internal kind and carries no §2.6 prefix. A slot
+  §5 step 10 condemned is the same condition reached the other way,
+  since the entry naming the block's grain and digest is itself the
+  damage, and is refused in the same internal words. It then accepts
+  the bytes only against the stored `dig[i]`, answering `checksum
+  mismatch` if they do not hash to it, and refuses — internally again
+  — a block whose *own* bytes already hash to that digest: repair is
+  driven by the set verify answers, and a block outside that set is
+  whole, so the commit would change nothing, cost a grain, and, where
+  the block is a hole (§4), leave the object one grain heavier with
+  the same content. On acceptance one `Eobj` publishes the block with
+  the four-tuple unchanged, freeing the grain it replaced under §3.5
+  like any other commit. It does **not** clear the flag: one block
+  matching says nothing about the others, and the clearing belongs to
+  the verify that finds every block matching.
 - **a slot cursor**, so a pass can walk the index in order. It
   answers what one slot holds — live or tomb, the oid and the
   four-tuple — and copies the oid out, because the entry's own copy

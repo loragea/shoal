@@ -1617,7 +1617,7 @@ objrepair(Store *s, uchar *oid, int oidlen, ulong blk, void *a, long n)
 	Upd u;
 	Omap mold;
 	Objinfo oi;
-	uchar *buf, *digs, dig[Blkdlen], csum[Csumlen];
+	uchar *buf, *digs, dig[Blkdlen], cur[Blkdlen], csum[Csumlen];
 	uvlong i, nblk;
 	ulong g, cov;
 
@@ -1641,8 +1641,27 @@ objrepair(Store *s, uchar *oid, int oidlen, ulong blk, void *a, long n)
 	 * saying so as a checksum mismatch would blame the peer for the
 	 * caller's arithmetic.
 	 */
-	if(updopen(&u, s, oid, oidlen, oi.len, Ucorrupt) < 0)
+	if(updopen(&u, s, oid, oidlen, oi.len, Ubad|Ucorrupt) < 0)
 		return -1;
+	/*
+	 * A slot §5 step 10 condemned — already, or by the mapread
+	 * updopen has just made — is the arraybad case reached the other
+	 * way: the entry that names this block's grain and digest *is*
+	 * the damaged bytes, so there is no acceptance test here either
+	 * and §8 sends the object to op=full.  That makes it one caller
+	 * bug with the arraybad refusal below, so it is spelled the same
+	 * internal way rather than coming back as §2.6's `checksum
+	 * mismatch' from updopen — which a /repl peer would read as a
+	 * media fault it should retry.
+	 */
+	if(u.e.bad){
+		updabort(&u);
+		updclose(&u);
+		werrstr("block repair: slot %lud: the extent map does not "
+			"pass its checksum; the repair here is op=full",
+			u.slot);
+		return -1;
+	}
 	cov = blkcover(s, u.e.len, blk);
 	if(n < 0 || (ulong)n != cov){
 		updabort(&u);
@@ -1682,6 +1701,37 @@ objrepair(Store *s, uchar *oid, int oidlen, ulong blk, void *a, long n)
 		updabort(&u);
 		updclose(&u);
 		werrstr("out of memory");
+		return -1;
+	}
+	/*
+	 * The block this is asked to repair must be one that needs it.
+	 * A block whose own bytes already hash to the stored digest is
+	 * whole, so the repair changes nothing and costs a grain — and
+	 * where the block is a hole (§4) it costs the hole as well:
+	 * mapgrain is 0, so the freed grain is a no-op and the object
+	 * comes back one grain heavier with the same content.  §8's
+	 * repair is driven by the *set* verify answers, so asking here
+	 * for a block outside that set is the same caller bug as asking
+	 * with a failing digest array, and carries no §2.6 prefix.
+	 */
+	g = mapgrain(&mold, blk);
+	if(g == 0)
+		zerodigest(s, u.e.len, blk, cur);
+	else{
+		if(grainread(s, buf, g) < 0){
+			free(buf);
+			updabort(&u);
+			updclose(&u);
+			return -1;
+		}
+		blkdigest(buf, cov, cur);
+	}
+	if(memcmp(cur, mapdig(&mold, blk), Blkdlen) == 0){
+		free(buf);
+		updabort(&u);
+		updclose(&u);
+		werrstr("block repair: block %lud already hashes to its "
+			"stored digest", blk);
 		return -1;
 	}
 	/*

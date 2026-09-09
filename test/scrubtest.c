@@ -463,8 +463,10 @@ trepair(void)
 	Store *s;
 	Objinfo oi;
 	Super sup;
+	Storestat sst;
 	Vfy v;
-	uchar *buf, *bad, oid[Oidmax], csum[Csumlen];
+	uchar *buf, *bad, *zeros, oid[Oidmax], hid[Oidmax], csum[Csumlen];
+	uvlong gf;
 	ulong g, emapslot;
 
 	d = newdisk();
@@ -472,6 +474,7 @@ trepair(void)
 		return;
 	buf = mkbuf(3*Blk, 71);
 	bad = mkbuf(3*Blk, 72);
+	zeros = mkbuf(Blk, 0);
 	mk(s, "r");
 	mustwr(s, "r", buf, 3*Blk, 0, 2);
 	oidof(oid, "r");
@@ -494,6 +497,15 @@ trepair(void)
 	refusedinternal("a block repair past the last block",
 		objrepair(s, oid, 1, 3, buf, Blk));
 
+	/*
+	 * Block 0 is whole, and the bytes offered are the ones it already
+	 * holds.  §8 drives repair off the set verify answers, so a block
+	 * outside that set is a caller bug: the commit would change
+	 * nothing and cost a grain.
+	 */
+	refusedinternal("a block repair of a block that already matches",
+		objrepair(s, oid, 1, 0, buf, Blk));
+
 	checks++;
 	if(objrepair(s, oid, 1, 2, buf + 2*Blk, Blk) < 0)
 		fail("objrepair: %r");
@@ -510,6 +522,32 @@ trepair(void)
 	else{
 		eqv("the repair left the version alone", oi.ver, 2);
 		eqv("and the length", oi.len, 3*Blk);
+	}
+
+	/*
+	 * A hole is the sharp form of the same refusal.  Its stored
+	 * digest is the zero digest (§4), so the zeros it already reads
+	 * as pass the acceptance test — and taking them would allocate a
+	 * grain while freeing grain 0, which frees nothing: the object
+	 * would come out one grain heavier with the same content and one
+	 * hole fewer.
+	 */
+	mk(s, "h");
+	mustwr(s, "h", buf, Blk, 2*Blk, 2);	/* blocks 0 and 1 are holes */
+	oidof(hid, "h");
+	memset(zeros, 0, Blk);
+	storestat(s, &sst);
+	gf = sst.grainfree;
+	refusedinternal("a block repair of a hole with the zeros it reads as",
+		objrepair(s, hid, 1, 0, zeros, Blk));
+	storestat(s, &sst);
+	eqv("and the refused hole repair costs no grain", sst.grainfree, gf);
+	checks++;
+	if(objverify(s, hid, 1, &v) < 0)
+		fail("objverify of the holed object: %r");
+	else{
+		eqv("the holed object still verifies", v.nbad, 0);
+		vfyfree(&v);
 	}
 
 	/*
@@ -587,11 +625,13 @@ trepair(void)
 	devclose(d);
 	free(buf);
 	free(bad);
+	free(zeros);
 }
 
 /*
- * A copy §5 step 10 condemned for a damaged extent map: what a delete
- * does with it, and where the grains the damaged map named end up.
+ * A copy §5 step 10 condemned for a damaged extent map: what a block
+ * repair answers, what a delete does with it, and where the grains
+ * the damaged map named end up.
  */
 static void
 tcondemned(void)
@@ -631,6 +671,16 @@ tcondemned(void)
 	storestat(s, &st);
 	eqv("the first read condemns the slot", st.nlost, 1);
 	gf = st.grainfree;
+
+	/*
+	 * §3.7: one caller bug, one spelling.  There is no acceptance
+	 * test here — the entry that names this block's digest is itself
+	 * the damage — which is exactly the arraybad case, so the refusal
+	 * is the same internal one and not §2.6's `checksum mismatch',
+	 * which a /repl peer reads as a media fault worth retrying.
+	 */
+	refusedinternal("a block repair of a condemned slot",
+		objrepair(s, oid, 1, 0, buf, Blk));
 
 	/*
 	 * §8: the delete applies.  op=delete carries its own key and a
