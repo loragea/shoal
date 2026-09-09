@@ -1222,7 +1222,6 @@ int
 objcorrupt(Store *s, uchar *oid, int oidlen, int set, Dirtyrec *dr, int ndr)
 {
 	Upd u;
-	Omap mold;
 	Objinfo oi;
 
 	if(objstat(s, oid, oidlen, &oi) < 0)
@@ -1230,21 +1229,21 @@ objcorrupt(Store *s, uchar *oid, int oidlen, int set, Dirtyrec *dr, int ndr)
 	if(updopen(&u, s, oid, oidlen, oi.len, Utomb|Ucorrupt) < 0)
 		return -1;
 	u.keepcsum = 1;
-	mapopen(s, &mold, &u.e, u.cold);
 	/*
 	 * §2.7's slot rule is what makes a commit name every block, and
-	 * this commit changes no emapslot: clause 2 zeroes nothing, so
-	 * the map the apply inherits is this object's own and an empty
-	 * nmap leaves it exactly as it is.  Naming them anyway would put
-	 * nblkmax map triples — 28.2 KiB at the defaults — into a record
-	 * §8 describes as "an Eobj that changes nothing but the corrupt
-	 * flag".
+	 * this commit changes no emapslot, so it names none: the map the
+	 * apply inherits is this object's own and an empty nmap leaves it
+	 * exactly as it is.  Naming them anyway would put nblkmax map
+	 * triples — 28.2 KiB at the defaults — into a record §8 describes
+	 * as "an Eobj that changes nothing but the corrupt flag".
+	 *
+	 * The slot cannot move under this caller: len does not change,
+	 * so an entry of more than one block keeps the map it has; one
+	 * of a block or fewer holds no map to keep (the apply's Oslot
+	 * arm zeroes emapslot whenever the new slot is 0); and a
+	 * condemned entry, the one case that would rebuild the map in a
+	 * fresh slot, updopen refuses, since nothing here passes Ubad.
 	 */
-	if(u.oslot && nameall(&u, &mold) < 0){
-		updabort(&u);
-		updclose(&u);
-		return -1;
-	}
 	if(updcommit(&u, u.e.state, u.e.ver, u.e.wepoch, u.e.mtime, set,
 		dr, ndr) < 0){
 		updclose(&u);
