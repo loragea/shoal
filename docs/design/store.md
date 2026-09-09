@@ -1132,7 +1132,10 @@ policy, both tunable without a format change. A quarter rather than a
 half because the checkpointer's job is to keep the log from ever
 being full, and starting earlier is what keeps §6's wait rare.
 
-*Anything dirty* is **counted at each checkpoint's end, not zeroed**.
+*Anything dirty* is **recounted at the end of each checkpoint that
+completes, and never zeroed** — a checkpoint that fails returns before
+the recount and keeps its pre-checkpoint count, which over-counts and
+so cannot lose the trigger.
 A page's count is raised on its clean-to-dirty edge only, so a page
 dirtied while a checkpoint runs — after that checkpoint's own pass
 packed it and cleared its mark — keeps the mark and would lose the
@@ -2153,7 +2156,7 @@ nothing is ever taken under them.
 | Lock | Covers |
 |---|---|
 | the flush lock | the coalescing flusher's ticket counters (§3.2): who is issuing the one device flush and who is waiting for it |
-| the checkpoint lock | the checkpointer's request and completion counters, and its wake-up. The checkpoint itself runs with it released |
+| the checkpoint lock | the checkpointer's request and completion counters, its wake-up, and the failure state a checkpoint leaves behind (§2.8): the stuck flag, the count of failed attempts and the last failure's text, which §6's refusal reads under it. The checkpoint itself runs with it released |
 | the proc lock | the count of procs the store has started, so `storeclose` can wait for them |
 
 Three rules make that discipline checkable rather than aspirational:
@@ -3202,8 +3205,9 @@ which a read-only device — the open every flag but `-R` takes —
 records no write at all;
 and §12's `-R` — a bitmap page that is valid and wrong, which no
 start repairs and which `-R` corrects to a full scan of the live
-maps, both free-grain counts asserted as numbers, a bitmap page that reads and fails its checksum, over
-which the `as found` count is not printed at all,
+maps, both free-grain counts asserted as numbers, a bitmap page that
+reads and fails its checksum, over which the `as found` count is not
+printed at all,
 an extent map that fails its `csum128`, which `-R` condemns rather
 than rebuilds from, a rebuild that counts the objects committed since
 the last checkpoint, `-R -v` writing the rebuild's lines before the
@@ -3228,9 +3232,10 @@ read-only replay too big for its cache is refused naming the cache —
 a checkpointer that cannot write, whose failures are counted, named
 in the commit refused for log space, and dropped from that refusal by
 a device that heals — the same store's next full log, with nothing
-checkpointing, answering the bare `disk full`, §2.8's dirty-page trigger surviving a condemnation that lands
-while a checkpoint runs, and a store opened, written and replayed at
-a `blksz` four times the device's `Wunit`), `objtest` (§2.7's extent-map slot
+checkpointing, answering the bare `disk full` — §2.8's dirty-page
+trigger surviving a condemnation that lands while a checkpoint runs,
+and a store opened, written and replayed at a `blksz` four times the
+device's `Wunit`), `objtest` (§2.7's extent-map slot
 rule over all three transitions and both the crash and the re-replay
 schedules, §2.4's invariant on the shrinking side, §3.5's deferred
 reuse of grains and of slots under a held batch, §3.6's stage lifetimes,
