@@ -680,12 +680,16 @@ dumpobj(Ck *k, char *oid)
  * would clear grains the log has since handed out.
  *
  * storeopen(spawn=nil, nockptproc=1) is what replays the log into
- * memory: with no spawn callback the engine makes no proc, commits
- * are synchronous in the caller, and the start writes nothing —
- * §5 step 11's rebuild only marks pages dirty, and replay leaves the
- * maps it applied dirty in the cache for the checkpoint rather than
- * writing them.  storecheckpoint is therefore the only write either
- * flag makes, and only -R makes it.
+ * memory: with no spawn callback the engine makes no proc and commits
+ * are synchronous in the caller.  -v opens the device read-only, so
+ * that run writes nothing at all: §5 step 11's rebuild only marks
+ * pages dirty, and replay holds the maps it applied in the cache
+ * rather than writing them, which a read-only device could not take.
+ * -R takes the read-write open shoalfmt takes, and there replay ends
+ * by writing those maps back — which is what makes a device error
+ * under the extent-map region a refusal of the start rather than a
+ * checkpoint that fails afterwards — and storecheckpoint is the
+ * write -R is for.
  */
 static void
 ckverify(Ck *k, Store *st)

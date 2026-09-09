@@ -1319,14 +1319,19 @@ tvreplay(void)
  * §12's "reads and never writes", on the store that can make it
  * false: a checkpoint, then a multi-block commit that is NOT
  * checkpointed, then a close.  Replay applies that record, which
- * dirties an extent map, and a write-back at the end of replay would
- * both break the claim on a writable device and strand the whole
- * store on a read-only one — which is every store -v exists for,
- * since a store with nothing in its log since the checkpoint is a
- * store that stopped cleanly.
+ * dirties an extent map, and a write-back there would strand the
+ * whole store — which is every store -v exists for, since a store
+ * with nothing in its log since its checkpoint is a store that
+ * stopped cleanly.  So the read-only open every flag but -R takes
+ * (shoalck.c) holds those maps instead, and the run writes nothing.
  *
- * Mutation: replay writes the maps it dirtied back before returning
- * (mut replay-writes-emaps).
+ * The writable open is -R's alone and is not asserted here: there
+ * replay's closing write-back DOES write the maps back (§5 step 7),
+ * which is what makes a device error under that region refuse the
+ * start (storetest's treplaymaps), and -R writes a checkpoint anyway.
+ *
+ * Mutation: replay writes the maps it dirtied back whatever the
+ * device was opened as (mut replay-writes-ro).
  */
 static void
 tvdirty(void)
@@ -1370,19 +1375,11 @@ tvdirty(void)
 		if(t[i].op == Sopwrite)
 			nw++;
 	eqv("-v writes nothing on a read-only store", nw, 0);
-	d->rdonly = 0;
-
-	simtracereset(d);
 	checks++;
 	if((bad = scrub(d, 1, 0)) != 0)
-		fail("-v on the same store opened writable reported %d "
+		fail("a second -v on the read-only store reported %d "
 			"problem(s)", bad);
-	n = simtrace(d, &t);
-	nw = 0;
-	for(i = 0; i < n; i++)
-		if(t[i].op == Sopwrite)
-			nw++;
-	eqv("-v writes nothing on a writable store either", nw, 0);
+	d->rdonly = 0;
 	free(buf);
 	devclose(d);
 }

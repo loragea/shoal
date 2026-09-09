@@ -262,13 +262,19 @@ emapdirty(Store *s, Emape *c)
  * depends on: cklogoff has not moved, so the records behind these
  * bytes are still in the log.
  *
- * A read-only store writes nothing at all (§12), so there the escape
- * hatch is not available and the maps are held instead — etrim never
- * evicts a dirty entry, so holding them is all it takes.  What that
- * cannot survive is a log dirtying more entries than the cache is
- * sized for, and that condition is named here: a devwrite refusal
- * would answer `opened read-only', which tells the operator nothing
- * about what was actually hit.
+ * Replay also calls this at its end, where the write-back is not an
+ * escape hatch but the point: a device that refuses the extent-map
+ * region refuses the start, and the region is named here so that the
+ * refusal says which region it was.
+ *
+ * A read-only store writes nothing at all (§12), so there neither
+ * call can write and the maps are held instead — etrim never evicts a
+ * dirty entry, so holding them is all it takes, and replay skips the
+ * closing call entirely.  What holding them cannot survive is a log
+ * dirtying more entries than the cache is sized for, and that
+ * condition is named here too: a devwrite refusal would answer
+ * `opened read-only', which tells the operator nothing about what was
+ * actually hit.
  */
 int
 emapreclaim(Store *s)
@@ -282,9 +288,10 @@ emapreclaim(Store *s)
 			ndirty++;
 		if(ndirty > s->emapcap){
 			/*
-			 * Short on purpose: replay wraps this in its own
-			 * refusal and ERRMAX cuts the tail, so the
-			 * condition has to fit in front of the numbers.
+			 * Replay passes this through rather than wrapping
+			 * it in the corrupt-log remedy, so the whole of it
+			 * — condition, read-only and both numbers — is
+			 * what the operator is shown.
 			 */
 			werrstr("extent-map cache is full and the store is "
 				"read-only: %lud dirty, room for %lud",
@@ -300,8 +307,10 @@ emapreclaim(Store *s)
 		return 0;
 	}
 	for(c = s->edirty; c != nil; c = c->dnext){
-		if(emapwrite(s, c->slot, c->p) < 0)
+		if(emapwrite(s, c->slot, c->p) < 0){
+			werrstr("writing the extent-map region: %r");
 			return -1;
+		}
 		c->dirty = 0;
 		c->bad = 0;
 	}

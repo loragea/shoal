@@ -535,18 +535,27 @@ replay(Store *s)
 				rel = 0;
 		}
 		if(s->nemapc > s->emapcap && emapreclaim(s) < 0)
-			goto refuse;
+			goto relay;
 	}
+	USED(bad);			/* only the refusals below read it */
 	/*
-	 * Replay ends with the maps it dirtied still in the cache: they
-	 * are the state a commit leaves behind on any other path, and
-	 * §2.8's checkpoint is what materialises them.  Writing them
-	 * here instead would make a start that applied a multi-block
-	 * record write — which §12 says no flag but -R does, and which a
-	 * read-only open cannot do at all.  The write-back above stays
-	 * as what it is: the escape hatch for a log with more maps in it
-	 * than the cache holds.
+	 * Replay ends by writing back the maps the applied records
+	 * dirtied.  That is what makes a device error under the
+	 * extent-map region a refusal of the *start*, named while the
+	 * operator is looking at it, rather than a store that opens and
+	 * whose every checkpoint then fails behind it.  A read-only
+	 * store cannot take the write (§12), and there is nothing to
+	 * lose by not taking it: the maps stay dirty in the cache, as a
+	 * live commit's do, for the checkpoint a later writable open
+	 * makes.  The one condition that cannot survive being held —
+	 * a log dirtying more entries than the cache holds — is what
+	 * the in-loop write-back above refuses by name.  emapreclaim
+	 * would hold them anyway on such a store; the test is here so
+	 * that replay says what it does without being read through
+	 * another file.
 	 */
+	if(!s->d->rdonly && emapreclaim(s) < 0)
+		goto relay;
 	free(hdr);
 	free(buf);
 	s->logtail = rel;
@@ -568,6 +577,19 @@ refuse:
 	 */
 	werrstr("the log cannot be replayed; shoalck, then refill from "
 		"peers; log sector %llud: %s", bad, e);
+	return -1;
+
+	/*
+	 * A refusal replay merely relays — the extent-map cache's, or a
+	 * device error under the extent-map region — is not log damage,
+	 * and the remedy above would send the operator to wipe a store
+	 * whose log is intact.  It is passed through as it stands, which
+	 * is also what keeps the condition itself inside ERRMAX: the
+	 * wrapper is what the tail that gets cut used to be.
+	 */
+relay:
+	free(hdr);
+	free(buf);
 	return -1;
 }
 

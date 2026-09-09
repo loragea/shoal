@@ -1103,23 +1103,29 @@ treclaimfault(void)
 }
 
 /*
- * Replay ends with the extent maps it applied still dirty in the
- * cache: they are what a commit leaves behind on any other path, and
- * §2.8's checkpoint is what materialises them.  So a start writes
- * nothing (§12) — not even over a map region the device refuses — and
- * the write that fails is the checkpoint's, where the operator can
- * see it named.  §5 step 7's in-loop write-back is what remains, and
- * it is the escape hatch for a log naming more maps than the cache
- * holds (treclaimfault above).
+ * §5 step 7's closing write-back, on a writable store and on a
+ * read-only one.  Writable, replay materialises the extent maps the
+ * applied records dirtied, and a device that refuses that region
+ * refuses the START, where the operator is looking: the alternative
+ * is a store that opens clean and whose every checkpoint then fails
+ * behind it, reclaiming no log space, until commits stop.  The
+ * refusal names the region and NOT the corrupt-log remedy — the log
+ * is intact, and `refill from peers' would answer a bad sector under
+ * the maps by wiping the store.
  *
- * That is also what makes shoalck -v work at all: a device opened
- * read-only can take no write, and every store worth running -v on
- * has records since its last checkpoint.  There the escape hatch is
- * gone, so a cache too small for the log is refused BY NAME rather
- * than as a bare `opened read-only' out of devwrite.
+ * Read-only (§12, shoalck -v) there is no write to make: the maps
+ * stay in the cache for a later writable open's checkpoint, and the
+ * run writes nothing at all.  The one condition that cannot survive
+ * being held is a log dirtying more entries than the cache holds, and
+ * that is refused BY NAME rather than as a bare `opened read-only'
+ * out of devwrite — the whole of it, since replay passes it through
+ * instead of wrapping it in a remedy ERRMAX would then cut.
  *
- * Mutation: replay writes its dirty maps back before returning (mut
- * replay-writes-emaps), and the read-only store below does not open.
+ * Mutations: replay holds its dirty maps on a writable store too (mut
+ * replay-holds-emaps), and the start over the refused region opens;
+ * replay wraps a relayed refusal in the corrupt-log remedy (mut
+ * relay-wraps-refusal), and the read-only text is neither whole nor
+ * about the cache.
  */
 static void
 treplaymaps(void)
@@ -1128,11 +1134,12 @@ treplaymaps(void)
 	Store *s;
 	Storecfg c;
 	Storestat st;
+	Simop *t;
 	Super sb;
 	Sbsel sel;
 	uchar *buf, oid[Oidmax];
 	char err[ERRMAX];
-	int i;
+	long i, n, nw;
 	static char *nm[3] = { "p0", "p1", "p2" };
 
 	d = newdisk();
@@ -1160,27 +1167,43 @@ treplaymaps(void)
 	simfaultat(d, Sfeio, 0, (vlong)sb.emapoff*sb.secsz,
 		(vlong)sb.emapsecs*sb.secsz);
 	checks++;
+	if((s = openstore(d)) != nil){
+		storestat(s, &st);
+		fail("the store started over a map region the device "
+			"refuses (nlive=%llud)", st.nlive);
+		storeclose(s);
+	}else{
+		rerrstr(err, sizeof err);
+		istrue("the writable refusal names the region",
+			strstr(err, "writing the extent-map region") != nil);
+		istrue("and not the log's own remedy",
+			strstr(err, "refill from peers") == nil);
+	}
+	simfault(d, Sfnone, 0);
+
+	/* with the region writable, the same start materialises the maps */
+	simtracereset(d);
+	checks++;
 	if((s = openstore(d)) == nil)
-		fail("the start wrote the extent-map region: %r");
+		fail("the map region, writable again: %r");
 	else{
 		storestat(s, &st);
 		eqv("every replayed object is there", st.nlive, 3);
-		checks++;
-		if(storecheckpoint(s) < 0){
-			rerrstr(err, sizeof err);
-			istrue("and the checkpoint is the write that fails",
-				err[0] != '\0');
-		}else
-			fail("the checkpoint wrote a map region the device "
-				"refuses");
+		n = simtrace(d, &t);
+		nw = 0;
+		for(i = 0; i < n; i++)
+			if(t[i].op == Sopwrite
+			&& t[i].off >= (vlong)sb.emapoff*sb.secsz
+			&& t[i].off < (vlong)(sb.emapoff + sb.emapsecs)*sb.secsz)
+				nw++;
+		istrue("and a writable replay wrote the maps back", nw > 0);
 		storeclose(s);
 	}
-	simfault(d, Sfnone, 0);
 
 	/*
 	 * Read-only, with a cache of one: the second record's map cannot
 	 * be spilled and cannot be held either, and that is the condition
-	 * the refusal has to name.
+	 * the refusal has to name — whole, ERRMAX and all.
 	 */
 	d->rdonly = 1;
 	tcfg(&c);
@@ -1191,10 +1214,10 @@ treplaymaps(void)
 		storeclose(s);
 	}else{
 		rerrstr(err, sizeof err);
-		istrue("the read-only refusal names the cache",
-			strstr(err, "extent-map cache is full") != nil);
-		istrue("and not the device's write refusal",
-			strstr(err, "opened read-only") == nil);
+		checks++;
+		if(strcmp(err, "simdisk: replay: extent-map cache is full "
+			"and the store is read-only: 2 dirty, room for 1") != 0)
+			fail("the read-only refusal reads `%s'", err);
 	}
 
 	/* with room for them, the same read-only store opens and writes nothing */
@@ -1206,6 +1229,12 @@ treplaymaps(void)
 	else{
 		storestat(s, &st);
 		eqv("and replays every record", st.nlive, 3);
+		n = simtrace(d, &t);
+		nw = 0;
+		for(i = 0; i < n; i++)
+			if(t[i].op == Sopwrite)
+				nw++;
+		eqv("a read-only replay writes nothing", nw, 0);
 		storeclose(s);
 	}
 	d->rdonly = 0;
@@ -1213,15 +1242,6 @@ treplaymaps(void)
 	devclose(d);
 }
 
-/*
- * §5 step 3: a geometry with no dirty region cannot serve — applydirty
- * can drop a peer's records to make room, but ndirty == 0 leaves it
- * nothing to drop, so such a store commits no Edirty and replay
- * refuses the first record that carries one.  shoalfmt never writes
- * one; a superblock claiming it is refused whole at open.
- *
- * Mutation: drop geomok's ndirty test, and the store below opens.
- */
 static void
 tnodirty(void)
 {
