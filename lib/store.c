@@ -818,7 +818,18 @@ storeopen(Dev *d, Storecfg *cfg)
 	 * an operator claim, not an observation, so it is reported as
 	 * flush=asserted-writethrough and never as flush=raw.
 	 */
-	if(d->flushmode == Fraw)
+	if(d->rdonly)
+		/*
+		 * A device opened read-only writes nothing at all — §0's
+		 * devwrite refuses on the flag — so there is no
+		 * durability to assert and no raw channel to want, and
+		 * §12's shoalck -v opens the store this way to replay it
+		 * in memory.  The mode stays what the device reported,
+		 * which for a read-only open is `not examined': calling
+		 * it asserted would be a claim no operator made.
+		 */
+		s->flushmode = d->flushmode;
+	else if(d->flushmode == Fraw)
 		s->flushmode = Fraw;
 	else if(cfg->noflush)
 		s->flushmode = Fasserted;
@@ -928,7 +939,16 @@ storeopen(Dev *d, Storecfg *cfg)
 		return nil;
 	}
 
-	/* steps 10 and 11 */
+	/*
+	 * Steps 10 and 11.  §12's shoalck -R is step 5's flag set by
+	 * hand: a page that fails its checksum is rebuilt here anyway,
+	 * and -R is for the page that is valid but wrong and for the
+	 * operator who wants the scan done now rather than at the next
+	 * start.  The rebuild scans the *replayed* maps, so a grain a
+	 * committed-but-not-checkpointed record allocated is counted.
+	 */
+	if(s->cfg.forcerebuild)
+		s->bmaprebuild = 1;
 	if(condemn(s) < 0){
 		storefree(s);
 		return nil;
