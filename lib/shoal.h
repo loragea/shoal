@@ -637,6 +637,14 @@ struct Storestat
 	uvlong	nlive, ntomb, nlost;	/* nlost: /lost, §8 */
 	uvlong	ndirty, ndirtydrop;
 	uvlong	nreplay, pmax;
+	/*
+	 * §2.8's checkpointer, whose failures no client operation
+	 * reports: how many checkpoints have failed and what the last
+	 * one said.  A store whose checkpoints fail reclaims no log
+	 * space, so this is what tells a full log from a stuck one.
+	 */
+	uvlong	ckfail;
+	char	ckerr[ERRMAX];
 };
 
 struct Objinfo

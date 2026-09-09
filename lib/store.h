@@ -241,6 +241,8 @@ struct Store
 	Rendez	ckrz;			/* on cklk: a checkpoint completed */
 	uvlong	ckreq, ckdone;
 	int	ckerr, ckbusy, ckproc;
+	uvlong	ckfail;			/* checkpoints that failed */
+	char	ckerrstr[ERRMAX];	/* what the last one said */
 	vlong	cklast;
 	uvlong	ndirtypage;		/* pages dirtied since the last one */
 

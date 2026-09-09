@@ -1084,6 +1084,18 @@ The new `ckseq`/`cklogoff` become publishable only after step 2's
 flush has returned (§2.2), so a publish triggered by anything else
 mid-checkpoint carries the old mark.
 
+**A checkpoint that fails is counted and named.** A failing
+checkpoint does **not** condemn the store: §3.2's condemnation is for
+a failed *log* write, where committed state is already gone, while
+here the state is still in the log and a later checkpoint over a
+healed device materialises it. But it is also invisible from every
+other angle — no client operation fails, and the only symptom is that
+log space stops being reclaimed, which arrives at the operator as
+§6's `disk full` on a store whose disk is not full. So the store
+keeps a count of failed checkpoints and the text of the last one's
+error, reports both in its statistics, and §6's refusal for log space
+carries the cause when the count is not zero.
+
 Its cost is therefore proportional to the state dirtied since the
 last checkpoint and to nothing else, which is what lets §6 put a
 number on how long a commit may wait for log space.
@@ -1973,7 +1985,12 @@ the entry's `mtime`, which is why the tombstone keeps one.
   `/status` reports `grainfree=`, `slotfree=` and `emapfree=`
   separately and why the tools print all three.
 - *No free log space*: the commit **waits** for the checkpointer,
-  and then answers `disk full`.
+  and then answers `disk full`. If the checkpointer is itself
+  failing (§2.8) the log will not drain at all, and the disk may be
+  nearly empty, so that refusal names the cause behind the wire
+  error: `disk full: log full and the checkpoint fails: <error>`.
+  Layer-a §2.6's prefix is what the client matches on and does not
+  move; what follows it is for the operator reading the log.
 
 **The log's reserved tail.** The last `logresv` sectors of free log
 space (policy, default one sixteenth of `logsecs`) are usable only by

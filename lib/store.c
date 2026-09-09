@@ -1136,6 +1136,10 @@ storestat(Store *s, Storestat *st)
 	st->ndirty = s->ndirtused;
 	st->nlost = s->nlost;
 	qunlock(&s->qlstate);
+	qlock(&s->cklk);
+	st->ckfail = s->ckfail;
+	strecpy(st->ckerr, st->ckerr + sizeof st->ckerr, s->ckerrstr);
+	qunlock(&s->cklk);
 	st->ndirtydrop = s->ndirtydrop;
 	st->nreplay = s->nreplay;
 	st->pmax = s->pmax;

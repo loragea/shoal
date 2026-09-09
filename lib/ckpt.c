@@ -429,6 +429,32 @@ checkpoint(Store *s)
 }
 
 /*
+ * Run one checkpoint, keeping what it said if it failed.  Nothing a
+ * client does reports a checkpoint failure -- the commit path only
+ * sees the log not being reclaimed -- so the count and the text are
+ * where §6's refusal and Storestat get it from.  A failed checkpoint
+ * does NOT condemn the store: §3.2's broken flag is for a failed LOG
+ * write, where committed state is already gone; here the state is
+ * still in the log and a later checkpoint over a healed device
+ * materialises it.
+ */
+static int
+ckrun(Store *s)
+{
+	char e[ERRMAX];
+	int r;
+
+	if((r = checkpoint(s)) < 0){
+		rerrstr(e, sizeof e);
+		qlock(&s->cklk);
+		s->ckfail++;
+		strecpy(s->ckerrstr, s->ckerrstr + sizeof s->ckerrstr, e);
+		qunlock(&s->cklk);
+	}
+	return r;
+}
+
+/*
  * Checkpoints run when the log passes ckhigh (default one quarter
  * full) and every ckms if anything is dirty — both policy, both
  * tunable without a format change.  A quarter rather than a half
@@ -481,7 +507,7 @@ ckptproc(void *a)
 		req = s->ckreq;
 		s->ckbusy = 1;
 		qunlock(&s->cklk);
-		r = checkpoint(s);
+		r = ckrun(s);
 		qlock(&s->cklk);
 		s->ckbusy = 0;
 		s->ckerr = r;
@@ -507,7 +533,7 @@ storecheckpoint(Store *s)
 			rsleep(&s->ckrz);
 		s->ckbusy = 1;
 		qunlock(&s->cklk);
-		r = checkpoint(s);
+		r = ckrun(s);
 		qlock(&s->cklk);
 		s->ckbusy = 0;
 		s->cklast = nsec();
