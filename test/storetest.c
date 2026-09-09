@@ -1250,10 +1250,23 @@ treplaymaps(void)
  * runs out of it then answers §2.6's `disk full' on a store whose
  * disk is not full, which is the report an operator cannot act on.
  * So the wire error keeps its prefix and carries the cause, and
- * Storestat counts the failures and keeps the last one's text.
+ * Storestat carries the stuck flag, the lifetime count of failed
+ * attempts and the last failure's text.
  *
- * Mutation: the refusal is the bare `disk full' again (mut
- * bare-disk-full).
+ * Then the other half, on the SAME store rather than a restarted one
+ * — a restart clears the state by construction and asserts nothing.
+ * The device heals, a checkpoint succeeds, and a log filled the
+ * ordinary way from there is answered `disk full' and nothing else:
+ * the cure is what §6's wording is gated on, so the cured store's
+ * genuinely full log must not carry the old error.
+ *
+ * §13 drives the checkpointer by hand here (tcfg), which is what lets
+ * the second fill run with nothing checkpointing at all — a live
+ * checkpointer serves §6's request and the log would drain.
+ *
+ * Mutations: the refusal is the bare `disk full' again (mut
+ * bare-disk-full); a checkpoint that succeeds leaves the failure
+ * state standing (mut ck-never-clears).
  */
 static void
 tckfail(void)
@@ -1266,12 +1279,11 @@ tckfail(void)
 	Sbsel sel;
 	uchar *buf, oid[Oidmax];
 	char err[ERRMAX];
-	int i, n;
+	uvlong nfail;
+	int i, n, nok;
 
 	d = newdisk();
 	tcfg(&c);
-	c.nockptproc = 0;		/* §2.8's proc: the failures are its */
-	c.ckms = 50;
 	spawnforget();
 	if((s = storeopen(d, &c)) == nil){
 		fail("a store with a checkpointer: %r");
@@ -1297,12 +1309,18 @@ tckfail(void)
 	simfaultat(d, Sfeio, 0, (vlong)sb.emapoff*sb.secsz,
 		(vlong)sb.emapsecs*sb.secsz);
 
+	/* the log fills because the checkpoint cannot reclaim it */
 	n = -1;
-	for(i = 0; i < 400; i++)
+	nok = 0;
+	for(i = 0; i < 400; i++){
 		if(objwrite(s, oid, 2, buf, 2*Blk, 0, 3 + i, 1, nil, 0) < 0){
 			n = i;
 			break;
 		}
+		if(storecheckpoint(s) >= 0)
+			nok++;
+	}
+	eqv("no checkpoint succeeds over a refusing map region", nok, 0);
 	checks++;
 	if(n < 0)
 		fail("the log drained with every checkpoint failing");
@@ -1315,29 +1333,48 @@ tckfail(void)
 			fail("the refusal names the checkpoint: `%s'", err);
 	}
 	storestat(s, &st);
-	istrue("a failing checkpointer is counted", st.ckfail > 0);
+	istrue("a failing checkpointer is counted", st.ckfailed > 0);
+	istrue("and it is what the store is stuck on", st.ckstuck != 0);
 	istrue("and what it said is kept", st.ckerr[0] != '\0');
 	istrue("a failed checkpoint does not condemn the store",
 		st.broken == 0);
 	istrue("and the log is what ran out", st.logfree < sb.logsecs/2);
-	storeclose(s);
+	nfail = st.ckfailed;
 
 	/* healed, the same store checkpoints and takes commits again */
 	simfault(d, Sfnone, 0);
-	spawnforget();
-	if((s = storeopen(d, &c)) == nil)
-		fail("the store does not restart: %r");
+	checks++;
+	if(storecheckpoint(s) < 0)
+		fail("a healed device still refuses the checkpoint: %r");
+	storestat(s, &st);
+	eqv("a checkpoint that succeeds is no longer stuck", st.ckstuck, 0);
+	istrue("and takes the failure's text with it", st.ckerr[0] == '\0');
+	eqv("the lifetime count of attempts stands", st.ckfailed, nfail);
+	checks++;
+	if(objwrite(s, oid, 2, buf, 2*Blk, 0, 500, 1, nil, 0) < 0)
+		fail("a healed store still refuses commits: %r");
+
+	/*
+	 * And a log filled the ordinary way from there — nothing
+	 * checkpointing, nothing failing — is §2.6's bare refusal.
+	 */
+	n = -1;
+	for(i = 0; i < 400; i++)
+		if(objwrite(s, oid, 2, buf, 2*Blk, 0, 501 + i, 1, nil, 0) < 0){
+			n = i;
+			break;
+		}
+	checks++;
+	if(n < 0)
+		fail("the log did not fill with nothing checkpointing");
 	else{
+		rerrstr(err, sizeof err);
 		checks++;
-		if(storecheckpoint(s) < 0)
-			fail("a healed device still refuses the checkpoint: %r");
-		checks++;
-		if(objwrite(s, oid, 2, buf, 2*Blk, 0, 500, 1, nil, 0) < 0)
-			fail("a healed store still refuses commits: %r");
-		storestat(s, &st);
-		eqv("and nothing is left counted against it", st.ckfail, 0);
-		storeclose(s);
+		if(strcmp(err, "disk full") != 0)
+			fail("a full log after a cured checkpoint is "
+				"answered `%s'", err);
 	}
+	storeclose(s);
 	free(buf);
 	devclose(d);
 }

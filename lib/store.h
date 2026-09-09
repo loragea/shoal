@@ -240,9 +240,10 @@ struct Store
 	QLock	cklk;
 	Rendez	ckrz;			/* on cklk: a checkpoint completed */
 	uvlong	ckreq, ckdone;
-	int	ckerr, ckbusy, ckproc;
-	uvlong	ckfail;			/* checkpoints that failed */
-	char	ckerrstr[ERRMAX];	/* what the last one said */
+	int	ckret, ckbusy, ckproc;	/* ckret: the last one's return */
+	int	ckstuck;		/* the LAST checkpoint failed */
+	uvlong	ckfailed;		/* checkpoint attempts that failed */
+	char	ckerrstr[ERRMAX];	/* what the last failure said */
 	vlong	cklast;
 	uvlong	ndirtypage;		/* pages dirtied since the last one */
 

@@ -467,12 +467,19 @@ checkpoint(Store *s)
 /*
  * Run one checkpoint, keeping what it said if it failed.  Nothing a
  * client does reports a checkpoint failure -- the commit path only
- * sees the log not being reclaimed -- so the count and the text are
- * where §6's refusal and Storestat get it from.  A failed checkpoint
- * does NOT condemn the store: §3.2's broken flag is for a failed LOG
- * write, where committed state is already gone; here the state is
- * still in the log and a later checkpoint over a healed device
- * materialises it.
+ * sees the log not being reclaimed -- so what is kept here is where
+ * §6's refusal and Storestat get it from.  A failed checkpoint does
+ * NOT condemn the store: §3.2's broken flag is for a failed LOG write,
+ * where committed state is already gone; here the state is still in
+ * the log and a later checkpoint over a healed device materialises
+ * it.
+ *
+ * That healing is why a SUCCESS clears ckstuck and the text: §6's
+ * refusal has to tell a log that will not drain from one that is
+ * merely full, and a flag that only ever rises cannot.  ckfailed is
+ * the lifetime statistic and is not cleared -- it counts ATTEMPTS,
+ * and a store whose checkpoints fail re-attempts every Cktickms, so
+ * it is a rate of retrying and not a count of distinct outages.
  */
 static int
 ckrun(Store *s)
@@ -480,13 +487,18 @@ ckrun(Store *s)
 	char e[ERRMAX];
 	int r;
 
-	if((r = checkpoint(s)) < 0){
+	if((r = checkpoint(s)) < 0)
 		rerrstr(e, sizeof e);
-		qlock(&s->cklk);
-		s->ckfail++;
+	qlock(&s->cklk);
+	if(r < 0){
+		s->ckfailed++;
+		s->ckstuck = 1;
 		strecpy(s->ckerrstr, s->ckerrstr + sizeof s->ckerrstr, e);
-		qunlock(&s->cklk);
+	}else{
+		s->ckstuck = 0;
+		s->ckerrstr[0] = '\0';
 	}
+	qunlock(&s->cklk);
 	return r;
 }
 
@@ -546,7 +558,7 @@ ckptproc(void *a)
 		r = ckrun(s);
 		qlock(&s->cklk);
 		s->ckbusy = 0;
-		s->ckerr = r;
+		s->ckret = r;
 		if(req > s->ckdone)
 			s->ckdone = req;
 		s->cklast = nsec();
@@ -581,7 +593,7 @@ storecheckpoint(Store *s)
 	gen = ++s->ckreq;
 	while(s->ckdone < gen)
 		rsleep(&s->ckrz);
-	r = s->ckerr;
+	r = s->ckret;
 	qunlock(&s->cklk);
 	return r;
 }

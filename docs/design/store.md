@@ -1092,9 +1092,18 @@ healed device materialises it. But it is also invisible from every
 other angle — no client operation fails, and the only symptom is that
 log space stops being reclaimed, which arrives at the operator as
 §6's `disk full` on a store whose disk is not full. So the store
-keeps a count of failed checkpoints and the text of the last one's
-error, reports both in its statistics, and §6's refusal for log space
-carries the cause when the count is not zero.
+keeps a **stuck** flag — the last checkpoint failed and none has
+succeeded since — together with that failure's text, reports both in
+its statistics beside a lifetime count of failed attempts, and §6's
+refusal for log space carries the cause **while the flag is set**.
+
+A checkpoint that succeeds clears the flag and the text: a device
+that heals is the expected end of a failure (above), and a store
+whose log then fills for the ordinary reason must be answered §2.6's
+bare `disk full` rather than an error it has recovered from. The
+count is not cleared, and it counts *attempts*: a stuck store
+re-attempts on every checkpoint tick, so it reports a rate of
+retrying rather than a number of distinct outages.
 
 Its cost is therefore proportional to the state dirtied since the
 last checkpoint and to nothing else, which is what lets §6 put a
@@ -2002,10 +2011,12 @@ the entry's `mtime`, which is why the tombstone keeps one.
   `/status` reports `grainfree=`, `slotfree=` and `emapfree=`
   separately and why the tools print all three.
 - *No free log space*: the commit **waits** for the checkpointer,
-  and then answers `disk full`. If the checkpointer is itself
-  failing (§2.8) the log will not drain at all, and the disk may be
-  nearly empty, so that refusal names the cause behind the wire
-  error: `disk full: log full and the checkpoint fails: <error>`.
+  and then answers `disk full`. If the **last** checkpoint failed
+  (§2.8) the log will not drain at all, and the disk may be nearly
+  empty, so that refusal names the cause behind the wire error:
+  `disk full: log full and the checkpoint fails: <error>`. A failure
+  a later checkpoint has cured does not: the store's log drains
+  again, and this refusal is then the ordinary one.
   Layer-a §2.6's prefix is what the client matches on and does not
   move; what follows it is for the operator reading the log.
 
@@ -3215,8 +3226,9 @@ maps — a writable start over a map region the device refuses is
 refused and names the region, a read-only one writes nothing, and a
 read-only replay too big for its cache is refused naming the cache —
 a checkpointer that cannot write, whose failures are counted, named
-in the commit refused for log space, and left behind by a device that
-heals, §2.8's dirty-page trigger surviving a condemnation that lands
+in the commit refused for log space, and dropped from that refusal by
+a device that heals — the same store's next full log, with nothing
+checkpointing, answering the bare `disk full`, §2.8's dirty-page trigger surviving a condemnation that lands
 while a checkpoint runs, and a store opened, written and replayed at
 a `blksz` four times the device's `Wunit`), `objtest` (§2.7's extent-map slot
 rule over all three transitions and both the crash and the re-replay

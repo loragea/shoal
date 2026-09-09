@@ -733,7 +733,7 @@ logcommit(Store *s, Item *ci)
 	Item *it;
 	Batch *b;
 	vlong t0;
-	uvlong nckfail;
+	int ckstuck;
 	char cke[ERRMAX];
 	int full, oom, forced, r;
 
@@ -853,12 +853,18 @@ logcommit(Store *s, Item *ci)
 		 * with half its log free has been told nothing.  So when
 		 * the last checkpoint failed, the cause follows the
 		 * prefix.
+		 *
+		 * The LAST one, not any one ever: a checkpoint failure
+		 * that a healed device has since cured leaves a log that
+		 * drains, and labelling this store's genuinely full log
+		 * with a cured error is the same disservice the other way
+		 * round.  §2.8's ckstuck is cleared by a success for that.
 		 */
 		qlock(&s->cklk);
-		nckfail = s->ckfail;
+		ckstuck = s->ckstuck;
 		strecpy(cke, cke + sizeof cke, s->ckerrstr);
 		qunlock(&s->cklk);
-		if(nckfail > 0)
+		if(ckstuck)
 			werrstr("disk full: log full and the checkpoint "
 				"fails: %s", cke);
 		else

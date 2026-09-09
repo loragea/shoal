@@ -639,11 +639,16 @@ struct Storestat
 	uvlong	nreplay, pmax;
 	/*
 	 * §2.8's checkpointer, whose failures no client operation
-	 * reports: how many checkpoints have failed and what the last
-	 * one said.  A store whose checkpoints fail reclaims no log
-	 * space, so this is what tells a full log from a stuck one.
+	 * reports.  A store whose checkpoints fail reclaims no log
+	 * space, so ckstuck — the LAST checkpoint failed and none has
+	 * succeeded since — is what tells a full log from a stuck one,
+	 * and ckerr is what that one said (empty when not stuck).
+	 * ckfailed counts failed ATTEMPTS over the store's life: a
+	 * stuck store re-attempts on every checkpoint tick, so it is a
+	 * rate of retrying rather than a count of distinct outages.
 	 */
-	uvlong	ckfail;
+	int	ckstuck;
+	uvlong	ckfailed;
 	char	ckerr[ERRMAX];
 };
 
