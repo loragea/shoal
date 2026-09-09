@@ -658,7 +658,7 @@ tbadmap(void)
 	uchar *buf, *other, rd[64], junk[8], oid[Oidmax];
 	char err[ERRMAX];
 	ulong slot, gf, sf;
-	uvlong nl;
+	uvlong nl, ef;
 
 	memset(&sh, 0, sizeof sh);
 	d = newdisk();
@@ -806,6 +806,8 @@ tbadmap(void)
 	 * land in the slot and at the qid.path the object already had,
 	 * which layer-a §2.3 wants stable.
 	 */
+	storestat(s, &st);
+	ef = st.emapfree;
 	if((g = stageopen(s, oid, 4, 3*Blk, 0)) == nil)
 		fail("stageopen: %r");
 	else{
@@ -828,6 +830,17 @@ tbadmap(void)
 			checkobj(s, "wide", &sh, "after the heal");
 			storestat(s, &st);
 			eqv("and the slot is no longer lost", st.nlost, 0);
+			/*
+			 * The heal rebuilds the map in a FRESH extent-map
+			 * slot (§2.7's Oslot rule), so the apply has to
+			 * release the one it moved off.  Leaking it would
+			 * cost a slot per repair — a run repairing many
+			 * would reach `disk full' with slots free — and a
+			 * restart, which recomputes emapused from the
+			 * index, would hide it.
+			 */
+			eqv("and the map it moved off is released",
+				st.emapfree, ef);
 		}
 		free(other);
 	}

@@ -370,6 +370,18 @@ applyrec(Store *s, Objrec *o, Emape *c)
 					"emapslot %lud", o->slot, o->emapslot);
 				return -1;
 			}
+			/*
+			 * The entry the object is moving off is released
+			 * here as it is on the way to inline: §3.6's repair
+			 * of a condemned copy rebuilds the map whole in a
+			 * fresh slot (§2.7's Oslot rule), so this is the one
+			 * path that moves from one non-zero emapslot to
+			 * another, and leaking the old one would erode
+			 * emapfree by a slot per repair until a restart
+			 * recomputed it from the index.
+			 */
+			if(e->emapslot != 0 && e->emapslot != o->emapslot)
+				emapclear(s, e->emapslot);
 			emapmark(s, o->emapslot);
 			memset(c->p, 0, s->sb.emapsz);
 		}else{
