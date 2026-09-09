@@ -2845,8 +2845,10 @@ format a unit whose raw channel it cannot open.
 never writes, and the device is then opened read-only so the kernel
 enforces that rather than the code promising it — which also lets it
 run against a disk its user may only read. Such a run opens no raw
-channel, so it reports the device's flush channel as *not examined*
-rather than claiming the operator asserted write-through.
+channel, so on an sd unit it reports the device's flush channel as
+*not examined* rather than claiming the operator asserted
+write-through. A file image has no flush channel to examine at all
+and is reported as *none*, read-only or not.
 
     shoalck [-lqvRw] [-o oid] /dev/sdXX/name
 
@@ -2925,7 +2927,10 @@ object, and a rebuild driven from one object's map would clear every
 grain the rest of the store holds. The passes above run first and
 report the bitmap they found, so a `-R` run that repairs a wrong
 bitmap still exits non-zero on what it repaired; the run after it is
-the clean one.
+the clean one. `-R -v` can exit non-zero for either reason at once —
+the bitmap it repaired, an object that failed its verify, or both —
+so the exit code alone does not say which, and the report is what
+does.
 
 **`shoalmonfmt`** — format a monitor map partition. Not built yet;
 §10 is the format it will write.
