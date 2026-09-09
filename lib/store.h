@@ -335,7 +335,6 @@ void	ientpack(Store*, ulong slot, uchar *p);
 void	zerodigest(Store*, uvlong len, ulong i, uchar *dig);
 void	ienthash(Store*, ulong slot);
 void	ientunhash(Store*, ulong slot);
-void	storefound(Store*, ulong slot);
 long	ientfind(Store*, uchar *oid, int oidlen);
 
 /* commit.c — the log, group commit and the flusher */
@@ -353,3 +352,4 @@ int	publishlocked(Store*);
 int	storeproc(Store*, void (*)(void*), void*);
 void	storeprocdone(Store*);
 void	storecondemn(Store*, ulong slot);	/* §5 step 10, at run time */
+void	lostupdate(Store*, ulong slot);		/* /lost membership, §8 */

@@ -627,7 +627,7 @@ struct Storestat
 	uvlong	logfree;		/* sectors */
 	uvlong	logwait;		/* commits in §6's wait for log space */
 	int	broken;			/* a log write failed: §3.2 */
-	uvlong	nlive, ntomb, nlost;
+	uvlong	nlive, ntomb, nlost;	/* nlost: /lost, §8 */
 	uvlong	ndirty, ndirtydrop;
 	uvlong	nreplay, pmax;
 };
@@ -648,7 +648,16 @@ void	storeclose(Store*);	/* stop the procs; write nothing */
 int	storecheckpoint(Store*);
 void	storestat(Store*, Storestat*);
 void	storehook(Store*, char *name, uvlong n);	/* §13's -X hooks */
-ulong	storelost(Store*, ulong i);	/* the i'th condemned slot */
+/*
+ * /lost, layer-a §7.5: every copy this instance holds that fails
+ * local verification — §5 step 10's condemned slots and §8's
+ * corrupt-flagged entries alike.  storelost answers the i'th slot, or
+ * ~0 past the end; Storestat.nlost is how many there are.  The two
+ * are read together and the list moves under a concurrent scrub, so a
+ * walker that wants a consistent picture is the caller's problem, as
+ * every other enumeration here is.
+ */
+ulong	storelost(Store*, ulong i);
 int	storefullsync(Store*, char *peer);
 
 /* §2.2's publisher: durable before the value is acted on */

@@ -653,6 +653,71 @@ completemaps(Store *s)
 }
 
 /*
+ * /lost, layer-a §7.5 and §8: every copy this instance holds that
+ * fails local verification.  Two conditions put a slot on it and both
+ * are the same statement about the copy — §5 step 10's condemnation
+ * (Ient.bad, an extent map the log cannot repair) and §8's durable
+ * corrupt flag (Icorrupt, a scrub that found a block that does not
+ * hash to its digest).  A condemned slot carries both.  The list is
+ * therefore membership rather than a log: lostadd and lostdel are
+ * idempotent, so a slot that reaches both conditions appears once and
+ * a transition that changes only one of them cannot lose the other.
+ *
+ * Caller holds qlstate: storecondemn reallocs the array from any
+ * worker proc, on the first read of a damaged extent map.
+ */
+static int
+lostadd(Store *s, ulong slot)
+{
+	ulong i, *l;
+
+	for(i = 0; i < s->nlost; i++)
+		if(s->lost[i] == slot)
+			return 0;
+	if((l = realloc(s->lost, (s->nlost+1)*sizeof *l)) == nil){
+		werrstr("out of memory");
+		return -1;
+	}
+	s->lost = l;
+	s->lost[s->nlost++] = slot;
+	return 0;
+}
+
+static void
+lostdel(Store *s, ulong slot)
+{
+	ulong i;
+
+	for(i = 0; i < s->nlost; i++)
+		if(s->lost[i] == slot){
+			memmove(&s->lost[i], &s->lost[i+1],
+				(s->nlost - i - 1)*sizeof *s->lost);
+			s->nlost--;
+			return;
+		}
+}
+
+/*
+ * An apply is the one thing that changes an entry's Icorrupt, and it
+ * rebuilds a condemned slot's map (§3.6), so it decides the slot's
+ * membership afresh from the entry it just wrote rather than from the
+ * transition it made.
+ */
+void
+lostupdate(Store *s, ulong slot)
+{
+	Ient *e;
+
+	if(slot >= s->sb.nslots)
+		return;
+	e = &s->idx[slot];
+	if(e->state != Sfree && (e->bad || (e->flags & Icorrupt) != 0))
+		lostadd(s, slot);
+	else
+		lostdel(s, slot);
+}
+
+/*
  * §5 step 10, at run time.  An extent-map entry that fails its
  * csum128 and that replay did not touch is media damage the log
  * cannot repair, and it is found when the object is first read rather
@@ -673,49 +738,28 @@ completemaps(Store *s)
 void
 storecondemn(Store *s, ulong slot)
 {
-	ulong *l;
-
 	if(slot >= s->sb.nslots || s->idx[slot].bad)
 		return;
 	s->idx[slot].bad = 1;
 	s->idx[slot].flags |= Icorrupt;
-	if((l = realloc(s->lost, (s->nlost+1)*sizeof *l)) == nil)
-		return;
-	s->lost = l;
-	s->lost[s->nlost++] = slot;
+	lostadd(s, slot);
 }
 
-/*
- * ... and the reverse: an apply that rebuilt a condemned slot's map
- * has repaired it, so it is no longer lost.  Caller holds qlstate.
- */
-void
-storefound(Store *s, ulong slot)
-{
-	ulong i;
-
-	for(i = 0; i < s->nlost; i++)
-		if(s->lost[i] == slot){
-			memmove(&s->lost[i], &s->lost[i+1],
-				(s->nlost - i - 1)*sizeof *s->lost);
-			s->nlost--;
-			return;
-		}
-}
-
-/* §5 step 10: condemn what replay did not restore */
+/* §5 step 10: condemn what replay did not restore, and §8's flag as
+ * the index carries it — an apply during replay has already updated
+ * the slots it touched, and lostadd is idempotent. */
 static int
 condemn(Store *s)
 {
-	ulong slot, *l;
+	Ient *e;
+	ulong slot;
 
 	for(slot = 0; slot < s->sb.nslots; slot++){
-		if(!s->idx[slot].bad)
-			continue;
-		if((l = realloc(s->lost, (s->nlost+1)*sizeof *l)) == nil)
+		e = &s->idx[slot];
+		if((e->bad || (e->state != Sfree
+			&& (e->flags & Icorrupt) != 0))
+		&& lostadd(s, slot) < 0)
 			return -1;
-		s->lost = l;
-		s->lost[s->nlost++] = slot;
 	}
 	return 0;
 }
@@ -1027,10 +1071,13 @@ storestat(Store *s, Storestat *st)
 }
 
 /*
- * §5 step 10's list.  storecondemn reallocs s->lost from any worker
- * proc, on the first read of a damaged extent map, so both the count
- * and the array are qlstate's: reading them unlocked — as this could
- * while the list was built once at start — indexes a freed array.
+ * /lost's i'th slot: every copy that fails local verification, which
+ * is §5 step 10's condemned slots and §8's corrupt-flagged entries
+ * alike (layer-a §7.5).  storecondemn reallocs s->lost from any
+ * worker proc, on the first read of a damaged extent map, so both the
+ * count and the array are qlstate's: reading them unlocked — as this
+ * could while the list was built once at start — indexes a freed
+ * array.
  */
 ulong
 storelost(Store *s, ulong i)

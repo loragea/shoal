@@ -782,13 +782,21 @@ tbadmap(void)
 		eqv("the restarted slot keeps its key", oi2.ver, 2);
 		eqv("and its length", oi2.len, 3*Blk);
 	}
-	eqv("start condemns nothing: replay never read the entry",
-		st.nlost, 0);
+	/*
+	 * The condemnation is durable in the entry's own Icorrupt bit
+	 * (D14), and §8's /lost is every copy that fails local
+	 * verification, so the restart lists it without re-reading the
+	 * map — which is the point: a store that only listed what this
+	 * run happened to read would drop a known-bad copy out of /lost
+	 * at every restart.
+	 */
+	eqv("the restart lists the corrupt-flagged slot", st.nlost, 1);
+	eqv("and names it", storelost(s, 0), oi.slot);
 	checks++;
 	if(objread(s, oid, 4, rd, sizeof rd, 0) >= 0)
 		fail("a damaged extent map was served after a restart");
 	storestat(s, &st);
-	eqv("and the next read condemns the slot again", st.nlost, 1);
+	eqv("and the read does not double-list it", st.nlost, 1);
 
 	/*
 	 * D14 again, from the sending side: a copy that fails local

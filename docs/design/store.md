@@ -1802,10 +1802,15 @@ lose arbitration against everything including absence.
     for a damaged extent map is intact, and is written back as it
     stands: its slot stays allocated across a restart, the grains the
     object holds stay accounted for, and the object keeps its oid, its
-    key and its `qid.path`. Its `/lost` line is not restored at start,
-    because step 9 reads only the entries replay touched; the next
-    read of the object re-establishes it by the same rule that found
-    the damage. Such a slot also stays **hashed**, and takes the
+    key and its `qid.path`. Its `/lost` line is restored at start from
+    the entry's own `corrupt` flag, which the checkpoint wrote back
+    with it — `/lost` is every copy that fails local verification
+    (§8), so a copy the store has already condemned is on it whether
+    or not this run has read the damaged map. What start-up does not
+    do is *re-establish the damage*: step 9 reads only the entries
+    replay touched, so the extent map is judged again at the next read
+    of the object, by the same rule that found it the first time.
+    Such a slot also stays **hashed**, and takes the
     index entry's `corrupt` flag: what "not served" means for it is
     that nothing reads through the damaged map — content reads,
     verifies and every update but §5.5's `op=full` refuse — while
@@ -2305,8 +2310,11 @@ a full pass takes about `scrubdays`. At layer-a §7.5's ~4 MiB/s on a
 is worth knowing on a two-vCPU node that also runs the write path.
 On mismatch it sets the index entry's `corrupt` flag — durably, via
 an `Eobj` that changes nothing else but its `Ocorrupt` bit (§2.7), so
-a restart does not forget —
-lists the object in `/lost`, and fails client access with
+a restart does not forget — lists the object in `/lost`, together
+with every slot §5 step 10 condemned, since `/lost` is every copy
+this instance holds that fails local verification (layer-a §7.5) and
+is maintained by the set, the clear, the condemnation and start-up
+alike rather than built once — and fails client access with
 `checksum mismatch`. A corrupt
 copy loses arbitration against everything including absence (layer-a
 §1.3), which the server enforces by refusing to advertise it.

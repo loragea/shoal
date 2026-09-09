@@ -329,10 +329,14 @@ applyrec(Store *s, Objrec *o, Emape *c)
 	e->flags = 0;
 	if(o->oflags & Ocorrupt)
 		e->flags |= Icorrupt;
-	if(e->bad){
-		e->bad = 0;
-		storefound(s, o->slot);
-	}
+	/*
+	 * A record rebuilds a condemned slot's map whole (§3.6), so the
+	 * entry it publishes is no longer the damaged one; §8's flag is
+	 * this record's to set or clear.  /lost carries both conditions
+	 * (layer-a §7.5), so its membership is recomputed from the entry
+	 * after both have been written.
+	 */
+	e->bad = 0;
 	e->qidpath = o->qidpath;
 	e->len = o->len;
 	e->ver = o->ver;
@@ -344,6 +348,7 @@ applyrec(Store *s, Objrec *o, Emape *c)
 		s->nlive++;
 	else if(e->state == Stomb)
 		s->ntomb++;
+	lostupdate(s, o->slot);
 	ienthash(s, o->slot);
 	slotmark(s, o->slot);
 	idxdirty(s, o->slot);
@@ -671,6 +676,7 @@ applyslot(Store *s, ulong slot)
 	free(e->oid);
 	memset(e, 0, sizeof *e);
 	e->hashnext = ~0UL;
+	lostupdate(s, slot);		/* a released slot holds no copy */
 	slotclear(s, slot);
 	idxdirty(s, slot);
 	return 0;
