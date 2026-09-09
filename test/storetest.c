@@ -1103,26 +1103,30 @@ treclaimfault(void)
 }
 
 /*
- * The other write-back, after the loop: replay's last act is to flush
- * the extent-map entries the applied records installed, and a failure
- * there refuses the start for exactly the reason the in-loop one does.
- * What is pinned here is the refusal's *text*: the operator meets this
- * failure with a store that will not open, so it must name the sector
- * and the way out, like every other refusal on this path, and not the
- * bare device error.
+ * Replay ends with the extent maps it applied still dirty in the
+ * cache: they are what a commit leaves behind on any other path, and
+ * §2.8's checkpoint is what materialises them.  So a start writes
+ * nothing (§12) — not even over a map region the device refuses — and
+ * the write that fails is the checkpoint's, where the operator can
+ * see it named.  §5 step 7's in-loop write-back is what remains, and
+ * it is the escape hatch for a log naming more maps than the cache
+ * holds (treclaimfault above).
  *
- * The fault is sticky, and the cache is the default, so the in-loop
- * write-back never runs and the post-loop one takes it; the records
- * install fresh maps, so nothing reads the region either.
+ * That is also what makes shoalck -v work at all: a device opened
+ * read-only can take no write, and every store worth running -v on
+ * has records since its last checkpoint.  There the escape hatch is
+ * gone, so a cache too small for the log is refused BY NAME rather
+ * than as a bare `opened read-only' out of devwrite.
  *
- * Mutation: return -1 bare from the post-loop reclaim, as before, and
- * the refusal below arrives with neither sector nor remedy.
+ * Mutation: replay writes its dirty maps back before returning (mut
+ * replay-writes-emaps), and the read-only store below does not open.
  */
 static void
-tpostreclaim(void)
+treplaymaps(void)
 {
 	Dev *d;
 	Store *s;
+	Storecfg c;
 	Storestat st;
 	Super sb;
 	Sbsel sel;
@@ -1132,7 +1136,7 @@ tpostreclaim(void)
 	static char *nm[3] = { "p0", "p1", "p2" };
 
 	d = newdisk();
-	if((s = mustopen(d, "a failing post-loop reclaim")) == nil){
+	if((s = mustopen(d, "a replay that dirties maps")) == nil){
 		devclose(d);
 		return;
 	}
@@ -1147,34 +1151,64 @@ tpostreclaim(void)
 		if(objwrite(s, oid, 2, buf, 2*Blk, 0, 2, 1, nil, 0) < 0)
 			fail("objwrite %s: %r", nm[i]);
 	}
-	storeclose(s);
+	storeclose(s);				/* no second checkpoint */
 
 	if(superselect(d, &sel) < 0)
 		sysfatal("superselect: %r");
 	sb = sel.sb[sel.start];
+	/* sticky, so the whole region is unwritable for as long as it is armed */
 	simfaultat(d, Sfeio, 0, (vlong)sb.emapoff*sb.secsz,
 		(vlong)sb.emapsecs*sb.secsz);
 	checks++;
-	if((s = openstore(d)) != nil){
+	if((s = openstore(d)) == nil)
+		fail("the start wrote the extent-map region: %r");
+	else{
 		storestat(s, &st);
-		fail("the store started over a failed post-loop emapreclaim "
-			"(nlive=%llud)", st.nlive);
+		eqv("every replayed object is there", st.nlive, 3);
+		checks++;
+		if(storecheckpoint(s) < 0){
+			rerrstr(err, sizeof err);
+			istrue("and the checkpoint is the write that fails",
+				err[0] != '\0');
+		}else
+			fail("the checkpoint wrote a map region the device "
+				"refuses");
 		storeclose(s);
-	}else{
-		rerrstr(err, sizeof err);
-		istrue("the post-loop refusal carries the remedy",
-			strstr(err, "shoalck, then refill from peers") != nil);
-		istrue("and names the log sector it stopped on",
-			strstr(err, "log sector") != nil);
 	}
 	simfault(d, Sfnone, 0);
 
-	if((s = mustopen(d, "the map region, writable again")) != nil){
+	/*
+	 * Read-only, with a cache of one: the second record's map cannot
+	 * be spilled and cannot be held either, and that is the condition
+	 * the refusal has to name.
+	 */
+	d->rdonly = 1;
+	tcfg(&c);
+	c.emapcache = 1;
+	checks++;
+	if((s = storeopen(d, &c)) != nil){
+		fail("a read-only replay spilled the extent-map cache");
+		storeclose(s);
+	}else{
+		rerrstr(err, sizeof err);
+		istrue("the read-only refusal names the cache",
+			strstr(err, "extent-map cache is full") != nil);
+		istrue("and not the device's write refusal",
+			strstr(err, "opened read-only") == nil);
+	}
+
+	/* with room for them, the same read-only store opens and writes nothing */
+	tcfg(&c);
+	simtracereset(d);
+	checks++;
+	if((s = storeopen(d, &c)) == nil)
+		fail("a read-only replay that fits the cache: %r");
+	else{
 		storestat(s, &st);
-		eqv("every object is there once the map is writable",
-			st.nlive, 3);
+		eqv("and replays every record", st.nlive, 3);
 		storeclose(s);
 	}
+	d->rdonly = 0;
 	free(buf);
 	devclose(d);
 }
@@ -1647,7 +1681,7 @@ main(int argc, char **argv)
 	tlogread();
 	treplayapply();
 	treclaimfault();
-	tpostreclaim();
+	treplaymaps();
 	tnodirty();
 	tdirtyfull();
 	tdirtytie(0);

@@ -1077,10 +1077,8 @@ tverify(void)
 	Super s;
 	Store *st;
 	Idxent e;
-	Simop *t;
 	uchar *buf, blk[16];
 	ulong slot, g;
-	long i, n, nw;
 	int bad;
 
 	d = newstore(&s);
@@ -1107,19 +1105,11 @@ tverify(void)
 	said("-v", "3 objects verified");
 	said("-v skips tombstones", "1 tombstones skipped");
 	/*
-	 * §12: shoalck reads and never writes, and -v does not change
-	 * that.  The simulated disk records every operation in issue
-	 * order, so the claim is checked rather than asserted; the
-	 * read-only open a file or a partition gets would also fault
-	 * the write.
+	 * §12's "reads and never writes" is asserted in tvdirty below,
+	 * on the store that can make it false: this one was checkpointed
+	 * before it was closed, so its replay applies nothing and an
+	 * empty trace here would prove nothing about -v.
 	 */
-	n = simtrace(d, &t);
-	nw = 0;
-	for(i = 0; i < n; i++)
-		if(t[i].op == Sopwrite)
-			nw++;
-	eqv("-v issues no write", nw, 0);
-
 	slot = slotof(d, &s, "many", &e);
 	istrue("the checkpointed index has many", slot != ~0UL);
 	g = grainof(d, &s, &e, 1);
@@ -1217,6 +1207,78 @@ tvreplay(void)
 	free(gbuf);
 	free(abuf);
 	free(bbuf);
+	devclose(d);
+}
+
+/*
+ * §12's "reads and never writes", on the store that can make it
+ * false: a checkpoint, then a multi-block commit that is NOT
+ * checkpointed, then a close.  Replay applies that record, which
+ * dirties an extent map, and a write-back at the end of replay would
+ * both break the claim on a writable device and strand the whole
+ * store on a read-only one — which is every store -v exists for,
+ * since a store with nothing in its log since the checkpoint is a
+ * store that stopped cleanly.
+ *
+ * Mutation: replay writes the maps it dirtied back before returning
+ * (mut replay-writes-emaps).
+ */
+static void
+tvdirty(void)
+{
+	Dev *d;
+	Super s;
+	Store *st;
+	Simop *t;
+	uchar *buf;
+	long i, n, nw;
+	int bad;
+
+	d = newstore(&s);
+	if((st = opens(d, "an un-checkpointed multi-block commit")) == nil){
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(3*Vblk, 43);
+	mk(st, "before", 1);
+	wr(st, "before", buf, Vblk, 0, 2);
+	ckpt(st);
+	mk(st, "many", 1);
+	wr(st, "many", buf, 3*Vblk, 0, 2);
+	storeclose(st);				/* no second checkpoint */
+
+	/*
+	 * Dev.rdonly is what a read-only open sets and what devwrite
+	 * refuses on, whichever device opened it, so setting it here is
+	 * the same store shoalck -v is handed.
+	 */
+	d->rdonly = 1;
+	simtracereset(d);
+	checks++;
+	if((bad = scrub(d, 1, 0)) != 0)
+		fail("-v on a read-only store with an un-checkpointed "
+			"multi-block commit reported %d problem(s)", bad);
+	said("-v after an unclean stop", "2 objects verified");
+	n = simtrace(d, &t);
+	nw = 0;
+	for(i = 0; i < n; i++)
+		if(t[i].op == Sopwrite)
+			nw++;
+	eqv("-v writes nothing on a read-only store", nw, 0);
+	d->rdonly = 0;
+
+	simtracereset(d);
+	checks++;
+	if((bad = scrub(d, 1, 0)) != 0)
+		fail("-v on the same store opened writable reported %d "
+			"problem(s)", bad);
+	n = simtrace(d, &t);
+	nw = 0;
+	for(i = 0; i < n; i++)
+		if(t[i].op == Sopwrite)
+			nw++;
+	eqv("-v writes nothing on a writable store either", nw, 0);
+	free(buf);
 	devclose(d);
 }
 
@@ -1473,6 +1535,7 @@ main(int, char**)
 	tbadlog();
 	tverify();
 	tvreplay();
+	tvdirty();
 	trebuildoff();
 	tRlog();
 	trefuse();

@@ -1782,7 +1782,18 @@ lose arbitration against everything including absence.
    `Oslot` zeroes the target map before its blocks are set,
    this dirty record exists or is gone — so replay is idempotent and
    a partially checkpointed region is corrected by it. Replay uses
-   the apply function the commit path uses (§3.2).
+   the apply function the commit path uses (§3.2). The extent-map
+   entries the applied records dirty are left in the cache, exactly as
+   a live commit's are, and §2.8's checkpoint is what materialises
+   them — so replay itself writes nothing. The one exception is cache
+   pressure: a log naming more maps than the cache holds is written
+   back mid-replay so that replay's footprint is a function of the
+   cache and not of the log, which is safe because start-up is
+   single-proc and `cklogoff` has not moved, so the records behind
+   those bytes are still in the log. A store opened read-only has no
+   such escape hatch — it can write nothing at all — so a read-only
+   replay that fills the cache refuses naming *that*, rather than
+   letting the device answer with a bare write refusal.
 8. Check replay coverage. The greater of the superblock's `ckseq`
    (step 2) and the highest `seq` replay applied MUST be ≥ `Pmax`
    from step 5; if it is not, the log no longer covers state the
@@ -2865,12 +2876,18 @@ has since handed out, and the checkpoint `-R` writes publishes a
 `ckseq` past the records that would have corrected it. So both flags
 replay the log first. `storeopen` with no `spawn` callback and no
 checkpointer proc is that replay and nothing else: the engine makes
-no proc, commits are synchronous in the caller, and a clean start
-writes nothing — §5 step 11's rebuild only marks pages dirty.
-`storecheckpoint` is the one write either flag makes, and only `-R`
-makes it. A device opened read-only is accepted by that open: it can
-write nothing at all, so there is no durability to assert and no raw
-channel to want, and its flush mode stays *not examined*.
+no proc, commits are synchronous in the caller, and the start writes
+nothing — §5 step 11's rebuild only marks pages dirty, and the extent
+maps replay applied stay dirty in the cache for the next checkpoint
+exactly as a commit's do. `storecheckpoint` is the one write either
+flag makes, and only `-R` makes it. A device opened read-only is
+accepted by that open: it can write nothing at all, so there is no
+durability to assert and no raw channel to want, and its flush mode
+stays as the device reported it. The one thing a read-only replay
+cannot do is spill the extent-map cache — §5 step 7's write-back is
+how a log naming more maps than the cache holds gets through — so a
+read-only replay that fills the cache is refused naming *that*, and
+not as the bare write refusal the device would answer with.
 
 **`-v`** verifies every object's content against its digests — §8's
 verify, offline, over every slot rather than over one object. For
@@ -3110,7 +3127,11 @@ after — and only after — replay and again when a damaged extent map
 is first read, §2.6's exhaustion dropping one peer's records on the
 live path and on replay alike, §3.2's refusal to start without a
 flush channel, §4's re-hashing over every shape of write that changes
-a block's covered length, and a store opened, written and replayed at
+a block's covered length, a replay that leaves its extent maps in the
+cache — so a start over a map region the device refuses still opens
+and it is the checkpoint that fails, while a read-only replay too big
+for its cache is refused naming the cache — and a store opened,
+written and replayed at
 a `blksz` four times the device's `Wunit`), `objtest` (§2.7's extent-map slot
 rule over all three transitions and both the crash and the re-replay
 schedules, §2.4's invariant on the shrinking side, §3.5's deferred

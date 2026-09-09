@@ -681,9 +681,11 @@ dumpobj(Ck *k, char *oid)
  *
  * storeopen(spawn=nil, nockptproc=1) is what replays the log into
  * memory: with no spawn callback the engine makes no proc, commits
- * are synchronous in the caller, and a clean start writes nothing —
- * §5 step 11's rebuild only marks pages dirty.  storecheckpoint is
- * therefore the only write either flag makes, and only -R makes it.
+ * are synchronous in the caller, and the start writes nothing —
+ * §5 step 11's rebuild only marks pages dirty, and replay leaves the
+ * maps it applied dirty in the cache for the checkpoint rather than
+ * writing them.  storecheckpoint is therefore the only write either
+ * flag makes, and only -R makes it.
  */
 static void
 ckverify(Ck *k, Store *st)

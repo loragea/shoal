@@ -538,13 +538,15 @@ replay(Store *s)
 			goto refuse;
 	}
 	/*
-	 * The final write-back can fail exactly as the in-loop one above
-	 * and refuses the same way; bad still names the last record
-	 * applied — or the checkpoint mark, when there was none — whose
-	 * maps are among the entries being written.
+	 * Replay ends with the maps it dirtied still in the cache: they
+	 * are the state a commit leaves behind on any other path, and
+	 * §2.8's checkpoint is what materialises them.  Writing them
+	 * here instead would make a start that applied a multi-block
+	 * record write — which §12 says no flag but -R does, and which a
+	 * read-only open cannot do at all.  The write-back above stays
+	 * as what it is: the escape hatch for a log with more maps in it
+	 * than the cache holds.
 	 */
-	if(emapreclaim(s) < 0)
-		goto refuse;
 	free(hdr);
 	free(buf);
 	s->logtail = rel;
