@@ -1330,8 +1330,11 @@ tvreplay(void)
  * which is what makes a device error under that region refuse the
  * start (storetest's treplaymaps), and -R writes a checkpoint anyway.
  *
- * Mutation: replay writes the maps it dirtied back whatever the
- * device was opened as (mut replay-writes-ro).
+ * Mutation: replay's closing write-back and emapreclaim's own
+ * read-only branch both go, so the maps are written back whatever the
+ * device was opened as (mut ro-writeback-both).  It takes both:
+ * emapreclaim holds a read-only store's maps by itself, so dropping
+ * replay's guard alone changes nothing this can see.
  */
 static void
 tvdirty(void)
