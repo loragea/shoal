@@ -40,6 +40,7 @@ struct Upd
 	ulong	nfree, afree;
 	int	slotresv;		/* this update reserved an index slot */
 	int	emapresv;		/* ... and an extent-map slot */
+	int	keepcsum;		/* publish e.csum rather than recompute */
 };
 
 static void updclose(Upd*);
@@ -197,7 +198,22 @@ updcommit(Upd *u, int state, uvlong ver, uvlong wepoch, vlong mtime,
 
 	s = u->s;
 	mapopen(s, &mold, &u->e, u->cold);
-	if(updcsum(u, &mold, csum) < 0){
+	/*
+	 * §8's key-preserving commit publishes the csum the object
+	 * already carries.  updcsum recomputes it from the *stored*
+	 * digest array, and the one commit that names no block is the
+	 * one made when that array is what failed: recomputing there
+	 * publishes a csum that agrees with the damage, so hash(dig[])
+	 * == csum again, objrepair's precondition passes and every
+	 * correct byte a peer sends for a damaged block is refused for
+	 * the life of the disk (§8's two kinds of mismatch collapse into
+	 * one).  It also moves the four-tuple's csum at an unchanged
+	 * key, which is layer-a §1.3's I3 fed a divergence this store
+	 * manufactured.
+	 */
+	if(u->keepcsum)
+		memmove(csum, u->e.csum, Csumlen);
+	else if(updcsum(u, &mold, csum) < 0){
 		updabort(u);
 		return -1;
 	}
@@ -1186,7 +1202,10 @@ objremove(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
  * corrupt flag.  The flag is durable so a restart does not forget it,
  * and §2.7's oflags is where the record carries it — an apply that
  * kept the entry's own flag would not be a function of the record
- * alone, and replay would clear what a scrub had found.
+ * alone, and replay would clear what a scrub had found.  "Nothing
+ * but" includes the csum: this commit names no block, so it publishes
+ * the one the object already carries rather than a recomputation of
+ * the stored digest array — see updcommit.
  */
 int
 objcorrupt(Store *s, uchar *oid, int oidlen, int set, Dirtyrec *dr, int ndr)
@@ -1199,6 +1218,7 @@ objcorrupt(Store *s, uchar *oid, int oidlen, int set, Dirtyrec *dr, int ndr)
 		return -1;
 	if(updopen(&u, s, oid, oidlen, oi.len, Utomb|Ucorrupt) < 0)
 		return -1;
+	u.keepcsum = 1;
 	mapopen(s, &mold, &u.e, u.cold);
 	/*
 	 * §2.7's slot rule is what makes a commit name every block, and

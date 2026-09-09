@@ -433,7 +433,7 @@ trepair(void)
 	Objinfo oi;
 	Super sup;
 	Vfy v;
-	uchar *buf, *bad, oid[Oidmax];
+	uchar *buf, *bad, oid[Oidmax], csum[Csumlen];
 	ulong g, emapslot;
 
 	d = newdisk();
@@ -517,6 +517,9 @@ trepair(void)
 		objrepair(s, oid, 1, 1, buf + Blk, Blk));
 
 	/* and the scrub flags it, for the whole-object repair to find */
+	if(ostat(s, "r", &oi) < 0)
+		fail("objstat r: %r");
+	memmove(csum, oi.csum, Csumlen);
 	scrub(s, "r", &v, "a damaged digest array");
 	eqv("the scrub calls the array suspect", v.arraybad, 1);
 	vfyfree(&v);
@@ -524,6 +527,31 @@ trepair(void)
 		fail("objstat r: %r");
 	else
 		eqv("and sets the flag", oi.corrupt, 1);
+	/*
+	 * §8's flag commit changes nothing but the flag, and the csum is
+	 * part of "nothing but".  Recomputing it from the stored digest
+	 * array — the array that is what failed — would publish a csum
+	 * that agrees with the damage: arraybad would clear, objrepair's
+	 * precondition would pass, and every correct byte a peer sent for
+	 * the damaged block would be refused for the life of the disk.
+	 * It would also move the four-tuple's csum at an unchanged key,
+	 * which is layer-a §1.3's I3 fed a divergence made here.
+	 */
+	checks++;
+	if(memcmp(oi.csum, csum, Csumlen) != 0)
+		fail("the scrub rewrote the object's csum");
+	checks++;
+	if(objverify(s, oid, 1, &v) < 0)
+		fail("objverify after the scrub: %r");
+	else{
+		eqv("the digest array is still the suspect after the scrub",
+			v.arraybad, 1);
+		vfyfree(&v);
+	}
+	refusedinternal("a block repair of a good block after the scrub",
+		objrepair(s, oid, 1, 0, buf, Blk));
+	refusedinternal("a block repair of the mismatching block after the "
+		"scrub", objrepair(s, oid, 1, 1, buf + Blk, Blk));
 	storeclose(s);
 	devclose(d);
 	free(buf);
