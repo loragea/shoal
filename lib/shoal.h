@@ -606,6 +606,9 @@ struct Storecfg
 	int	(*spawn)(void (*)(void*), void*);
 	int	noflush;		/* §3.2's -w */
 	int	nockptproc;		/* no checkpointer proc: T1 drives it */
+	int	forcerebuild;		/* §12's shoalck -R: rebuild the free
+					 * map from the live maps whatever the
+					 * bitmap's own checksums say */
 	ulong	logdepth;
 	ulong	ckms;
 	ulong	ckhigh;
