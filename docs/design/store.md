@@ -3187,11 +3187,12 @@ reported as `arraybad` and a slot whose extent map fails its
 by an un-checkpointed truncate and handed to another object, which
 verifying from the checkpointed index would report as a mismatch,
 and a store closed on an un-checkpointed multi-block commit, over
-which the device records no write at all — read-only or writable;
+which a read-only device — the open every flag but `-R` takes —
+records no write at all;
 and §12's `-R` — a bitmap page that is valid and wrong, which no
 start repairs and which `-R` corrects to a full scan of the live
-maps, both free-grain counts asserted as numbers, a bitmap page that
-will not read, over which the `as found` count is not printed at all,
+maps, both free-grain counts asserted as numbers, a bitmap page that reads and fails its checksum, over
+which the `as found` count is not printed at all,
 an extent map that fails its `csum128`, which `-R` condemns rather
 than rebuilds from, a rebuild that counts the objects committed since
 the last checkpoint, `-R -v` writing the rebuild's lines before the
@@ -3213,7 +3214,10 @@ a block's covered length, replay's closing write-back of its extent
 maps — a writable start over a map region the device refuses is
 refused and names the region, a read-only one writes nothing, and a
 read-only replay too big for its cache is refused naming the cache —
-and a store opened, written and replayed at
+a checkpointer that cannot write, whose failures are counted, named
+in the commit refused for log space, and left behind by a device that
+heals, §2.8's dirty-page trigger surviving a condemnation that lands
+while a checkpoint runs, and a store opened, written and replayed at
 a `blksz` four times the device's `Wunit`), `objtest` (§2.7's extent-map slot
 rule over all three transitions and both the crash and the re-replay
 schedules, §2.4's invariant on the shrinking side, §3.5's deferred
@@ -3231,7 +3235,8 @@ included — and that a delete applies and clears the flag; the scrub's
 two durable transitions, each across a restart taken over a
 checkpoint so that the index bit and not the replayed record is what
 carries it; block repair, its two refusals told apart by whether they
-carry a §2.6 prefix, and the grain it frees; the slot cursor over
+carry a §2.6 prefix, its acceptance of a block whose old grain the
+device will not read, and the grain it frees; the slot cursor over
 live, tomb and free slots; and `/lost` through the set, the clear,
 the delete and §5 step 10's condemnation) and `committest` (§3.2's flush
 placement read off the device trace, the torn-header sweep over a
