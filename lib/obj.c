@@ -458,9 +458,10 @@ updopen(Upd *u, Store *s, uchar *oid, int oidlen, uvlong newlen, int flags)
 	 * D14: a copy that fails local verification contributes no key
 	 * and has no old map to read — the entry that named its grains
 	 * *is* the damaged bytes.  Those grains are unrecoverable and
-	 * stay marked used until the slot's map is written again; the
-	 * update names none of them, so oldnblk is 0 and nothing reads
-	 * through mold.
+	 * stay marked used until a bitmap rebuild (§3.6, §12): writing
+	 * this slot's map again does not reclaim them, because nothing
+	 * knows which they were.  The update names none of them, so
+	 * oldnblk is 0 and nothing reads through mold.
 	 */
 	if(u->e.bad)
 		u->oldnblk = 0;

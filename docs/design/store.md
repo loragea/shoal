@@ -2945,8 +2945,16 @@ did not read and gives no number. It reports `bmaprebuild` and any
 refusal from the store in the store's own words. An extent-map entry
 that fails its own `csum128` is not rebuilt from: every grain number
 in it is the damaged bytes', so §5 step 10 condemns the slot and the
-rebuild skips its map, which is what keeps the slot's grains out of
-the free set and the slot itself out of the allocator. It opens the device read-write — the open
+rebuild skips its map. The **slot** stays out of the allocator —
+`completemaps` counts a condemned slot as used — but the **grains**
+the damaged map named are not marked and so return to the free set,
+because nothing knows which they were. That is safe and it is the
+only answer available: the copy is unrecoverable (§3.6, D14), the
+grains it held are named by no readable structure, and holding an
+unknown set of grains out of the allocator for ever would leak the
+disk instead. Until such a rebuild runs they stay marked from the
+bitmap as it was found, which is what §3.6 means by a condemned
+copy's grains staying marked used until a rebuild. It opens the device read-write — the open
 `shoalfmt` takes, with the flush channel, and `-w` as §3.2's operator
 assertion for a unit whose raw channel will not open — so `-w`
 without `-R` is refused rather than ignored. `-R` with `-v` rebuilds
