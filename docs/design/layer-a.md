@@ -333,7 +333,11 @@ record for `o` is a tombstone whose key is exactly the one named, and
 (ii) that tombstone's `wepoch` is strictly less than the receiver's
 own current map epoch — condition 3, the one condition that bears on
 the receiver's own safety. If either check fails it MUST answer
-`not discardable` and keep the record. Conditions 1 and 2 are the
+`not discardable` and keep the record. A receiver that holds no
+record for `o` at all has nothing for check (i) to judge and answers
+`no such object`, as `op=drop` and `op=verify` do for an absent id
+(§5.6); to the primary it is the same non-`ok` as `not discardable`,
+and the discard is incomplete either way. Conditions 1 and 2 are the
 primary's to establish; re-deriving them at every receiver would cost
 a round trip per pair of instances — quadratic, for a space
 optimisation.
@@ -1837,7 +1841,8 @@ Responses:
   procedure calls for when it says "make both holders re-verify".
 - `op=discard` is §1.5's tombstone discard. The receiver applies the
   two local checks §1.5 defines and answers `ok` or
-  `not discardable`.
+  `not discardable`; an id it holds no record for is `no such
+  object`, as for `op=drop` and `op=verify`.
 - `epoch=` is checked exactly as on `/repl`. One consequence worth
   stating because implementers will see it: immediately after a bump,
   the first `op=meta` a lagging instance receives fails

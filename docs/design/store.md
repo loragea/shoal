@@ -1594,11 +1594,11 @@ them obvious:
   where the key genuinely arrives from elsewhere — answers a
   tombstone's defence as §2.6's `stale version`.
 - **`no such object` for a discard of an id this store does not
-  hold.** layer-a §1.5's receiver rule reads as making absence fail
-  its check (i) — `not discardable` — while §5.6's table lists
-  `no such object` among `op=discard`'s errors; the two pull in
-  different directions and layer-a does not say which wins. This
-  store follows §5.6's table.
+  hold.** layer-a §1.5's receiver checks judge a record; an id this
+  store holds no record for has nothing for check (i) to judge, and
+  §1.5 and §5.6's table both answer it `no such object` (D15). To
+  the sender it is the same non-`ok` as `not discardable`: the
+  discard is incomplete and retried either way.
 - **`checksum mismatch` is answered for local damage as well as for a
   transfer that failed its check.** §2.6 defines it as "content fails
   verification, or a replicated op's resulting `csum` does not match

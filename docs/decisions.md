@@ -283,3 +283,25 @@ complexity and latency rise sharply."
 records the condition across a restart, and whether a repair
 transfers whole objects or only the mismatching blocks (layer-a
 §7.5; `design/store.md` §8).
+
+## D15 — An absent id answers `op=discard` with `no such object` (2026-09-09, Victor)
+
+**Decision:** A receiver of `op=discard` that holds no record at all
+for the named id answers `no such object`, not `not discardable`.
+`design/layer-a.md` §1.5's receiver rule now says so; §5.6's table
+already listed it.
+**Rationale:** §1.5's check (i) judges the receiver's record and had
+no wording for there being none, while §5.6's table listed
+`no such object` for `op=discard` as it does for `op=drop` and
+`op=verify`; the store (`design/store.md` §3.7) followed the table
+from wave 1c-α and the contract text is reconciled to match.
+Nothing distinguishes the two answers: §1.5's sender rule removes the
+primary's own record only after every holder answered `ok`, and
+treats any other answer as an incomplete discard to retry on a later
+pass. A receiver lacks the record either because an earlier pass
+discarded it and the `ok` was lost, or because a §7.4 drop removed a
+stray's copy between its confirmation and the discard; in both cases
+it holds nothing that could resurrect the object, and on the next
+pass it confirms `absent=1` and is not sent the discard at all.
+**Normative:** the answer.
+**Implementation policy:** none.
