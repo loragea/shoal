@@ -379,6 +379,19 @@ tdead(void)
 	devclose(d);
 }
 
+/*
+ * §13 says a test that wants a file drives it through its own file
+ * under /tmp.  The names carry this program's pid because /tmp is
+ * shared: two runs of devtest at once — one mk test beside another,
+ * or a mutant being timed against the tree — would otherwise create,
+ * write, read back and remove the *same* files, and what that looks
+ * like is not a collision but one run's create truncating the image
+ * the other is reading, or its remove taking the file out from under
+ * an open fd.  The unit directory needs the pid for the same reason.
+ */
+static char imgpath[64], ropath[64];
+static char sddir[64], sdnm[3][64];
+
 /* the file-backed device: §12's tools work on an image, so T1 can too */
 static void
 tfile(void)
@@ -387,7 +400,7 @@ tfile(void)
 	uchar w[Secsz], r[Secsz];
 	char *path;
 
-	path = "/tmp/shoaldevtest.img";
+	path = imgpath;
 	remove(path);
 	if((d = fileopen(path, Secsz, 32*Secsz, 0)) == nil){
 		fail("fileopen: %r");
@@ -561,7 +574,7 @@ trdonly(void)
 	d->rdonly = 0;
 	devclose(d);
 
-	path = "/tmp/shoaldevro.img";
+	path = ropath;
 	remove(path);
 	if((d = fileopen(path, Secsz, 32*Secsz, 0)) == nil){
 		fail("fileopen: %r");
@@ -1035,10 +1048,10 @@ tclassify(void)
 	char *dir, *nm[3];
 	int i, fd;
 
-	dir = "/tmp/shoalsdunit";
-	nm[0] = "/tmp/shoalsdunit/ctl";
-	nm[1] = "/tmp/shoalsdunit/raw";
-	nm[2] = "/tmp/shoalsdunit/shoal";
+	dir = sddir;
+	nm[0] = sdnm[0];
+	nm[1] = sdnm[1];
+	nm[2] = sdnm[2];
 	for(i = 0; i < 3; i++)
 		remove(nm[i]);
 	remove(dir);
@@ -1060,7 +1073,7 @@ tclassify(void)
 	if(!sdpart(nm[2]))
 		fail("a partition of a unit directory was taken for a file");
 	checks++;
-	if(sdpart("/tmp/shoalsdunit/ctl") == 0)
+	if(sdpart(nm[0]) == 0)
 		fail("the rule is the directory a path lies in, not its name");
 	remove(nm[0]);
 	checks++;
@@ -1076,9 +1089,36 @@ tclassify(void)
 		fail("a /dev path that is not a partition was taken for one");
 }
 
+/*
+ * The success paths above remove their own files; a sysfatal or a
+ * mutant that dies inside one does not, so the removals are also
+ * registered here and run however this program exits.  A fault is
+ * the one exit they do not reach.
+ */
+static void
+cleanup(void)
+{
+	int i;
+
+	remove(imgpath);
+	remove(ropath);
+	for(i = 0; i < 3; i++)
+		remove(sdnm[i]);
+	remove(sddir);
+}
+
 void
 main(int, char**)
 {
+	int i;
+
+	snprint(imgpath, sizeof imgpath, "/tmp/shoaldevtest.%d.img", getpid());
+	snprint(ropath, sizeof ropath, "/tmp/shoaldevro.%d.img", getpid());
+	snprint(sddir, sizeof sddir, "/tmp/shoalsdunit.%d", getpid());
+	for(i = 0; i < 3; i++)
+		snprint(sdnm[i], sizeof sdnm[i], "%s/%s", sddir,
+			i == 0 ? "ctl" : i == 1 ? "raw" : "shoal");
+	atexit(cleanup);
 	tcache();
 	ttear();
 	tshort();
