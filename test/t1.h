@@ -79,8 +79,18 @@ spawnproc(void (*fn)(void*), void *a)
 		(*fn)(a);
 		exits(nil);
 	}
-	if(nspawnpid < Nspawnpid)
-		spawnpid[nspawnpid++] = pid;
+	/*
+	 * Dropping the pid would silently restore the leak this registry
+	 * exists to close, so a full registry stops the program instead.
+	 * nspawnpid is a plain counter in RFMEM-shared memory and is not
+	 * synchronised: every spawn a T1 program makes is made from its
+	 * own main proc — the engine calls Storecfg.spawn only from
+	 * storeopen, in the caller — so there is one writer today.
+	 */
+	if(nspawnpid >= Nspawnpid)
+		sysfatal("spawnproc: more than %d procs in one test",
+			Nspawnpid);
+	spawnpid[nspawnpid++] = pid;
 	return 0;
 }
 
