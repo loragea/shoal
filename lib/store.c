@@ -603,6 +603,22 @@ rebuildbitmap(Store *s)
 		}
 		if((c = emapget(s, e->emapslot, 0)) == nil)
 			return -1;
+		/*
+		 * §5 step 10, as every other reader of a map applies it:
+		 * an entry that failed its csum128 and that replay did not
+		 * touch is media damage the log cannot repair, and every
+		 * grain number in it is the damaged bytes'.  Marking those
+		 * numbers would free grains a live entry still names and
+		 * publish a checkpoint calling the slot healthy, so the
+		 * slot is condemned and its map skipped — which is also
+		 * what keeps it out of the allocator, since completemaps
+		 * counts a bad slot as used.
+		 */
+		if(c->bad){
+			emapunpin(s, c);
+			storecondemn(s, slot);
+			continue;
+		}
 		for(i = 0; i < nblk && i < s->sb.nblkmax; i++){
 			g = emapgrain(c->p, i);
 			if(g != 0 && g < s->sb.ngrains)

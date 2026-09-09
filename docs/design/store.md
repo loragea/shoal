@@ -2912,7 +2912,11 @@ visible — the first of those numbers comes from the checker's own
 bitmap pass, so it is printed only when every bitmap page was read
 and passed its checksum, and otherwise the line says how many pages
 did not read and gives no number. It reports `bmaprebuild` and any
-refusal from the store in the store's own words. It opens the device read-write — the open
+refusal from the store in the store's own words. An extent-map entry
+that fails its own `csum128` is not rebuilt from: every grain number
+in it is the damaged bytes', so §5 step 10 condemns the slot and the
+rebuild skips its map, which is what keeps the slot's grains out of
+the free set and the slot itself out of the allocator. It opens the device read-write — the open
 `shoalfmt` takes, with the flush channel, and `-w` as §3.2's operator
 assertion for a unit whose raw channel will not open — so `-w`
 without `-R` is refused rather than ignored. `-R` with `-v` rebuilds

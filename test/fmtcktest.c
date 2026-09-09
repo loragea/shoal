@@ -474,6 +474,28 @@ said(char *what, char *want)
 }
 
 static void
+didnotsay(char *what, char *want)
+{
+	checks++;
+	if(strstr(ckbuf, want) != nil)
+		fail("%s: the report says `%s'", what, want);
+}
+
+/* the report is written in pass order, so order is an observable */
+static void
+saidbefore(char *what, char *first, char *then)
+{
+	char *a, *b;
+
+	checks++;
+	a = strstr(ckbuf, first);
+	b = strstr(ckbuf, then);
+	if(a == nil || b == nil || a > b)
+		fail("%s: the report does not say `%s' before `%s'", what,
+			first, then);
+}
+
+static void
 putidx(Dev *d, Super *s, ulong slot, Idxent *e)
 {
 	uchar p[Idxentsz];
@@ -1028,6 +1050,20 @@ pokebmhdr(Dev *d, Super *s, uvlong page)
 }
 
 /*
+ * Damage an extent-map entry without re-sealing it, so the entry
+ * itself fails its csum128 and §5 step 10 condemns the slot.
+ */
+static void
+pokeemap(Dev *d, Super *s, ulong emapslot)
+{
+	uchar junk[8];
+
+	memset(junk, 0xa5, sizeof junk);
+	simpoke(d, emapentoff(s, emapslot) + s->emapsz - sizeof junk, junk,
+		sizeof junk);
+}
+
+/*
  * Move one bit of the on-disk bitmap and re-seal the page with the
  * engine's own packer, keeping the ckseq the page already carried.
  * The result is a page that PASSES its checksum and is wrong, which
@@ -1289,6 +1325,96 @@ tvdirty(void)
 		if(t[i].op == Sopwrite)
 			nw++;
 	eqv("-v writes nothing on a writable store either", nw, 0);
+	free(buf);
+	devclose(d);
+}
+
+/*
+ * -R over an extent map that failed its own csum128.  §5 step 10
+ * condemns such a slot on every other path; a rebuild that read the
+ * map instead would free grains a live entry still names, publish a
+ * checkpoint calling the slot healthy, and leave a bitmap its own
+ * cross-check calls a problem.
+ *
+ * Mutation: rebuildbitmap ignores Emape.bad (mut rebuild-reads-bad).
+ */
+static void
+tRbad(void)
+{
+	Dev *d;
+	Super s;
+	Store *st;
+	Storestat s0, s1;
+	Idxent e;
+	uchar *buf;
+	ulong slot;
+
+	d = newstore(&s);
+	if((st = opens(d, "a damaged extent map at -R")) == nil){
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(3*Vblk, 53);
+	mk(st, "live", 1);
+	wr(st, "live", buf, 3*Vblk, 0, 2);
+	mk(st, "gone", 1);
+	wr(st, "gone", buf, 3*Vblk, 0, 2);
+	ckpt(st);
+	storestat(st, &s0);
+	storeclose(st);
+
+	slot = slotof(d, &s, "gone", &e);
+	istrue("the checkpointed index has gone", slot != ~0UL);
+	pokeemap(d, &s, e.emapslot);
+
+	checks++;
+	if(scrub(d, 0, 1) == 0)
+		fail("-R reported nothing about an extent map that failed "
+			"its checksum");
+	said("-R condemns the damaged slot", "1 slot(s) condemned");
+	said("-R still rewrites the checkpoint", "checkpoint rewritten at "
+		"ckseq");
+
+	/*
+	 * What is left is the damage itself and nothing the rebuild
+	 * added: the checker still refuses to read the entry, but no
+	 * grain is marked with nothing naming it and none is named with
+	 * its bit clear.
+	 */
+	checks++;
+	if(scrub(d, 0, 0) == 0)
+		fail("the checker passed a store whose extent map fails its "
+			"checksum");
+	didnotsay("-R leaves no leaked grain", "referenced by nothing");
+	didnotsay("-R leaves no phantom grain", "clear in the bitmap");
+	said("and the checkpoint calls the slot corrupt",
+		"0 free, 0 bad, 1 corrupt-flagged");
+
+	if((st = opens(d, "after -R over a damaged map")) != nil){
+		storestat(st, &s1);
+		eqv("the damaged slot is condemned", s1.nlost, 1);
+		eqv("and named", storelost(st, 0), slot);
+		/*
+		 * The live object keeps its three grains; the condemned
+		 * slot's three are no longer marked, because nothing names
+		 * them any more.
+		 */
+		eqv("the live entry's grains stay marked, the damaged "
+			"entry's do not", s1.grainfree, s0.grainfree + 3);
+		storeclose(st);
+	}
+
+	/*
+	 * §12: -R rebuilds and then verifies, in that order, and the two
+	 * passes write their lines as they run — so a -R -v that verified
+	 * first would report the objects before the checkpoint it had not
+	 * yet rewritten.
+	 */
+	checks++;
+	if(scrub(d, 1, 1) == 0)
+		fail("-R -v reported nothing about the damaged extent map");
+	saidbefore("-R -v rebuilds before it verifies",
+		"checkpoint rewritten at ckseq", "objects verified");
 	free(buf);
 	devclose(d);
 }
@@ -1571,6 +1697,7 @@ main(int, char**)
 	tverify();
 	tvreplay();
 	tvdirty();
+	tRbad();
 	trebuildoff();
 	tRlog();
 	trefuse();
