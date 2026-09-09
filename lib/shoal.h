@@ -627,6 +627,7 @@ struct Storestat
 	uvlong	logfree;		/* sectors */
 	uvlong	logwait;		/* commits in §6's wait for log space */
 	int	broken;			/* a log write failed: §3.2 */
+	uvlong	nslots;			/* the index's size, for §8's cursor */
 	uvlong	nlive, ntomb, nlost;	/* nlost: /lost, §8 */
 	uvlong	ndirty, ndirtydrop;
 	uvlong	nreplay, pmax;
@@ -724,6 +725,46 @@ struct Vfy
 };
 int	objverify(Store*, uchar *oid, int oidlen, Vfy*);
 void	vfyfree(Vfy*);
+
+/*
+ * §8's scrub: objverify plus the one durable transition it licenses —
+ * a mismatch on a copy the index calls whole sets the corrupt flag, a
+ * copy the index calls corrupt whose every block matches clears it,
+ * and anything else commits nothing.  The Vfy is answered either way,
+ * because which repair to ask for is what it says, and the caller
+ * frees it with vfyfree.  objverify stays pure: it is also what
+ * layer-a §5.6's op=verify and shoalck -v need.
+ *
+ * The rate limit, the proc and the pass are the server's (§8): this
+ * is one object, called from the caller's per-object queue like every
+ * other call here.
+ */
+int	objscrub(Store*, uchar *oid, int oidlen, Vfy*);
+
+/*
+ * §8's slot cursor, so a scrubber can walk the index in order.  Given
+ * a slot below Storestat.nslots it answers 1 for a live or tomb entry
+ * — filling oid (up to Oidmax bytes), *oidlen and *oi — 0 for a free
+ * slot, and -1 for a slot out of range or a condemned store.  It
+ * holds the state lock for the copy alone, so a caller may verify
+ * between two calls; what it answers is a snapshot of a slot and not
+ * a lease on it, so every call the caller then makes names the oid
+ * rather than the slot.
+ */
+int	objslot(Store*, ulong slot, uchar *oid, int *oidlen, Objinfo*);
+
+/*
+ * §8's block repair.  a is block blk as fetched from a holder of a
+ * copy at the same key (layer-a §5.6's op=get), n its covered length.
+ * The bytes are accepted only against the *stored* dig[i], and only
+ * when hash(dig[]) == csum: an object whose digest array fails is
+ * §8's whole-object op=full case, and asking for a block repair there
+ * is a caller bug, so that refusal carries no §2.6 prefix while the
+ * bytes' own failure is `checksum mismatch'.  On acceptance one Eobj
+ * publishes the block with the four-tuple unchanged.  The corrupt
+ * flag is not cleared — objscrub clears it when every block matches.
+ */
+int	objrepair(Store*, uchar *oid, int oidlen, ulong blk, void *a, long n);
 
 /* the dirty set, §2.6 and layer-a §7.1 */
 int	dirtyadd(Store*, uchar *oid, int oidlen, char *peer, uvlong epoch);

@@ -1060,6 +1060,7 @@ storestat(Store *s, Storestat *st)
 	st->staged = s->nstaged;
 	st->slotfree = s->slotfree;
 	st->emapfree = s->emapfree;
+	st->nslots = s->sb.nslots;
 	st->nlive = s->nlive;
 	st->ntomb = s->ntomb;
 	st->ndirty = s->ndirtused;

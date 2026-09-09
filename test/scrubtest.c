@@ -11,6 +11,8 @@
  * row), the durable transition objscrub makes, block repair and the
  * two refusals it owes, the slot cursor, and /lost's accounting over
  * every way a copy comes to fail local verification.
+ *
+ * §13's T1.17 is the arraybad refusal in trepair below.
  */
 
 enum
@@ -63,6 +65,62 @@ refused(char *what, int r, char *want)
 		fail("%s: %s, want %s", what, e, want);
 }
 
+/*
+ * §3.7: an internal-invariant error MUST NOT begin with one of layer-a
+ * §2.6's prefixes, because §2.6's set is prefix-free and a client
+ * parsing a prefix out of one of these reads a bug as an ordinary
+ * refusal.  The one that would be reached for by mistake on the
+ * block-repair path is `checksum mismatch', which is what the *other*
+ * refusal there answers, so the two are told apart on the wire.
+ */
+static void
+notwire(char *what, int r)
+{
+	char e[ERRMAX];
+
+	checks++;
+	if(r >= 0){
+		fail("%s was accepted", what);
+		return;
+	}
+	rerrstr(e, sizeof e);
+	checks++;
+	if(strncmp(e, "checksum mismatch", 17) == 0
+	|| strncmp(e, "no such object", 14) == 0
+	|| strncmp(e, "object ", 7) == 0
+	|| strncmp(e, "stale version", 13) == 0
+	|| strncmp(e, "bad ctl", 7) == 0
+	|| strncmp(e, "not discardable", 15) == 0
+	|| strncmp(e, "disk full", 9) == 0)
+		fail("%s: %s, want an error with no layer-a 2.6 prefix", what,
+			e);
+}
+
+static void
+refusedinternal(char *what, int r)
+{
+	char e[ERRMAX];
+
+	notwire(what, r);
+	if(r >= 0)
+		return;
+	rerrstr(e, sizeof e);
+	checks++;
+	if(strncmp(e, "block repair", 12) != 0)
+		fail("%s: %s, want the block-repair refusal", what, e);
+}
+
+static void
+scrub(Store *s, char *name, Vfy *v, char *what)
+{
+	uchar o[Oidmax];
+
+	memset(v, 0, sizeof *v);
+	oidof(o, name);
+	if(objscrub(s, o, strlen(name), v) < 0)
+		fail("%s: objscrub %s: %r", what, name);
+}
+
 /* the current geometry, for reaching past the API at the media */
 static void
 geom(Dev *d, Super *sup)
@@ -72,6 +130,64 @@ geom(Dev *d, Super *sup)
 	if(superselect(d, &sel) < 0)
 		sysfatal("superselect: %r");
 	*sup = sel.sb[sel.start];
+}
+
+/* the grain holding block blk of an object, read off the media */
+static ulong
+grainof(Dev *d, Super *sup, Objinfo *oi, ulong blk)
+{
+	uchar *p;
+	ulong g;
+
+	if(oi->emapslot == 0){
+		fail("grainof: object has no extent-map slot");
+		return 0;
+	}
+	if((p = malloc(sup->emapsz)) == nil)
+		sysfatal("malloc: %r");
+	simpeek(d, emapentoff(sup, oi->emapslot), p, sup->emapsz);
+	g = emapgrain(p, blk);
+	free(p);
+	return g;
+}
+
+/* flip every byte of n bytes at off, so the change is never a no-op */
+static void
+flipbytes(Dev *d, vlong off, long n)
+{
+	uchar b[16];
+	long i;
+
+	if(n > (long)sizeof b)
+		n = sizeof b;
+	simpeek(d, off, b, n);
+	for(i = 0; i < n; i++)
+		b[i] = ~b[i];
+	simpoke(d, off, b, n);
+}
+
+/*
+ * Damage one stored block digest and leave the extent-map entry's own
+ * csum128 correct, so the entry is served and hash(dig[]) != csum:
+ * §8's second kind of mismatch, which is T1.17's.  Damaging the entry
+ * without repairing its checksum is the *other* fault — §5 step 10's
+ * condemnation — and tlost drives that one.
+ */
+static void
+damagedigest(Dev *d, Super *sup, ulong emapslot, ulong blk)
+{
+	uchar *p, *dig;
+	int i;
+
+	if((p = malloc(sup->emapsz)) == nil)
+		sysfatal("malloc: %r");
+	simpeek(d, emapentoff(sup, emapslot), p, sup->emapsz);
+	dig = emapdig(p, sup->nblkmax, blk);
+	for(i = 0; i < Blkdlen; i++)
+		dig[i] = ~dig[i];
+	reccsumset(p, sup->emapsz, 0);
+	simpoke(d, emapentoff(sup, emapslot), p, sup->emapsz);
+	free(p);
 }
 
 /*
@@ -160,6 +276,336 @@ taccess(void)
 	if(objdiscard(s, oid, 1, 3, 1, 2) < 0)
 		fail("objdiscard of the tombstone: %r");
 
+	storeclose(s);
+	devclose(d);
+	free(buf);
+}
+
+/*
+ * Decision (3): objscrub is objverify plus the durable transition.
+ * A mismatch on a copy the index calls whole sets the flag, every
+ * block matching on a copy it calls corrupt clears it, and an
+ * unchanged verdict commits nothing.  Both transitions survive a
+ * restart, which is the whole reason the flag is an Eobj and not a
+ * bit in memory.
+ */
+static void
+tscrub(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Objinfo oi;
+	Super sup;
+	Vfy v;
+	uchar *buf, oid[Oidmax];
+	uvlong lf, gf;
+	ulong g;
+
+	d = newdisk();
+	if((s = mustopen(d, "scrub")) == nil)
+		return;
+	buf = mkbuf(3*Blk, 41);
+	mk(s, "s");
+	mustwr(s, "s", buf, 3*Blk, 0, 2);
+	oidof(oid, "s");
+
+	storestat(s, &st);
+	lf = st.logfree;
+	scrub(s, "s", &v, "a whole copy");
+	eqv("a scrub of a whole copy finds nothing", v.nbad, 0);
+	eqv("and no bad digest array", v.arraybad, 0);
+	vfyfree(&v);
+	storestat(s, &st);
+	eqv("and commits nothing", st.logfree, lf);
+	eqv("and lists nothing", st.nlost, 0);
+
+	/*
+	 * Damage the bytes of block 1 and nothing else: the digest array
+	 * still hashes to csum, so this is §8's first kind of mismatch —
+	 * the content is suspect and block repair is the repair.
+	 */
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	geom(d, &sup);
+	if(ostat(s, "s", &oi) < 0)
+		fail("objstat s: %r");
+	g = grainof(d, &sup, &oi, 1);
+	istrue("block 1 has a grain", g != 0);
+	flipbytes(d, grainoff(&sup, g), 16);
+
+	scrub(s, "s", &v, "a damaged block");
+	eqv("the scrub finds one bad block", v.nbad, 1);
+	if(v.nbad == 1)
+		eqv("and names it", v.bad[0], 1);
+	eqv("the digest array is not the suspect", v.arraybad, 0);
+	vfyfree(&v);
+	if(ostat(s, "s", &oi) < 0)
+		fail("objstat s: %r");
+	else
+		eqv("the scrub set the corrupt flag", oi.corrupt, 1);
+	storestat(s, &st);
+	eqv("and listed the object in /lost", st.nlost, 1);
+
+	/*
+	 * Durable: a restart must not forget it.  The checkpoint is what
+	 * makes this discriminating — without it the restart replays the
+	 * flag's own Eobj and would list the object however start-up read
+	 * the index, so the flag would look durable while the index bit
+	 * it is written into was ignored.
+	 */
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	storeclose(s);
+	if((s = mustopen(d, "scrub replayed")) == nil){
+		devclose(d);
+		free(buf);
+		return;
+	}
+	if(ostat(s, "s", &oi) < 0)
+		fail("objstat s: %r");
+	else
+		eqv("the flag survives a restart", oi.corrupt, 1);
+	storestat(s, &st);
+	eqv("and so does /lost", st.nlost, 1);
+
+	/* repair the block, then let the scrub clear the flag */
+	storestat(s, &st);
+	gf = st.grainfree;
+	checks++;
+	if(objrepair(s, oid, 1, 1, buf + Blk, Blk) < 0)
+		fail("objrepair: %r");
+	storestat(s, &st);
+	eqv("a repair frees the grain it replaced", st.grainfree, gf);
+	if(ostat(s, "s", &oi) < 0)
+		fail("objstat s: %r");
+	else
+		eqv("and does not itself clear the flag", oi.corrupt, 1);
+
+	scrub(s, "s", &v, "after the repair");
+	eqv("the next scrub finds every block matching", v.nbad, 0);
+	eqv("with a good digest array", v.arraybad, 0);
+	vfyfree(&v);
+	if(ostat(s, "s", &oi) < 0)
+		fail("objstat s: %r");
+	else
+		eqv("so it clears the flag", oi.corrupt, 0);
+	storestat(s, &st);
+	eqv("and the object leaves /lost", st.nlost, 0);
+
+	/* and the clear is durable too */
+	storeclose(s);
+	if((s = mustopen(d, "scrub cleared, replayed")) == nil){
+		devclose(d);
+		free(buf);
+		return;
+	}
+	if(ostat(s, "s", &oi) < 0)
+		fail("objstat s: %r");
+	else
+		eqv("the cleared flag survives a restart", oi.corrupt, 0);
+	storestat(s, &st);
+	eqv("and /lost is empty", st.nlost, 0);
+	checks++;
+	if(objread(s, oid, 1, buf, Blk, 0) < 0)
+		fail("a repaired object is not served: %r");
+	storeclose(s);
+	devclose(d);
+	free(buf);
+}
+
+/*
+ * Decision (5): block repair, and the two refusals §8 owes.  The
+ * second of them is §13's T1.17: with hash(dig[]) != csum the stored
+ * dig[i] cannot be the acceptance test for anything, so a block
+ * repair — even of a block whose own digest is intact and whose bytes
+ * are right — must be refused, and refused as a caller bug rather
+ * than as a media fault, because §8's repair for that object is the
+ * whole-object op=full.  Accepting there rejects every correct byte a
+ * peer sends for the damaged blocks and leaves the object lost with
+ * good copies all over the cluster.
+ */
+static void
+trepair(void)
+{
+	Dev *d;
+	Store *s;
+	Objinfo oi;
+	Super sup;
+	Vfy v;
+	uchar *buf, *bad, oid[Oidmax];
+	ulong g, emapslot;
+
+	d = newdisk();
+	if((s = mustopen(d, "block repair")) == nil)
+		return;
+	buf = mkbuf(3*Blk, 71);
+	bad = mkbuf(3*Blk, 72);
+	mk(s, "r");
+	mustwr(s, "r", buf, 3*Blk, 0, 2);
+	oidof(oid, "r");
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	geom(d, &sup);
+	if(ostat(s, "r", &oi) < 0)
+		fail("objstat r: %r");
+	emapslot = oi.emapslot;
+	g = grainof(d, &sup, &oi, 2);
+	flipbytes(d, grainoff(&sup, g), 16);
+
+	/* bytes that do not hash to the stored digest are the peer's fault */
+	refused("a block repair with the wrong bytes",
+		objrepair(s, oid, 1, 2, bad + 2*Blk, Blk),
+		"checksum mismatch");
+	/* and a count that is not the block's covered length is the caller's */
+	refusedinternal("a block repair of the wrong length",
+		objrepair(s, oid, 1, 2, buf + 2*Blk, Blk - 1));
+	refusedinternal("a block repair past the last block",
+		objrepair(s, oid, 1, 3, buf, Blk));
+
+	checks++;
+	if(objrepair(s, oid, 1, 2, buf + 2*Blk, Blk) < 0)
+		fail("objrepair: %r");
+	checks++;
+	if(objverify(s, oid, 1, &v) < 0)
+		fail("objverify after the repair: %r");
+	else{
+		eqv("the repaired object verifies", v.nbad, 0);
+		eqv("with a good digest array", v.arraybad, 0);
+		vfyfree(&v);
+	}
+	if(ostat(s, "r", &oi) < 0)
+		fail("objstat r: %r");
+	else{
+		eqv("the repair left the version alone", oi.ver, 2);
+		eqv("and the length", oi.len, 3*Blk);
+	}
+
+	/*
+	 * T1.17.  Damage a stored digest and leave the extent-map entry's
+	 * own csum128 right, so the entry is served and the array is the
+	 * suspect.  The store must re-read it, so this goes through a
+	 * restart.
+	 */
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	storeclose(s);
+	damagedigest(d, &sup, emapslot, 1);
+	if((s = mustopen(d, "a damaged digest array")) == nil){
+		devclose(d);
+		free(buf);
+		free(bad);
+		return;
+	}
+	checks++;
+	if(objverify(s, oid, 1, &v) < 0)
+		fail("objverify over a damaged digest array: %r");
+	else{
+		eqv("verify calls the digest array suspect", v.arraybad, 1);
+		eqv("and block 1 mismatching with it", v.nbad, 1);
+		vfyfree(&v);
+	}
+	/*
+	 * Block 0's bytes are right and its stored digest is intact, so
+	 * a repair that tested only dig[i] would take them.  §8 refuses:
+	 * the array is not an acceptance test, and this object's repair
+	 * is the whole-object push.
+	 */
+	refusedinternal("a block repair of a good block under a bad array",
+		objrepair(s, oid, 1, 0, buf, Blk));
+	refusedinternal("a block repair of the mismatching block",
+		objrepair(s, oid, 1, 1, buf + Blk, Blk));
+
+	/* and the scrub flags it, for the whole-object repair to find */
+	scrub(s, "r", &v, "a damaged digest array");
+	eqv("the scrub calls the array suspect", v.arraybad, 1);
+	vfyfree(&v);
+	if(ostat(s, "r", &oi) < 0)
+		fail("objstat r: %r");
+	else
+		eqv("and sets the flag", oi.corrupt, 1);
+	storeclose(s);
+	devclose(d);
+	free(buf);
+	free(bad);
+}
+
+/*
+ * Decision (4): the slot cursor.  It answers what a slot holds, in
+ * slot order, copying the oid out — which is what lets a scrubber
+ * walk the index without holding the state lock across a verify.
+ */
+static void
+tcursor(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Objinfo oi;
+	uchar *buf, oid[Oidmax], got[Oidmax];
+	ulong slot;
+	int oidlen, r, nlive, ntomb, nfree, seen;
+
+	d = newdisk();
+	if((s = mustopen(d, "the slot cursor")) == nil)
+		return;
+	buf = mkbuf(Blk, 83);
+	mk(s, "c1");
+	mustwr(s, "c1", buf, Blk, 0, 2);
+	mk(s, "c2");
+	mk(s, "c3");
+	oidof(oid, "c3");
+	if(objremove(s, oid, 2, 2, 1, nil, 0) < 0)
+		fail("objremove c3: %r");
+
+	storestat(s, &st);
+	eqv("the cursor's bound is the index's size", st.nslots, 128);
+	nlive = ntomb = nfree = seen = 0;
+	for(slot = 0; slot < st.nslots; slot++){
+		r = objslot(s, slot, got, &oidlen, &oi);
+		if(r < 0){
+			fail("objslot %lud: %r", slot);
+			break;
+		}
+		if(r == 0){
+			nfree++;
+			continue;
+		}
+		if(oi.state == Slive)
+			nlive++;
+		else if(oi.state == Stomb)
+			ntomb++;
+		eqv("the cursor reports the slot it was asked for", oi.slot,
+			slot);
+		if(oidlen == 2 && memcmp(got, "c1", 2) == 0){
+			seen++;
+			eqv("and the object's length", oi.len, Blk);
+			eqv("and its key", oi.ver, 2);
+			eqv("and that it is whole", oi.corrupt, 0);
+		}
+	}
+	eqv("the cursor finds every live object", nlive, st.nlive);
+	eqv("and every tombstone", ntomb, st.ntomb);
+	eqv("and calls the rest free", nfree, st.nslots - st.nlive - st.ntomb);
+	eqv("and named c1 once", seen, 1);
+	notwire("a cursor past the last slot",
+		objslot(s, (ulong)st.nslots, got, &oidlen, &oi));
+
+	/* it reports a corrupt copy as corrupt rather than hiding it */
+	oidof(oid, "c1");
+	if(objcorrupt(s, oid, 2, 1, nil, 0) < 0)
+		fail("objcorrupt c1: %r");
+	seen = 0;
+	for(slot = 0; slot < st.nslots; slot++){
+		if(objslot(s, slot, got, &oidlen, &oi) != 1)
+			continue;
+		if(oidlen == 2 && memcmp(got, "c1", 2) == 0){
+			seen++;
+			eqv("the cursor reports the corrupt flag", oi.corrupt,
+				1);
+		}
+	}
+	eqv("c1 is still there", seen, 1);
 	storeclose(s);
 	devclose(d);
 	free(buf);
@@ -277,6 +723,9 @@ main(int argc, char **argv)
 {
 	USED(argc); USED(argv);
 	taccess();
+	tscrub();
+	trepair();
+	tcursor();
 	tlost();
 	killspawned();
 	if(fails > 0){

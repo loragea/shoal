@@ -1464,6 +1464,245 @@ vfyfree(Vfy *v)
 }
 
 /*
+ * §8's scrub: objverify plus the durable transition it licenses.
+ * Verify itself stays pure — it is also what layer-a §5.6's op=verify
+ * and shoalck -v need, and neither may commit — so the transition
+ * lives here, and it is exactly two moves.  A mismatch on a copy the
+ * index calls whole sets the flag; every block matching on a copy the
+ * index calls corrupt clears it (§8: "the holder's next verify finds
+ * every block matching, clears the corrupt flag ... and the object
+ * leaves /lost").  Anything else commits nothing: an unchanged verdict
+ * is not news, and a scrubber that wrote a record per object per pass
+ * would put the whole disk through the log every scrubdays.
+ *
+ * The Vfy is answered either way, because which repair the caller
+ * must ask for is what it says (§8's two kinds of mismatch), and the
+ * caller frees it with vfyfree.  Serialisation is the caller's, as
+ * for every other call here: the verify and the commit are two hands
+ * on one object and §7's queue is what keeps a write out from
+ * between them.
+ */
+int
+objscrub(Store *s, uchar *oid, int oidlen, Vfy *v)
+{
+	Objinfo oi;
+	int bad;
+
+	if(objverify(s, oid, oidlen, v) < 0)
+		return -1;
+	if(objstat(s, oid, oidlen, &oi) < 0){
+		vfyfree(v);
+		return -1;
+	}
+	bad = v->arraybad || v->nbad > 0;
+	if(bad != oi.corrupt && objcorrupt(s, oid, oidlen, bad, nil, 0) < 0){
+		vfyfree(v);
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * §8's slot cursor.  A scrubber walks slots in order, and the index
+ * is the engine's; this is the whole of what it needs to do that.  It
+ * holds qlstate for the copy and not a moment longer — §8's scrub
+ * reads grains through the caller's queue, and a cursor that stayed
+ * locked across the verify would serialise every commit in the store
+ * behind one object's hashing.
+ *
+ * The oid is copied out for the same reason: s->idx[slot].oid is
+ * freed by the apply of a commit that releases the slot, so a pointer
+ * into it is good only under the lock.  What the caller holds
+ * afterwards is a snapshot of a slot, not a lease on it: by the time
+ * it verifies, the object may have been written, deleted or replaced,
+ * and every call it then makes takes the oid rather than the slot, so
+ * it acts on the object it named and not on whatever the slot came to
+ * hold.  Answers 1 for a live or tomb entry, 0 for a free slot.
+ */
+int
+objslot(Store *s, ulong slot, uchar *oid, int *oidlen, Objinfo *oi)
+{
+	Ient *e;
+
+	if(!serving(s))
+		return -1;
+	if(slot >= s->sb.nslots){
+		werrstr("slot %lud, nslots %lud", slot, s->sb.nslots);
+		return -1;
+	}
+	qlock(&s->qlstate);
+	e = &s->idx[slot];
+	if(e->state == Sfree){
+		qunlock(&s->qlstate);
+		*oidlen = 0;
+		return 0;
+	}
+	memmove(oid, e->oid, e->oidlen);
+	*oidlen = e->oidlen;
+	memset(oi, 0, sizeof *oi);
+	oi->slot = slot;
+	oi->emapslot = e->emapslot;
+	oi->qidpath = e->qidpath;
+	oi->len = e->len;
+	oi->ver = e->ver;
+	oi->wepoch = e->wepoch;
+	oi->mtime = e->mtime;
+	memmove(oi->csum, e->csum, Csumlen);
+	oi->state = e->state;
+	oi->corrupt = (e->flags & Icorrupt) != 0;
+	qunlock(&s->qlstate);
+	return 1;
+}
+
+/*
+ * §8's first bullet: block repair.  The caller has fetched block blk
+ * from a holder of a copy at the same key (layer-a §5.6's op=get) and
+ * hands the bytes here; this checks them and, if they are the block
+ * the object is missing, commits an Eobj whose four-tuple is
+ * unchanged and whose nmap names that one block.  §3.5's deferred
+ * reuse covers the grain it frees, as for any commit.
+ *
+ * The two refusals are different kinds on purpose (§3.7).
+ *
+ * The first is the acceptance test's own precondition: if
+ * hash(dig[]) != csum the stored dig[i] cannot be the acceptance test
+ * for anything, so accepting bytes against it would reject every
+ * correct byte a peer sent — and, worse, accept the wrong ones — and
+ * leave the object `object lost' with good copies all over the
+ * cluster.  §8 says that case is the whole-object op=full, so a
+ * caller that block-repairs through it is a server bug rather than a
+ * media fault, and the refusal carries no §2.6 prefix.
+ *
+ * The second is the acceptance test: bytes that do not hash to the
+ * stored dig[i] are content that failed verification, which is what
+ * layer-a §2.6's `checksum mismatch' names.
+ *
+ * The corrupt flag is not cleared here.  One block matching says
+ * nothing about the others, and §8 gives the clearing to the verify
+ * that finds every block matching — objscrub above.
+ */
+int
+objrepair(Store *s, uchar *oid, int oidlen, ulong blk, void *a, long n)
+{
+	Upd u;
+	Omap mold;
+	Objinfo oi;
+	uchar *buf, *digs, dig[Blkdlen], csum[Csumlen];
+	uvlong i, nblk;
+	ulong g, cov;
+
+	if(!serving(s))
+		return -1;
+	if(objstat(s, oid, oidlen, &oi) < 0)
+		return -1;
+	if(oi.state != Slive){
+		werrstr(oi.state == Stomb ? "object deleted" : "no such object");
+		return -1;
+	}
+	nblk = blkcount(oi.len, s->sb.blksz);
+	if(blk >= nblk){
+		werrstr("block repair: block %lud of %llud", blk, nblk);
+		return -1;
+	}
+	/*
+	 * The count is the block's covered length (layer-a §1.4), which
+	 * the caller knows from the len it fetched against; anything else
+	 * would hash to something that is not this block's digest, and
+	 * saying so as a checksum mismatch would blame the peer for the
+	 * caller's arithmetic.
+	 */
+	if(updopen(&u, s, oid, oidlen, oi.len, Ucorrupt) < 0)
+		return -1;
+	cov = blkcover(s, u.e.len, blk);
+	if(n < 0 || (ulong)n != cov){
+		updabort(&u);
+		updclose(&u);
+		werrstr("block repair: %ld bytes for a block of %lud", n, cov);
+		return -1;
+	}
+	mapopen(s, &mold, &u.e, u.cold);
+	nblk = blkcount(u.e.len, s->sb.blksz);
+	digs = nil;
+	if(nblk > 0 && (digs = malloc(nblk*Blkdlen)) == nil){
+		updabort(&u);
+		updclose(&u);
+		werrstr("out of memory");
+		return -1;
+	}
+	for(i = 0; i < nblk; i++)
+		memmove(digs + i*Blkdlen, mapdig(&mold, i), Blkdlen);
+	csumdigests(digs, nblk, csum);
+	free(digs);
+	if(memcmp(csum, u.e.csum, Csumlen) != 0){
+		updabort(&u);
+		updclose(&u);
+		werrstr("block repair: slot %lud: the digest array does not "
+			"hash to csum; the repair here is op=full", u.slot);
+		return -1;
+	}
+	blkdigest(a, n, dig);
+	if(memcmp(dig, mapdig(&mold, blk), Blkdlen) != 0){
+		updabort(&u);
+		updclose(&u);
+		werrstr("checksum mismatch: block %lud does not hash to its "
+			"stored digest", blk);
+		return -1;
+	}
+	if((buf = malloc(s->sb.blksz)) == nil){
+		updabort(&u);
+		updclose(&u);
+		werrstr("out of memory");
+		return -1;
+	}
+	/*
+	 * The grain holds a whole block; the bytes above the block's
+	 * covered length are not the object's content and MUST read as
+	 * the zeros §4 says they read as, or the next partial write of
+	 * this block would merge them back in.
+	 */
+	memmove(buf, a, n);
+	if(n < (long)s->sb.blksz)
+		memset(buf + n, 0, s->sb.blksz - n);
+	qlock(&s->qlstate);
+	/* grainalloc spells its own failure: disk full, or out of memory */
+	if(grainalloc(s, &g) < 0){
+		qunlock(&s->qlstate);
+		free(buf);
+		updabort(&u);
+		updclose(&u);
+		return -1;
+	}
+	qunlock(&s->qlstate);
+	if(grainwrite(s, buf, g) < 0){
+		qlock(&s->qlstate);
+		grainstageclr(s, g);
+		qunlock(&s->qlstate);
+		free(buf);
+		updabort(&u);
+		updclose(&u);
+		return -1;
+	}
+	free(buf);
+	/* stageblk's window, released the same way */
+	if(addfree(&u, mapgrain(&mold, blk)) < 0
+	|| addmap(&u, blk, g, dig) < 0){
+		qlock(&s->qlstate);
+		grainstageclr(s, g);
+		qunlock(&s->qlstate);
+		updabort(&u);
+		updclose(&u);
+		return -1;
+	}
+	if(updcommit(&u, u.e.state, u.e.ver, u.e.wepoch, u.e.mtime,
+		(u.e.flags & Icorrupt) != 0, nil, 0) < 0){
+		updclose(&u);
+		return -1;
+	}
+	updclose(&u);
+	return 0;
+}
+
+/*
  * Multi-request op=full stages, §3.6.  layer-a §5.5 stages a whole
  * object across many writes, pipelined, with the arbitration
  * comparison made once at final=1 against the receiver's then-current
