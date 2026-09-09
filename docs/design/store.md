@@ -2908,8 +2908,11 @@ start (§2.5); `-R` is for the page that is **valid and wrong**, which
 no start repairs, and for the operator who wants the scan done now
 rather than at the next one. It prints how many grains the on-disk
 bitmap left free and how many the rebuild leaves, so what changed is
-visible, and it reports `bmaprebuild` and any refusal from the store
-in the store's own words. It opens the device read-write — the open
+visible — the first of those numbers comes from the checker's own
+bitmap pass, so it is printed only when every bitmap page was read
+and passed its checksum, and otherwise the line says how many pages
+did not read and gives no number. It reports `bmaprebuild` and any
+refusal from the store in the store's own words. It opens the device read-write — the open
 `shoalfmt` takes, with the flush channel, and `-w` as §3.2's operator
 assertion for a unit whose raw channel will not open — so `-w`
 without `-R` is refused rather than ignored. `-R` with `-v` rebuilds

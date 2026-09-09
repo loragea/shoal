@@ -1016,6 +1016,17 @@ grainof(Dev *d, Super *s, Idxent *e, ulong blk)
 	return g;
 }
 
+/* break a bitmap page's own checksum, so the checker cannot read it */
+static void
+pokebmhdr(Dev *d, Super *s, uvlong page)
+{
+	uchar junk[8];
+
+	memset(junk, 0x5c, sizeof junk);
+	simpoke(d, (vlong)s->bmapoff*s->secsz + (vlong)page*s->blksz, junk,
+		sizeof junk);
+}
+
 /*
  * Move one bit of the on-disk bitmap and re-seal the page with the
  * engine's own packer, keeping the ckseq the page already carried.
@@ -1298,6 +1309,7 @@ trebuildoff(void)
 	Storestat s0, s1;
 	Idxent e;
 	uchar *buf;
+	char want[128];
 	ulong g;
 	int bad;
 
@@ -1339,7 +1351,16 @@ trebuildoff(void)
 	if(scrub(d, 0, 1) == 0)
 		fail("-R reported nothing about the bitmap it found wrong");
 	said("-R rebuilds", "bmaprebuild=yes");
-	said("-R prints the two counts", "the rebuild leaves");
+	/*
+	 * The numbers and not just the phrase: the `as found' count is
+	 * the operator's only sight of what the bitmap said before, so a
+	 * line that always printed 0 would read as a total loss and be
+	 * asserted by nothing.
+	 */
+	snprint(want, sizeof want, "the on-disk bitmap leaves %llud grains "
+		"free, the rebuild leaves %llud", s0.grainfree - 1,
+		s0.grainfree);
+	said("-R prints both counts", want);
 	said("-R rewrites the checkpoint", "checkpoint rewritten at ckseq");
 
 	checks++;
@@ -1351,6 +1372,20 @@ trebuildoff(void)
 			s1.grainfree, s0.grainfree);
 		storeclose(st);
 	}
+
+	/*
+	 * The `as found' count comes from the checker's own bitmap pass,
+	 * so it means nothing on a store with a page that would not read
+	 * — which is a store -R is run on.  There the line says how many
+	 * pages that was and gives no number at all.
+	 */
+	pokebmhdr(d, &s, 0);
+	checks++;
+	if(scrub(d, 0, 1) == 0)
+		fail("-R reported nothing about a bitmap page that fails its "
+			"checksum");
+	said("-R counts the unreadable pages", "bitmap page(s) did not read");
+	didnotsay("and gives no as-found count", "the on-disk bitmap leaves");
 	free(buf);
 	devclose(d);
 }
