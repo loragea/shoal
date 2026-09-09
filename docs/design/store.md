@@ -1954,6 +1954,12 @@ that freed it is durable (§3.5).
 delete time — the `Eobj` that sets `state=tomb` carries `len=0`,
 `nmap` empty, `nfree` naming every grain the object held, and
 `emapslot=0`, so the extent-map slot is released with the content.
+A slot §5 step 10 condemned is the exception, and it is the point of
+allowing the delete at all: the entry that named its grains is the
+damaged bytes, so the delete reads no map and its `nfree` names
+**nothing**. The extent-map slot is still released and the tombstone
+is still clean; the grains come back at a bitmap rebuild and not
+before (§3.6, §8, §12).
 What survives is the 256-byte index entry. Layer-a §1.5's discard,
 once its three cluster-wide conditions hold, commits an `Eslot` and
 the slot returns to the free list. The discard names the tombstone's
