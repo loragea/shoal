@@ -110,6 +110,22 @@ refusedinternal(char *what, int r)
 		fail("%s: %s, want the block-repair refusal", what, e);
 }
 
+/* §5 step 11's rebuild, forced: what `shoalck -R' drives */
+static Store*
+openrebuild(Dev *d, char *what)
+{
+	Storecfg c;
+	Store *s;
+
+	tcfg(&c);
+	c.forcerebuild = 1;
+	if((s = storeopen(d, &c)) == nil){
+		fail("%s: storeopen: %r", what);
+		return nil;
+	}
+	return s;
+}
+
 static void
 scrub(Store *s, char *name, Vfy *v, char *what)
 {
@@ -188,6 +204,21 @@ damagedigest(Dev *d, Super *sup, ulong emapslot, ulong blk)
 	reccsumset(p, sup->emapsz, 0);
 	simpoke(d, emapentoff(sup, emapslot), p, sup->emapsz);
 	free(p);
+}
+
+/*
+ * Damage an extent-map entry without repairing its csum128, so the
+ * entry itself fails and §5 step 10 condemns the slot on the first
+ * read — the other kind of damage from damagedigest above.
+ */
+static void
+damageentry(Dev *d, Super *sup, ulong emapslot)
+{
+	uchar junk[8];
+
+	memset(junk, 0xa5, sizeof junk);
+	simpoke(d, emapentoff(sup, emapslot) + sup->emapsz - sizeof junk,
+		junk, sizeof junk);
 }
 
 /*
@@ -559,6 +590,93 @@ trepair(void)
 }
 
 /*
+ * A copy §5 step 10 condemned for a damaged extent map: what a delete
+ * does with it, and where the grains the damaged map named end up.
+ */
+static void
+tcondemned(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Objinfo oi;
+	Super sup;
+	uchar *buf, oid[Oidmax];
+	uvlong gf;
+	ulong emapslot;
+
+	d = newdisk();
+	if((s = mustopen(d, "a condemned slot")) == nil)
+		return;
+	buf = mkbuf(3*Blk, 113);
+	mk(s, "d");
+	mustwr(s, "d", buf, 3*Blk, 0, 2);
+	oidof(oid, "d");
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	geom(d, &sup);
+	if(ostat(s, "d", &oi) < 0)
+		fail("objstat d: %r");
+	emapslot = oi.emapslot;
+	storeclose(s);
+	damageentry(d, &sup, emapslot);
+	if((s = mustopen(d, "a condemned slot, reopened")) == nil){
+		devclose(d);
+		free(buf);
+		return;
+	}
+	checks++;
+	if(objread(s, oid, 1, buf, Blk, 0) >= 0)
+		fail("a damaged extent map was served");
+	storestat(s, &st);
+	eqv("the first read condemns the slot", st.nlost, 1);
+	gf = st.grainfree;
+
+	/*
+	 * §8: the delete applies.  op=delete carries its own key and a
+	 * condemned copy has none to defend, and refusing would leave the
+	 * object with no exit at all — op=full is its other repair, and
+	 * an object deleted cluster-wide has no live copy left to push
+	 * one, so layer-a §1.5's discard would wait on this witness for
+	 * ever.
+	 */
+	checks++;
+	if(objremove(s, oid, 1, 3, 1, nil, 0) < 0)
+		fail("objremove of a condemned slot: %r");
+	if(objstat(s, oid, 1, &oi) < 0)
+		fail("objstat after the delete: %r");
+	else{
+		eqv("the delete tombstones the condemned copy", oi.state,
+			Stomb);
+		eqv("and commits a clean tombstone", oi.corrupt, 0);
+	}
+	storestat(s, &st);
+	eqv("so the slot leaves /lost", st.nlost, 0);
+	eqv("and the damaged map's grains are still marked used",
+		st.grainfree, gf);
+
+	/*
+	 * §3.6: those grains come back at a bitmap rebuild and at nothing
+	 * else.  The tombstone released the extent-map slot, so §5 step
+	 * 11's scan no longer finds them named by anything.
+	 */
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	storeclose(s);
+	if((s = openrebuild(d, "after the delete")) == nil){
+		devclose(d);
+		free(buf);
+		return;
+	}
+	storestat(s, &st);
+	eqv("a bitmap rebuild reclaims the condemned map's grains",
+		st.grainfree, gf + 3);
+	storeclose(s);
+	devclose(d);
+	free(buf);
+}
+
+/*
  * Decision (4): the slot cursor.  It answers what a slot holds, in
  * slot order, copying the oid out — which is what lets a scrubber
  * walk the index without holding the state lock across a verify.
@@ -753,6 +871,7 @@ main(int argc, char **argv)
 	taccess();
 	tscrub();
 	trepair();
+	tcondemned();
 	tcursor();
 	tlost();
 	killspawned();

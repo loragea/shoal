@@ -1474,8 +1474,10 @@ time of the last chunk. It is owned by the fid.
   is taken at any key. It rebuilds the map whole in a fresh
   extent-map slot (§2.7's slot rule), in the index slot and at the
   `qid.path` the object already had, and the grains the damaged entry
-  named are unrecoverable and stay marked used until that slot is
-  written again. The rebuild does not depend on some earlier read
+  named are unrecoverable and stay marked used until a bitmap rebuild
+  (§2.5, `shoalck -R`): writing the slot again does not reclaim them,
+  because the rebuild is what recomputes the bitmap from the maps that
+  are left. The rebuild does not depend on some earlier read
   having found the damage: a `final=1` that reads the map and finds
   it damaged condemns the slot and rebuilds it in the same call,
   because a repair that worked only for a slot condemned since the
@@ -2362,9 +2364,17 @@ and replaces the content with none — so there is nothing left for the
 flag to defend, and the tombstone it commits holds no content to be
 suspect of and so carries the flag cleared. A create over a live
 flagged copy is still `object exists`. A slot §5 step 10 condemned is
-not in the delete's set: the grains it holds are named by the damaged
-map alone, so a delete would leak every one of them (§3.6), and
-`op=full` remains its only repair.
+in the delete's set for the same reason and by the same rule: a
+delete arbitrates on the key it carries, and a copy that fails local
+verification has none to defend. The grains its damaged map named are
+unrecoverable whichever way the delete goes — refusing does not
+reclaim them, since §5 step 11's rebuild re-marks whatever a live
+entry's map still says (§3.6) — and refusing costs the object its
+only exit: `op=full` is a condemned copy's other repair, and an
+object being deleted cluster-wide has no live copy left to push one,
+so layer-a §1.5's tombstone discard would wait on this witness
+forever. The tombstone releases the extent-map slot, so the next
+bitmap rebuild (§2.5, `shoalck -R`) returns the grains.
 
 A corrupt copy loses arbitration against everything including absence
 (layer-a §1.3), which the server enforces by refusing to advertise

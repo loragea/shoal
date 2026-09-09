@@ -1166,17 +1166,27 @@ objremove(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 		return -1;
 	}
 	/*
-	 * §8: a delete applies to a corrupt-flagged copy.  op=delete is
-	 * self-contained — it arbitrates on the key it carries and
-	 * replaces the content with none — so there is nothing here for
-	 * the flag to protect, and the tombstone this commits holds no
-	 * content to be suspect of: updcommit publishes it with the flag
-	 * clear, which is what takes the object out of /lost.  A slot §5
-	 * step 10 condemned is not in this set: its grains are named by
-	 * the damaged map alone, so a delete would leak every one of them
-	 * (§3.6), and op=full remains its only repair.
+	 * §8: a delete applies to a copy that fails local verification,
+	 * whether the §8 flag is what says so or §5 step 10's
+	 * condemnation is.  op=delete is self-contained — it arbitrates
+	 * on the key it carries and replaces the content with none — so
+	 * there is nothing here for the flag to protect, and the
+	 * tombstone this commits holds no content to be suspect of:
+	 * updcommit publishes it with the flag clear, which is what takes
+	 * the object out of /lost.
+	 *
+	 * A condemned slot is in that set and not an exception to it.
+	 * The grains its damaged map named are unrecoverable either way
+	 * — a refusal does not reclaim them, because §5 step 11's rebuild
+	 * re-marks whatever a live entry's map still says (§3.6) — and
+	 * the refusal costs what the delete is for: op=full is a
+	 * condemned copy's only other repair, and an object being deleted
+	 * cluster-wide has no live copy left to push one, so layer-a
+	 * §1.5's tombstone discard would wait on this witness forever.
+	 * The tombstone releases the map, so the next bitmap rebuild
+	 * (§2.5, `shoalck -R') is what returns the grains.
 	 */
-	if(updopen(&u, s, oid, oidlen, 0, Ucorrupt) < 0)
+	if(updopen(&u, s, oid, oidlen, 0, Ubad|Ucorrupt) < 0)
 		return -1;
 	mapopen(s, &mold, &u.e, u.cold);
 	if(freetail(&u, &mold) < 0){
