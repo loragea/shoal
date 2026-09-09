@@ -1123,6 +1123,16 @@ policy, both tunable without a format change. A quarter rather than a
 half because the checkpointer's job is to keep the log from ever
 being full, and starting earlier is what keeps §6's wait rare.
 
+*Anything dirty* is **counted at each checkpoint's end, not zeroed**.
+A page's count is raised on its clean-to-dirty edge only, so a page
+dirtied while a checkpoint runs — after that checkpoint's own pass
+packed it and cleared its mark — keeps the mark and would lose the
+count. Almost everything that dirties a page also writes a record, so
+the log trigger covers it; §5 step 10's condemnation is the exception,
+being the one thing that dirties an index page without writing a byte
+to the log, and on a store doing nothing but reads the dirty count is
+then the only trigger there is.
+
 ## 3. Write path
 
 *Policy for the mechanics; the invariants it establishes are

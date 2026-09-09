@@ -1342,6 +1342,172 @@ tckfail(void)
 	devclose(d);
 }
 
+/*
+ * §2.8's wake-up condition, over a condemnation that lands while a
+ * checkpoint is running.  A page is counted dirty on its 0->1 edge
+ * only, so a page dirtied after its own pass has packed it keeps its
+ * mark and loses its count; zeroing the count at the checkpoint's end
+ * therefore drops it.  Everything else that dirties a page also puts
+ * a record in the log, which is ckdue's other trigger — storecondemn
+ * is the one that does not, so on a store doing nothing but reads the
+ * count is the only trigger there is, and a condemnation landing in
+ * that window would sit in memory until unrelated write traffic
+ * arrived.
+ *
+ * The schedule is made rather than waited for: a second proc asks for
+ * the checkpoint and the checkpointer is held at the flush that
+ * follows its page passes (§13's flush hook), so the read that
+ * condemns is certainly after the index page was packed and certainly
+ * before the checkpoint ends.  ckhigh is off, so the log cannot ask
+ * for the checkpoint that follows, and ckms is long enough that none
+ * can start before the hook is set.
+ *
+ * Mutation: the count is zeroed at a checkpoint's end (mut
+ * ckend-zeroes-dirty), and nothing writes the condemnation down.
+ */
+typedef struct Ckask Ckask;
+struct Ckask
+{
+	Store	*s;
+	int	done;
+	int	err;
+};
+
+static void
+ckaskproc(void *a)
+{
+	Ckask *k;
+
+	k = a;
+	k->err = storecheckpoint(k->s) < 0;
+	k->done = 1;
+}
+
+/* wait for a write into [lo, hi) since the last trace reset */
+static int
+sawwrite(Dev *d, vlong lo, vlong hi, int ms)
+{
+	Simop *t;
+	long i, n;
+	int j;
+
+	for(j = 0; j < ms; j++){
+		n = simtrace(d, &t);
+		for(i = 0; i < n; i++)
+			if(t[i].op == Sopwrite && t[i].off >= lo
+			&& t[i].off < hi)
+				return 1;
+		sleep(1);
+	}
+	return 0;
+}
+
+static void
+tckdirty(void)
+{
+	Dev *d;
+	Store *s;
+	Storecfg c;
+	Storestat st;
+	Ckask *k;
+	Super sb;
+	Sbsel sel;
+	uchar *buf, oid[Oidmax], rd[64], junk[8];
+	vlong lo, hi;
+	int j;
+
+	d = newdisk();
+	if((s = mustopen(d, "a condemnation during a checkpoint")) == nil){
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(3*Blk, 93);
+	oidof(oid, "w");
+	if(objcreate(s, oid, 1, 1, 1, nil, 0, nil) < 0)
+		fail("objcreate w: %r");
+	if(objwrite(s, oid, 1, buf, 3*Blk, 0, 2, 1, nil, 0) < 0)
+		fail("objwrite w: %r");
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	storeclose(s);
+
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	sb = sel.sb[sel.start];
+	lo = (vlong)sb.idxoff*sb.secsz;
+	hi = lo + (vlong)sb.idxsecs*sb.secsz;
+	memset(junk, 0xa5, sizeof junk);
+	simpoke(d, emapentoff(&sb, 1) + sb.emapsz - sizeof junk, junk,
+		sizeof junk);
+
+	tcfg(&c);
+	c.nockptproc = 0;
+	c.ckhigh = 0;
+	c.ckms = 500;
+	spawnforget();
+	if((s = storeopen(d, &c)) == nil){
+		fail("a store with a checkpointer: %r");
+		free(buf);
+		devclose(d);
+		return;
+	}
+	storestat(s, &st);
+	eqv("the damaged map is not read at start", st.nlost, 0);
+	oidof(oid, "x");
+	if(objcreate(s, oid, 1, 1, 1, nil, 0, nil) < 0)
+		fail("objcreate x: %r");
+	if(objwrite(s, oid, 1, buf, 64, 0, 2, 1, nil, 0) < 0)
+		fail("objwrite x: %r");
+
+	/* held at the page passes' flush, which is the first from here */
+	storehook(s, "flush", 1);
+	simtracereset(d);
+	/*
+	 * §7 rule 3: an RFMEM proc shares the data and bss segments and
+	 * not the stack, and every proc's stack is at the same address,
+	 * so a structure two procs share is the store's kind of memory
+	 * or the heap — never a caller's local.
+	 */
+	if((k = mallocz(sizeof *k, 1)) == nil)
+		sysfatal("malloc: %r");
+	k->s = s;
+	if(spawnproc(ckaskproc, k) < 0)
+		fail("spawn: %r");
+	istrue("the held checkpoint wrote its index page",
+		sawwrite(d, lo, hi, 4000));
+
+	/* §5 step 10, from a read, with no record behind it */
+	oidof(oid, "w");
+	checks++;
+	if(objread(s, oid, 1, rd, sizeof rd, 0) >= 0)
+		fail("a damaged extent map was served");
+	storestat(s, &st);
+	eqv("the read condemned the slot", st.nlost, 1);
+
+	storehook(s, "flush", 0);		/* the checkpoint completes */
+	for(j = 0; j < 4000 && !k->done; j++)
+		sleep(1);
+	istrue("and the checkpoint it was in completed", k->done && !k->err);
+
+	/*
+	 * Nothing else is dirty and nothing else is written, so the next
+	 * checkpoint runs only if the condemnation is still counted.
+	 */
+	simtracereset(d);
+	istrue("a later checkpoint writes the condemnation down",
+		sawwrite(d, lo, hi, 4000));
+	storeclose(s);
+
+	if((s = mustopen(d, "a condemnation the checkpointer wrote")) != nil){
+		storestat(s, &st);
+		eqv("and the restart lists the slot", st.nlost, 1);
+		storeclose(s);
+	}
+	free(k);
+	free(buf);
+	devclose(d);
+}
+
 static void
 tnodirty(void)
 {
@@ -1803,6 +1969,7 @@ main(int argc, char **argv)
 	treclaimfault();
 	treplaymaps();
 	tckfail();
+	tckdirty();
 	tnodirty();
 	tdirtyfull();
 	tdirtytie(0);

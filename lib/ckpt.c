@@ -221,6 +221,42 @@ freedirt(uchar *p)
 	dirtpack(p, &e);
 }
 
+/*
+ * How many pages are dirty right now, counted rather than tracked.
+ * A checkpoint's end cannot simply zero the count: idxdirty and its
+ * three siblings raise it only on a page's 0->1 edge, so a page
+ * dirtied WHILE the checkpoint ran — after its own pass packed it and
+ * cleared its mark — keeps the mark and would lose its count.  Almost
+ * everything that dirties a page also puts a record in the log, and
+ * ckdue's other trigger picks that up; storecondemn (§5 step 10) is
+ * the one thing that dirties an index page without writing a byte to
+ * the log, so on a store doing nothing but reads this count is
+ * ckdue's only trigger and a condemnation landing in that window
+ * would wait for unrelated write traffic to be written down.
+ *
+ * Under qlstate.
+ */
+static uvlong
+dirtypages(Store *s)
+{
+	Emape *c;
+	uvlong i, n;
+
+	n = 0;
+	for(i = 0; i < s->nidxpage; i++)
+		if(s->idxdirty[i])
+			n++;
+	for(i = 0; i < s->ndirtpage; i++)
+		if(s->dirtdirty[i])
+			n++;
+	for(i = 0; i < s->nbmpage; i++)
+		if(s->bmdirty[i])
+			n++;
+	for(c = s->edirty; c != nil; c = c->dnext)
+		n++;
+	return n;
+}
+
 int
 checkpoint(Store *s)
 {
@@ -423,7 +459,7 @@ checkpoint(Store *s)
 	rwakeupall(&s->roomrz);
 	qunlock(&s->qllog);
 	qlock(&s->qlstate);
-	s->ndirtypage = 0;
+	s->ndirtypage = dirtypages(s);
 	qunlock(&s->qlstate);
 	return 0;
 }
