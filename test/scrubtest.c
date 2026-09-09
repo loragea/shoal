@@ -563,6 +563,43 @@ trepair(void)
 	}
 
 	/*
+	 * The same repair with the block's grain UNREADABLE.  A media
+	 * error under a block is the case §8's repair exists for, so the
+	 * read that asks whether the block needs repairing must not turn
+	 * its own failure into a refusal: the offered bytes have already
+	 * passed the acceptance test above, and a grain that cannot be
+	 * read is the plainest case of the repair being needed.
+	 *
+	 * Mutation: a failed grainread refuses (mut repair-refuses-unread),
+	 * and the repair answers the media error it was called to fix.
+	 */
+	if(ostat(s, "r", &oi) < 0)
+		fail("objstat r: %r");
+	g = grainof(d, &sup, &oi, 1);
+	flipbytes(d, grainoff(&sup, g), 16);
+	checks++;
+	if(objverify(s, oid, 1, &v) < 0)
+		fail("objverify of the flipped block: %r");
+	else{
+		eqv("the flipped block is the only mismatch", v.nbad, 1);
+		eqv("and the digest array is sound", v.arraybad, 0);
+		vfyfree(&v);
+	}
+	simfaultat(d, Sfeio, 1, grainoff(&sup, g), Blk);
+	checks++;
+	if(objrepair(s, oid, 1, 1, buf + Blk, Blk) < 0)
+		fail("a block repair whose old grain cannot be read: %r");
+	simfault(d, Sfnone, 0);
+	checks++;
+	if(objverify(s, oid, 1, &v) < 0)
+		fail("objverify after a repair over an unreadable grain: %r");
+	else{
+		eqv("the object verifies after that repair", v.nbad, 0);
+		eqv("and its digest array is sound", v.arraybad, 0);
+		vfyfree(&v);
+	}
+
+	/*
 	 * §4's merge-back: the bytes of the grain above the block's
 	 * covered length are not the object's content and MUST read as
 	 * zeros, or the next write that covers them merges them in.  A

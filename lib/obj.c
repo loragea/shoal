@@ -1634,6 +1634,7 @@ objrepair(Store *s, uchar *oid, int oidlen, ulong blk, void *a, long n)
 	uchar *buf, *digs, dig[Blkdlen], cur[Blkdlen], csum[Csumlen];
 	uvlong i, nblk;
 	ulong g, cov;
+	int match;
 
 	if(!serving(s))
 		return -1;
@@ -1727,20 +1728,24 @@ objrepair(Store *s, uchar *oid, int oidlen, ulong blk, void *a, long n)
 	 * repair is driven by the *set* verify answers, so asking here
 	 * for a block outside that set is the same caller bug as asking
 	 * with a failing digest array, and carries no §2.6 prefix.
+	 *
+	 * A grain that cannot be READ is not that case: it is the case
+	 * this call exists for, and the bytes offered have already
+	 * passed the acceptance test above, so the only thing the read
+	 * was for — whether the repair is needed — is answered by the
+	 * failure itself.  Refusing there would answer §8's own repair
+	 * of a media error with the media error.
 	 */
+	match = 0;
 	g = mapgrain(&mold, blk);
-	if(g == 0)
+	if(g == 0){
 		zerodigest(s, u.e.len, blk, cur);
-	else{
-		if(grainread(s, buf, g) < 0){
-			free(buf);
-			updabort(&u);
-			updclose(&u);
-			return -1;
-		}
+		match = memcmp(cur, mapdig(&mold, blk), Blkdlen) == 0;
+	}else if(grainread(s, buf, g) == 0){
 		blkdigest(buf, cov, cur);
+		match = memcmp(cur, mapdig(&mold, blk), Blkdlen) == 0;
 	}
-	if(memcmp(cur, mapdig(&mold, blk), Blkdlen) == 0){
+	if(match){
 		free(buf);
 		updabort(&u);
 		updclose(&u);

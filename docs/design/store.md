@@ -1593,7 +1593,8 @@ expired (§3.6), a block repair asked for on an object whose digest
 array fails its `csum` or through an extent-map entry that failed its
 own `csum128`, at a block the object does not have, at a count that is
 not that block's covered length, or at a block whose bytes already
-hash to their stored digest (§8), a slot cursor's
+hash to their stored digest — a block whose grain the device refuses
+to read is repaired rather than refused (§8), a slot cursor's
 index outside `nslots`, a device error carried out of the commit
 path, a
 geometry that does not check out at start, and the two condemnations
@@ -2382,7 +2383,11 @@ through and the peer fetch — is the server's, and is not built yet
   driven by the set verify answers, and a block outside that set is
   whole, so the commit would change nothing, cost a grain, and, where
   the block is a hole (§4), leave the object one grain heavier with
-  the same content. On acceptance one `Eobj` publishes the block with
+  the same content. A grain the device will not **read** is not that
+  case and does not refuse: the offered bytes have already passed the
+  acceptance test, the read was only ever asking whether the repair
+  was needed, and a grain that cannot be read is the plainest case of
+  its being needed. On acceptance one `Eobj` publishes the block with
   the four-tuple unchanged, freeing the grain it replaced under §3.5
   like any other commit. It does **not** clear the flag: one block
   matching says nothing about the others, and the clearing belongs to
