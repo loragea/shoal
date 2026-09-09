@@ -398,7 +398,17 @@ tcutream(void)
  * by the write path, which does not exist yet.
  */
 
-static char *ckpath = "/tmp/shoalcktest.out";
+/*
+ * §13 says a test that wants a file drives it through its own file
+ * under /tmp.  The name carries this program's pid because /tmp is
+ * shared: two runs of fmtcktest at once — one mk test beside another,
+ * or a mutant being timed against the tree — otherwise create, write,
+ * read back and remove the *same* four files.  What that looks like
+ * is not a collision but a scatter of content assertions failing
+ * against a report of zero bytes: the other run's create truncated it,
+ * or its remove took it out from under the fd this one is reading.
+ */
+static char ckpath[64];
 static char ckbuf[65536];
 
 /* run the checker, keeping its report for what it said as well as how much */
@@ -413,8 +423,19 @@ runck(Dev *d, Ckcfg *c)
 	c->out = fd;
 	bad = ckstore(d, c);
 	seek(fd, 0, 0);
-	if((n = readn(fd, ckbuf, sizeof ckbuf - 1)) < 0)
-		n = 0;
+	n = readn(fd, ckbuf, sizeof ckbuf - 1);
+	/*
+	 * A report this cannot read is a fault in the harness, and one
+	 * loud line is the honest way to say so: mapping it onto an empty
+	 * buffer turns it into whichever content assertions happen to
+	 * come next, which is a misdiagnosis of every one of them.
+	 */
+	if(n <= 0)
+		sysfatal("%s: the checker's report reads back as %ld bytes: %r",
+			ckpath, n);
+	if(n >= (long)sizeof ckbuf - 1)
+		sysfatal("%s: the checker's report fills the %d-byte buffer",
+			ckpath, (int)sizeof ckbuf);
 	ckbuf[n] = '\0';
 	close(fd);
 	remove(ckpath);
@@ -811,7 +832,7 @@ tlive(void)
  * Mutation: drop cklog's entry validation (print-only, as before),
  * and both reports below come back clean.
  */
-static char *badpath = "/tmp/shoalckbadlog.img";
+static char badpath[64];
 
 static void
 tbadlog(void)
@@ -1323,7 +1344,7 @@ tRlog(void)
 	devclose(d);
 }
 
-static char *ropath = "/tmp/shoalckro.img";
+static char ropath[64];
 
 /*
  * The two refusals.  -o dumps one object and -R rebuilds from every
@@ -1394,11 +1415,10 @@ trefuse(void)
 	remove(ropath);
 }
 
-static char *imgpath = "/tmp/shoalfmtcktest.img";
+static char imgpath[64];
 
 /*
- * §13 says a test that wants a file image creates and removes its
- * own under /tmp.  The success paths below do; a sysfatal or a
+ * The success paths below remove their own files; a sysfatal or a
  * mutant that dies inside ckstore does not, so the removals are also
  * registered here and run however this program exits.
  */
@@ -1417,6 +1437,10 @@ main(int, char**)
 	Dev *d;
 	char *path;
 
+	snprint(ckpath, sizeof ckpath, "/tmp/shoalcktest.%d.out", getpid());
+	snprint(badpath, sizeof badpath, "/tmp/shoalckbadlog.%d.img", getpid());
+	snprint(ropath, sizeof ropath, "/tmp/shoalckro.%d.img", getpid());
+	snprint(imgpath, sizeof imgpath, "/tmp/shoalfmtck.%d.img", getpid());
 	atexit(cleanup);
 	if((null = open("/dev/null", OWRITE)) < 0)
 		null = 2;
