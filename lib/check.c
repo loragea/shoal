@@ -794,18 +794,22 @@ ckengine(Ck *k, Dev *d)
 		 * The `as found' count comes from the checker's own bitmap
 		 * pass, so it means what it says only when every page of
 		 * that bitmap was read and passed its checksum.  A store
-		 * with an unreadable page is exactly a store -R serves, and
-		 * printing a number there would tell the operator that the
-		 * rebuild changed a count it never had.
+		 * with a page that fails either test is exactly a store -R
+		 * serves, and printing a number there would tell the
+		 * operator that the rebuild changed a count it never had.
+		 * nbmbad counts both failures, so the line names both:
+		 * a page that read cleanly and did not unpack is the
+		 * commoner of the two (§2.5).
 		 */
 		if(k->nbmbad == 0)
 			say(k, "rebuild: the on-disk bitmap leaves %llud "
 				"grains free, the rebuild leaves %llud",
 				k->nbmfree, ss.grainfree);
 		else
-			say(k, "rebuild: %llud bitmap page(s) did not read, so "
-				"what the on-disk bitmap left free is not "
-				"known; the rebuild leaves %llud grains free",
+			say(k, "rebuild: %llud bitmap page(s) did not read or "
+				"did not pass their checksum, so what the "
+				"on-disk bitmap left free is not known; the "
+				"rebuild leaves %llud grains free",
 				k->nbmbad, ss.grainfree);
 		if(storecheckpoint(st) < 0)
 			problem(k, "rewriting the checkpoint: %r");

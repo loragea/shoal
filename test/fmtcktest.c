@@ -1556,16 +1556,19 @@ trebuildoff(void)
 
 	/*
 	 * The `as found' count comes from the checker's own bitmap pass,
-	 * so it means nothing on a store with a page that would not read
-	 * — which is a store -R is run on.  There the line says how many
-	 * pages that was and gives no number at all.
+	 * so it means nothing on a store with a page that pass could not
+	 * use — which is a store -R is run on.  There the line says how
+	 * many pages that was and gives no number at all.  The page
+	 * damaged here reads perfectly and fails its checksum, which is
+	 * the half of that count the line used to leave out.
 	 */
 	pokebmhdr(d, &s, 0);
 	checks++;
 	if(scrub(d, 0, 1) == 0)
 		fail("-R reported nothing about a bitmap page that fails its "
 			"checksum");
-	said("-R counts the unreadable pages", "bitmap page(s) did not read");
+	said("-R counts the pages its bitmap pass could not use",
+		"bitmap page(s) did not read or did not pass their checksum");
 	didnotsay("and gives no as-found count", "the on-disk bitmap leaves");
 	free(buf);
 	devclose(d);

@@ -2952,7 +2952,9 @@ bitmap left free and how many the rebuild leaves, so what changed is
 visible — the first of those numbers comes from the checker's own
 bitmap pass, so it is printed only when every bitmap page was read
 and passed its checksum, and otherwise the line says how many pages
-did not read and gives no number. It reports `bmaprebuild` and any
+did not read **or** did not pass their checksum — both are counted,
+and a page that reads cleanly and fails its checksum is the commoner
+— and gives no number. It reports `bmaprebuild` and any
 refusal from the store in the store's own words. An extent-map entry
 that fails its own `csum128` is not rebuilt from: every grain number
 in it is the damaged bytes', so §5 step 10 condemns the slot and the
