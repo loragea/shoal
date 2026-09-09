@@ -240,7 +240,10 @@ struct Store
 	QLock	cklk;
 	Rendez	ckrz;			/* on cklk: a checkpoint completed */
 	uvlong	ckreq, ckdone;
-	int	ckerr, ckbusy, ckproc;
+	int	ckret, ckbusy, ckproc;	/* ckret: the last one's return */
+	int	ckstuck;		/* the LAST checkpoint failed */
+	uvlong	ckfailed;		/* checkpoint attempts that failed */
+	char	ckerrstr[ERRMAX];	/* what the last failure said */
 	vlong	cklast;
 	uvlong	ndirtypage;		/* pages dirtied since the last one */
 
@@ -335,7 +338,6 @@ void	ientpack(Store*, ulong slot, uchar *p);
 void	zerodigest(Store*, uvlong len, ulong i, uchar *dig);
 void	ienthash(Store*, ulong slot);
 void	ientunhash(Store*, ulong slot);
-void	storefound(Store*, ulong slot);
 long	ientfind(Store*, uchar *oid, int oidlen);
 
 /* commit.c — the log, group commit and the flusher */
@@ -353,3 +355,4 @@ int	publishlocked(Store*);
 int	storeproc(Store*, void (*)(void*), void*);
 void	storeprocdone(Store*);
 void	storecondemn(Store*, ulong slot);	/* §5 step 10, at run time */
+void	lostupdate(Store*, ulong slot);		/* /lost membership, §8 */

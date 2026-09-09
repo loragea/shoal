@@ -544,6 +544,9 @@ struct Ckcfg
 	int	verbose;	/* -l: dump log records */
 	int	quiet;		/* report problems only */
 	char	*oid;		/* -o: dump one object */
+	int	verify;		/* -v: verify every object's content (§8) */
+	int	rebuild;	/* -R: rebuild the bitmap, rewrite the checkpoint */
+	int	noflush;	/* -w: §3.2's assertion, which -R's open needs */
 	int	out;		/* fd for the report */
 };
 
@@ -606,6 +609,9 @@ struct Storecfg
 	int	(*spawn)(void (*)(void*), void*);
 	int	noflush;		/* §3.2's -w */
 	int	nockptproc;		/* no checkpointer proc: T1 drives it */
+	int	forcerebuild;		/* §12's shoalck -R: rebuild the free
+					 * map from the live maps whatever the
+					 * bitmap's own checksums say */
 	ulong	logdepth;
 	ulong	ckms;
 	ulong	ckhigh;
@@ -627,9 +633,23 @@ struct Storestat
 	uvlong	logfree;		/* sectors */
 	uvlong	logwait;		/* commits in §6's wait for log space */
 	int	broken;			/* a log write failed: §3.2 */
-	uvlong	nlive, ntomb, nlost;
+	uvlong	nslots;			/* the index's size, for §8's cursor */
+	uvlong	nlive, ntomb, nlost;	/* nlost: /lost, §8 */
 	uvlong	ndirty, ndirtydrop;
 	uvlong	nreplay, pmax;
+	/*
+	 * §2.8's checkpointer, whose failures no client operation
+	 * reports.  A store whose checkpoints fail reclaims no log
+	 * space, so ckstuck — the LAST checkpoint failed and none has
+	 * succeeded since — is what tells a full log from a stuck one,
+	 * and ckerr is what that one said (empty when not stuck).
+	 * ckfailed counts failed ATTEMPTS over the store's life: a
+	 * stuck store re-attempts on every checkpoint tick, so it is a
+	 * rate of retrying rather than a count of distinct outages.
+	 */
+	int	ckstuck;
+	uvlong	ckfailed;
+	char	ckerr[ERRMAX];
 };
 
 struct Objinfo
@@ -648,7 +668,16 @@ void	storeclose(Store*);	/* stop the procs; write nothing */
 int	storecheckpoint(Store*);
 void	storestat(Store*, Storestat*);
 void	storehook(Store*, char *name, uvlong n);	/* §13's -X hooks */
-ulong	storelost(Store*, ulong i);	/* the i'th condemned slot */
+/*
+ * /lost, layer-a §7.5: every copy this instance holds that fails
+ * local verification — §5 step 10's condemned slots and §8's
+ * corrupt-flagged entries alike.  storelost answers the i'th slot, or
+ * ~0 past the end; Storestat.nlost is how many there are.  The two
+ * are read together and the list moves under a concurrent scrub, so a
+ * walker that wants a consistent picture is the caller's problem, as
+ * every other enumeration here is.
+ */
+ulong	storelost(Store*, ulong i);
 int	storefullsync(Store*, char *peer);
 
 /* §2.2's publisher: durable before the value is acted on */
@@ -714,7 +743,53 @@ struct Vfy
 	ulong	*bad;		/* nbad block indices */
 };
 int	objverify(Store*, uchar *oid, int oidlen, Vfy*);
+/*
+ * vfyfree is always safe after objverify or objscrub, whatever they
+ * returned, and safe twice: a failure from either leaves the Vfy
+ * zeroed, so the bad-block array a partial pass allocated is never
+ * the caller's to lose.
+ */
 void	vfyfree(Vfy*);
+
+/*
+ * §8's scrub: objverify plus the one durable transition it licenses —
+ * a mismatch on a copy the index calls whole sets the corrupt flag, a
+ * copy the index calls corrupt whose every block matches clears it,
+ * and anything else commits nothing.  The Vfy is answered either way,
+ * because which repair to ask for is what it says, and the caller
+ * frees it with vfyfree.  objverify stays pure: it is also what
+ * layer-a §5.6's op=verify and shoalck -v need.
+ *
+ * The rate limit, the proc and the pass are the server's (§8): this
+ * is one object, called from the caller's per-object queue like every
+ * other call here.
+ */
+int	objscrub(Store*, uchar *oid, int oidlen, Vfy*);
+
+/*
+ * §8's slot cursor, so a scrubber can walk the index in order.  Given
+ * a slot below Storestat.nslots it answers 1 for a live or tomb entry
+ * — filling oid (up to Oidmax bytes), *oidlen and *oi — 0 for a free
+ * slot, and -1 for a slot out of range or a condemned store.  It
+ * holds the state lock for the copy alone, so a caller may verify
+ * between two calls; what it answers is a snapshot of a slot and not
+ * a lease on it, so every call the caller then makes names the oid
+ * rather than the slot.
+ */
+int	objslot(Store*, ulong slot, uchar *oid, int *oidlen, Objinfo*);
+
+/*
+ * §8's block repair.  a is block blk as fetched from a holder of a
+ * copy at the same key (layer-a §5.6's op=get), n its covered length.
+ * The bytes are accepted only against the *stored* dig[i], and only
+ * when hash(dig[]) == csum: an object whose digest array fails is
+ * §8's whole-object op=full case, and asking for a block repair there
+ * is a caller bug, so that refusal carries no §2.6 prefix while the
+ * bytes' own failure is `checksum mismatch'.  On acceptance one Eobj
+ * publishes the block with the four-tuple unchanged.  The corrupt
+ * flag is not cleared — objscrub clears it when every block matches.
+ */
+int	objrepair(Store*, uchar *oid, int oidlen, ulong blk, void *a, long n);
 
 /* the dirty set, §2.6 and layer-a §7.1 */
 int	dirtyadd(Store*, uchar *oid, int oidlen, char *peer, uvlong epoch);

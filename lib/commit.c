@@ -733,6 +733,8 @@ logcommit(Store *s, Item *ci)
 	Item *it;
 	Batch *b;
 	vlong t0;
+	int ckstuck;
+	char cke[ERRMAX];
 	int full, oom, forced, r;
 
 	ci->err[0] = '\0';
@@ -841,7 +843,32 @@ logcommit(Store *s, Item *ci)
 		unlink(s, it);
 		qunlock(&s->qllog);
 		itemfree(it);
-		werrstr("disk full");
+		/*
+		 * §2.6's `disk full' is the wire error and stays the
+		 * prefix.  But a log that will not drain because the
+		 * CHECKPOINTER is failing is not a full disk, and nothing
+		 * else on this path would say so: the checkpointer's
+		 * failures are its own, the store is not condemned by them
+		 * (§2.8), and an operator reading `disk full' on a store
+		 * with half its log free has been told nothing.  So when
+		 * the last checkpoint failed, the cause follows the
+		 * prefix.
+		 *
+		 * The LAST one, not any one ever: a checkpoint failure
+		 * that a healed device has since cured leaves a log that
+		 * drains, and labelling this store's genuinely full log
+		 * with a cured error is the same disservice the other way
+		 * round.  §2.8's ckstuck is cleared by a success for that.
+		 */
+		qlock(&s->cklk);
+		ckstuck = s->ckstuck;
+		strecpy(cke, cke + sizeof cke, s->ckerrstr);
+		qunlock(&s->cklk);
+		if(ckstuck)
+			werrstr("disk full: log full and the checkpoint "
+				"fails: %s", cke);
+		else
+			werrstr("disk full");
 		return -1;
 	}
 	qunlock(&s->qllog);

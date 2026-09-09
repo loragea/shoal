@@ -50,6 +50,14 @@ eqv(char *what, uvlong got, uvlong want)
 }
 
 static void
+istrue(char *what, int ok)
+{
+	checks++;
+	if(!ok)
+		fail("%s", what);
+}
+
+static void
 smallcfg(Fmtcfg *c)
 {
 	memset(c, 0, sizeof *c);
@@ -390,31 +398,71 @@ tcutream(void)
  * by the write path, which does not exist yet.
  */
 
-static char *ckpath = "/tmp/shoalcktest.out";
+/*
+ * §13 says a test that wants a file drives it through its own file
+ * under /tmp.  The name carries this program's pid because /tmp is
+ * shared: two runs of fmtcktest at once — one mk test beside another,
+ * or a mutant being timed against the tree — otherwise create, write,
+ * read back and remove the *same* four files.  What that looks like
+ * is not a collision but a scatter of content assertions failing
+ * against a report of zero bytes: the other run's create truncated it,
+ * or its remove took it out from under the fd this one is reading.
+ */
+static char ckpath[64];
 static char ckbuf[65536];
 
 /* run the checker, keeping its report for what it said as well as how much */
 static int
-report(Dev *d, char *oid)
+runck(Dev *d, Ckcfg *c)
 {
-	Ckcfg c;
 	int fd, bad;
 	long n;
 
-	memset(&c, 0, sizeof c);
 	if((fd = create(ckpath, ORDWR, 0666)) < 0)
 		sysfatal("create %s: %r", ckpath);
-	c.out = fd;
-	c.verbose = 1;
-	c.oid = oid;
-	bad = ckstore(d, &c);
+	c->out = fd;
+	bad = ckstore(d, c);
 	seek(fd, 0, 0);
-	if((n = readn(fd, ckbuf, sizeof ckbuf - 1)) < 0)
-		n = 0;
+	n = readn(fd, ckbuf, sizeof ckbuf - 1);
+	/*
+	 * A report this cannot read is a fault in the harness, and one
+	 * loud line is the honest way to say so: mapping it onto an empty
+	 * buffer turns it into whichever content assertions happen to
+	 * come next, which is a misdiagnosis of every one of them.
+	 */
+	if(n <= 0)
+		sysfatal("%s: the checker's report reads back as %ld bytes: %r",
+			ckpath, n);
+	if(n >= (long)sizeof ckbuf - 1)
+		sysfatal("%s: the checker's report fills the %d-byte buffer",
+			ckpath, (int)sizeof ckbuf);
 	ckbuf[n] = '\0';
 	close(fd);
 	remove(ckpath);
 	return bad;
+}
+
+static int
+report(Dev *d, char *oid)
+{
+	Ckcfg c;
+
+	memset(&c, 0, sizeof c);
+	c.verbose = 1;
+	c.oid = oid;
+	return runck(d, &c);
+}
+
+/* §12's -v and -R, whose reports the tests below read back */
+static int
+scrub(Dev *d, int verify, int rebuild)
+{
+	Ckcfg c;
+
+	memset(&c, 0, sizeof c);
+	c.verify = verify;
+	c.rebuild = rebuild;
+	return runck(d, &c);
 }
 
 static void
@@ -423,6 +471,28 @@ said(char *what, char *want)
 	checks++;
 	if(strstr(ckbuf, want) == nil)
 		fail("%s: the report does not say `%s'", what, want);
+}
+
+static void
+didnotsay(char *what, char *want)
+{
+	checks++;
+	if(strstr(ckbuf, want) != nil)
+		fail("%s: the report says `%s'", what, want);
+}
+
+/* the report is written in pass order, so order is an observable */
+static void
+saidbefore(char *what, char *first, char *then)
+{
+	char *a, *b;
+
+	checks++;
+	a = strstr(ckbuf, first);
+	b = strstr(ckbuf, then);
+	if(a == nil || b == nil || a > b)
+		fail("%s: the report does not say `%s' before `%s'", what,
+			first, then);
 }
 
 static void
@@ -784,7 +854,7 @@ tlive(void)
  * Mutation: drop cklog's entry validation (print-only, as before),
  * and both reports below come back clean.
  */
-static char *badpath = "/tmp/shoalckbadlog.img";
+static char badpath[64];
 
 static void
 tbadlog(void)
@@ -849,11 +919,790 @@ tbadlog(void)
 	remove(badpath);
 }
 
-static char *imgpath = "/tmp/shoalfmtcktest.img";
+/*
+ * §12's -v and -R, the two flags that work on the REPLAYED state
+ * rather than on the checkpoint every pass above reads.  §2.8 makes
+ * the log the authority for everything since ckseq and §3.5 defers a
+ * released grain's reuse only until the freeing commit's flush, so a
+ * grain a committed-but-not-checkpointed record freed may already
+ * hold another object's bytes: verifying from the checkpointed index
+ * would report a mismatch on a sound object, and a rebuild from it
+ * would clear grains the log has since handed out.
+ *
+ * These are the first cases here that drive the store engine, because
+ * they are the first that need content on the disk rather than
+ * entries poked into the regions.
+ */
+
+enum
+{
+	Vblk	= 4096,		/* smallcfg's blksz */
+};
+
+/* the engine with no procs at all: storeopen's replay is all that runs */
+static Store*
+opens(Dev *d, char *what)
+{
+	Storecfg c;
+	Store *s;
+
+	memset(&c, 0, sizeof c);
+	c.nockptproc = 1;		/* spawn is nil, so there is no proc */
+	if((s = storeopen(d, &c)) == nil)
+		fail("%s: storeopen: %r", what);
+	return s;
+}
+
+static uchar*
+mkbuf(long n, int seed)
+{
+	uchar *p;
+	long i;
+
+	if((p = malloc(n)) == nil)
+		sysfatal("malloc: %r");
+	for(i = 0; i < n; i++)
+		p[i] = (uchar)(seed*7 + i*31 + (i>>8)*13);
+	return p;
+}
+
+static void
+mk(Store *s, char *name, uvlong ver)
+{
+	if(objcreate(s, (uchar*)name, strlen(name), ver, 1, nil, 0, nil) < 0)
+		fail("objcreate %s: %r", name);
+}
+
+static void
+wr(Store *s, char *name, void *a, long n, uvlong off, uvlong ver)
+{
+	if(objwrite(s, (uchar*)name, strlen(name), a, n, off, ver, 1, nil, 0) < 0)
+		fail("objwrite %s %ld at %llud: %r", name, n, off);
+}
+
+static void
+tr(Store *s, char *name, uvlong len, uvlong ver)
+{
+	if(objtrunc(s, (uchar*)name, strlen(name), len, ver, 1, nil, 0) < 0)
+		fail("objtrunc %s to %llud: %r", name, len);
+}
+
+static void
+rm(Store *s, char *name, uvlong ver)
+{
+	if(objremove(s, (uchar*)name, strlen(name), ver, 1, nil, 0) < 0)
+		fail("objremove %s: %r", name);
+}
+
+static void
+ckpt(Store *s)
+{
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+}
+
+/* the checkpointed index entry of one object, and one block's grain */
+static ulong
+slotof(Dev *d, Super *s, char *name, Idxent *e)
+{
+	uchar p[Idxentsz];
+	ulong slot;
+	int n;
+
+	n = strlen(name);
+	for(slot = 0; slot < s->nslots; slot++){
+		if(devread(d, p, Idxentsz, idxentoff(s, slot)) < 0)
+			break;
+		if(idxunpack(e, p, s->nemap) < 0 || e->state == Sfree)
+			continue;
+		if(e->oidlen == n && memcmp(e->oid, name, n) == 0)
+			return slot;
+	}
+	return ~0UL;
+}
+
+static ulong
+grainof(Dev *d, Super *s, Idxent *e, ulong blk)
+{
+	uchar *p;
+	ulong g;
+
+	if(e->emapslot == 0)
+		return e->grain0;
+	if((p = malloc(s->emapsz)) == nil)
+		sysfatal("malloc: %r");
+	g = 0;
+	if(devread(d, p, s->emapsz, emapentoff(s, e->emapslot)) == 0)
+		g = emapgrain(p, blk);
+	free(p);
+	return g;
+}
+
+/* break a bitmap page's own checksum, so the checker cannot read it */
+static void
+pokebmhdr(Dev *d, Super *s, uvlong page)
+{
+	uchar junk[8];
+
+	memset(junk, 0x5c, sizeof junk);
+	simpoke(d, (vlong)s->bmapoff*s->secsz + (vlong)page*s->blksz, junk,
+		sizeof junk);
+}
 
 /*
- * §13 says a test that wants a file image creates and removes its
- * own under /tmp.  The success paths below do; a sysfatal or a
+ * Damage an extent-map entry without re-sealing it, so the entry
+ * itself fails its csum128 and §5 step 10 condemns the slot.
+ */
+static void
+pokeemap(Dev *d, Super *s, ulong emapslot)
+{
+	uchar junk[8];
+
+	memset(junk, 0xa5, sizeof junk);
+	simpoke(d, emapentoff(s, emapslot) + s->emapsz - sizeof junk, junk,
+		sizeof junk);
+}
+
+/*
+ * Move one bit of the on-disk bitmap and re-seal the page with the
+ * engine's own packer, keeping the ckseq the page already carried.
+ * The result is a page that PASSES its checksum and is wrong, which
+ * is the one §2.5's automatic rebuild never fires on and the one -R
+ * exists for.
+ */
+static void
+pokebit(Dev *d, Super *s, uvlong g, int on)
+{
+	uchar *p;
+	Bmpage h;
+	uvlong page, bpp, off;
+
+	bpp = bmbits(s->blksz);
+	page = g/bpp;
+	off = (uvlong)s->bmapoff*s->secsz + page*(uvlong)s->blksz;
+	if((p = malloc(s->blksz)) == nil)
+		sysfatal("malloc: %r");
+	simpeek(d, off, p, s->blksz);
+	if(bmunpack(&h, p, s->blksz, page) < 0)
+		sysfatal("bitmap page %llud: %r", page);
+	if(on)
+		bmset(p, g % bpp);
+	else
+		bmclr(p, g % bpp);
+	bmpack(p, s->blksz, &h);
+	simpoke(d, off, p, s->blksz);
+	free(p);
+}
+
+static Dev*
+newstore(Super *s)
+{
+	Dev *d;
+	Fmtcfg c;
+
+	if((d = simopen(Secsz, Nsec, Seed)) == nil)
+		sysfatal("simopen: %r");
+	smallcfg(&c);
+	if(geometry(s, &c, d->size) < 0 || fmtstore(d, s) < 0)
+		sysfatal("format: %r");
+	return d;
+}
+
+/*
+ * -v over a store with a multi-block object, a hole and a tombstone.
+ * It must pass a sound store, write nothing at all, and name the
+ * object and the block index when a grain is overwritten under it —
+ * which the checkpoint passes cannot see, because they never read
+ * content.
+ *
+ * Mutation: objverify records no mismatch (mut verify-nocompare).
+ */
+static void
+tverify(void)
+{
+	Dev *d;
+	Super s;
+	Store *st;
+	Idxent e;
+	uchar *buf, blk[16];
+	ulong slot, g;
+	int bad;
+
+	d = newstore(&s);
+	if((st = opens(d, "verify")) == nil){
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(3*Vblk, 3);
+	mk(st, "one", 1);
+	wr(st, "one", buf, 1000, 0, 2);
+	mk(st, "many", 1);
+	wr(st, "many", buf, 3*Vblk, 0, 2);
+	mk(st, "holed", 1);
+	wr(st, "holed", buf, 100, 2*Vblk, 2);	/* blocks 0 and 1 are holes */
+	mk(st, "gone", 1);
+	rm(st, "gone", 2);
+	ckpt(st);
+	storeclose(st);
+
+	simtracereset(d);
+	checks++;
+	if((bad = scrub(d, 1, 0)) != 0)
+		fail("-v reported %d problem(s) on a sound store", bad);
+	said("-v", "3 objects verified");
+	said("-v skips tombstones", "1 tombstones skipped");
+	/*
+	 * §12's "reads and never writes" is asserted in tvdirty below,
+	 * on the store that can make it false: this one was checkpointed
+	 * before it was closed, so its replay applies nothing and an
+	 * empty trace here would prove nothing about -v.
+	 */
+	slot = slotof(d, &s, "many", &e);
+	istrue("the checkpointed index has many", slot != ~0UL);
+	g = grainof(d, &s, &e, 1);
+	istrue("block 1 of many has a grain", g != 0);
+	simpeek(d, grainoff(&s, g), blk, sizeof blk);
+	blk[0] ^= 0x5a;
+	simpoke(d, grainoff(&s, g), blk, sizeof blk);
+	checks++;
+	if(scrub(d, 0, 0) != 0)
+		fail("the checkpoint passes must not see a poked grain: they "
+			"never read content");
+	checks++;
+	if(scrub(d, 1, 0) == 0)
+		fail("-v passed an object whose grain was overwritten");
+	said("-v names the object", "oid many");
+	said("-v names the block and clears the array",
+		"(blocks 1), arraybad=0");
+	free(buf);
+	devclose(d);
+
+	/*
+	 * §8: an object flagged corrupt that verifies clean is
+	 * information and not a problem — the flag is durable and it is
+	 * the online scrub's key-preserving Eobj that clears it.
+	 */
+	d = newstore(&s);
+	if((st = opens(d, "corrupt flag")) == nil){
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(Vblk, 9);
+	mk(st, "flagged", 1);
+	wr(st, "flagged", buf, Vblk, 0, 2);
+	if(objcorrupt(st, (uchar*)"flagged", 7, 1, nil, 0) < 0)
+		fail("objcorrupt: %r");
+	ckpt(st);
+	storeclose(st);
+	checks++;
+	if((bad = scrub(d, 1, 0)) != 0)
+		fail("-v made a problem of %d corrupt-flagged object(s) that "
+			"verify clean", bad);
+	said("the corrupt flag", "flagged corrupt and verifies clean");
+	said("the corrupt count", "1 flagged corrupt but clean");
+	free(buf);
+	devclose(d);
+
+	/*
+	 * §8's second kind of mismatch, which is the one -v exists to
+	 * tell from the first, and it has to be reported when it is the
+	 * ONLY thing wrong: every block still hashes to its stored
+	 * digest, and the digest array does not hash to the object's
+	 * csum.  Damaging the csum in the index entry and re-sealing the
+	 * entry is that state exactly, and its repair is the whole-object
+	 * op=full rather than any number of block repairs.
+	 */
+	d = newstore(&s);
+	if((st = opens(d, "a damaged digest array")) == nil){
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(3*Vblk, 13);
+	mk(st, "array", 1);
+	wr(st, "array", buf, 3*Vblk, 0, 2);
+	ckpt(st);
+	storeclose(st);
+	slot = slotof(d, &s, "array", &e);
+	istrue("the checkpointed index has array", slot != ~0UL);
+	e.csum[0] ^= 0x5a;
+	putidx(d, &s, slot, &e);
+	checks++;
+	if(scrub(d, 1, 0) == 0)
+		fail("-v passed an object whose digest array does not hash "
+			"to its csum");
+	said("-v calls the digest array suspect",
+		"0 of 3 blocks mismatch (blocks ), arraybad=1");
+	free(buf);
+	devclose(d);
+
+	/*
+	 * And a slot objverify refuses outright — §5 step 10's damaged
+	 * extent map, which is the headline case -v is run for.  Skipping
+	 * it would report the store clean.
+	 */
+	d = newstore(&s);
+	if((st = opens(d, "a damaged extent map")) == nil){
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(3*Vblk, 19);
+	mk(st, "damaged", 1);
+	wr(st, "damaged", buf, 3*Vblk, 0, 2);
+	ckpt(st);
+	storeclose(st);
+	slot = slotof(d, &s, "damaged", &e);
+	istrue("the checkpointed index has damaged", slot != ~0UL);
+	pokeemap(d, &s, e.emapslot);
+	checks++;
+	if(scrub(d, 1, 0) == 0)
+		fail("-v passed a slot whose extent map failed its checksum");
+	said("-v names the refused slot", "verify: checksum mismatch");
+	said("-v counts it a failure", "1 failed");
+	free(buf);
+	devclose(d);
+}
+
+/*
+ * -v works on the replayed state.  A checkpoint, then a truncate that
+ * frees a grain and a create that is handed it, and no second
+ * checkpoint: the checkpointed index still names the freed grain as
+ * A's third block, and the bytes there are now B's.
+ *
+ * Mutation: storeopen skips replay (mut verify-noreplay), which is
+ * exactly "verify from the checkpointed index".
+ */
+static void
+tvreplay(void)
+{
+	Dev *d;
+	Super s;
+	Store *st;
+	Idxent e;
+	uchar *abuf, *bbuf, *gbuf;
+	ulong g2;
+	int bad;
+
+	d = newstore(&s);
+	if((st = opens(d, "replayed verify")) == nil){
+		devclose(d);
+		return;
+	}
+	abuf = mkbuf(3*Vblk, 11);
+	bbuf = mkbuf(Vblk, 29);
+	mk(st, "A", 1);
+	wr(st, "A", abuf, 3*Vblk, 0, 2);
+	ckpt(st);
+	istrue("the checkpointed index has A", slotof(d, &s, "A", &e) != ~0UL);
+	g2 = grainof(d, &s, &e, 2);
+	istrue("block 2 of A has a grain", g2 != 0);
+	tr(st, "A", 2*Vblk, 3);		/* frees it; §6 parks the cursor there */
+	mk(st, "B", 1);
+	wr(st, "B", bbuf, Vblk, 0, 2);	/* ... and B is handed it */
+	storeclose(st);			/* no second checkpoint */
+
+	if((gbuf = malloc(Vblk)) == nil)
+		sysfatal("malloc: %r");
+	simpeek(d, grainoff(&s, g2), gbuf, Vblk);
+	istrue("B was handed the grain A's truncate freed",
+		memcmp(gbuf, bbuf, Vblk) == 0);
+	checks++;
+	if((bad = scrub(d, 1, 0)) != 0)
+		fail("-v on the replayed state reported %d problem(s)", bad);
+	said("both objects", "2 objects verified");
+	free(gbuf);
+	free(abuf);
+	free(bbuf);
+	devclose(d);
+}
+
+/*
+ * §12's "reads and never writes", on the store that can make it
+ * false: a checkpoint, then a multi-block commit that is NOT
+ * checkpointed, then a close.  Replay applies that record, which
+ * dirties an extent map, and a write-back there would strand the
+ * whole store — which is every store -v exists for, since a store
+ * with nothing in its log since its checkpoint is a store that
+ * stopped cleanly.  So the read-only open every flag but -R takes
+ * (shoalck.c) holds those maps instead, and the run writes nothing.
+ *
+ * The writable open is -R's alone and is not asserted here: there
+ * replay's closing write-back DOES write the maps back (§5 step 7),
+ * which is what makes a device error under that region refuse the
+ * start (storetest's treplaymaps), and -R writes a checkpoint anyway.
+ *
+ * Mutation: replay's closing write-back and emapreclaim's own
+ * read-only branch both go, so the maps are written back whatever the
+ * device was opened as (mut ro-writeback-both).  It takes both:
+ * emapreclaim holds a read-only store's maps by itself, so dropping
+ * replay's guard alone changes nothing this can see.
+ */
+static void
+tvdirty(void)
+{
+	Dev *d;
+	Super s;
+	Store *st;
+	Simop *t;
+	uchar *buf;
+	long i, n, nw;
+	int bad;
+
+	d = newstore(&s);
+	if((st = opens(d, "an un-checkpointed multi-block commit")) == nil){
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(3*Vblk, 43);
+	mk(st, "before", 1);
+	wr(st, "before", buf, Vblk, 0, 2);
+	ckpt(st);
+	mk(st, "many", 1);
+	wr(st, "many", buf, 3*Vblk, 0, 2);
+	storeclose(st);				/* no second checkpoint */
+
+	/*
+	 * Dev.rdonly is what a read-only open sets and what devwrite
+	 * refuses on, whichever device opened it, so setting it here is
+	 * the same store shoalck -v is handed.
+	 */
+	d->rdonly = 1;
+	simtracereset(d);
+	checks++;
+	if((bad = scrub(d, 1, 0)) != 0)
+		fail("-v on a read-only store with an un-checkpointed "
+			"multi-block commit reported %d problem(s)", bad);
+	said("-v after an unclean stop", "2 objects verified");
+	n = simtrace(d, &t);
+	nw = 0;
+	for(i = 0; i < n; i++)
+		if(t[i].op == Sopwrite)
+			nw++;
+	eqv("-v writes nothing on a read-only store", nw, 0);
+	checks++;
+	if((bad = scrub(d, 1, 0)) != 0)
+		fail("a second -v on the read-only store reported %d "
+			"problem(s)", bad);
+	d->rdonly = 0;
+	free(buf);
+	devclose(d);
+}
+
+/*
+ * -R over an extent map that failed its own csum128.  §5 step 10
+ * condemns such a slot on every other path; a rebuild that read the
+ * map instead would free grains a live entry still names, publish a
+ * checkpoint calling the slot healthy, and leave a bitmap its own
+ * cross-check calls a problem.
+ *
+ * Mutation: rebuildbitmap ignores Emape.bad (mut rebuild-reads-bad).
+ */
+static void
+tRbad(void)
+{
+	Dev *d;
+	Super s;
+	Store *st;
+	Storestat s0, s1;
+	Idxent e;
+	uchar *buf;
+	ulong slot;
+
+	d = newstore(&s);
+	if((st = opens(d, "a damaged extent map at -R")) == nil){
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(3*Vblk, 53);
+	mk(st, "live", 1);
+	wr(st, "live", buf, 3*Vblk, 0, 2);
+	mk(st, "gone", 1);
+	wr(st, "gone", buf, 3*Vblk, 0, 2);
+	ckpt(st);
+	storestat(st, &s0);
+	storeclose(st);
+
+	slot = slotof(d, &s, "gone", &e);
+	istrue("the checkpointed index has gone", slot != ~0UL);
+	pokeemap(d, &s, e.emapslot);
+
+	checks++;
+	if(scrub(d, 0, 1) == 0)
+		fail("-R reported nothing about an extent map that failed "
+			"its checksum");
+	said("-R condemns the damaged slot", "1 slot(s) condemned");
+	said("-R still rewrites the checkpoint", "checkpoint rewritten at "
+		"ckseq");
+
+	/*
+	 * What is left is the damage itself and nothing the rebuild
+	 * added: the checker still refuses to read the entry, but no
+	 * grain is marked with nothing naming it and none is named with
+	 * its bit clear.
+	 */
+	checks++;
+	if(scrub(d, 0, 0) == 0)
+		fail("the checker passed a store whose extent map fails its "
+			"checksum");
+	didnotsay("-R leaves no leaked grain", "referenced by nothing");
+	didnotsay("-R leaves no phantom grain", "clear in the bitmap");
+	said("and the checkpoint calls the slot corrupt",
+		"0 free, 0 bad, 1 corrupt-flagged");
+
+	if((st = opens(d, "after -R over a damaged map")) != nil){
+		storestat(st, &s1);
+		eqv("the damaged slot is condemned", s1.nlost, 1);
+		eqv("and named", storelost(st, 0), slot);
+		/*
+		 * The live object keeps its three grains; the condemned
+		 * slot's three are no longer marked, because nothing names
+		 * them any more.
+		 */
+		eqv("the live entry's grains stay marked, the damaged "
+			"entry's do not", s1.grainfree, s0.grainfree + 3);
+		storeclose(st);
+	}
+
+	/*
+	 * §12: -R rebuilds and then verifies, in that order, and the two
+	 * passes write their lines as they run — so a -R -v that verified
+	 * first would report the objects before the checkpoint it had not
+	 * yet rewritten.
+	 */
+	checks++;
+	if(scrub(d, 1, 1) == 0)
+		fail("-R -v reported nothing about the damaged extent map");
+	saidbefore("-R -v rebuilds before it verifies",
+		"checkpoint rewritten at ckseq", "objects verified");
+	free(buf);
+	devclose(d);
+}
+
+/*
+ * -R on a bitmap page that is valid and wrong.  §2.5 repairs a page
+ * that fails its checksum automatically, so the page a plain start
+ * believes is this one, and -R is what corrects it offline.
+ *
+ * Mutation: storeopen ignores Storecfg.forcerebuild (mut rebuild-skip).
+ */
+static void
+trebuildoff(void)
+{
+	Dev *d;
+	Super s;
+	Store *st;
+	Storestat s0, s1;
+	Idxent e;
+	uchar *buf;
+	char want[128];
+	ulong g;
+	int bad;
+
+	d = newstore(&s);
+	if((st = opens(d, "offline rebuild")) == nil){
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(3*Vblk, 5);
+	mk(st, "one", 1);
+	wr(st, "one", buf, 1000, 0, 2);
+	mk(st, "many", 1);
+	wr(st, "many", buf, 3*Vblk, 0, 2);
+	ckpt(st);
+	storestat(st, &s0);
+	storeclose(st);
+
+	istrue("the checkpointed index has many",
+		slotof(d, &s, "many", &e) != ~0UL);
+	g = grainof(d, &s, &e, 1);
+	istrue("block 1 of many has a grain", g != 0);
+	pokebit(d, &s, g, 0);			/* a used grain, cleared */
+	pokebit(d, &s, s.ngrains - 1, 1);	/* two free grains, set */
+	pokebit(d, &s, s.ngrains - 2, 1);
+
+	if((st = opens(d, "a valid but wrong bitmap")) != nil){
+		storestat(st, &s1);
+		eqv("a page that passes its checksum is not rebuilt at start",
+			s1.bmaprebuild, 0);
+		eqv("and its wrong free count is what the store believes",
+			s1.grainfree, s0.grainfree - 1);
+		storeclose(st);
+	}
+	checks++;
+	if(scrub(d, 0, 0) == 0)
+		fail("the cross-check passed a valid but wrong bitmap");
+
+	checks++;
+	if(scrub(d, 0, 1) == 0)
+		fail("-R reported nothing about the bitmap it found wrong");
+	said("-R rebuilds", "bmaprebuild=yes");
+	/*
+	 * The numbers and not just the phrase: the `as found' count is
+	 * the operator's only sight of what the bitmap said before, so a
+	 * line that always printed 0 would read as a total loss and be
+	 * asserted by nothing.
+	 */
+	snprint(want, sizeof want, "the on-disk bitmap leaves %llud grains "
+		"free, the rebuild leaves %llud", s0.grainfree - 1,
+		s0.grainfree);
+	said("-R prints both counts", want);
+	said("-R rewrites the checkpoint", "checkpoint rewritten at ckseq");
+
+	checks++;
+	if((bad = scrub(d, 0, 0)) != 0)
+		fail("the store reported %d problem(s) after -R", bad);
+	if((st = opens(d, "after -R")) != nil){
+		storestat(st, &s1);
+		eqv("the rebuilt free map equals a full scan of the live maps",
+			s1.grainfree, s0.grainfree);
+		storeclose(st);
+	}
+
+	/*
+	 * The `as found' count comes from the checker's own bitmap pass,
+	 * so it means nothing on a store with a page that pass could not
+	 * use — which is a store -R is run on.  There the line says how
+	 * many pages that was and gives no number at all.  The page
+	 * damaged here reads perfectly and fails its checksum, which is
+	 * the half of that count the line used to leave out.
+	 */
+	pokebmhdr(d, &s, 0);
+	checks++;
+	if(scrub(d, 0, 1) == 0)
+		fail("-R reported nothing about a bitmap page that fails its "
+			"checksum");
+	said("-R counts the pages its bitmap pass could not use",
+		"bitmap page(s) did not read or did not pass their checksum");
+	didnotsay("and gives no as-found count", "the on-disk bitmap leaves");
+	free(buf);
+	devclose(d);
+}
+
+/*
+ * -R's rebuild scans the replayed maps, so an object committed after
+ * the last checkpoint keeps its grains.  The checkpoint -R then
+ * writes publishes a ckseq past those records, so a rebuild that had
+ * read the checkpointed index would leave their grains free with
+ * nothing left in the log to correct it.
+ *
+ * Mutation: rebuildbitmap scans the on-disk index region instead of
+ * the replayed one (mut rebuild-ckpt-index).
+ */
+static void
+tRlog(void)
+{
+	Dev *d;
+	Super s;
+	Store *st;
+	Storestat s0, s1;
+	uchar *buf;
+	int bad;
+
+	d = newstore(&s);
+	if((st = opens(d, "rebuild over the log")) == nil){
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(3*Vblk, 17);
+	mk(st, "old", 1);
+	wr(st, "old", buf, 3*Vblk, 0, 2);
+	ckpt(st);
+	mk(st, "new", 1);
+	wr(st, "new", buf, 2*Vblk, 0, 2);	/* committed, not checkpointed */
+	storestat(st, &s0);
+	storeclose(st);
+
+	checks++;
+	if((bad = scrub(d, 0, 1)) != 0)
+		fail("-R on a sound store reported %d problem(s)", bad);
+	checks++;
+	if((bad = scrub(d, 0, 0)) != 0)
+		fail("after -R the bitmap disagrees with the live maps: %d "
+			"problem(s)", bad);
+	if((st = opens(d, "after -R over the log")) != nil){
+		storestat(st, &s1);
+		eqv("the rebuild counted the un-checkpointed records",
+			s1.grainfree, s0.grainfree);
+		storeclose(st);
+	}
+	free(buf);
+	devclose(d);
+}
+
+static char ropath[64];
+
+/*
+ * The two refusals.  -o dumps one object and -R rebuilds from every
+ * live map, so the pair is a contradiction rather than a narrowing;
+ * and -R on a device opened read-only must say so rather than replay
+ * the whole log and fall over on the first write.  -v on the same
+ * read-only image must work, which is what §12's read-only open is
+ * for.
+ *
+ * Mutation: both guards dropped (mut rebuild-norefuse).
+ */
+static void
+trefuse(void)
+{
+	Dev *d;
+	Super s;
+	Fmtcfg c;
+	Ckcfg k;
+	Store *st;
+	uchar *buf;
+
+	d = newstore(&s);
+	if((st = opens(d, "refusals")) != nil){
+		buf = mkbuf(Vblk, 23);
+		mk(st, "one", 1);
+		wr(st, "one", buf, Vblk, 0, 2);
+		ckpt(st);
+		storeclose(st);
+		free(buf);
+	}
+	memset(&k, 0, sizeof k);
+	k.rebuild = 1;
+	k.oid = "one";
+	checks++;
+	if(runck(d, &k) == 0)
+		fail("-R with -o was not refused");
+	said("-R with -o", "work over the whole store");
+	devclose(d);
+
+	remove(ropath);
+	if((d = fileopen(ropath, Secsz, (vlong)Nsec*Secsz, 0)) == nil)
+		sysfatal("fileopen: %r");
+	smallcfg(&c);
+	if(geometry(&s, &c, d->size) < 0 || fmtstore(d, &s) < 0)
+		sysfatal("format: %r");
+	devclose(d);
+
+	if((d = fileopen(ropath, Secsz, 0, Drdonly)) == nil)
+		sysfatal("reopen read-only: %r");
+	memset(&k, 0, sizeof k);
+	k.rebuild = 1;
+	checks++;
+	if(runck(d, &k) == 0)
+		fail("-R on a read-only device reported nothing");
+	said("-R read-only", "is open read-only");
+	/*
+	 * ... and -v opens the same image: a device that cannot write
+	 * has no durability to assert and no flush channel to want, so
+	 * §5 step 1's refusal does not apply to it.
+	 */
+	memset(&k, 0, sizeof k);
+	k.verify = 1;
+	checks++;
+	if(runck(d, &k) != 0)
+		fail("-v on a read-only image reported problems");
+	said("-v on a read-only image", "0 objects verified");
+	devclose(d);
+	remove(ropath);
+}
+
+static char imgpath[64];
+
+/*
+ * The success paths below remove their own files; a sysfatal or a
  * mutant that dies inside ckstore does not, so the removals are also
  * registered here and run however this program exits.
  */
@@ -863,6 +1712,7 @@ cleanup(void)
 	remove(ckpath);
 	remove(imgpath);
 	remove(badpath);
+	remove(ropath);
 }
 
 void
@@ -871,6 +1721,10 @@ main(int, char**)
 	Dev *d;
 	char *path;
 
+	snprint(ckpath, sizeof ckpath, "/tmp/shoalcktest.%d.out", getpid());
+	snprint(badpath, sizeof badpath, "/tmp/shoalckbadlog.%d.img", getpid());
+	snprint(ropath, sizeof ropath, "/tmp/shoalckro.%d.img", getpid());
+	snprint(imgpath, sizeof imgpath, "/tmp/shoalfmtck.%d.img", getpid());
 	atexit(cleanup);
 	if((null = open("/dev/null", OWRITE)) < 0)
 		null = 2;
@@ -901,6 +1755,13 @@ main(int, char**)
 	tcutream();
 	tlive();
 	tbadlog();
+	tverify();
+	tvreplay();
+	tvdirty();
+	tRbad();
+	trebuildoff();
+	tRlog();
+	trefuse();
 	if(fails > 0)
 		exits("failed");
 	print("fmtcktest: %d checks ok\n", checks);

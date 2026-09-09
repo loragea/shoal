@@ -40,6 +40,7 @@ struct Upd
 	ulong	nfree, afree;
 	int	slotresv;		/* this update reserved an index slot */
 	int	emapresv;		/* ... and an extent-map slot */
+	int	keepcsum;		/* publish e.csum rather than recompute */
 };
 
 static void updclose(Upd*);
@@ -197,7 +198,22 @@ updcommit(Upd *u, int state, uvlong ver, uvlong wepoch, vlong mtime,
 
 	s = u->s;
 	mapopen(s, &mold, &u->e, u->cold);
-	if(updcsum(u, &mold, csum) < 0){
+	/*
+	 * §8's key-preserving commit publishes the csum the object
+	 * already carries.  updcsum recomputes it from the *stored*
+	 * digest array, and the one commit that names no block is the
+	 * one made when that array is what failed: recomputing there
+	 * publishes a csum that agrees with the damage, so hash(dig[])
+	 * == csum again, objrepair's precondition passes and every
+	 * correct byte a peer sends for a damaged block is refused for
+	 * the life of the disk (§8's two kinds of mismatch collapse into
+	 * one).  It also moves the four-tuple's csum at an unchanged
+	 * key, which is layer-a §1.3's I3 fed a divergence this store
+	 * manufactured.
+	 */
+	if(u->keepcsum)
+		memmove(csum, u->e.csum, Csumlen);
+	else if(updcsum(u, &mold, csum) < 0){
 		updabort(u);
 		return -1;
 	}
@@ -347,6 +363,7 @@ enum
 {
 	Utomb	= 1,	/* a tombstone may be opened */
 	Ubad	= 2,	/* ... and so may a slot §5 step 10 condemned */
+	Ucorrupt = 4,	/* ... and one whose §8 corrupt flag is set */
 };
 
 static int
@@ -389,6 +406,22 @@ updopen(Upd *u, Store *s, uchar *oid, int oidlen, uvlong newlen, int flags)
 		werrstr("checksum mismatch: slot %lud, extent map", slot);
 		return -1;
 	}
+	/*
+	 * §8: a copy whose corrupt flag is set fails client access with
+	 * layer-a §2.6's `checksum mismatch' — the content is what failed
+	 * verification, and §3.7's row for that condition is where the
+	 * spelling is fixed.  The exceptions pass Ucorrupt and each has a
+	 * reason: §5.5's op=full and §8's block repair are the repairs, a
+	 * delete is self-contained and has no key to defend (its
+	 * tombstone holds no content, so its commit clears the flag), and
+	 * objcorrupt is the flag's own setter.
+	 */
+	if((e->flags & Icorrupt) && !(flags & Ucorrupt)){
+		qunlock(&s->qlstate);
+		werrstr("checksum mismatch: slot %lud, corrupt flag set",
+			slot);
+		return -1;
+	}
 	u->slot = slot;
 	u->e = *e;
 	u->e.oid = malloc(e->oidlen);
@@ -425,20 +458,49 @@ updopen(Upd *u, Store *s, uchar *oid, int oidlen, uvlong newlen, int flags)
 	 * D14: a copy that fails local verification contributes no key
 	 * and has no old map to read — the entry that named its grains
 	 * *is* the damaged bytes.  Those grains are unrecoverable and
-	 * stay marked used until the slot's map is written again; the
-	 * update names none of them, so oldnblk is 0 and nothing reads
-	 * through mold.
+	 * stay marked used until a bitmap rebuild (§3.6, §12): writing
+	 * this slot's map again does not reclaim them, because nothing
+	 * knows which they were.  The update names none of them, so
+	 * oldnblk is 0 and nothing reads through mold.
 	 */
 	if(u->e.bad)
 		u->oldnblk = 0;
 	else if(u->e.emapslot != 0
 	&& (u->cold = mapread(s, u->slot, u->e.emapslot)) == nil){
+		if(!(flags & Ubad)){
+			qlock(&s->qlstate);
+			if(u->emapresv)
+				emapresvclr(s, u->newslot);
+			qunlock(&s->qlstate);
+			free(u->e.oid);
+			return -1;
+		}
+		/*
+		 * mapread has just condemned this slot (§5 step 10): the
+		 * damage was not known when the slot decision above was
+		 * made, so make it again on what is known now.  §5.5's
+		 * op=full is the one caller that may take a condemned copy,
+		 * and it must be able to whether or not some earlier read
+		 * happened to be the one that found the damage — a repair
+		 * that works only for a slot condemned since the last
+		 * restart is not a repair.  The map is rebuilt whole in a
+		 * fresh slot (§2.7's Oslot rule) and the grains the damaged
+		 * entry named stay marked used (§3.6).
+		 */
 		qlock(&s->qlstate);
-		if(u->emapresv)
-			emapresvclr(s, u->newslot);
+		u->e.bad = 1;
+		u->oldnblk = 0;
+		if(u->nblk > 1 && !u->emapresv){
+			if(emapalloc(s, &u->newslot) < 0){
+				qunlock(&s->qlstate);
+				free(u->e.oid);
+				werrstr("disk full");
+				return -1;
+			}
+			u->emapresv = 1;
+		}
 		qunlock(&s->qlstate);
-		free(u->e.oid);
-		return -1;
+		u->oslot = u->newslot != u->e.emapslot;
 	}
 	if(u->newslot == u->e.emapslot)
 		u->cnew = u->cold;
@@ -962,6 +1024,17 @@ objwrite(Store *s, uchar *oid, int oidlen, void *a, long n, uvlong off,
 		return -1;
 	}
 	/*
+	 * §8's refusal, made here rather than left to updopen because it
+	 * MUST precede the count-0 shortcut below: a zero-count write
+	 * commits nothing and would otherwise answer ok on a copy that
+	 * fails verification, which is client access served.
+	 */
+	if(oi.corrupt){
+		werrstr("checksum mismatch: slot %lud, corrupt flag set",
+			oi.slot);
+		return -1;
+	}
+	/*
 	 * layer-a §2.4 extends an object at "a write at offset > len" —
 	 * bytes landing above it.  A count of zero lands none, and 9P
 	 * clients issue count-0 Twrites, so taking one as an extend would
@@ -1093,7 +1166,28 @@ objremove(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 		werrstr("delete at version 0");
 		return -1;
 	}
-	if(updopen(&u, s, oid, oidlen, 0, 0) < 0)
+	/*
+	 * §8: a delete applies to a copy that fails local verification,
+	 * whether the §8 flag is what says so or §5 step 10's
+	 * condemnation is.  op=delete is self-contained — it arbitrates
+	 * on the key it carries and replaces the content with none — so
+	 * there is nothing here for the flag to protect, and the
+	 * tombstone this commits holds no content to be suspect of:
+	 * updcommit publishes it with the flag clear, which is what takes
+	 * the object out of /lost.
+	 *
+	 * A condemned slot is in that set and not an exception to it.
+	 * The grains its damaged map named are unrecoverable either way
+	 * — a refusal does not reclaim them, because §5 step 11's rebuild
+	 * re-marks whatever a live entry's map still says (§3.6) — and
+	 * the refusal costs what the delete is for: op=full is a
+	 * condemned copy's only other repair, and an object being deleted
+	 * cluster-wide has no live copy left to push one, so layer-a
+	 * §1.5's tombstone discard would wait on this witness forever.
+	 * The tombstone releases the map, so the next bitmap rebuild
+	 * (§2.5, `shoalck -R') is what returns the grains.
+	 */
+	if(updopen(&u, s, oid, oidlen, 0, Ubad|Ucorrupt) < 0)
 		return -1;
 	mapopen(s, &mold, &u.e, u.cold);
 	if(freetail(&u, &mold) < 0){
@@ -1119,34 +1213,37 @@ objremove(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
  * corrupt flag.  The flag is durable so a restart does not forget it,
  * and §2.7's oflags is where the record carries it — an apply that
  * kept the entry's own flag would not be a function of the record
- * alone, and replay would clear what a scrub had found.
+ * alone, and replay would clear what a scrub had found.  "Nothing
+ * but" includes the csum: this commit names no block, so it publishes
+ * the one the object already carries rather than a recomputation of
+ * the stored digest array — see updcommit.
  */
 int
 objcorrupt(Store *s, uchar *oid, int oidlen, int set, Dirtyrec *dr, int ndr)
 {
 	Upd u;
-	Omap mold;
 	Objinfo oi;
 
 	if(objstat(s, oid, oidlen, &oi) < 0)
 		return -1;
-	if(updopen(&u, s, oid, oidlen, oi.len, Utomb) < 0)
+	if(updopen(&u, s, oid, oidlen, oi.len, Utomb|Ucorrupt) < 0)
 		return -1;
-	mapopen(s, &mold, &u.e, u.cold);
+	u.keepcsum = 1;
 	/*
 	 * §2.7's slot rule is what makes a commit name every block, and
-	 * this commit changes no emapslot: clause 2 zeroes nothing, so
-	 * the map the apply inherits is this object's own and an empty
-	 * nmap leaves it exactly as it is.  Naming them anyway would put
-	 * nblkmax map triples — 28.2 KiB at the defaults — into a record
-	 * §8 describes as "an Eobj that changes nothing but the corrupt
-	 * flag".
+	 * this commit changes no emapslot, so it names none: the map the
+	 * apply inherits is this object's own and an empty nmap leaves it
+	 * exactly as it is.  Naming them anyway would put nblkmax map
+	 * triples — 28.2 KiB at the defaults — into a record §8 describes
+	 * as "an Eobj that changes nothing but the corrupt flag".
+	 *
+	 * The slot cannot move under this caller: len does not change,
+	 * so an entry of more than one block keeps the map it has; one
+	 * of a block or fewer holds no map to keep (the apply's Oslot
+	 * arm zeroes emapslot whenever the new slot is 0); and a
+	 * condemned entry, the one case that would rebuild the map in a
+	 * fresh slot, updopen refuses, since nothing here passes Ubad.
 	 */
-	if(u.oslot && nameall(&u, &mold) < 0){
-		updabort(&u);
-		updclose(&u);
-		return -1;
-	}
 	if(updcommit(&u, u.e.state, u.e.ver, u.e.wepoch, u.e.mtime, set,
 		dr, ndr) < 0){
 		updclose(&u);
@@ -1238,6 +1335,20 @@ objread(Store *s, uchar *oid, int oidlen, void *a, long n, uvlong off)
 		werrstr(slot >= 0 && s->idx[slot].state == Stomb
 			? "object deleted" : "no such object");
 		qunlock(&s->qlstate);
+		return -1;
+	}
+	/*
+	 * §8: a copy whose corrupt flag is set fails client access with
+	 * `checksum mismatch' (§3.7's row).  The flag says a block does
+	 * not hash to its digest, so what this read would return is the
+	 * damaged bytes — the one thing layer-a §1.4's checksums exist to
+	 * stop — and a corrupt copy is out of arbitration anyway (§1.3),
+	 * so there is no caller left that wants them.
+	 */
+	if(s->idx[slot].flags & Icorrupt){
+		qunlock(&s->qlstate);
+		werrstr("checksum mismatch: slot %lud, corrupt flag set",
+			slot);
 		return -1;
 	}
 	e = s->idx[slot];
@@ -1359,6 +1470,15 @@ objverify(Store *s, uchar *oid, int oidlen, Vfy *v)
 				free(buf);
 				free(digs);
 				emapunpin(s, c);
+				/*
+				 * The Vfy is the caller's on success only:
+				 * a failure answers a zeroed one, so the
+				 * bad-block array a partial pass allocated
+				 * is this function's to release.  A wave-1d
+				 * scrubber crossing an unreadable region
+				 * calls this once per object per pass.
+				 */
+				vfyfree(v);
 				return -1;
 			}
 			blkdigest(buf, n, dig);
@@ -1374,12 +1494,310 @@ objverify(Store *s, uchar *oid, int oidlen, Vfy *v)
 	return 0;
 }
 
+/*
+ * Always safe, whatever objverify or objscrub returned, and safe
+ * twice: it leaves the Vfy zeroed, which is also what every failure
+ * path of those two leaves behind.
+ */
 void
 vfyfree(Vfy *v)
 {
 	free(v->bad);
-	v->bad = nil;
-	v->nbad = 0;
+	memset(v, 0, sizeof *v);
+}
+
+/*
+ * §8's scrub: objverify plus the durable transition it licenses.
+ * Verify itself stays pure — it is also what layer-a §5.6's op=verify
+ * and shoalck -v need, and neither may commit — so the transition
+ * lives here, and it is exactly two moves.  A mismatch on a copy the
+ * index calls whole sets the flag; every block matching on a copy the
+ * index calls corrupt clears it (§8: "the holder's next verify finds
+ * every block matching, clears the corrupt flag ... and the object
+ * leaves /lost").  Anything else commits nothing: an unchanged verdict
+ * is not news, and a scrubber that wrote a record per object per pass
+ * would put the whole disk through the log every scrubdays.
+ *
+ * The Vfy is answered either way, because which repair the caller
+ * must ask for is what it says (§8's two kinds of mismatch), and the
+ * caller frees it with vfyfree.  Serialisation is the caller's, as
+ * for every other call here: the verify and the commit are two hands
+ * on one object and §7's queue is what keeps a write out from
+ * between them.
+ */
+int
+objscrub(Store *s, uchar *oid, int oidlen, Vfy *v)
+{
+	Objinfo oi;
+	int bad;
+
+	if(objverify(s, oid, oidlen, v) < 0)
+		return -1;
+	if(objstat(s, oid, oidlen, &oi) < 0){
+		vfyfree(v);
+		return -1;
+	}
+	bad = v->arraybad || v->nbad > 0;
+	if(bad != oi.corrupt && objcorrupt(s, oid, oidlen, bad, nil, 0) < 0){
+		vfyfree(v);
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * §8's slot cursor.  A scrubber walks slots in order, and the index
+ * is the engine's; this is the whole of what it needs to do that.  It
+ * holds qlstate for the copy and not a moment longer — §8's scrub
+ * reads grains through the caller's queue, and a cursor that stayed
+ * locked across the verify would serialise every commit in the store
+ * behind one object's hashing.
+ *
+ * The oid is copied out for the same reason: s->idx[slot].oid is
+ * freed by the apply of a commit that releases the slot, so a pointer
+ * into it is good only under the lock.  What the caller holds
+ * afterwards is a snapshot of a slot, not a lease on it: by the time
+ * it verifies, the object may have been written, deleted or replaced,
+ * and every call it then makes takes the oid rather than the slot, so
+ * it acts on the object it named and not on whatever the slot came to
+ * hold.  Answers 1 for a live or tomb entry, 0 for a free slot.
+ */
+int
+objslot(Store *s, ulong slot, uchar *oid, int *oidlen, Objinfo *oi)
+{
+	Ient *e;
+
+	if(!serving(s))
+		return -1;
+	if(slot >= s->sb.nslots){
+		werrstr("slot %lud, nslots %lud", slot, s->sb.nslots);
+		return -1;
+	}
+	qlock(&s->qlstate);
+	e = &s->idx[slot];
+	if(e->state == Sfree){
+		qunlock(&s->qlstate);
+		*oidlen = 0;
+		return 0;
+	}
+	memmove(oid, e->oid, e->oidlen);
+	*oidlen = e->oidlen;
+	memset(oi, 0, sizeof *oi);
+	oi->slot = slot;
+	oi->emapslot = e->emapslot;
+	oi->qidpath = e->qidpath;
+	oi->len = e->len;
+	oi->ver = e->ver;
+	oi->wepoch = e->wepoch;
+	oi->mtime = e->mtime;
+	memmove(oi->csum, e->csum, Csumlen);
+	oi->state = e->state;
+	oi->corrupt = (e->flags & Icorrupt) != 0;
+	qunlock(&s->qlstate);
+	return 1;
+}
+
+/*
+ * §8's first bullet: block repair.  The caller has fetched block blk
+ * from a holder of a copy at the same key (layer-a §5.6's op=get) and
+ * hands the bytes here; this checks them and, if they are the block
+ * the object is missing, commits an Eobj whose four-tuple is
+ * unchanged and whose nmap names that one block.  §3.5's deferred
+ * reuse covers the grain it frees, as for any commit.
+ *
+ * The two refusals are different kinds on purpose (§3.7).
+ *
+ * The first is the acceptance test's own precondition: if
+ * hash(dig[]) != csum the stored dig[i] cannot be the acceptance test
+ * for anything, so accepting bytes against it would reject every
+ * correct byte a peer sent — and, worse, accept the wrong ones — and
+ * leave the object `object lost' with good copies all over the
+ * cluster.  §8 says that case is the whole-object op=full, so a
+ * caller that block-repairs through it is a server bug rather than a
+ * media fault, and the refusal carries no §2.6 prefix.
+ *
+ * The second is the acceptance test: bytes that do not hash to the
+ * stored dig[i] are content that failed verification, which is what
+ * layer-a §2.6's `checksum mismatch' names.
+ *
+ * The corrupt flag is not cleared here.  One block matching says
+ * nothing about the others, and §8 gives the clearing to the verify
+ * that finds every block matching — objscrub above.
+ */
+int
+objrepair(Store *s, uchar *oid, int oidlen, ulong blk, void *a, long n)
+{
+	Upd u;
+	Omap mold;
+	Objinfo oi;
+	uchar *buf, *digs, dig[Blkdlen], cur[Blkdlen], csum[Csumlen];
+	uvlong i, nblk;
+	ulong g, cov;
+	int match;
+
+	if(!serving(s))
+		return -1;
+	if(objstat(s, oid, oidlen, &oi) < 0)
+		return -1;
+	if(oi.state != Slive){
+		werrstr(oi.state == Stomb ? "object deleted" : "no such object");
+		return -1;
+	}
+	nblk = blkcount(oi.len, s->sb.blksz);
+	if(blk >= nblk){
+		werrstr("block repair: block %lud of %llud", blk, nblk);
+		return -1;
+	}
+	/*
+	 * The count is the block's covered length (layer-a §1.4), which
+	 * the caller knows from the len it fetched against; anything else
+	 * would hash to something that is not this block's digest, and
+	 * saying so as a checksum mismatch would blame the peer for the
+	 * caller's arithmetic.
+	 */
+	if(updopen(&u, s, oid, oidlen, oi.len, Ubad|Ucorrupt) < 0)
+		return -1;
+	/*
+	 * A slot §5 step 10 condemned — already, or by the mapread
+	 * updopen has just made — is the arraybad case reached the other
+	 * way: the entry that names this block's grain and digest *is*
+	 * the damaged bytes, so there is no acceptance test here either
+	 * and §8 sends the object to op=full.  That makes it one caller
+	 * bug with the arraybad refusal below, so it is spelled the same
+	 * internal way rather than coming back as §2.6's `checksum
+	 * mismatch' from updopen — which a /repl peer would read as a
+	 * media fault it should retry.
+	 */
+	if(u.e.bad){
+		updabort(&u);
+		updclose(&u);
+		werrstr("block repair: slot %lud: the extent map does not "
+			"pass its checksum; the repair here is op=full",
+			u.slot);
+		return -1;
+	}
+	cov = blkcover(s, u.e.len, blk);
+	if(n < 0 || (ulong)n != cov){
+		updabort(&u);
+		updclose(&u);
+		werrstr("block repair: %ld bytes for a block of %lud", n, cov);
+		return -1;
+	}
+	mapopen(s, &mold, &u.e, u.cold);
+	nblk = blkcount(u.e.len, s->sb.blksz);
+	digs = nil;
+	if(nblk > 0 && (digs = malloc(nblk*Blkdlen)) == nil){
+		updabort(&u);
+		updclose(&u);
+		werrstr("out of memory");
+		return -1;
+	}
+	for(i = 0; i < nblk; i++)
+		memmove(digs + i*Blkdlen, mapdig(&mold, i), Blkdlen);
+	csumdigests(digs, nblk, csum);
+	free(digs);
+	if(memcmp(csum, u.e.csum, Csumlen) != 0){
+		updabort(&u);
+		updclose(&u);
+		werrstr("block repair: slot %lud: the digest array does not "
+			"hash to csum; the repair here is op=full", u.slot);
+		return -1;
+	}
+	blkdigest(a, n, dig);
+	if(memcmp(dig, mapdig(&mold, blk), Blkdlen) != 0){
+		updabort(&u);
+		updclose(&u);
+		werrstr("checksum mismatch: block %lud does not hash to its "
+			"stored digest", blk);
+		return -1;
+	}
+	if((buf = malloc(s->sb.blksz)) == nil){
+		updabort(&u);
+		updclose(&u);
+		werrstr("out of memory");
+		return -1;
+	}
+	/*
+	 * The block this is asked to repair must be one that needs it.
+	 * A block whose own bytes already hash to the stored digest is
+	 * whole, so the repair changes nothing and costs a grain — and
+	 * where the block is a hole (§4) it costs the hole as well:
+	 * mapgrain is 0, so the freed grain is a no-op and the object
+	 * comes back one grain heavier with the same content.  §8's
+	 * repair is driven by the *set* verify answers, so asking here
+	 * for a block outside that set is the same caller bug as asking
+	 * with a failing digest array, and carries no §2.6 prefix.
+	 *
+	 * A grain that cannot be READ is not that case: it is the case
+	 * this call exists for, and the bytes offered have already
+	 * passed the acceptance test above, so the only thing the read
+	 * was for — whether the repair is needed — is answered by the
+	 * failure itself.  Refusing there would answer §8's own repair
+	 * of a media error with the media error.
+	 */
+	match = 0;
+	g = mapgrain(&mold, blk);
+	if(g == 0){
+		zerodigest(s, u.e.len, blk, cur);
+		match = memcmp(cur, mapdig(&mold, blk), Blkdlen) == 0;
+	}else if(grainread(s, buf, g) == 0){
+		blkdigest(buf, cov, cur);
+		match = memcmp(cur, mapdig(&mold, blk), Blkdlen) == 0;
+	}
+	if(match){
+		free(buf);
+		updabort(&u);
+		updclose(&u);
+		werrstr("block repair: block %lud already hashes to its "
+			"stored digest", blk);
+		return -1;
+	}
+	/*
+	 * The grain holds a whole block; the bytes above the block's
+	 * covered length are not the object's content and MUST read as
+	 * the zeros §4 says they read as, or the next partial write of
+	 * this block would merge them back in.
+	 */
+	memmove(buf, a, n);
+	if(n < (long)s->sb.blksz)
+		memset(buf + n, 0, s->sb.blksz - n);
+	qlock(&s->qlstate);
+	/* grainalloc spells its own failure: disk full, or out of memory */
+	if(grainalloc(s, &g) < 0){
+		qunlock(&s->qlstate);
+		free(buf);
+		updabort(&u);
+		updclose(&u);
+		return -1;
+	}
+	qunlock(&s->qlstate);
+	if(grainwrite(s, buf, g) < 0){
+		qlock(&s->qlstate);
+		grainstageclr(s, g);
+		qunlock(&s->qlstate);
+		free(buf);
+		updabort(&u);
+		updclose(&u);
+		return -1;
+	}
+	free(buf);
+	/* stageblk's window, released the same way */
+	if(addfree(&u, mapgrain(&mold, blk)) < 0
+	|| addmap(&u, blk, g, dig) < 0){
+		qlock(&s->qlstate);
+		grainstageclr(s, g);
+		qunlock(&s->qlstate);
+		updabort(&u);
+		updclose(&u);
+		return -1;
+	}
+	if(updcommit(&u, u.e.state, u.e.ver, u.e.wepoch, u.e.mtime,
+		(u.e.flags & Icorrupt) != 0, nil, 0) < 0){
+		updclose(&u);
+		return -1;
+	}
+	updclose(&u);
+	return 0;
 }
 
 /*
@@ -1703,7 +2121,7 @@ stagefinal(Stage *g, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 	uvlong i;
 	uchar dig[Blkdlen];
 	long slot;
-	int absent, corrupt, c;
+	int absent, nokey, c;
 
 	s = g->s;
 	/*
@@ -1755,9 +2173,10 @@ stagefinal(Stage *g, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 	if(absent){
 		if(updnew(&u, s, g->oid, g->oidlen, g->len) < 0)
 			return stagefail(g);
-	}else if(updopen(&u, s, g->oid, g->oidlen, g->len, Utomb|Ubad) < 0)
+	}else if(updopen(&u, s, g->oid, g->oidlen, g->len,
+		Utomb|Ubad|Ucorrupt) < 0)
 		return stagefail(g);
-	corrupt = !absent && ((u.e.flags & Icorrupt) != 0 || u.e.bad);
+	nokey = !absent && ((u.e.flags & Icorrupt) != 0 || u.e.bad);
 	/*
 	 * layer-a §5.5's comparison, made once here and against the
 	 * receiver's then-current key: strictly greater, or equal with
@@ -1773,10 +2192,19 @@ stagefinal(Stage *g, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 	 * content to a media fault refuses the serving primary's repair
 	 * push at the lower (E, ver) as `stale version', by the very
 	 * copy that asked for it, and is unrepairable for the life of
-	 * the disk.  The flag itself is not cleared here: §8 clears it
-	 * from the verify that finds every block matching again.
+	 * the disk.
+	 *
+	 * The commit clears the flag.  Every block this record names was
+	 * staged from bytes the sender's dcsum covered and the whole
+	 * against its csum (§5.5), and the digests were computed from
+	 * those bytes here, so the verify §8 would run next finds every
+	 * block matching by construction: there is nothing left for the
+	 * flag to describe.  Leaving it set would keep a copy that is now
+	 * whole out of arbitration, and — because a copy with no key to
+	 * defend takes any push — would go on accepting a push at any key
+	 * until the scrubber's next pass, which is days (§8).
 	 */
-	if(!absent && !corrupt){
+	if(!absent && !nokey){
 		c = keycmp(wepoch, ver, u.e.wepoch, u.e.ver);
 		if(c < 0 || (c == 0 && !g->force)){
 			updabort(&u);
@@ -1810,7 +2238,7 @@ stagefinal(Stage *g, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 		}
 	}
 	stagehandoff(g, g->nblk);
-	if(updcommit(&u, Slive, ver, wepoch, time(nil), corrupt, dr, ndr) < 0){
+	if(updcommit(&u, Slive, ver, wepoch, time(nil), 0, dr, ndr) < 0){
 		updclose(&u);
 		return stagefail(g);
 	}

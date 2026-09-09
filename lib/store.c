@@ -535,16 +535,27 @@ replay(Store *s)
 				rel = 0;
 		}
 		if(s->nemapc > s->emapcap && emapreclaim(s) < 0)
-			goto refuse;
+			goto relay;
 	}
+	USED(bad);			/* only the refusals below read it */
 	/*
-	 * The final write-back can fail exactly as the in-loop one above
-	 * and refuses the same way; bad still names the last record
-	 * applied — or the checkpoint mark, when there was none — whose
-	 * maps are among the entries being written.
+	 * Replay ends by writing back the maps the applied records
+	 * dirtied.  That is what makes a device error under the
+	 * extent-map region a refusal of the *start*, named while the
+	 * operator is looking at it, rather than a store that opens and
+	 * whose every checkpoint then fails behind it.  A read-only
+	 * store cannot take the write (§12), and there is nothing to
+	 * lose by not taking it: the maps stay dirty in the cache, as a
+	 * live commit's do, for the checkpoint a later writable open
+	 * makes.  The one condition that cannot survive being held —
+	 * a log dirtying more entries than the cache holds — is what
+	 * the in-loop write-back above refuses by name.  emapreclaim
+	 * would hold them anyway on such a store; the test is here so
+	 * that replay says what it does without being read through
+	 * another file.
 	 */
-	if(emapreclaim(s) < 0)
-		goto refuse;
+	if(!s->d->rdonly && emapreclaim(s) < 0)
+		goto relay;
 	free(hdr);
 	free(buf);
 	s->logtail = rel;
@@ -566,6 +577,19 @@ refuse:
 	 */
 	werrstr("the log cannot be replayed; shoalck, then refill from "
 		"peers; log sector %llud: %s", bad, e);
+	return -1;
+
+	/*
+	 * A refusal replay merely relays — the extent-map cache's, or a
+	 * device error under the extent-map region — is not log damage,
+	 * and the remedy above would send the operator to wipe a store
+	 * whose log is intact.  It is passed through as it stands, which
+	 * is also what keeps the condition itself inside ERRMAX: the
+	 * wrapper is what the tail that gets cut used to be.
+	 */
+relay:
+	free(hdr);
+	free(buf);
 	return -1;
 }
 
@@ -601,6 +625,22 @@ rebuildbitmap(Store *s)
 		}
 		if((c = emapget(s, e->emapslot, 0)) == nil)
 			return -1;
+		/*
+		 * §5 step 10, as every other reader of a map applies it:
+		 * an entry that failed its csum128 and that replay did not
+		 * touch is media damage the log cannot repair, and every
+		 * grain number in it is the damaged bytes'.  Marking those
+		 * numbers would free grains a live entry still names and
+		 * publish a checkpoint calling the slot healthy, so the
+		 * slot is condemned and its map skipped — which is also
+		 * what keeps it out of the allocator, since completemaps
+		 * counts a bad slot as used.
+		 */
+		if(c->bad){
+			emapunpin(s, c);
+			storecondemn(s, slot);
+			continue;
+		}
 		for(i = 0; i < nblk && i < s->sb.nblkmax; i++){
 			g = emapgrain(c->p, i);
 			if(g != 0 && g < s->sb.ngrains)
@@ -653,6 +693,71 @@ completemaps(Store *s)
 }
 
 /*
+ * /lost, layer-a §7.5 and §8: every copy this instance holds that
+ * fails local verification.  Two conditions put a slot on it and both
+ * are the same statement about the copy — §5 step 10's condemnation
+ * (Ient.bad, an extent map the log cannot repair) and §8's durable
+ * corrupt flag (Icorrupt, a scrub that found a block that does not
+ * hash to its digest).  A condemned slot carries both.  The list is
+ * therefore membership rather than a log: lostadd and lostdel are
+ * idempotent, so a slot that reaches both conditions appears once and
+ * a transition that changes only one of them cannot lose the other.
+ *
+ * Caller holds qlstate: storecondemn reallocs the array from any
+ * worker proc, on the first read of a damaged extent map.
+ */
+static int
+lostadd(Store *s, ulong slot)
+{
+	ulong i, *l;
+
+	for(i = 0; i < s->nlost; i++)
+		if(s->lost[i] == slot)
+			return 0;
+	if((l = realloc(s->lost, (s->nlost+1)*sizeof *l)) == nil){
+		werrstr("out of memory");
+		return -1;
+	}
+	s->lost = l;
+	s->lost[s->nlost++] = slot;
+	return 0;
+}
+
+static void
+lostdel(Store *s, ulong slot)
+{
+	ulong i;
+
+	for(i = 0; i < s->nlost; i++)
+		if(s->lost[i] == slot){
+			memmove(&s->lost[i], &s->lost[i+1],
+				(s->nlost - i - 1)*sizeof *s->lost);
+			s->nlost--;
+			return;
+		}
+}
+
+/*
+ * An apply is the one thing that changes an entry's Icorrupt, and it
+ * rebuilds a condemned slot's map (§3.6), so it decides the slot's
+ * membership afresh from the entry it just wrote rather than from the
+ * transition it made.
+ */
+void
+lostupdate(Store *s, ulong slot)
+{
+	Ient *e;
+
+	if(slot >= s->sb.nslots)
+		return;
+	e = &s->idx[slot];
+	if(e->state != Sfree && (e->bad || (e->flags & Icorrupt) != 0))
+		lostadd(s, slot);
+	else
+		lostdel(s, slot);
+}
+
+/*
  * §5 step 10, at run time.  An extent-map entry that fails its
  * csum128 and that replay did not touch is media damage the log
  * cannot repair, and it is found when the object is first read rather
@@ -673,49 +778,38 @@ completemaps(Store *s)
 void
 storecondemn(Store *s, ulong slot)
 {
-	ulong *l;
-
 	if(slot >= s->sb.nslots || s->idx[slot].bad)
 		return;
 	s->idx[slot].bad = 1;
 	s->idx[slot].flags |= Icorrupt;
-	if((l = realloc(s->lost, (s->nlost+1)*sizeof *l)) == nil)
-		return;
-	s->lost = l;
-	s->lost[s->nlost++] = slot;
+	/*
+	 * Ient.bad is memory only; Icorrupt is the half §2.3 writes, and
+	 * the checkpoint writes an index page only when something
+	 * dirtied it.  Without this the condemnation reaches the disk
+	 * only if some other commit happened to touch the same page, so
+	 * a restart would drop a copy known to fail local verification
+	 * out of layer-a §7.5's /lost until something read it again.
+	 * The caller holds qlstate, which is what idxdirty wants.
+	 */
+	idxdirty(s, slot);
+	lostadd(s, slot);
 }
 
-/*
- * ... and the reverse: an apply that rebuilt a condemned slot's map
- * has repaired it, so it is no longer lost.  Caller holds qlstate.
- */
-void
-storefound(Store *s, ulong slot)
-{
-	ulong i;
-
-	for(i = 0; i < s->nlost; i++)
-		if(s->lost[i] == slot){
-			memmove(&s->lost[i], &s->lost[i+1],
-				(s->nlost - i - 1)*sizeof *s->lost);
-			s->nlost--;
-			return;
-		}
-}
-
-/* §5 step 10: condemn what replay did not restore */
+/* §5 step 10: condemn what replay did not restore, and §8's flag as
+ * the index carries it — an apply during replay has already updated
+ * the slots it touched, and lostadd is idempotent. */
 static int
 condemn(Store *s)
 {
-	ulong slot, *l;
+	Ient *e;
+	ulong slot;
 
 	for(slot = 0; slot < s->sb.nslots; slot++){
-		if(!s->idx[slot].bad)
-			continue;
-		if((l = realloc(s->lost, (s->nlost+1)*sizeof *l)) == nil)
+		e = &s->idx[slot];
+		if((e->bad || (e->state != Sfree
+			&& (e->flags & Icorrupt) != 0))
+		&& lostadd(s, slot) < 0)
 			return -1;
-		s->lost = l;
-		s->lost[s->nlost++] = slot;
 	}
 	return 0;
 }
@@ -818,7 +912,18 @@ storeopen(Dev *d, Storecfg *cfg)
 	 * an operator claim, not an observation, so it is reported as
 	 * flush=asserted-writethrough and never as flush=raw.
 	 */
-	if(d->flushmode == Fraw)
+	if(d->rdonly)
+		/*
+		 * A device opened read-only writes nothing at all — §0's
+		 * devwrite refuses on the flag — so there is no
+		 * durability to assert and no raw channel to want, and
+		 * §12's shoalck -v opens the store this way to replay it
+		 * in memory.  The mode stays what the device reported,
+		 * which for a read-only open is `not examined': calling
+		 * it asserted would be a claim no operator made.
+		 */
+		s->flushmode = d->flushmode;
+	else if(d->flushmode == Fraw)
 		s->flushmode = Fraw;
 	else if(cfg->noflush)
 		s->flushmode = Fasserted;
@@ -928,7 +1033,16 @@ storeopen(Dev *d, Storecfg *cfg)
 		return nil;
 	}
 
-	/* steps 10 and 11 */
+	/*
+	 * Steps 10 and 11.  §12's shoalck -R is step 5's flag set by
+	 * hand: a page that fails its checksum is rebuilt here anyway,
+	 * and -R is for the page that is valid but wrong and for the
+	 * operator who wants the scan done now rather than at the next
+	 * start.  The rebuild scans the *replayed* maps, so a grain a
+	 * committed-but-not-checkpointed record allocated is counted.
+	 */
+	if(s->cfg.forcerebuild)
+		s->bmaprebuild = 1;
 	if(condemn(s) < 0){
 		storefree(s);
 		return nil;
@@ -1016,21 +1130,30 @@ storestat(Store *s, Storestat *st)
 	st->staged = s->nstaged;
 	st->slotfree = s->slotfree;
 	st->emapfree = s->emapfree;
+	st->nslots = s->sb.nslots;
 	st->nlive = s->nlive;
 	st->ntomb = s->ntomb;
 	st->ndirty = s->ndirtused;
 	st->nlost = s->nlost;
 	qunlock(&s->qlstate);
+	qlock(&s->cklk);
+	st->ckfailed = s->ckfailed;
+	st->ckstuck = s->ckstuck;
+	strecpy(st->ckerr, st->ckerr + sizeof st->ckerr, s->ckerrstr);
+	qunlock(&s->cklk);
 	st->ndirtydrop = s->ndirtydrop;
 	st->nreplay = s->nreplay;
 	st->pmax = s->pmax;
 }
 
 /*
- * §5 step 10's list.  storecondemn reallocs s->lost from any worker
- * proc, on the first read of a damaged extent map, so both the count
- * and the array are qlstate's: reading them unlocked — as this could
- * while the list was built once at start — indexes a freed array.
+ * /lost's i'th slot: every copy that fails local verification, which
+ * is §5 step 10's condemned slots and §8's corrupt-flagged entries
+ * alike (layer-a §7.5).  storecondemn reallocs s->lost from any
+ * worker proc, on the first read of a damaged extent map, so both the
+ * count and the array are qlstate's: reading them unlocked — as this
+ * could while the list was built once at start — indexes a freed
+ * array.
  */
 ulong
 storelost(Store *s, ulong i)

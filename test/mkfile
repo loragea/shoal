@@ -12,6 +12,7 @@ TESTS=\
 	fmtcktest\
 	storetest\
 	objtest\
+	scrubtest\
 	committest\
 
 LIB=../lib/libshoal.a$O

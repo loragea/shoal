@@ -658,7 +658,7 @@ tbadmap(void)
 	uchar *buf, *other, rd[64], junk[8], oid[Oidmax];
 	char err[ERRMAX];
 	ulong slot, gf, sf;
-	uvlong nl;
+	uvlong nl, ef;
 
 	memset(&sh, 0, sizeof sh);
 	d = newdisk();
@@ -752,11 +752,12 @@ tbadmap(void)
 	 * writes it back as it stands; writing it back free would hand
 	 * the slot out again, leave the object's grains set in the bitmap
 	 * with nothing naming them, and lose the store's only record that
-	 * it ever held the object.  storecondemn does not itself dirty
-	 * the index page, so a second object is what gets it written.
+	 * it ever held the object.  This store holds ONE object, so
+	 * nothing but the condemnation can have dirtied the index page it
+	 * sits in: a storecondemn that did not dirty it would leave the
+	 * checkpoint carrying the entry as it was before, and the restart
+	 * below would list nothing.
 	 */
-	mkobj(s, "narrow", 1);
-	wr(s, "narrow", &sh, buf, 64, 0, 2);
 	if(storecheckpoint(s) < 0)
 		fail("storecheckpoint: %r");
 	storestat(s, &st);
@@ -782,13 +783,21 @@ tbadmap(void)
 		eqv("the restarted slot keeps its key", oi2.ver, 2);
 		eqv("and its length", oi2.len, 3*Blk);
 	}
-	eqv("start condemns nothing: replay never read the entry",
-		st.nlost, 0);
+	/*
+	 * The condemnation is durable in the entry's own Icorrupt bit
+	 * (D14), and §8's /lost is every copy that fails local
+	 * verification, so the restart lists it without re-reading the
+	 * map — which is the point: a store that only listed what this
+	 * run happened to read would drop a known-bad copy out of /lost
+	 * at every restart.
+	 */
+	eqv("the restart lists the corrupt-flagged slot", st.nlost, 1);
+	eqv("and names it", storelost(s, 0), oi.slot);
 	checks++;
 	if(objread(s, oid, 4, rd, sizeof rd, 0) >= 0)
 		fail("a damaged extent map was served after a restart");
 	storestat(s, &st);
-	eqv("and the next read condemns the slot again", st.nlost, 1);
+	eqv("and the read does not double-list it", st.nlost, 1);
 
 	/*
 	 * D14 again, from the sending side: a copy that fails local
@@ -797,6 +806,8 @@ tbadmap(void)
 	 * land in the slot and at the qid.path the object already had,
 	 * which layer-a §2.3 wants stable.
 	 */
+	storestat(s, &st);
+	ef = st.emapfree;
 	if((g = stageopen(s, oid, 4, 3*Blk, 0)) == nil)
 		fail("stageopen: %r");
 	else{
@@ -819,6 +830,17 @@ tbadmap(void)
 			checkobj(s, "wide", &sh, "after the heal");
 			storestat(s, &st);
 			eqv("and the slot is no longer lost", st.nlost, 0);
+			/*
+			 * The heal rebuilds the map in a FRESH extent-map
+			 * slot (§2.7's Oslot rule), so the apply has to
+			 * release the one it moved off.  Leaking it would
+			 * cost a slot per repair — a run repairing many
+			 * would reach `disk full' with slots free — and a
+			 * restart, which recomputes emapused from the
+			 * index, would hide it.
+			 */
+			eqv("and the map it moved off is released",
+				st.emapfree, ef);
 		}
 		free(other);
 	}
@@ -1081,36 +1103,47 @@ treclaimfault(void)
 }
 
 /*
- * The other write-back, after the loop: replay's last act is to flush
- * the extent-map entries the applied records installed, and a failure
- * there refuses the start for exactly the reason the in-loop one does.
- * What is pinned here is the refusal's *text*: the operator meets this
- * failure with a store that will not open, so it must name the sector
- * and the way out, like every other refusal on this path, and not the
- * bare device error.
+ * §5 step 7's closing write-back, on a writable store and on a
+ * read-only one.  Writable, replay materialises the extent maps the
+ * applied records dirtied, and a device that refuses that region
+ * refuses the START, where the operator is looking: the alternative
+ * is a store that opens clean and whose every checkpoint then fails
+ * behind it, reclaiming no log space, until commits stop.  The
+ * refusal names the region and NOT the corrupt-log remedy — the log
+ * is intact, and `refill from peers' would answer a bad sector under
+ * the maps by wiping the store.
  *
- * The fault is sticky, and the cache is the default, so the in-loop
- * write-back never runs and the post-loop one takes it; the records
- * install fresh maps, so nothing reads the region either.
+ * Read-only (§12, shoalck -v) there is no write to make: the maps
+ * stay in the cache for a later writable open's checkpoint, and the
+ * run writes nothing at all.  The one condition that cannot survive
+ * being held is a log dirtying more entries than the cache holds, and
+ * that is refused BY NAME rather than as a bare `opened read-only'
+ * out of devwrite — the whole of it, since replay passes it through
+ * instead of wrapping it in a remedy ERRMAX would then cut.
  *
- * Mutation: return -1 bare from the post-loop reclaim, as before, and
- * the refusal below arrives with neither sector nor remedy.
+ * Mutations: replay holds its dirty maps on a writable store too (mut
+ * replay-holds-emaps), and the start over the refused region opens;
+ * replay wraps a relayed refusal in the corrupt-log remedy (mut
+ * relay-wraps-refusal), and the read-only text is neither whole nor
+ * about the cache.
  */
 static void
-tpostreclaim(void)
+treplaymaps(void)
 {
 	Dev *d;
 	Store *s;
+	Storecfg c;
 	Storestat st;
+	Simop *t;
 	Super sb;
 	Sbsel sel;
 	uchar *buf, oid[Oidmax];
 	char err[ERRMAX];
-	int i;
+	long i, n, nw;
 	static char *nm[3] = { "p0", "p1", "p2" };
 
 	d = newdisk();
-	if((s = mustopen(d, "a failing post-loop reclaim")) == nil){
+	if((s = mustopen(d, "a replay that dirties maps")) == nil){
 		devclose(d);
 		return;
 	}
@@ -1125,47 +1158,393 @@ tpostreclaim(void)
 		if(objwrite(s, oid, 2, buf, 2*Blk, 0, 2, 1, nil, 0) < 0)
 			fail("objwrite %s: %r", nm[i]);
 	}
-	storeclose(s);
+	storeclose(s);				/* no second checkpoint */
 
 	if(superselect(d, &sel) < 0)
 		sysfatal("superselect: %r");
 	sb = sel.sb[sel.start];
+	/* sticky, so the whole region is unwritable for as long as it is armed */
 	simfaultat(d, Sfeio, 0, (vlong)sb.emapoff*sb.secsz,
 		(vlong)sb.emapsecs*sb.secsz);
 	checks++;
 	if((s = openstore(d)) != nil){
 		storestat(s, &st);
-		fail("the store started over a failed post-loop emapreclaim "
-			"(nlive=%llud)", st.nlive);
+		fail("the store started over a map region the device "
+			"refuses (nlive=%llud)", st.nlive);
 		storeclose(s);
 	}else{
 		rerrstr(err, sizeof err);
-		istrue("the post-loop refusal carries the remedy",
-			strstr(err, "shoalck, then refill from peers") != nil);
-		istrue("and names the log sector it stopped on",
-			strstr(err, "log sector") != nil);
+		istrue("the writable refusal names the region",
+			strstr(err, "writing the extent-map region") != nil);
+		istrue("and not the log's own remedy",
+			strstr(err, "refill from peers") == nil);
 	}
 	simfault(d, Sfnone, 0);
 
-	if((s = mustopen(d, "the map region, writable again")) != nil){
+	/* with the region writable, the same start materialises the maps */
+	simtracereset(d);
+	checks++;
+	if((s = openstore(d)) == nil)
+		fail("the map region, writable again: %r");
+	else{
 		storestat(s, &st);
-		eqv("every object is there once the map is writable",
-			st.nlive, 3);
+		eqv("every replayed object is there", st.nlive, 3);
+		n = simtrace(d, &t);
+		nw = 0;
+		for(i = 0; i < n; i++)
+			if(t[i].op == Sopwrite
+			&& t[i].off >= (vlong)sb.emapoff*sb.secsz
+			&& t[i].off < (vlong)(sb.emapoff + sb.emapsecs)*sb.secsz)
+				nw++;
+		istrue("and a writable replay wrote the maps back", nw > 0);
 		storeclose(s);
 	}
+
+	/*
+	 * Read-only, with a cache of one: the second record's map cannot
+	 * be spilled and cannot be held either, and that is the condition
+	 * the refusal has to name — whole, ERRMAX and all.
+	 */
+	d->rdonly = 1;
+	tcfg(&c);
+	c.emapcache = 1;
+	checks++;
+	if((s = storeopen(d, &c)) != nil){
+		fail("a read-only replay spilled the extent-map cache");
+		storeclose(s);
+	}else{
+		rerrstr(err, sizeof err);
+		checks++;
+		if(strcmp(err, "simdisk: replay: extent-map cache is full "
+			"and the store is read-only: 2 dirty, room for 1") != 0)
+			fail("the read-only refusal reads `%s'", err);
+	}
+
+	/* with room for them, the same read-only store opens and writes nothing */
+	tcfg(&c);
+	simtracereset(d);
+	checks++;
+	if((s = storeopen(d, &c)) == nil)
+		fail("a read-only replay that fits the cache: %r");
+	else{
+		storestat(s, &st);
+		eqv("and replays every record", st.nlive, 3);
+		n = simtrace(d, &t);
+		nw = 0;
+		for(i = 0; i < n; i++)
+			if(t[i].op == Sopwrite)
+				nw++;
+		eqv("a read-only replay writes nothing", nw, 0);
+		storeclose(s);
+	}
+	d->rdonly = 0;
 	free(buf);
 	devclose(d);
 }
 
 /*
- * §5 step 3: a geometry with no dirty region cannot serve — applydirty
- * can drop a peer's records to make room, but ndirty == 0 leaves it
- * nothing to drop, so such a store commits no Edirty and replay
- * refuses the first record that carries one.  shoalfmt never writes
- * one; a superblock claiming it is refused whole at open.
+ * A checkpointer that cannot write is invisible: no client operation
+ * fails, nothing is condemned (§2.8 — §3.2's broken flag is for a
+ * failed LOG write, and this state is still in the log), and the only
+ * symptom is that log space stops being reclaimed.  The commit that
+ * runs out of it then answers §2.6's `disk full' on a store whose
+ * disk is not full, which is the report an operator cannot act on.
+ * So the wire error keeps its prefix and carries the cause, and
+ * Storestat carries the stuck flag, the lifetime count of failed
+ * attempts and the last failure's text.
  *
- * Mutation: drop geomok's ndirty test, and the store below opens.
+ * Then the other half, on the SAME store rather than a restarted one
+ * — a restart clears the state by construction and asserts nothing.
+ * The device heals, a checkpoint succeeds, and a log filled the
+ * ordinary way from there is answered `disk full' and nothing else:
+ * the cure is what §6's wording is gated on, so the cured store's
+ * genuinely full log must not carry the old error.
+ *
+ * §13 drives the checkpointer by hand here (tcfg), which is what lets
+ * the second fill run with nothing checkpointing at all — a live
+ * checkpointer serves §6's request and the log would drain.
+ *
+ * Mutations: the refusal is the bare `disk full' again (mut
+ * bare-disk-full); a checkpoint that succeeds leaves the failure
+ * state standing (mut ck-never-clears).
  */
+static void
+tckfail(void)
+{
+	Dev *d;
+	Store *s;
+	Storecfg c;
+	Storestat st;
+	Super sb;
+	Sbsel sel;
+	uchar *buf, oid[Oidmax];
+	char err[ERRMAX];
+	uvlong nfail;
+	int i, n, nok;
+
+	d = newdisk();
+	tcfg(&c);
+	spawnforget();
+	if((s = storeopen(d, &c)) == nil){
+		fail("a store with a checkpointer: %r");
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(2*Blk, 91);
+	oidof(oid, "ck");
+	if(objcreate(s, oid, 2, 1, 1, nil, 0, nil) < 0)
+		fail("objcreate: %r");
+	if(objwrite(s, oid, 2, buf, 2*Blk, 0, 2, 1, nil, 0) < 0)
+		fail("objwrite: %r");
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+
+	/*
+	 * Armed AFTER a clean start, so the store is healthy and every
+	 * checkpoint from here on fails on its first extent-map write.
+	 */
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	sb = sel.sb[sel.start];
+	simfaultat(d, Sfeio, 0, (vlong)sb.emapoff*sb.secsz,
+		(vlong)sb.emapsecs*sb.secsz);
+
+	/* the log fills because the checkpoint cannot reclaim it */
+	n = -1;
+	nok = 0;
+	for(i = 0; i < 400; i++){
+		if(objwrite(s, oid, 2, buf, 2*Blk, 0, 3 + i, 1, nil, 0) < 0){
+			n = i;
+			break;
+		}
+		if(storecheckpoint(s) >= 0)
+			nok++;
+	}
+	eqv("no checkpoint succeeds over a refusing map region", nok, 0);
+	checks++;
+	if(n < 0)
+		fail("the log drained with every checkpoint failing");
+	else{
+		rerrstr(err, sizeof err);
+		istrue("the refusal keeps §2.6's prefix",
+			strncmp(err, "disk full", 9) == 0);
+		checks++;
+		if(strstr(err, "log full and the checkpoint fails: ") == nil)
+			fail("the refusal names the checkpoint: `%s'", err);
+	}
+	storestat(s, &st);
+	istrue("a failing checkpointer is counted", st.ckfailed > 0);
+	istrue("and it is what the store is stuck on", st.ckstuck != 0);
+	istrue("and what it said is kept", st.ckerr[0] != '\0');
+	istrue("a failed checkpoint does not condemn the store",
+		st.broken == 0);
+	istrue("and the log is what ran out", st.logfree < sb.logsecs/2);
+	nfail = st.ckfailed;
+
+	/* healed, the same store checkpoints and takes commits again */
+	simfault(d, Sfnone, 0);
+	checks++;
+	if(storecheckpoint(s) < 0)
+		fail("a healed device still refuses the checkpoint: %r");
+	storestat(s, &st);
+	eqv("a checkpoint that succeeds is no longer stuck", st.ckstuck, 0);
+	istrue("and takes the failure's text with it", st.ckerr[0] == '\0');
+	eqv("the lifetime count of attempts stands", st.ckfailed, nfail);
+	checks++;
+	if(objwrite(s, oid, 2, buf, 2*Blk, 0, 500, 1, nil, 0) < 0)
+		fail("a healed store still refuses commits: %r");
+
+	/*
+	 * And a log filled the ordinary way from there — nothing
+	 * checkpointing, nothing failing — is §2.6's bare refusal.
+	 */
+	n = -1;
+	for(i = 0; i < 400; i++)
+		if(objwrite(s, oid, 2, buf, 2*Blk, 0, 501 + i, 1, nil, 0) < 0){
+			n = i;
+			break;
+		}
+	checks++;
+	if(n < 0)
+		fail("the log did not fill with nothing checkpointing");
+	else{
+		rerrstr(err, sizeof err);
+		checks++;
+		if(strcmp(err, "disk full") != 0)
+			fail("a full log after a cured checkpoint is "
+				"answered `%s'", err);
+	}
+	storeclose(s);
+	free(buf);
+	devclose(d);
+}
+
+/*
+ * §2.8's wake-up condition, over a condemnation that lands while a
+ * checkpoint is running.  A page is counted dirty on its 0->1 edge
+ * only, so a page dirtied after its own pass has packed it keeps its
+ * mark and loses its count; zeroing the count at the checkpoint's end
+ * therefore drops it.  Everything else that dirties a page also puts
+ * a record in the log, which is ckdue's other trigger — storecondemn
+ * is the one that does not, so on a store doing nothing but reads the
+ * count is the only trigger there is, and a condemnation landing in
+ * that window would sit in memory until unrelated write traffic
+ * arrived.
+ *
+ * The schedule is made rather than waited for: a second proc asks for
+ * the checkpoint and the checkpointer is held at the flush that
+ * follows its page passes (§13's flush hook), so the read that
+ * condemns is certainly after the index page was packed and certainly
+ * before the checkpoint ends.  ckhigh is off, so the log cannot ask
+ * for the checkpoint that follows, and ckms is long enough that none
+ * can start before the hook is set.
+ *
+ * Mutation: the count is zeroed at a checkpoint's end (mut
+ * ckend-zeroes-dirty), and nothing writes the condemnation down.
+ */
+typedef struct Ckask Ckask;
+struct Ckask
+{
+	Store	*s;
+	int	done;
+	int	err;
+};
+
+static void
+ckaskproc(void *a)
+{
+	Ckask *k;
+
+	k = a;
+	k->err = storecheckpoint(k->s) < 0;
+	k->done = 1;
+}
+
+/* wait for a write into [lo, hi) since the last trace reset */
+static int
+sawwrite(Dev *d, vlong lo, vlong hi, int ms)
+{
+	Simop *t;
+	long i, n;
+	int j;
+
+	for(j = 0; j < ms; j++){
+		n = simtrace(d, &t);
+		for(i = 0; i < n; i++)
+			if(t[i].op == Sopwrite && t[i].off >= lo
+			&& t[i].off < hi)
+				return 1;
+		sleep(1);
+	}
+	return 0;
+}
+
+static void
+tckdirty(void)
+{
+	Dev *d;
+	Store *s;
+	Storecfg c;
+	Storestat st;
+	Ckask *k;
+	Super sb;
+	Sbsel sel;
+	uchar *buf, oid[Oidmax], rd[64], junk[8];
+	vlong lo, hi;
+	int j;
+
+	d = newdisk();
+	if((s = mustopen(d, "a condemnation during a checkpoint")) == nil){
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(3*Blk, 93);
+	oidof(oid, "w");
+	if(objcreate(s, oid, 1, 1, 1, nil, 0, nil) < 0)
+		fail("objcreate w: %r");
+	if(objwrite(s, oid, 1, buf, 3*Blk, 0, 2, 1, nil, 0) < 0)
+		fail("objwrite w: %r");
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	storeclose(s);
+
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	sb = sel.sb[sel.start];
+	lo = (vlong)sb.idxoff*sb.secsz;
+	hi = lo + (vlong)sb.idxsecs*sb.secsz;
+	memset(junk, 0xa5, sizeof junk);
+	simpoke(d, emapentoff(&sb, 1) + sb.emapsz - sizeof junk, junk,
+		sizeof junk);
+
+	tcfg(&c);
+	c.nockptproc = 0;
+	c.ckhigh = 0;
+	c.ckms = 500;
+	spawnforget();
+	if((s = storeopen(d, &c)) == nil){
+		fail("a store with a checkpointer: %r");
+		free(buf);
+		devclose(d);
+		return;
+	}
+	storestat(s, &st);
+	eqv("the damaged map is not read at start", st.nlost, 0);
+	oidof(oid, "x");
+	if(objcreate(s, oid, 1, 1, 1, nil, 0, nil) < 0)
+		fail("objcreate x: %r");
+	if(objwrite(s, oid, 1, buf, 64, 0, 2, 1, nil, 0) < 0)
+		fail("objwrite x: %r");
+
+	/* held at the page passes' flush, which is the first from here */
+	storehook(s, "flush", 1);
+	simtracereset(d);
+	/*
+	 * §7 rule 3: an RFMEM proc shares the data and bss segments and
+	 * not the stack, and every proc's stack is at the same address,
+	 * so a structure two procs share is the store's kind of memory
+	 * or the heap — never a caller's local.
+	 */
+	if((k = mallocz(sizeof *k, 1)) == nil)
+		sysfatal("malloc: %r");
+	k->s = s;
+	if(spawnproc(ckaskproc, k) < 0)
+		fail("spawn: %r");
+	istrue("the held checkpoint wrote its index page",
+		sawwrite(d, lo, hi, 4000));
+
+	/* §5 step 10, from a read, with no record behind it */
+	oidof(oid, "w");
+	checks++;
+	if(objread(s, oid, 1, rd, sizeof rd, 0) >= 0)
+		fail("a damaged extent map was served");
+	storestat(s, &st);
+	eqv("the read condemned the slot", st.nlost, 1);
+
+	storehook(s, "flush", 0);		/* the checkpoint completes */
+	for(j = 0; j < 4000 && !k->done; j++)
+		sleep(1);
+	istrue("and the checkpoint it was in completed", k->done && !k->err);
+
+	/*
+	 * Nothing else is dirty and nothing else is written, so the next
+	 * checkpoint runs only if the condemnation is still counted.
+	 */
+	simtracereset(d);
+	istrue("a later checkpoint writes the condemnation down",
+		sawwrite(d, lo, hi, 4000));
+	storeclose(s);
+
+	if((s = mustopen(d, "a condemnation the checkpointer wrote")) != nil){
+		storestat(s, &st);
+		eqv("and the restart lists the slot", st.nlost, 1);
+		storeclose(s);
+	}
+	free(k);
+	free(buf);
+	devclose(d);
+}
+
 static void
 tnodirty(void)
 {
@@ -1625,7 +2004,9 @@ main(int argc, char **argv)
 	tlogread();
 	treplayapply();
 	treclaimfault();
-	tpostreclaim();
+	treplaymaps();
+	tckfail();
+	tckdirty();
 	tnodirty();
 	tdirtyfull();
 	tdirtytie(0);

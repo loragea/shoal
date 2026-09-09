@@ -221,6 +221,42 @@ freedirt(uchar *p)
 	dirtpack(p, &e);
 }
 
+/*
+ * How many pages are dirty right now, counted rather than tracked.
+ * A checkpoint's end cannot simply zero the count: idxdirty and its
+ * three siblings raise it only on a page's 0->1 edge, so a page
+ * dirtied WHILE the checkpoint ran — after its own pass packed it and
+ * cleared its mark — keeps the mark and would lose its count.  Almost
+ * everything that dirties a page also puts a record in the log, and
+ * ckdue's other trigger picks that up; storecondemn (§5 step 10) is
+ * the one thing that dirties an index page without writing a byte to
+ * the log, so on a store doing nothing but reads this count is
+ * ckdue's only trigger and a condemnation landing in that window
+ * would wait for unrelated write traffic to be written down.
+ *
+ * Under qlstate.
+ */
+static uvlong
+dirtypages(Store *s)
+{
+	Emape *c;
+	uvlong i, n;
+
+	n = 0;
+	for(i = 0; i < s->nidxpage; i++)
+		if(s->idxdirty[i])
+			n++;
+	for(i = 0; i < s->ndirtpage; i++)
+		if(s->dirtdirty[i])
+			n++;
+	for(i = 0; i < s->nbmpage; i++)
+		if(s->bmdirty[i])
+			n++;
+	for(c = s->edirty; c != nil; c = c->dnext)
+		n++;
+	return n;
+}
+
 int
 checkpoint(Store *s)
 {
@@ -423,9 +459,47 @@ checkpoint(Store *s)
 	rwakeupall(&s->roomrz);
 	qunlock(&s->qllog);
 	qlock(&s->qlstate);
-	s->ndirtypage = 0;
+	s->ndirtypage = dirtypages(s);
 	qunlock(&s->qlstate);
 	return 0;
+}
+
+/*
+ * Run one checkpoint, keeping what it said if it failed.  Nothing a
+ * client does reports a checkpoint failure -- the commit path only
+ * sees the log not being reclaimed -- so what is kept here is where
+ * §6's refusal and Storestat get it from.  A failed checkpoint does
+ * NOT condemn the store: §3.2's broken flag is for a failed LOG write,
+ * where committed state is already gone; here the state is still in
+ * the log and a later checkpoint over a healed device materialises
+ * it.
+ *
+ * That healing is why a SUCCESS clears ckstuck and the text: §6's
+ * refusal has to tell a log that will not drain from one that is
+ * merely full, and a flag that only ever rises cannot.  ckfailed is
+ * the lifetime statistic and is not cleared -- it counts ATTEMPTS,
+ * and a store whose checkpoints fail re-attempts every Cktickms, so
+ * it is a rate of retrying and not a count of distinct outages.
+ */
+static int
+ckrun(Store *s)
+{
+	char e[ERRMAX];
+	int r;
+
+	if((r = checkpoint(s)) < 0)
+		rerrstr(e, sizeof e);
+	qlock(&s->cklk);
+	if(r < 0){
+		s->ckfailed++;
+		s->ckstuck = 1;
+		strecpy(s->ckerrstr, s->ckerrstr + sizeof s->ckerrstr, e);
+	}else{
+		s->ckstuck = 0;
+		s->ckerrstr[0] = '\0';
+	}
+	qunlock(&s->cklk);
+	return r;
 }
 
 /*
@@ -481,10 +555,10 @@ ckptproc(void *a)
 		req = s->ckreq;
 		s->ckbusy = 1;
 		qunlock(&s->cklk);
-		r = checkpoint(s);
+		r = ckrun(s);
 		qlock(&s->cklk);
 		s->ckbusy = 0;
-		s->ckerr = r;
+		s->ckret = r;
 		if(req > s->ckdone)
 			s->ckdone = req;
 		s->cklast = nsec();
@@ -507,7 +581,7 @@ storecheckpoint(Store *s)
 			rsleep(&s->ckrz);
 		s->ckbusy = 1;
 		qunlock(&s->cklk);
-		r = checkpoint(s);
+		r = ckrun(s);
 		qlock(&s->cklk);
 		s->ckbusy = 0;
 		s->cklast = nsec();
@@ -519,7 +593,7 @@ storecheckpoint(Store *s)
 	gen = ++s->ckreq;
 	while(s->ckdone < gen)
 		rsleep(&s->ckrz);
-	r = s->ckerr;
+	r = s->ckret;
 	qunlock(&s->cklk);
 	return r;
 }

@@ -1084,6 +1084,27 @@ The new `ckseq`/`cklogoff` become publishable only after step 2's
 flush has returned (§2.2), so a publish triggered by anything else
 mid-checkpoint carries the old mark.
 
+**A checkpoint that fails is counted and named.** A failing
+checkpoint does **not** condemn the store: §3.2's condemnation is for
+a failed *log* write, where committed state is already gone, while
+here the state is still in the log and a later checkpoint over a
+healed device materialises it. But it is also invisible from every
+other angle — no client operation fails, and the only symptom is that
+log space stops being reclaimed, which arrives at the operator as
+§6's `disk full` on a store whose disk is not full. So the store
+keeps a **stuck** flag — the last checkpoint failed and none has
+succeeded since — together with that failure's text, reports both in
+its statistics beside a lifetime count of failed attempts, and §6's
+refusal for log space carries the cause **while the flag is set**.
+
+A checkpoint that succeeds clears the flag and the text: a device
+that heals is the expected end of a failure (above), and a store
+whose log then fills for the ordinary reason must be answered §2.6's
+bare `disk full` rather than an error it has recovered from. The
+count is not cleared, and it counts *attempts*: a stuck store
+re-attempts on every checkpoint tick, so it reports a rate of
+retrying rather than a number of distinct outages.
+
 Its cost is therefore proportional to the state dirtied since the
 last checkpoint and to nothing else, which is what lets §6 put a
 number on how long a commit may wait for log space.
@@ -1110,6 +1131,19 @@ full) and every `ckms` (default 30000) if anything is dirty — both
 policy, both tunable without a format change. A quarter rather than a
 half because the checkpointer's job is to keep the log from ever
 being full, and starting earlier is what keeps §6's wait rare.
+
+*Anything dirty* is **recounted at the end of each checkpoint that
+completes, and never zeroed** — a checkpoint that fails returns before
+the recount and keeps its pre-checkpoint count, which over-counts and
+so cannot lose the trigger.
+A page's count is raised on its clean-to-dirty edge only, so a page
+dirtied while a checkpoint runs — after that checkpoint's own pass
+packed it and cleared its mark — keeps the mark and would lose the
+count. Almost everything that dirties a page also writes a record, so
+the log trigger covers it; §5 step 10's condemnation is the exception,
+being the one thing that dirties an index page without writing a byte
+to the log, and on a store doing nothing but reads the dirty count is
+then the only trigger there is.
 
 ## 3. Write path
 
@@ -1461,15 +1495,27 @@ time of the last chunk. It is owned by the fid.
   whose `corrupt` flag is set (§8): it contributes no key at all
   (layer-a §1.3, and D14's rule in §5.5), so a holder that committed
   `(E, ver+1)` and then lost the content takes the serving primary's
-  repair at the lower `(E, ver)`. The push does not clear the flag —
-  §8 clears it from the verify that finds every block matching again.
+  repair at the lower `(E, ver)`. **The commit clears the flag**: its
+  blocks are the ones the transfer's own checks passed, so the verify
+  that would run next finds every block matching by construction, and
+  a flag left set would keep a whole copy out of arbitration — and
+  keep it accepting a push at any key — until the scrubber's next
+  pass, which is days (§8). The exemption ends with the push that
+  used it, so a second push at a lower key is refused `stale version`
+  like any other.
   A slot §5 step 10 condemned for a damaged extent map is the same
   case, reached the other way: it carries `corrupt` too, and the push
   is taken at any key. It rebuilds the map whole in a fresh
   extent-map slot (§2.7's slot rule), in the index slot and at the
   `qid.path` the object already had, and the grains the damaged entry
-  named are unrecoverable and stay marked used until that slot is
-  written again.
+  named are unrecoverable and stay marked used until a bitmap rebuild
+  (§2.5, `shoalck -R`): writing the slot again does not reclaim them,
+  because the rebuild is what recomputes the bitmap from the maps that
+  are left. The rebuild does not depend on some earlier read
+  having found the damage: a `final=1` that reads the map and finds
+  it damaged condemns the slot and rebuilds it in the same call,
+  because a repair that worked only for a slot condemned since the
+  last restart is not a repair.
 
   A **count-0 write** is not one of these and is not an extend
   either: layer-a §2.4 extends at a write *at* an offset above `len`,
@@ -1552,7 +1598,7 @@ own `not primary: n5.0` is the pattern. Callers can act on these:
 | a write, truncate or stage past `objmax`, at either bound | `object too large` |
 | an `op=full` at a key the receiver's own key defends (§3.6) | `stale version` |
 | an `op=full` at a version the object model forbids, and a chunk outside its stage's declared length | `bad ctl` |
-| a read, verify or update through an extent-map entry that failed its `csum128` (§5 step 9) | `checksum mismatch` |
+| a read, verify or update through an extent-map entry that failed its `csum128` (§5 step 9) — block repair excepted, below; a read, write or truncate of a copy whose `corrupt` flag is set (§8); a block repair whose bytes do not hash to the stored `dig[i]` | `checksum mismatch` |
 | a discard whose record fails layer-a §1.5's receiver checks: not a tombstone, not at exactly the named key, or its `wepoch` not strictly below the given epoch | `not discardable` |
 | no grain, index slot, extent-map slot, staged-grain budget, or log space after §6's bounded wait | `disk full` |
 
@@ -1565,7 +1611,14 @@ tombstone's plus one or a `wepoch` below the tombstone's — on a path
 whose version this instance chooses (create,
 write, truncate, delete), a
 failed allocation, a chunk or `final=1` on a stage the idle sweep has
-expired (§3.6), a device error carried out of the commit path, a
+expired (§3.6), a block repair asked for on an object whose digest
+array fails its `csum` or through an extent-map entry that failed its
+own `csum128`, at a block the object does not have, at a count that is
+not that block's covered length, or at a block whose bytes already
+hash to their stored digest — a block whose grain the device refuses
+to read is repaired rather than refused (§8), a slot cursor's
+index outside `nslots`, a device error carried out of the commit
+path, a
 geometry that does not check out at start, and the two condemnations
 — the `broken` store of §3.2 and the store whose apply failed after
 its record was durable. **None of these begins with a §2.6 prefix**,
@@ -1604,7 +1657,19 @@ them obvious:
   verification, or a replicated op's resulting `csum` does not match
   the sender's"; an extent-map entry that fails its own `csum128` is
   content that failed verification, and D14 requires such a holder to
-  say so rather than to answer as though the object were absent.
+  say so rather than to answer as though the object were absent. A
+  copy whose `corrupt` flag is set is that same statement made
+  durably, so client access to it is answered the same way (§8), a
+  count-0 write included — it commits nothing, but answering it `ok`
+  is client access served. The other block-repair refusals are
+  deliberately *not* this one: a repair asked for on an object whose
+  digest array does not hash to its `csum`, or through an extent-map
+  entry that failed its own `csum128`, is a caller that ignored §8's
+  two kinds of mismatch. Those are one condition told two ways — in
+  both, the stored `dig[i]` is not an acceptance test and the repair
+  is `op=full` — so they are spelled as one family of
+  internal-invariant error, `block repair: slot N: …`, rather than
+  splitting on which structure carried the damage.
 
 ## 4. Read path, holes and re-hashing
 
@@ -1752,7 +1817,23 @@ lose arbitration against everything including absence.
    `Oslot` zeroes the target map before its blocks are set,
    this dirty record exists or is gone — so replay is idempotent and
    a partially checkpointed region is corrected by it. Replay uses
-   the apply function the commit path uses (§3.2).
+   the apply function the commit path uses (§3.2). Replay ends by
+   writing back the extent-map entries the applied records dirtied,
+   and a log naming more maps than the cache holds is written back
+   mid-replay as well, so that replay's footprint is a function of
+   the cache and not of the log. Both are safe because start-up is
+   single-proc and `cklogoff` has not moved, so the records behind
+   those bytes are still in the log; and the closing one is what
+   makes a device error under the extent-map region a refusal of the
+   *start*, named there, rather than a store that opens and whose
+   every checkpoint then fails behind it. A store opened read-only
+   (§12) can write nothing at all: it skips the closing write-back
+   and holds the maps in the cache for the checkpoint a later
+   writable open makes, exactly as a live commit's are held, and a
+   read-only replay that fills the cache refuses naming *that*
+   rather than letting the device answer with a bare write refusal.
+   Neither refusal is log damage, so neither carries the remedy for
+   it.
 8. Check replay coverage. The greater of the superblock's `ckseq`
    (step 2) and the highest `seq` replay applied MUST be ≥ `Pmax`
    from step 5; if it is not, the log no longer covers state the
@@ -1792,10 +1873,15 @@ lose arbitration against everything including absence.
     for a damaged extent map is intact, and is written back as it
     stands: its slot stays allocated across a restart, the grains the
     object holds stay accounted for, and the object keeps its oid, its
-    key and its `qid.path`. Its `/lost` line is not restored at start,
-    because step 9 reads only the entries replay touched; the next
-    read of the object re-establishes it by the same rule that found
-    the damage. Such a slot also stays **hashed**, and takes the
+    key and its `qid.path`. Its `/lost` line is restored at start from
+    the entry's own `corrupt` flag, which the checkpoint wrote back
+    with it — `/lost` is every copy that fails local verification
+    (§8), so a copy the store has already condemned is on it whether
+    or not this run has read the damaged map. What start-up does not
+    do is *re-establish the damage*: step 9 reads only the entries
+    replay touched, so the extent map is judged again at the next read
+    of the object, by the same rule that found it the first time.
+    Such a slot also stays **hashed**, and takes the
     index entry's `corrupt` flag: what "not served" means for it is
     that nothing reads through the damaged map — content reads,
     verifies and every update but §5.5's `op=full` refuse — while
@@ -1803,9 +1889,11 @@ lose arbitration against everything including absence.
     what D14 requires of a holder that cannot vouch for its copy and
     therefore MUST NOT answer as absent. The flag is written back with
     the entry, so a restart still knows the copy is not to be trusted.
-    An `op=full` that heals it (§3.6) drops it from `/lost`; the
-    `corrupt` flag survives the push, as it does for every other
-    receiver §3.6 names, and it is §8's verify that clears it. The line carries `slot=<n>`
+    An `op=full` that heals it (§3.6) drops it from `/lost` and
+    clears the `corrupt` flag with it, as it does for every other
+    receiver §3.6 names: the pushed content is what the transfer's
+    own checks passed, so there is nothing left for the flag to
+    describe (§8). The line carries `slot=<n>`
     and **omits `oid=`**, rather than printing 128 bytes the store
     does not trust or inventing an oid layer-a §1.2's grammar would
     not admit; §14(15) records the deviation from layer-a §2.2's
@@ -1889,6 +1977,12 @@ that freed it is durable (§3.5).
 delete time — the `Eobj` that sets `state=tomb` carries `len=0`,
 `nmap` empty, `nfree` naming every grain the object held, and
 `emapslot=0`, so the extent-map slot is released with the content.
+A slot §5 step 10 condemned is the exception, and it is the point of
+allowing the delete at all: the entry that named its grains is the
+damaged bytes, so the delete reads no map and its `nfree` names
+**nothing**. The extent-map slot is still released and the tombstone
+is still clean; the grains come back at a bitmap rebuild and not
+before (§3.6, §8, §12).
 What survives is the 256-byte index entry. Layer-a §1.5's discard,
 once its three cluster-wide conditions hold, commits an `Eslot` and
 the slot returns to the free list. The discard names the tombstone's
@@ -1920,7 +2014,14 @@ the entry's `mtime`, which is why the tombstone keeps one.
   `/status` reports `grainfree=`, `slotfree=` and `emapfree=`
   separately and why the tools print all three.
 - *No free log space*: the commit **waits** for the checkpointer,
-  and then answers `disk full`.
+  and then answers `disk full`. If the **last** checkpoint failed
+  (§2.8) the log will not drain at all, and the disk may be nearly
+  empty, so that refusal names the cause behind the wire error:
+  `disk full: log full and the checkpoint fails: <error>`. A failure
+  a later checkpoint has cured does not: the store's log drains
+  again, and this refusal is then the ordinary one.
+  Layer-a §2.6's prefix is what the client matches on and does not
+  move; what follows it is for the operator reading the log.
 
 **The log's reserved tail.** The last `logresv` sectors of free log
 space (policy, default one sixteenth of `logsecs`) are usable only by
@@ -2055,7 +2156,7 @@ nothing is ever taken under them.
 | Lock | Covers |
 |---|---|
 | the flush lock | the coalescing flusher's ticket counters (§3.2): who is issuing the one device flush and who is waiting for it |
-| the checkpoint lock | the checkpointer's request and completion counters, and its wake-up. The checkpoint itself runs with it released |
+| the checkpoint lock | the checkpointer's request and completion counters, its wake-up, and the failure state a checkpoint leaves behind (§2.8): the stuck flag, the count of failed attempts and the last failure's text, which §6's refusal reads under it. The checkpoint itself runs with it released |
 | the proc lock | the count of procs the store has started, so `storeclose` can wait for them |
 
 Three rules make that discipline checkable rather than aspirational:
@@ -2251,7 +2352,9 @@ makes partial repair possible. A hole is verified against the zero
 digest without reading anything. Cost at `objmax`: 16 MiB of reads
 (~200 ms) and 16 MiB of hashing (~290 ms), no writes — half a second,
 and **hash-bound rather than read-bound**, which is what bounds the
-`verify` ctl verb and `op=verify` on `/rpc`.
+`verify` ctl verb and `op=verify` on `/rpc`. Verify commits nothing:
+it is also what `op=verify` and `shoalck -v` answer with, and neither
+may write.
 
 **Two kinds of mismatch, and they need different repairs.** Verify
 answers three states, not two, and the material to tell them apart is
@@ -2275,29 +2378,109 @@ already there:
   block.
 - Both consistent: the object verifies.
 
-**Scrub runs inside the queues.** A background proc walks slots in
-order, but it does not read grains itself: for each object it pushes
-one verify request onto that object's `Reqqueue` and waits for the
-answer, exactly as a client read would, and the repair commits below
-go the same way. The queue is the store's only object-level
-serialisation, and §3.5 defers a freed grain's reuse only until the
-freeing commit's flush returns — which says nothing about a reader
-that started earlier. A scrubber reading outside the queue would
-therefore hit grains freed, reallocated and staged into under it, and
-would durably flag a live, correct object `corrupt`: a background
-consistency checker that manufactures corruption is worse than none.
-One object per push keeps the pause it imposes on a client to one
-object's verify, and it rate-limits itself to the configured KiB/s so
-a full pass takes about `scrubdays`. At layer-a §7.5's ~4 MiB/s on a
-4 TB disk that is ~7% of one CPU spent hashing, continuously, which
-is worth knowing on a two-vCPU node that also runs the write path.
-On mismatch it sets the index entry's `corrupt` flag — durably, via
-an `Eobj` that changes nothing else but its `Ocorrupt` bit (§2.7), so
-a restart does not forget —
-lists the object in `/lost`, and fails client access with
-`checksum mismatch`. A corrupt
-copy loses arbitration against everything including absence (layer-a
-§1.3), which the server enforces by refusing to advertise it.
+**What the engine builds, and what the server still owes.** The
+engine holds the per-object primitives and the durable state; the
+pass that drives them — the proc, its rate limit, the queue it pushes
+through and the peer fetch — is the server's, and is not built yet
+(wave 1d). The primitives are:
+
+- **verify** one object, as above, mutating nothing.
+- **scrub** one object: verify, then the one durable transition that
+  verdict licenses. A mismatch on a copy the index calls whole sets
+  the `corrupt` flag; every block matching on a copy the index calls
+  corrupt clears it; an unchanged verdict commits nothing, because a
+  scrubber that wrote a record per object per pass would put the
+  whole disk through the log every `scrubdays`. It answers the same
+  three states verify does, because which repair to ask for is what
+  they say.
+- **block repair** of one block, given the bytes a caller fetched
+  from a holder at the same key. It refuses unless `hash(dig[]) ==
+  csum` — the acceptance test's own precondition, and a caller that
+  asks here for an object whose array fails is a server bug, so that
+  refusal is §3.7's internal kind and carries no §2.6 prefix. A slot
+  §5 step 10 condemned is the same condition reached the other way,
+  since the entry naming the block's grain and digest is itself the
+  damage, and is refused in the same internal words. It then accepts
+  the bytes only against the stored `dig[i]`, answering `checksum
+  mismatch` if they do not hash to it, and refuses — internally again
+  — a block whose *own* bytes already hash to that digest: repair is
+  driven by the set verify answers, and a block outside that set is
+  whole, so the commit would change nothing, cost a grain, and, where
+  the block is a hole (§4), leave the object one grain heavier with
+  the same content. A grain the device will not **read** is not that
+  case and does not refuse: the offered bytes have already passed the
+  acceptance test, the read was only ever asking whether the repair
+  was needed, and a grain that cannot be read is the plainest case of
+  its being needed. On acceptance one `Eobj` publishes the block with
+  the four-tuple unchanged, freeing the grain it replaced under §3.5
+  like any other commit. It does **not** clear the flag: one block
+  matching says nothing about the others, and the clearing belongs to
+  the verify that finds every block matching.
+- **a slot cursor**, so a pass can walk the index in order. It
+  answers what one slot holds — live or tomb, the oid and the
+  four-tuple — and copies the oid out, because the entry's own copy
+  is freed by the apply of a commit that releases the slot. It holds
+  the state lock for that copy and not across the caller's verify.
+  What it answers is a snapshot of a slot and not a lease on it, so
+  every call the caller then makes names the oid rather than the
+  slot.
+
+**The `corrupt` flag, and what a flagged copy answers.** The flag is
+durable — an `Eobj` that changes nothing else but its `Ocorrupt` bit
+(§2.7), so a restart does not forget it — and the object is listed in
+`/lost`, together with every slot §5 step 10 condemned: `/lost` is
+every copy this instance holds that fails local verification, which
+is layer-a §7.5's definition of it, and it is maintained by the set,
+the clear, the condemnation and start-up alike rather than built
+once.
+
+A flagged copy fails client access with `checksum mismatch` (§3.7's
+row): read, write and truncate refuse, and so does a write of zero
+bytes, which commits nothing but is client access all the same. Three
+calls do not refuse, and each is how the flag is meant to be got rid
+of: `objstat`, because that is where the flag is read; verify and
+scrub, because they are what clears it; and **delete**, because
+`op=delete` is self-contained — it arbitrates on the key it carries
+and replaces the content with none — so there is nothing left for the
+flag to defend, and the tombstone it commits holds no content to be
+suspect of and so carries the flag cleared. A create over a live
+flagged copy is still `object exists`. A slot §5 step 10 condemned is
+in the delete's set for the same reason and by the same rule: a
+delete arbitrates on the key it carries, and a copy that fails local
+verification has none to defend. The grains its damaged map named are
+unrecoverable whichever way the delete goes — refusing does not
+reclaim them, since §5 step 11's rebuild re-marks whatever a live
+entry's map still says (§3.6) — and refusing costs the object its
+only exit: `op=full` is a condemned copy's other repair, and an
+object being deleted cluster-wide has no live copy left to push one,
+so layer-a §1.5's tombstone discard would wait on this witness
+forever. The tombstone releases the extent-map slot, so the next
+bitmap rebuild (§2.5, `shoalck -R`) returns the grains.
+
+A corrupt copy loses arbitration against everything including absence
+(layer-a §1.3), which the server enforces by refusing to advertise
+it.
+
+**Scrub runs inside the queues.** *This is the half wave 1d builds.*
+A background proc walks slots in order, but it does not read grains
+itself: for each object it pushes one verify request onto that
+object's `Reqqueue` and waits for the answer, exactly as a client
+read would, and the repair commits below go the same way. The queue
+is the store's only object-level serialisation, and §3.5 defers a
+freed grain's reuse only until the freeing commit's flush returns —
+which says nothing about a reader that started earlier. A scrubber
+reading outside the queue would therefore hit grains freed,
+reallocated and staged into under it, and would durably flag a live,
+correct object `corrupt`: a background consistency checker that
+manufactures corruption is worse than none. One object per push keeps
+the pause it imposes on a client to one object's verify, and it
+rate-limits itself to the configured KiB/s so a full pass takes about
+`scrubdays`. At layer-a §7.5's ~4 MiB/s on a 4 TB disk that is ~7% of
+one CPU spent hashing, continuously, which is worth knowing on a
+two-vCPU node that also runs the write path. The engine's own calls
+make that discipline available rather than enforce it: each is one
+object's worth of work, serialised by the caller exactly as every
+other call in §7 is.
 
 **What a corrupt object answers to `op=meta`.** No available answer
 is right: reporting the key claims an arbitration position layer-a
@@ -2315,15 +2498,25 @@ ordinary `meta` line for the key it holds with **`corrupt=1`
 appended**, which is the grammar layer-a §5.6 defines. shoal's own
 callers honour that rule: the response satisfies the currency check
 and contributes no key, so it loses arbitration against everything
-including absence.
+including absence. *The `/rpc` surface that carries it is the
+server's and is not built yet; what the engine answers is the flag,
+through `objstat` and the cursor.*
 
 **The repair path.** Because the check completes, the object has a
 serving primary again, and that primary does what layer-a §1.3
 prescribes for a holder whose key already equals its own: it pushes
 `op=full force=1` at an equal key to the corrupt holder, replacing
-the whole object without bumping the key. The holder's next verify
-finds every block matching, clears the `corrupt` flag with a
-key-preserving `Eobj`, and the object leaves `/lost`. If the corrupt
+the whole object without bumping the key. **That commit clears the
+flag**, and the object leaves `/lost` with it. Every block the commit
+names was staged from bytes checked against the sender's `dcsum` and
+the whole against its `csum` (layer-a §5.5), and the digests were
+computed here from those same bytes, so the verify that would run
+next finds every block matching by construction: there is nothing
+left for the flag to describe. Leaving it set until a scrub came
+round would keep a copy that is now whole out of arbitration for as
+long as a full pass takes — `scrubdays`, days — and, because a copy
+with no key to defend takes a push at any key (§3.6), would go on
+accepting a *lower*-keyed push for exactly as long. If the corrupt
 copy is the only copy, nothing repairs it and layer-a §7.5's `object
 lost` is the honest outcome.
 
@@ -2337,9 +2530,9 @@ whose own copy fails local verification treats it as absent for the
 comparison and takes the push at any key (D14). §3.6's `final=1`
 comparison is where the exemption lives and it applies it: a stage
 committed against a copy whose `corrupt` flag is set is not compared
-at all. The flag survives the push, so the object stays out of
-arbitration until a verify finds every block matching and clears it
-with the key-preserving `Eobj` above.
+at all. Because the commit clears the flag, the exemption ends with
+the push that used it, and the next push is compared like any other —
+a second one at a lower key is refused `stale version`.
 
 A commit that does not advance the key is a first-class case in this
 store, and there are three of them: block repair, whole-object
@@ -2705,14 +2898,16 @@ unit: that unit is the device's property and `blksz` is the format's
 (§0, §2.1). `-w` is §3.2's operator assertion, which is what lets it
 format a unit whose raw channel it cannot open.
 
-**`shoalck`** — inspect and check. It reads and never writes, and
-opens the device read-only so the kernel enforces that rather than
-the code promising it — which also lets it run against a disk its
-user may only read. It opens no raw channel, so it reports the
-device's flush channel as *not examined* rather than claiming the
-operator asserted write-through.
+**`shoalck`** — inspect and check. Every flag but `-R` reads and
+never writes, and the device is then opened read-only so the kernel
+enforces that rather than the code promising it — which also lets it
+run against a disk its user may only read. Such a run opens no raw
+channel, so on an sd unit it reports the device's flush channel as
+*not examined* rather than claiming the operator asserted
+write-through. A file image has no flush channel to examine at all
+and is reported as *none*, read-only or not.
 
-    shoalck [-lq] [-o oid] /dev/sdXX/name
+    shoalck [-lqvRw] [-o oid] /dev/sdXX/name
 
 Default: print both superblocks and which one §2.2's three clauses
 select, which copy the next update would write and under which
@@ -2727,11 +2922,88 @@ inconsistency. `-l` dumps the log records and their entries; a second
 `-l` dumps each `Eobj`'s block map. `-q` prints the problems and
 nothing else. `-o` dumps one object's index entry and extent map.
 
-**Not built yet.** `-v`, which verifies every object's content
-against its digests — an offline scrub — and `-R`, which rebuilds the
-free-grain bitmap from the live maps and rewrites the checkpoint, the
-offline form of §5 step 11's automatic rebuild. Both wait on the
-write path they check.
+**`-v` and `-R` work on the replayed state, and every pass above
+works on the checkpoint.** The difference is not a refinement. §2.8
+makes the log the durable authority for everything since `ckseq`, and
+§3.5 defers a released grain's reuse only until the freeing commit's
+flush has returned — so a grain freed by a committed-but-not-
+checkpointed record may already hold another object's bytes.
+Verifying an object against the checkpointed index would read those
+bytes and report a mismatch on an object that is perfectly well; a
+bitmap rebuilt from the checkpointed index would clear grains the log
+has since handed out, and the checkpoint `-R` writes publishes a
+`ckseq` past the records that would have corrected it. So both flags
+replay the log first. `storeopen` with no `spawn` callback and no
+checkpointer proc is that replay and nothing else: the engine makes
+no proc and commits are synchronous in the caller. Every flag but
+`-R` opens the device **read-only**, and such a run writes nothing at
+all: §5 step 11's rebuild only marks pages dirty, and replay holds
+the extent maps it applied in the cache instead of writing them back,
+exactly as a live commit's are held. There is then no durability to
+assert and no raw channel to want, and the flush mode stays as the
+device reported it. `-R` takes the read-write open `shoalfmt` takes,
+and there replay's closing write-back runs (§5 step 7), so a device
+error under the extent-map region refuses the start and says so;
+`storecheckpoint` is the write `-R` is for. The one thing a read-only
+replay cannot do is spill the extent-map cache — §5 step 7's in-loop
+write-back is how a log naming more maps than the cache holds gets
+through — so a read-only replay that fills the cache is refused
+naming *that*, and not as the bare write refusal the device would
+answer with. Neither refusal is the log's damage, so neither is
+wrapped in the remedy for that; the way past a full read-only cache
+is a writable open, whose checkpoint materialises the maps, or a
+larger cache.
+
+**`-v`** verifies every object's content against its digests — §8's
+verify, offline, over every slot rather than over one object. For
+each live object it reports the mismatching block indices, whether
+the digest array itself is suspect (`arraybad`), and whether the
+entry is flagged `corrupt`; an object that fails is a problem and the
+exit is non-zero. A tombstone holds no content, so it verifies
+vacuously and is counted rather than read. An object that is flagged
+`corrupt` and verifies clean is reported as information and not as a
+problem: the flag is durable and it is §8's online scrub that clears
+it, with a key-preserving `Eobj` this tool does not write. `-q`
+prints the problems and nothing else.
+
+**`-R`** rebuilds the free-grain bitmap from the live maps and
+rewrites the checkpoint — the offline form of §5 step 11's automatic
+rebuild. A page that fails its checksum is already rebuilt at every
+start (§2.5); `-R` is for the page that is **valid and wrong**, which
+no start repairs, and for the operator who wants the scan done now
+rather than at the next one. It prints how many grains the on-disk
+bitmap left free and how many the rebuild leaves, so what changed is
+visible — the first of those numbers comes from the checker's own
+bitmap pass, so it is printed only when every bitmap page was read
+and passed its checksum, and otherwise the line says how many pages
+did not read **or** did not pass their checksum — both are counted,
+and a page that reads cleanly and fails its checksum is the commoner
+— and gives no number. It reports `bmaprebuild` and any
+refusal from the store in the store's own words. An extent-map entry
+that fails its own `csum128` is not rebuilt from: every grain number
+in it is the damaged bytes', so §5 step 10 condemns the slot and the
+rebuild skips its map. The **slot** stays out of the allocator —
+`completemaps` counts a condemned slot as used — but the **grains**
+the damaged map named are not marked and so return to the free set,
+because nothing knows which they were. That is safe and it is the
+only answer available: the copy is unrecoverable (§3.6, D14), the
+grains it held are named by no readable structure, and holding an
+unknown set of grains out of the allocator for ever would leak the
+disk instead. Until such a rebuild runs they stay marked from the
+bitmap as it was found, which is what §3.6 means by a condemned
+copy's grains staying marked used until a rebuild. It opens the device read-write — the open
+`shoalfmt` takes, with the flush channel, and `-w` as §3.2's operator
+assertion for a unit whose raw channel will not open — so `-w`
+without `-R` is refused rather than ignored. `-R` with `-v` rebuilds
+first and then verifies. `-R` with `-o` is refused: `-o` dumps one
+object, and a rebuild driven from one object's map would clear every
+grain the rest of the store holds. The passes above run first and
+report the bitmap they found, so a `-R` run that repairs a wrong
+bitmap still exits non-zero on what it repaired; the run after it is
+the clean one. `-R -v` can exit non-zero for either reason at once —
+the bitmap it repaired, an object that failed its verify, or both —
+so the exit code alone does not say which, and the report is what
+does.
 
 **`shoalmonfmt`** — format a monitor map partition. Not built yet;
 §10 is the format it will write.
@@ -2895,7 +3167,7 @@ T1 formats a **small geometry** — a partition image of a few MiB with
 over one header sector, not over the whole store, and the cases that
 need `nslots = 2^20` are T2's.
 
-**What T1 covers today.** Nine programs, all of them against the
+**What T1 covers today.** Ten programs, all of them against the
 simulated disk except where a file-backed device is the point:
 `csumtest` (layer-a §1.4's block digests and object checksums against
 known-answer vectors), `structtest` (§2's byte layouts against
@@ -2918,8 +3190,33 @@ simulated disk and a file image; a store with a live one-block object
 and a live three-block one, built through the codecs, with each fault
 §2 and §5 name poked into it in turn and the checker's own words read
 back; a store whose `blksz` is four device write units, whose every
-page and grain write must go out in `Wunit` pieces; and a ream cut
-short, which must leave no valid superblock), `storetest` (§5's
+page and grain write must go out in `Wunit` pieces; a ream cut
+short, which must leave no valid superblock; §12's `-v` over the
+replayed state — a multi-block object, a hole and a tombstone
+verified clean, a poked grain named with its object and block index
+where the checkpoint passes see nothing, a damaged digest array
+reported as `arraybad` and a slot whose extent map fails its
+`csum128` reported as a failure rather than skipped, an object flagged
+`corrupt` that verifies clean reported as information, a grain freed
+by an un-checkpointed truncate and handed to another object, which
+verifying from the checkpointed index would report as a mismatch,
+and a store closed on an un-checkpointed multi-block commit, over
+which a read-only device — the open every flag but `-R` takes —
+records no write at all;
+and §12's `-R` — a bitmap page that is valid and wrong, which no
+start repairs and which `-R` corrects to a full scan of the live
+maps, both free-grain counts asserted as numbers, a bitmap page that
+reads and fails its checksum, over which the `as found` count is not
+printed at all,
+an extent map that fails its `csum128`, which `-R` condemns rather
+than rebuilds from, a rebuild that counts the objects committed since
+the last checkpoint, `-R -v` writing the rebuild's lines before the
+verify's, and the refusals of `-R` with `-o` and of `-R` on a device
+opened read-only, which `-v` opens. `cmd/shoalck`'s own flag layer is
+covered only through `ckstore`, which is what T1 drives: every
+refusal `main` makes it makes again, and `-R -w` hands the no-flush
+assertion to a file image exactly as to an sd unit, so the two opens
+differ in the device and in nothing else), `storetest` (§5's
 ordered start-up: the tolerant index read, replay and its
 idempotence, §2.5's replay-coverage rule in all three of the
 cases it exists to tell apart, the automatic bitmap rebuild, §2.2's
@@ -2928,8 +3225,17 @@ after — and only after — replay and again when a damaged extent map
 is first read, §2.6's exhaustion dropping one peer's records on the
 live path and on replay alike, §3.2's refusal to start without a
 flush channel, §4's re-hashing over every shape of write that changes
-a block's covered length, and a store opened, written and replayed at
-a `blksz` four times the device's `Wunit`), `objtest` (§2.7's extent-map slot
+a block's covered length, replay's closing write-back of its extent
+maps — a writable start over a map region the device refuses is
+refused and names the region, a read-only one writes nothing, and a
+read-only replay too big for its cache is refused naming the cache —
+a checkpointer that cannot write, whose failures are counted, named
+in the commit refused for log space, and dropped from that refusal by
+a device that heals — the same store's next full log, with nothing
+checkpointing, answering the bare `disk full` — §2.8's dirty-page
+trigger surviving a condemnation that lands while a checkpoint runs,
+and a store opened, written and replayed at a `blksz` four times the
+device's `Wunit`), `objtest` (§2.7's extent-map slot
 rule over all three transitions and both the crash and the re-replay
 schedules, §2.4's invariant on the shrinking side, §3.5's deferred
 reuse of grains and of slots under a held batch, §3.6's stage lifetimes,
@@ -2940,7 +3246,16 @@ commit, layer-a §1.2's `object too large` at the bounds where a sum
 would wrap, layer-a §2.6's tombstone errors and §1.5's create over a
 tombstone, §3.7's rule that every refusal the API makes is either
 §2.6's prefix or plainly not one, and the key-preserving `corrupt`
-flag) and `committest` (§3.2's flush
+flag), `scrubtest` (§8's engine half: what a corrupt-flagged copy
+answers on every path §3.7's row covers — the count-0 write
+included — and that a delete applies and clears the flag; the scrub's
+two durable transitions, each across a restart taken over a
+checkpoint so that the index bit and not the replayed record is what
+carries it; block repair, its two refusals told apart by whether they
+carry a §2.6 prefix, its acceptance of a block whose old grain the
+device will not read, and the grain it frees; the slot cursor over
+live, tomb and free slots; and `/lost` through the set, the clear,
+the delete and §5 step 10's condemnation) and `committest` (§3.2's flush
 placement read off the device trace, the torn-header sweep over a
 whole sector, short counts on every call, §3.4's crash matrix at
 every point × every operation shape, several laps of the log
@@ -2957,15 +3272,19 @@ replay accepts, a multi-sector record at the region boundary, a
 header naming more sectors than that record, durable-before-ack for a
 batch's members, and `qid.path` across restarts).
 
-Against the list below that is T1.1–T1.8, T1.10–T1.14, T1.16,
-T1.18–T1.20 and T1.22–T1.26. Four cases are not covered and each
+Against the list below that is T1.1–T1.8, T1.10–T1.14, T1.16, T1.17,
+T1.18–T1.20 and T1.22–T1.26. Three cases are not covered and each
 waits on something this store does not have yet: **T1.9**'s second
 half and **T2.7** wait on the monitor's slot store (§10); **T1.15**
 waits on the enumeration snapshot of §9 and the `/obj` fid that reads
-it; **T1.17** and **T1.27** wait on the scrubber and the repair path
-of §8. T1.21 is covered for the orderings and the fields, but drives
-the four publish triggers in sequence rather than from concurrent
-procs.
+it; **T1.27** waits on the server's `Reqqueue` pool (§7), which is
+what it is about — the engine's own scrub and cursor take the same
+`qlstate` snapshot every other call takes and hold no lock across a
+verify, but *that a scrubber pushes through the object's queue rather
+than reading grains beside it* is a property of the server, and there
+is no server to hold it wrong yet. T1.21 is covered for the orderings
+and the fields, but drives the four publish triggers in sequence
+rather than from concurrent procs.
 
 - **T1.1 crash matrix (R1–R4).** Every point above × {create,
   whole-block write, partial write, truncate, delete, 16 MiB
@@ -3088,7 +3407,13 @@ procs.
 - **T1.17 corrupt digest array (§8).** Damage an extent-map entry so
   that `hash(dig[]) != csum`, and assert the repair takes the
   whole-object path. *Mutation:* accept a peer's block against the
-  stored `dig[i]` when the array itself fails.
+  stored `dig[i]` when the array itself fails. Covered by `scrubtest`,
+  which damages a stored digest and repairs the entry's own `csum128`
+  so that the entry is served and the array is the suspect, then
+  asserts that a block repair is refused even for a block whose bytes
+  are right and whose own digest is intact — and refused with an
+  error carrying no §2.6 prefix, because that case is a caller's bug
+  and not a peer's.
 - **T1.18 start after a mid-checkpoint crash (§2.5, R17).** Crash at
   `ckpt:n` with bitmap pages stamped ahead of the superblock, restart,
   and assert the store **starts**, replay reaches `Pmax`, and the free
@@ -3187,7 +3512,9 @@ procs.
   object while a commit on the same object frees that grain and
   another object stages into it; the scrub must not flag the object
   `corrupt`. *Mutation:* have the scrubber read grains directly
-  instead of pushing through the object's `Reqqueue`.
+  instead of pushing through the object's `Reqqueue`. Not covered:
+  the `Reqqueue` pool is the server's (§7) and is not built, so
+  neither is the thing this test discriminates between.
 
 T1 stays diskless and is `mk test` at the repo root, as `AGENTS.md`
 requires: the simulated disk is a T1 program's own memory.
@@ -3345,7 +3672,10 @@ rather than an amendment, because it touches the wire.
     (decisions.md D14); the grammar and the rules live in layer-a
     §5.6, the receiver half in layer-a §5.5 and — for a copy this
     store has condemned — in §3.6 and §5 step 10, and what this store
-    answers in §8. §13's uncovered list is where the open half is.
+    answers in §8. The engine holds the flag, the transitions that
+    set and clear it and the `/lost` accounting; the `op=meta`
+    response itself is the `/rpc` surface's, which is the server's
+    and is not built — §8 marks that half where it falls.
 
 12. **A tombstone's cost.** Layer-a §1.5 said a tombstone "occupies a
     metadata record and nothing else". True here — 256 bytes, because

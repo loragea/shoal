@@ -252,23 +252,65 @@ emapdirty(Store *s, Emape *c)
 
 /*
  * Write back every dirty entry and drop what the cache no longer
- * needs.  This is replay's escape hatch and nothing else's: replay
- * touches one extent map per multi-block object the log names, which
- * is a function of logsecs and not of the cache, so without a
- * write-back the cache would have to hold them all.  It is safe here
- * because start-up is single-proc — no other proc holds a pin, and
- * nothing is mutating an entry's bytes — and because materialising
- * applied state early changes nothing replay depends on: cklogoff has
- * not moved, so the records behind these bytes are still in the log.
+ * needs.  This is replay's escape hatch under cache pressure and
+ * nothing else's: replay touches one extent map per multi-block
+ * object the log names, which is a function of logsecs and not of the
+ * cache, so without a write-back the cache would have to hold them
+ * all.  It is safe here because start-up is single-proc — no other
+ * proc holds a pin, and nothing is mutating an entry's bytes — and
+ * because materialising applied state early changes nothing replay
+ * depends on: cklogoff has not moved, so the records behind these
+ * bytes are still in the log.
+ *
+ * Replay also calls this at its end, where the write-back is not an
+ * escape hatch but the point: a device that refuses the extent-map
+ * region refuses the start, and the region is named here so that the
+ * refusal says which region it was.
+ *
+ * A read-only store writes nothing at all (§12), so there neither
+ * call can write and the maps are held instead — etrim never evicts a
+ * dirty entry, so holding them is all it takes, and replay skips the
+ * closing call entirely.  What holding them cannot survive is a log
+ * dirtying more entries than the cache is sized for, and that
+ * condition is named here too: a devwrite refusal would answer
+ * `opened read-only', which tells the operator nothing about what was
+ * actually hit.
  */
 int
 emapreclaim(Store *s)
 {
 	Emape *c, *next;
+	ulong ndirty;
 
-	for(c = s->edirty; c != nil; c = c->dnext){
-		if(emapwrite(s, c->slot, c->p) < 0)
+	if(s->d->rdonly){
+		ndirty = 0;
+		for(c = s->edirty; c != nil; c = c->dnext)
+			ndirty++;
+		if(ndirty > s->emapcap){
+			/*
+			 * Replay passes this through rather than wrapping
+			 * it in the corrupt-log remedy, so the whole of it
+			 * — condition, read-only and both numbers — is
+			 * what the operator is shown.
+			 */
+			werrstr("extent-map cache is full and the store is "
+				"read-only: %lud dirty, room for %lud",
+				ndirty, s->emapcap);
 			return -1;
+		}
+		for(c = s->elrutail; c != nil && s->nemapc > s->emapcap;
+			c = next){
+			next = c->prev;
+			if(c->pin == 0 && !c->dirty && !c->busy && !c->wb)
+				efree(s, c);
+		}
+		return 0;
+	}
+	for(c = s->edirty; c != nil; c = c->dnext){
+		if(emapwrite(s, c->slot, c->p) < 0){
+			werrstr("writing the extent-map region: %r");
+			return -1;
+		}
 		c->dirty = 0;
 		c->bad = 0;
 	}
