@@ -544,6 +544,9 @@ struct Ckcfg
 	int	verbose;	/* -l: dump log records */
 	int	quiet;		/* report problems only */
 	char	*oid;		/* -o: dump one object */
+	int	verify;		/* -v: verify every object's content (§8) */
+	int	rebuild;	/* -R: rebuild the bitmap, rewrite the checkpoint */
+	int	noflush;	/* -w: §3.2's assertion, which -R's open needs */
 	int	out;		/* fd for the report */
 };
 

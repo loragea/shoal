@@ -2705,14 +2705,14 @@ unit: that unit is the device's property and `blksz` is the format's
 (§0, §2.1). `-w` is §3.2's operator assertion, which is what lets it
 format a unit whose raw channel it cannot open.
 
-**`shoalck`** — inspect and check. It reads and never writes, and
-opens the device read-only so the kernel enforces that rather than
-the code promising it — which also lets it run against a disk its
-user may only read. It opens no raw channel, so it reports the
-device's flush channel as *not examined* rather than claiming the
-operator asserted write-through.
+**`shoalck`** — inspect and check. Every flag but `-R` reads and
+never writes, and the device is then opened read-only so the kernel
+enforces that rather than the code promising it — which also lets it
+run against a disk its user may only read. Such a run opens no raw
+channel, so it reports the device's flush channel as *not examined*
+rather than claiming the operator asserted write-through.
 
-    shoalck [-lq] [-o oid] /dev/sdXX/name
+    shoalck [-lqvRw] [-o oid] /dev/sdXX/name
 
 Default: print both superblocks and which one §2.2's three clauses
 select, which copy the next update would write and under which
@@ -2727,11 +2727,56 @@ inconsistency. `-l` dumps the log records and their entries; a second
 `-l` dumps each `Eobj`'s block map. `-q` prints the problems and
 nothing else. `-o` dumps one object's index entry and extent map.
 
-**Not built yet.** `-v`, which verifies every object's content
-against its digests — an offline scrub — and `-R`, which rebuilds the
-free-grain bitmap from the live maps and rewrites the checkpoint, the
-offline form of §5 step 11's automatic rebuild. Both wait on the
-write path they check.
+**`-v` and `-R` work on the replayed state, and every pass above
+works on the checkpoint.** The difference is not a refinement. §2.8
+makes the log the durable authority for everything since `ckseq`, and
+§3.5 defers a released grain's reuse only until the freeing commit's
+flush has returned — so a grain freed by a committed-but-not-
+checkpointed record may already hold another object's bytes.
+Verifying an object against the checkpointed index would read those
+bytes and report a mismatch on an object that is perfectly well; a
+bitmap rebuilt from the checkpointed index would clear grains the log
+has since handed out, and the checkpoint `-R` writes publishes a
+`ckseq` past the records that would have corrected it. So both flags
+replay the log first. `storeopen` with no `spawn` callback and no
+checkpointer proc is that replay and nothing else: the engine makes
+no proc, commits are synchronous in the caller, and a clean start
+writes nothing — §5 step 11's rebuild only marks pages dirty.
+`storecheckpoint` is the one write either flag makes, and only `-R`
+makes it. A device opened read-only is accepted by that open: it can
+write nothing at all, so there is no durability to assert and no raw
+channel to want, and its flush mode stays *not examined*.
+
+**`-v`** verifies every object's content against its digests — §8's
+verify, offline, over every slot rather than over one object. For
+each live object it reports the mismatching block indices, whether
+the digest array itself is suspect (`arraybad`), and whether the
+entry is flagged `corrupt`; an object that fails is a problem and the
+exit is non-zero. A tombstone holds no content, so it verifies
+vacuously and is counted rather than read. An object that is flagged
+`corrupt` and verifies clean is reported as information and not as a
+problem: the flag is durable and it is §8's online scrub that clears
+it, with a key-preserving `Eobj` this tool does not write. `-q`
+prints the problems and nothing else.
+
+**`-R`** rebuilds the free-grain bitmap from the live maps and
+rewrites the checkpoint — the offline form of §5 step 11's automatic
+rebuild. A page that fails its checksum is already rebuilt at every
+start (§2.5); `-R` is for the page that is **valid and wrong**, which
+no start repairs, and for the operator who wants the scan done now
+rather than at the next one. It prints how many grains the on-disk
+bitmap left free and how many the rebuild leaves, so what changed is
+visible, and it reports `bmaprebuild` and any refusal from the store
+in the store's own words. It opens the device read-write — the open
+`shoalfmt` takes, with the flush channel, and `-w` as §3.2's operator
+assertion for a unit whose raw channel will not open — so `-w`
+without `-R` is refused rather than ignored. `-R` with `-v` rebuilds
+first and then verifies. `-R` with `-o` is refused: `-o` dumps one
+object, and a rebuild driven from one object's map would clear every
+grain the rest of the store holds. The passes above run first and
+report the bitmap they found, so a `-R` run that repairs a wrong
+bitmap still exits non-zero on what it repaired; the run after it is
+the clean one.
 
 **`shoalmonfmt`** — format a monitor map partition. Not built yet;
 §10 is the format it will write.
@@ -2918,8 +2963,20 @@ simulated disk and a file image; a store with a live one-block object
 and a live three-block one, built through the codecs, with each fault
 §2 and §5 name poked into it in turn and the checker's own words read
 back; a store whose `blksz` is four device write units, whose every
-page and grain write must go out in `Wunit` pieces; and a ream cut
-short, which must leave no valid superblock), `storetest` (§5's
+page and grain write must go out in `Wunit` pieces; a ream cut
+short, which must leave no valid superblock; §12's `-v` over the
+replayed state — a multi-block object, a hole and a tombstone
+verified clean while the device records no write at all, a poked
+grain named with its object and block index where the checkpoint
+passes see nothing, an object flagged `corrupt` that verifies clean
+reported as information, and a grain freed by an un-checkpointed
+truncate and handed to another object, which verifying from the
+checkpointed index would report as a mismatch; and §12's `-R` — a
+bitmap page that is valid and wrong, which no start repairs and which
+`-R` corrects to a full scan of the live maps, a rebuild that counts
+the objects committed since the last checkpoint, and the refusals of
+`-R` with `-o` and of `-R` on a device opened read-only, which `-v`
+opens), `storetest` (§5's
 ordered start-up: the tolerant index read, replay and its
 idempotence, §2.5's replay-coverage rule in all three of the
 cases it exists to tell apart, the automatic bitmap rebuild, §2.2's
