@@ -56,6 +56,7 @@ struct Ck
 	uvlong	nemapused, nbademap;
 	uvlong	ndirtyused, nbaddirty;
 	uvlong	nbmbad;
+	uvlong	nbmfree;	/* grains clear in the on-disk bitmap */
 	uvlong	pmax;
 	int	havepmax;
 };
@@ -605,6 +606,7 @@ ckcross(Ck *k)
 	if(leaked > 1)
 		problem(k, "%llud grains in all are marked and unreferenced",
 			leaked);
+	k->nbmfree = nfree;
 	say(k, "grains: %llud total, %llud referenced, %llud marked "
 		"allocated, %llud free (grain 0 is reserved)",
 		k->s->ngrains, nref, nmark, nfree);
@@ -663,6 +665,137 @@ dumpobj(Ck *k, char *oid)
 	problem(k, "no live object with oid %s", oid);
 	free(emap);
 	free(buf);
+}
+
+/*
+ * -v and -R work on the REPLAYED state, and nothing above works on
+ * anything but the checkpoint.  The difference is not a refinement:
+ * §2.8 makes the log the durable authority for everything since
+ * ckseq, and §3.5 defers a released grain's reuse only until the
+ * freeing commit's flush has returned — so a grain freed by a
+ * committed-but-not-checkpointed record may already hold another
+ * object's bytes.  Verifying an object against the checkpointed index
+ * would read those bytes and report a mismatch on an object that is
+ * perfectly well, and a bitmap rebuilt from the checkpointed index
+ * would clear grains the log has since handed out.
+ *
+ * storeopen(spawn=nil, nockptproc=1) is what replays the log into
+ * memory: with no spawn callback the engine makes no proc, commits
+ * are synchronous in the caller, and a clean start writes nothing —
+ * §5 step 11's rebuild only marks pages dirty.  storecheckpoint is
+ * therefore the only write either flag makes, and only -R makes it.
+ */
+static void
+ckverify(Ck *k, Store *st)
+{
+	Vfy v;
+	Ient *e;
+	char ob[Oidmax + 1], blks[128], *p, *ep;
+	uvlong nver, ntomb, nbadobj, nclean;
+	ulong slot, j;
+
+	nver = ntomb = nbadobj = nclean = 0;
+	for(slot = 0; slot < st->sb.nslots; slot++){
+		e = &st->idx[slot];
+		if(e->state == Sfree)
+			continue;
+		if(e->state == Stomb){
+			/*
+			 * A tombstone holds no content: layer-a §1.5 keeps
+			 * the key and nothing else, so it verifies
+			 * vacuously and is counted rather than read.
+			 */
+			ntomb++;
+			continue;
+		}
+		nver++;
+		if(objverify(st, e->oid, e->oidlen, &v) < 0){
+			problem(k, "slot %lud oid %s: verify: %r", slot,
+				oidstr(ob, e->oid, e->oidlen));
+			nbadobj++;
+			continue;
+		}
+		if(v.nbad > 0 || v.arraybad){
+			p = blks;
+			ep = blks + sizeof blks;
+			*p = '\0';
+			for(j = 0; j < v.nbad && j < 8; j++)
+				p = seprint(p, ep, "%s%lud", j > 0 ? "," : "",
+					v.bad[j]);
+			if(v.nbad > 8)
+				seprint(p, ep, ",...");
+			problem(k, "slot %lud oid %s: %lud of %llud blocks "
+				"mismatch (blocks %s), arraybad=%d, "
+				"corrupt-flagged=%d", slot,
+				oidstr(ob, e->oid, e->oidlen), v.nbad,
+				blkcount(e->len, st->sb.blksz), blks,
+				v.arraybad, (e->flags & Icorrupt) != 0);
+			nbadobj++;
+		}else if(e->flags & Icorrupt){
+			/*
+			 * Information and not a problem.  The flag is
+			 * durable and §8's online scrub is what clears it,
+			 * with a key-preserving Eobj this tool does not
+			 * write; an operator wants to know the copy is out
+			 * of arbitration and that its content is sound.
+			 */
+			nclean++;
+			say(k, "slot %lud oid %s: flagged corrupt and verifies "
+				"clean; §8's scrub is what clears the flag",
+				slot, oidstr(ob, e->oid, e->oidlen));
+		}
+		vfyfree(&v);
+	}
+	say(k, "verify: %llud objects verified, %llud tombstones skipped, "
+		"%llud failed, %llud flagged corrupt but clean", nver, ntomb,
+		nbadobj, nclean);
+}
+
+static void
+ckengine(Ck *k, Dev *d)
+{
+	Storecfg cfg;
+	Storestat ss;
+	Store *st;
+
+	if(k->c->rebuild && d->rdonly){
+		problem(k, "-R rebuilds the bitmap and rewrites the "
+			"checkpoint, and %s is open read-only", d->name);
+		return;
+	}
+	memset(&cfg, 0, sizeof cfg);
+	cfg.spawn = nil;		/* no procs: a pure in-memory replay */
+	cfg.nockptproc = 1;
+	cfg.noflush = k->c->noflush;
+	cfg.forcerebuild = k->c->rebuild;
+	if((st = storeopen(d, &cfg)) == nil){
+		/*
+		 * The engine's own refusal is the report: every one of
+		 * §5's names the structure, the offset and the tool, and
+		 * restating it here would be a second, worse diagnosis.
+		 */
+		problem(k, "the store does not open: %r");
+		return;
+	}
+	storestat(st, &ss);
+	if(ss.nlost > 0)
+		say(k, "replay: %llud slot(s) condemned by §5 step 10 and not "
+			"served", ss.nlost);
+	if(k->c->rebuild){
+		say(k, "rebuild: bmaprebuild=%s", ss.bmaprebuild ? "yes" : "no");
+		say(k, "rebuild: the on-disk bitmap leaves %llud grains free, "
+			"the rebuild leaves %llud", k->nbmfree, ss.grainfree);
+		if(storecheckpoint(st) < 0)
+			problem(k, "rewriting the checkpoint: %r");
+		else{
+			storestat(st, &ss);
+			say(k, "rebuild: checkpoint rewritten at ckseq %llud, "
+				"cklogoff %llud", ss.ckseq, ss.cklogoff);
+		}
+	}
+	if(k->c->verify)
+		ckverify(k, st);
+	storeclose(st);
 }
 
 int
@@ -742,7 +875,17 @@ ckstore(Dev *d, Ckcfg *c)
 		return k.bad;
 
 	if(c->oid != nil){
-		dumpobj(&k, c->oid);
+		/*
+		 * -o dumps one object's entry and map; -v and -R are
+		 * whole-store passes over the replayed state, and a
+		 * rebuild driven from one object's map would clear every
+		 * grain the rest of the store holds.
+		 */
+		if(c->rebuild || c->verify)
+			problem(&k, "-o dumps one object; -v and -R work over "
+				"the whole store");
+		else
+			dumpobj(&k, c->oid);
 		return k.bad;
 	}
 
@@ -770,6 +913,9 @@ ckstore(Dev *d, Ckcfg *c)
 		say(&k, "bitmap pages are stamped ahead of the superblock "
 			"(Pmax %llud > ckseq %llud): the ordinary "
 			"mid-checkpoint crash", k.pmax, s->ckseq);
+
+	if(c->verify || c->rebuild)
+		ckengine(&k, d);
 
 	free(k.used);
 	free(k.alloc);
