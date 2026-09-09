@@ -742,6 +742,16 @@ storecondemn(Store *s, ulong slot)
 		return;
 	s->idx[slot].bad = 1;
 	s->idx[slot].flags |= Icorrupt;
+	/*
+	 * Ient.bad is memory only; Icorrupt is the half §2.3 writes, and
+	 * the checkpoint writes an index page only when something
+	 * dirtied it.  Without this the condemnation reaches the disk
+	 * only if some other commit happened to touch the same page, so
+	 * a restart would drop a copy known to fail local verification
+	 * out of layer-a §7.5's /lost until something read it again.
+	 * The caller holds qlstate, which is what idxdirty wants.
+	 */
+	idxdirty(s, slot);
 	lostadd(s, slot);
 }
 

@@ -752,11 +752,12 @@ tbadmap(void)
 	 * writes it back as it stands; writing it back free would hand
 	 * the slot out again, leave the object's grains set in the bitmap
 	 * with nothing naming them, and lose the store's only record that
-	 * it ever held the object.  storecondemn does not itself dirty
-	 * the index page, so a second object is what gets it written.
+	 * it ever held the object.  This store holds ONE object, so
+	 * nothing but the condemnation can have dirtied the index page it
+	 * sits in: a storecondemn that did not dirty it would leave the
+	 * checkpoint carrying the entry as it was before, and the restart
+	 * below would list nothing.
 	 */
-	mkobj(s, "narrow", 1);
-	wr(s, "narrow", &sh, buf, 64, 0, 2);
 	if(storecheckpoint(s) < 0)
 		fail("storecheckpoint: %r");
 	storestat(s, &st);
