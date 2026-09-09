@@ -1703,7 +1703,7 @@ stagefinal(Stage *g, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 	uvlong i;
 	uchar dig[Blkdlen];
 	long slot;
-	int absent, corrupt, c;
+	int absent, nokey, c;
 
 	s = g->s;
 	/*
@@ -1757,7 +1757,7 @@ stagefinal(Stage *g, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 			return stagefail(g);
 	}else if(updopen(&u, s, g->oid, g->oidlen, g->len, Utomb|Ubad) < 0)
 		return stagefail(g);
-	corrupt = !absent && ((u.e.flags & Icorrupt) != 0 || u.e.bad);
+	nokey = !absent && ((u.e.flags & Icorrupt) != 0 || u.e.bad);
 	/*
 	 * layer-a §5.5's comparison, made once here and against the
 	 * receiver's then-current key: strictly greater, or equal with
@@ -1773,10 +1773,19 @@ stagefinal(Stage *g, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 	 * content to a media fault refuses the serving primary's repair
 	 * push at the lower (E, ver) as `stale version', by the very
 	 * copy that asked for it, and is unrepairable for the life of
-	 * the disk.  The flag itself is not cleared here: §8 clears it
-	 * from the verify that finds every block matching again.
+	 * the disk.
+	 *
+	 * The commit clears the flag.  Every block this record names was
+	 * staged from bytes the sender's dcsum covered and the whole
+	 * against its csum (§5.5), and the digests were computed from
+	 * those bytes here, so the verify §8 would run next finds every
+	 * block matching by construction: there is nothing left for the
+	 * flag to describe.  Leaving it set would keep a copy that is now
+	 * whole out of arbitration, and — because a copy with no key to
+	 * defend takes any push — would go on accepting a push at any key
+	 * until the scrubber's next pass, which is days (§8).
 	 */
-	if(!absent && !corrupt){
+	if(!absent && !nokey){
 		c = keycmp(wepoch, ver, u.e.wepoch, u.e.ver);
 		if(c < 0 || (c == 0 && !g->force)){
 			updabort(&u);
@@ -1810,7 +1819,7 @@ stagefinal(Stage *g, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 		}
 	}
 	stagehandoff(g, g->nblk);
-	if(updcommit(&u, Slive, ver, wepoch, time(nil), corrupt, dr, ndr) < 0){
+	if(updcommit(&u, Slive, ver, wepoch, time(nil), 0, dr, ndr) < 0){
 		updclose(&u);
 		return stagefail(g);
 	}

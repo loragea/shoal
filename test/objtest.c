@@ -1745,14 +1745,37 @@ tfull(void)
 		fail("objstat f: %r");
 	else{
 		eqv("the push applied at the lower key", oi.ver, 2);
-		eqv("and the flag survives it, for §8's verify to clear",
-			oi.corrupt, 1);
+		/*
+		 * §8: the commit clears the flag.  Every block it names was
+		 * staged from bytes checked against the sender's dcsum and
+		 * the whole against its csum, so the verify below finds
+		 * every block matching by construction and there is nothing
+		 * left for the flag to describe.  The discriminating half is
+		 * the push after it: while the flag is set the copy has no
+		 * key to defend and takes a push at any key, so a flag left
+		 * set by the repair would go on accepting a lower key until
+		 * the scrubber's next pass — days.
+		 */
+		eqv("and the repair clears the flag", oi.corrupt, 0);
 	}
 	rd(s, "f", got, 2*Blk, 0, "op=full to a corrupt copy");
 	checks++;
 	if(memcmp(got, b, 2*Blk) != 0)
 		fail("op=full to a corrupt copy did not replace the content");
 	mustverify(s, "f", "op=full to a corrupt copy");
+	if((g = fullstage(s, "f", a, 2*Blk, 0)) != nil)
+		refused("a second op=full at a lower key, after the repair",
+			stagefinal(g, 1, 1, nil, 0), "stale version");
+	if(ostat(s, "f", &oi) < 0)
+		fail("objstat f: %r");
+	else{
+		eqv("and it changed nothing", oi.ver, 2);
+		eqv("nor the flag", oi.corrupt, 0);
+	}
+	rd(s, "f", got, 2*Blk, 0, "after the refused second push");
+	checks++;
+	if(memcmp(got, b, 2*Blk) != 0)
+		fail("a refused op=full changed the content");
 
 	storeclose(s);
 	if((s = mustopen(d, "op=full replayed")) == nil){
@@ -1766,7 +1789,7 @@ tfull(void)
 		fail("objstat f: %r");
 	else{
 		eqv("every op=full replays", oi.ver, 2);
-		eqv("with its corrupt flag", oi.corrupt, 1);
+		eqv("with the flag its repair cleared", oi.corrupt, 0);
 	}
 	rd(s, "f", got, 2*Blk, 0, "op=full replayed");
 	checks++;

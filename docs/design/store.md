@@ -1461,15 +1461,25 @@ time of the last chunk. It is owned by the fid.
   whose `corrupt` flag is set (§8): it contributes no key at all
   (layer-a §1.3, and D14's rule in §5.5), so a holder that committed
   `(E, ver+1)` and then lost the content takes the serving primary's
-  repair at the lower `(E, ver)`. The push does not clear the flag —
-  §8 clears it from the verify that finds every block matching again.
+  repair at the lower `(E, ver)`. **The commit clears the flag**: its
+  blocks are the ones the transfer's own checks passed, so the verify
+  that would run next finds every block matching by construction, and
+  a flag left set would keep a whole copy out of arbitration — and
+  keep it accepting a push at any key — until the scrubber's next
+  pass, which is days (§8). The exemption ends with the push that
+  used it, so a second push at a lower key is refused `stale version`
+  like any other.
   A slot §5 step 10 condemned for a damaged extent map is the same
   case, reached the other way: it carries `corrupt` too, and the push
   is taken at any key. It rebuilds the map whole in a fresh
   extent-map slot (§2.7's slot rule), in the index slot and at the
   `qid.path` the object already had, and the grains the damaged entry
   named are unrecoverable and stay marked used until that slot is
-  written again.
+  written again. The rebuild does not depend on some earlier read
+  having found the damage: a `final=1` that reads the map and finds
+  it damaged condemns the slot and rebuilds it in the same call,
+  because a repair that worked only for a slot condemned since the
+  last restart is not a repair.
 
   A **count-0 write** is not one of these and is not an extend
   either: layer-a §2.4 extends at a write *at* an offset above `len`,
@@ -1803,9 +1813,11 @@ lose arbitration against everything including absence.
     what D14 requires of a holder that cannot vouch for its copy and
     therefore MUST NOT answer as absent. The flag is written back with
     the entry, so a restart still knows the copy is not to be trusted.
-    An `op=full` that heals it (§3.6) drops it from `/lost`; the
-    `corrupt` flag survives the push, as it does for every other
-    receiver §3.6 names, and it is §8's verify that clears it. The line carries `slot=<n>`
+    An `op=full` that heals it (§3.6) drops it from `/lost` and
+    clears the `corrupt` flag with it, as it does for every other
+    receiver §3.6 names: the pushed content is what the transfer's
+    own checks passed, so there is nothing left for the flag to
+    describe (§8). The line carries `slot=<n>`
     and **omits `oid=`**, rather than printing 128 bytes the store
     does not trust or inventing an oid layer-a §1.2's grammar would
     not admit; §14(15) records the deviation from layer-a §2.2's
@@ -2321,9 +2333,17 @@ including absence.
 serving primary again, and that primary does what layer-a §1.3
 prescribes for a holder whose key already equals its own: it pushes
 `op=full force=1` at an equal key to the corrupt holder, replacing
-the whole object without bumping the key. The holder's next verify
-finds every block matching, clears the `corrupt` flag with a
-key-preserving `Eobj`, and the object leaves `/lost`. If the corrupt
+the whole object without bumping the key. **That commit clears the
+flag**, and the object leaves `/lost` with it. Every block the commit
+names was staged from bytes checked against the sender's `dcsum` and
+the whole against its `csum` (layer-a §5.5), and the digests were
+computed here from those same bytes, so the verify that would run
+next finds every block matching by construction: there is nothing
+left for the flag to describe. Leaving it set until a scrub came
+round would keep a copy that is now whole out of arbitration for as
+long as a full pass takes — `scrubdays`, days — and, because a copy
+with no key to defend takes a push at any key (§3.6), would go on
+accepting a *lower*-keyed push for exactly as long. If the corrupt
 copy is the only copy, nothing repairs it and layer-a §7.5's `object
 lost` is the honest outcome.
 
@@ -2337,9 +2357,9 @@ whose own copy fails local verification treats it as absent for the
 comparison and takes the push at any key (D14). §3.6's `final=1`
 comparison is where the exemption lives and it applies it: a stage
 committed against a copy whose `corrupt` flag is set is not compared
-at all. The flag survives the push, so the object stays out of
-arbitration until a verify finds every block matching and clears it
-with the key-preserving `Eobj` above.
+at all. Because the commit clears the flag, the exemption ends with
+the push that used it, and the next push is compared like any other —
+a second one at a lower key is refused `stale version`.
 
 A commit that does not advance the key is a first-class case in this
 store, and there are three of them: block repair, whole-object
