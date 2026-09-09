@@ -713,6 +713,7 @@ ckverify(Ck *k, Store *st)
 			problem(k, "slot %lud oid %s: verify: %r", slot,
 				oidstr(ob, e->oid, e->oidlen));
 			nbadobj++;
+			vfyfree(&v);	/* always safe, whatever it returned */
 			continue;
 		}
 		if(v.nbad > 0 || v.arraybad){

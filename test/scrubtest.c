@@ -484,6 +484,27 @@ trepair(void)
 	if(ostat(s, "r", &oi) < 0)
 		fail("objstat r: %r");
 	emapslot = oi.emapslot;
+
+	/*
+	 * The Vfy is the caller's on success only.  A verify that fails
+	 * part-way — a media error under a grain, which is exactly the
+	 * region a wave-1d scrubber is crossing when it finds one —
+	 * answers a zeroed Vfy, so the bad-block array it had already
+	 * allocated is not left for nobody to free.  vfyfree is safe
+	 * afterwards either way, which is what shoal.h promises.
+	 */
+	g = grainof(d, &sup, &oi, 0);
+	memset(&v, 0xff, sizeof v);
+	simfaultat(d, Sfeio, 1, grainoff(&sup, g), Blk);
+	checks++;
+	if(objverify(s, oid, 1, &v) >= 0)
+		fail("objverify read a grain the device refused");
+	istrue("a failed verify leaves no bad-block array", v.bad == nil);
+	eqv("and answers a zeroed Vfy", v.nbad, 0);
+	eqv("and no verdict on the digest array", v.arraybad, 0);
+	vfyfree(&v);				/* safe, whatever it returned */
+	simfault(d, Sfnone, 0);
+
 	g = grainof(d, &sup, &oi, 2);
 	flipbytes(d, grainoff(&sup, g), 16);
 

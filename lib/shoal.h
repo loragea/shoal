@@ -730,6 +730,12 @@ struct Vfy
 	ulong	*bad;		/* nbad block indices */
 };
 int	objverify(Store*, uchar *oid, int oidlen, Vfy*);
+/*
+ * vfyfree is always safe after objverify or objscrub, whatever they
+ * returned, and safe twice: a failure from either leaves the Vfy
+ * zeroed, so the bad-block array a partial pass allocated is never
+ * the caller's to lose.
+ */
 void	vfyfree(Vfy*);
 
 /*

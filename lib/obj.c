@@ -1470,6 +1470,15 @@ objverify(Store *s, uchar *oid, int oidlen, Vfy *v)
 				free(buf);
 				free(digs);
 				emapunpin(s, c);
+				/*
+				 * The Vfy is the caller's on success only:
+				 * a failure answers a zeroed one, so the
+				 * bad-block array a partial pass allocated
+				 * is this function's to release.  A wave-1d
+				 * scrubber crossing an unreadable region
+				 * calls this once per object per pass.
+				 */
+				vfyfree(v);
 				return -1;
 			}
 			blkdigest(buf, n, dig);
@@ -1485,12 +1494,16 @@ objverify(Store *s, uchar *oid, int oidlen, Vfy *v)
 	return 0;
 }
 
+/*
+ * Always safe, whatever objverify or objscrub returned, and safe
+ * twice: it leaves the Vfy zeroed, which is also what every failure
+ * path of those two leaves behind.
+ */
 void
 vfyfree(Vfy *v)
 {
 	free(v->bad);
-	v->bad = nil;
-	v->nbad = 0;
+	memset(v, 0, sizeof *v);
 }
 
 /*
