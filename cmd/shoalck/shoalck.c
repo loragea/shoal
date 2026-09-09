@@ -76,7 +76,8 @@ main(int argc, char **argv)
 		if(sdpart(path))
 			d = sdopen(path, noflush ? Dnoflush : 0);
 		else
-			d = fileopen(path, Secszdflt, 0, 0);
+			d = fileopen(path, Secszdflt, 0,
+				noflush ? Dnoflush : 0);
 	}else if(sdpart(path))
 		d = sdopen(path, Dnoflush|Drdonly);
 	else
