@@ -303,9 +303,23 @@ taccess(void)
 	}
 	storestat(s, &st);
 	eqv("so it leaves /lost", st.nlost, 0);
+	/*
+	 * A tombstone can carry the flag only because objcorrupt will set
+	 * one — a scrub cannot, since a tombstone has no content to
+	 * mismatch — and the discard that then releases the slot has to
+	 * take it back out of /lost: the list is slots, and a released
+	 * slot holds no copy at all.
+	 */
+	checks++;
+	if(objcorrupt(s, oid, 1, 1, nil, 0) < 0)
+		fail("objcorrupt of the tombstone: %r");
+	storestat(s, &st);
+	eqv("a flagged tombstone is listed", st.nlost, 1);
 	checks++;
 	if(objdiscard(s, oid, 1, 3, 1, 2) < 0)
 		fail("objdiscard of the tombstone: %r");
+	storestat(s, &st);
+	eqv("and the discard delists the slot it released", st.nlost, 0);
 
 	storeclose(s);
 	devclose(d);
@@ -465,9 +479,11 @@ trepair(void)
 	Super sup;
 	Storestat sst;
 	Vfy v;
-	uchar *buf, *bad, *zeros, oid[Oidmax], hid[Oidmax], csum[Csumlen];
+	uchar *buf, *bad, *zeros, *tail, *dirty;
+	uchar oid[Oidmax], hid[Oidmax], tid[Oidmax], csum[Csumlen];
 	uvlong gf;
 	ulong g, emapslot;
+	long i;
 
 	d = newdisk();
 	if((s = mustopen(d, "block repair")) == nil)
@@ -475,6 +491,7 @@ trepair(void)
 	buf = mkbuf(3*Blk, 71);
 	bad = mkbuf(3*Blk, 72);
 	zeros = mkbuf(Blk, 0);
+	tail = mkbuf(Blk, 0);
 	mk(s, "r");
 	mustwr(s, "r", buf, 3*Blk, 0, 2);
 	oidof(oid, "r");
@@ -544,6 +561,57 @@ trepair(void)
 		eqv("the repair left the version alone", oi.ver, 2);
 		eqv("and the length", oi.len, 3*Blk);
 	}
+
+	/*
+	 * §4's merge-back: the bytes of the grain above the block's
+	 * covered length are not the object's content and MUST read as
+	 * zeros, or the next write that covers them merges them in.  A
+	 * repair writes a whole grain from a short buffer, so this is
+	 * where that rule is easiest to break.
+	 */
+	mk(s, "t");
+	mustwr(s, "t", buf, 2*Blk + 100, 0, 2);
+	oidof(tid, "t");
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	if(ostat(s, "t", &oi) < 0)
+		fail("objstat t: %r");
+	g = grainof(d, &sup, &oi, 2);
+	istrue("the short final block has a grain", g != 0);
+	/*
+	 * Damage the block's content, and the bytes of its grain above
+	 * the covered length with it: a media fault does not stop at a
+	 * boundary the object model draws, and those bytes are what a
+	 * repair that does not zero-fill carries forward — it reads the
+	 * grain to decide whether the block needs repairing at all.
+	 */
+	flipbytes(d, grainoff(&sup, g), 16);
+	dirty = mkbuf(Blk - 100, 0);
+	memset(dirty, 0xd7, Blk - 100);
+	simpoke(d, grainoff(&sup, g) + 100, dirty, Blk - 100);
+	free(dirty);
+	checks++;
+	if(objrepair(s, tid, 1, 2, buf + 2*Blk, 100) < 0)
+		fail("objrepair of a short final block: %r");
+	/*
+	 * The claim is about the bytes on the disk, so it is read off the
+	 * disk: every path that reads a block back through the API
+	 * zero-fills above the covered length itself, so the grain could
+	 * hold anything and no read would say so — until the day one
+	 * does not.
+	 */
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	if(ostat(s, "t", &oi) < 0)
+		fail("objstat t: %r");
+	g = grainof(d, &sup, &oi, 2);
+	istrue("the repaired block has a grain", g != 0);
+	simpeek(d, grainoff(&sup, g) + 100, tail, Blk - 100);
+	for(i = 0; i < Blk - 100; i++)
+		if(tail[i] != 0)
+			break;
+	istrue("a repair zeroes the grain above the covered length",
+		i == Blk - 100);
 
 	/*
 	 * A hole is the sharp form of the same refusal.  Its stored
@@ -647,6 +715,7 @@ trepair(void)
 	free(buf);
 	free(bad);
 	free(zeros);
+	free(tail);
 }
 
 /*
@@ -745,6 +814,85 @@ tcondemned(void)
 	storeclose(s);
 	devclose(d);
 	free(buf);
+}
+
+/*
+ * D14, and the case §5.5's exemption exists for: a copy that fails
+ * local verification contributes no key, so an op=full at a key LOWER
+ * than the one it stores must be taken.  Nothing reads the object
+ * first, so stagefinal is what finds the damage — the entry it copied
+ * out still has the corrupt flag clear, and Ient.bad is the only thing
+ * that says the copy has no key.
+ */
+static void
+tlowerkey(void)
+{
+	Dev *d;
+	Store *s;
+	Stage *g;
+	Storestat st;
+	Objinfo oi;
+	Super sup;
+	Vfy v;
+	uchar *buf, *other, oid[Oidmax];
+	ulong emapslot;
+
+	d = newdisk();
+	if((s = mustopen(d, "a lower-keyed push")) == nil)
+		return;
+	buf = mkbuf(3*Blk, 127);
+	other = mkbuf(3*Blk, 131);
+	mk(s, "n");
+	mustwr(s, "n", buf, 3*Blk, 0, 5);
+	oidof(oid, "n");
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	geom(d, &sup);
+	if(ostat(s, "n", &oi) < 0)
+		fail("objstat n: %r");
+	emapslot = oi.emapslot;
+	storeclose(s);
+	damageentry(d, &sup, emapslot);
+	if((s = mustopen(d, "a lower-keyed push, reopened")) == nil){
+		devclose(d);
+		free(buf);
+		free(other);
+		return;
+	}
+	storestat(s, &st);
+	eqv("nothing has read the object, so nothing is condemned yet",
+		st.nlost, 0);
+	if((g = stageopen(s, oid, 1, 3*Blk, 0)) == nil)
+		fail("stageopen: %r");
+	else{
+		if(stagewrite(g, other, 3*Blk, 0) < 0)
+			fail("stagewrite: %r");
+		checks++;
+		if(stagefinal(g, 3, 1, nil, 0) < 0)
+			fail("an op=full at a lower key onto a condemned "
+				"copy: %r");
+		else if(ostat(s, "n", &oi) < 0)
+			fail("objstat n: %r");
+		else{
+			eqv("the push at the lower key is what the object "
+				"now holds", oi.ver, 3);
+			eqv("and the repair clears the flag", oi.corrupt, 0);
+		}
+	}
+	checks++;
+	if(objverify(s, oid, 1, &v) < 0)
+		fail("objverify after the lower-keyed repair: %r");
+	else{
+		eqv("the repaired copy verifies", v.nbad, 0);
+		eqv("with a good digest array", v.arraybad, 0);
+		vfyfree(&v);
+	}
+	storestat(s, &st);
+	eqv("and it has left /lost", st.nlost, 0);
+	storeclose(s);
+	devclose(d);
+	free(buf);
+	free(other);
 }
 
 /*
@@ -943,6 +1091,7 @@ main(int argc, char **argv)
 	tscrub();
 	trepair();
 	tcondemned();
+	tlowerkey();
 	tcursor();
 	tlost();
 	killspawned();

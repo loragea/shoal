@@ -1202,6 +1202,64 @@ tverify(void)
 	said("the corrupt count", "1 flagged corrupt but clean");
 	free(buf);
 	devclose(d);
+
+	/*
+	 * §8's second kind of mismatch, which is the one -v exists to
+	 * tell from the first, and it has to be reported when it is the
+	 * ONLY thing wrong: every block still hashes to its stored
+	 * digest, and the digest array does not hash to the object's
+	 * csum.  Damaging the csum in the index entry and re-sealing the
+	 * entry is that state exactly, and its repair is the whole-object
+	 * op=full rather than any number of block repairs.
+	 */
+	d = newstore(&s);
+	if((st = opens(d, "a damaged digest array")) == nil){
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(3*Vblk, 13);
+	mk(st, "array", 1);
+	wr(st, "array", buf, 3*Vblk, 0, 2);
+	ckpt(st);
+	storeclose(st);
+	slot = slotof(d, &s, "array", &e);
+	istrue("the checkpointed index has array", slot != ~0UL);
+	e.csum[0] ^= 0x5a;
+	putidx(d, &s, slot, &e);
+	checks++;
+	if(scrub(d, 1, 0) == 0)
+		fail("-v passed an object whose digest array does not hash "
+			"to its csum");
+	said("-v calls the digest array suspect",
+		"0 of 3 blocks mismatch (blocks ), arraybad=1");
+	free(buf);
+	devclose(d);
+
+	/*
+	 * And a slot objverify refuses outright — §5 step 10's damaged
+	 * extent map, which is the headline case -v is run for.  Skipping
+	 * it would report the store clean.
+	 */
+	d = newstore(&s);
+	if((st = opens(d, "a damaged extent map")) == nil){
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(3*Vblk, 19);
+	mk(st, "damaged", 1);
+	wr(st, "damaged", buf, 3*Vblk, 0, 2);
+	ckpt(st);
+	storeclose(st);
+	slot = slotof(d, &s, "damaged", &e);
+	istrue("the checkpointed index has damaged", slot != ~0UL);
+	pokeemap(d, &s, e.emapslot);
+	checks++;
+	if(scrub(d, 1, 0) == 0)
+		fail("-v passed a slot whose extent map failed its checksum");
+	said("-v names the refused slot", "verify: checksum mismatch");
+	said("-v counts it a failure", "1 failed");
+	free(buf);
+	devclose(d);
 }
 
 /*

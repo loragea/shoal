@@ -3120,17 +3120,28 @@ back; a store whose `blksz` is four device write units, whose every
 page and grain write must go out in `Wunit` pieces; a ream cut
 short, which must leave no valid superblock; §12's `-v` over the
 replayed state — a multi-block object, a hole and a tombstone
-verified clean while the device records no write at all, a poked
-grain named with its object and block index where the checkpoint
-passes see nothing, an object flagged `corrupt` that verifies clean
-reported as information, and a grain freed by an un-checkpointed
-truncate and handed to another object, which verifying from the
-checkpointed index would report as a mismatch; and §12's `-R` — a
-bitmap page that is valid and wrong, which no start repairs and which
-`-R` corrects to a full scan of the live maps, a rebuild that counts
-the objects committed since the last checkpoint, and the refusals of
-`-R` with `-o` and of `-R` on a device opened read-only, which `-v`
-opens), `storetest` (§5's
+verified clean, a poked grain named with its object and block index
+where the checkpoint passes see nothing, a damaged digest array
+reported as `arraybad` and a slot whose extent map fails its
+`csum128` reported as a failure rather than skipped, an object flagged
+`corrupt` that verifies clean reported as information, a grain freed
+by an un-checkpointed truncate and handed to another object, which
+verifying from the checkpointed index would report as a mismatch,
+and a store closed on an un-checkpointed multi-block commit, over
+which the device records no write at all — read-only or writable;
+and §12's `-R` — a bitmap page that is valid and wrong, which no
+start repairs and which `-R` corrects to a full scan of the live
+maps, both free-grain counts asserted as numbers, a bitmap page that
+will not read, over which the `as found` count is not printed at all,
+an extent map that fails its `csum128`, which `-R` condemns rather
+than rebuilds from, a rebuild that counts the objects committed since
+the last checkpoint, `-R -v` writing the rebuild's lines before the
+verify's, and the refusals of `-R` with `-o` and of `-R` on a device
+opened read-only, which `-v` opens. `cmd/shoalck`'s own flag layer is
+covered only through `ckstore`, which is what T1 drives: every
+refusal `main` makes it makes again, and `-R -w` hands the no-flush
+assertion to a file image exactly as to an sd unit, so the two opens
+differ in the device and in nothing else), `storetest` (§5's
 ordered start-up: the tolerant index read, replay and its
 idempotence, §2.5's replay-coverage rule in all three of the
 cases it exists to tell apart, the automatic bitmap rebuild, §2.2's
