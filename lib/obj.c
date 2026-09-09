@@ -347,6 +347,7 @@ enum
 {
 	Utomb	= 1,	/* a tombstone may be opened */
 	Ubad	= 2,	/* ... and so may a slot §5 step 10 condemned */
+	Ucorrupt = 4,	/* ... and one whose §8 corrupt flag is set */
 };
 
 static int
@@ -387,6 +388,22 @@ updopen(Upd *u, Store *s, uchar *oid, int oidlen, uvlong newlen, int flags)
 	if(e->bad && !(flags & Ubad)){
 		qunlock(&s->qlstate);
 		werrstr("checksum mismatch: slot %lud, extent map", slot);
+		return -1;
+	}
+	/*
+	 * §8: a copy whose corrupt flag is set fails client access with
+	 * layer-a §2.6's `checksum mismatch' — the content is what failed
+	 * verification, and §3.7's row for that condition is where the
+	 * spelling is fixed.  The exceptions pass Ucorrupt and each has a
+	 * reason: §5.5's op=full and §8's block repair are the repairs, a
+	 * delete is self-contained and has no key to defend (its
+	 * tombstone holds no content, so its commit clears the flag), and
+	 * objcorrupt is the flag's own setter.
+	 */
+	if((e->flags & Icorrupt) && !(flags & Ucorrupt)){
+		qunlock(&s->qlstate);
+		werrstr("checksum mismatch: slot %lud, corrupt flag set",
+			slot);
 		return -1;
 	}
 	u->slot = slot;
@@ -433,12 +450,40 @@ updopen(Upd *u, Store *s, uchar *oid, int oidlen, uvlong newlen, int flags)
 		u->oldnblk = 0;
 	else if(u->e.emapslot != 0
 	&& (u->cold = mapread(s, u->slot, u->e.emapslot)) == nil){
+		if(!(flags & Ubad)){
+			qlock(&s->qlstate);
+			if(u->emapresv)
+				emapresvclr(s, u->newslot);
+			qunlock(&s->qlstate);
+			free(u->e.oid);
+			return -1;
+		}
+		/*
+		 * mapread has just condemned this slot (§5 step 10): the
+		 * damage was not known when the slot decision above was
+		 * made, so make it again on what is known now.  §5.5's
+		 * op=full is the one caller that may take a condemned copy,
+		 * and it must be able to whether or not some earlier read
+		 * happened to be the one that found the damage — a repair
+		 * that works only for a slot condemned since the last
+		 * restart is not a repair.  The map is rebuilt whole in a
+		 * fresh slot (§2.7's Oslot rule) and the grains the damaged
+		 * entry named stay marked used (§3.6).
+		 */
 		qlock(&s->qlstate);
-		if(u->emapresv)
-			emapresvclr(s, u->newslot);
+		u->e.bad = 1;
+		u->oldnblk = 0;
+		if(u->nblk > 1 && !u->emapresv){
+			if(emapalloc(s, &u->newslot) < 0){
+				qunlock(&s->qlstate);
+				free(u->e.oid);
+				werrstr("disk full");
+				return -1;
+			}
+			u->emapresv = 1;
+		}
 		qunlock(&s->qlstate);
-		free(u->e.oid);
-		return -1;
+		u->oslot = u->newslot != u->e.emapslot;
 	}
 	if(u->newslot == u->e.emapslot)
 		u->cnew = u->cold;
@@ -962,6 +1007,17 @@ objwrite(Store *s, uchar *oid, int oidlen, void *a, long n, uvlong off,
 		return -1;
 	}
 	/*
+	 * §8's refusal, made here rather than left to updopen because it
+	 * MUST precede the count-0 shortcut below: a zero-count write
+	 * commits nothing and would otherwise answer ok on a copy that
+	 * fails verification, which is client access served.
+	 */
+	if(oi.corrupt){
+		werrstr("checksum mismatch: slot %lud, corrupt flag set",
+			oi.slot);
+		return -1;
+	}
+	/*
 	 * layer-a §2.4 extends an object at "a write at offset > len" —
 	 * bytes landing above it.  A count of zero lands none, and 9P
 	 * clients issue count-0 Twrites, so taking one as an extend would
@@ -1093,7 +1149,18 @@ objremove(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 		werrstr("delete at version 0");
 		return -1;
 	}
-	if(updopen(&u, s, oid, oidlen, 0, 0) < 0)
+	/*
+	 * §8: a delete applies to a corrupt-flagged copy.  op=delete is
+	 * self-contained — it arbitrates on the key it carries and
+	 * replaces the content with none — so there is nothing here for
+	 * the flag to protect, and the tombstone this commits holds no
+	 * content to be suspect of: updcommit publishes it with the flag
+	 * clear, which is what takes the object out of /lost.  A slot §5
+	 * step 10 condemned is not in this set: its grains are named by
+	 * the damaged map alone, so a delete would leak every one of them
+	 * (§3.6), and op=full remains its only repair.
+	 */
+	if(updopen(&u, s, oid, oidlen, 0, Ucorrupt) < 0)
 		return -1;
 	mapopen(s, &mold, &u.e, u.cold);
 	if(freetail(&u, &mold) < 0){
@@ -1130,7 +1197,7 @@ objcorrupt(Store *s, uchar *oid, int oidlen, int set, Dirtyrec *dr, int ndr)
 
 	if(objstat(s, oid, oidlen, &oi) < 0)
 		return -1;
-	if(updopen(&u, s, oid, oidlen, oi.len, Utomb) < 0)
+	if(updopen(&u, s, oid, oidlen, oi.len, Utomb|Ucorrupt) < 0)
 		return -1;
 	mapopen(s, &mold, &u.e, u.cold);
 	/*
@@ -1238,6 +1305,20 @@ objread(Store *s, uchar *oid, int oidlen, void *a, long n, uvlong off)
 		werrstr(slot >= 0 && s->idx[slot].state == Stomb
 			? "object deleted" : "no such object");
 		qunlock(&s->qlstate);
+		return -1;
+	}
+	/*
+	 * §8: a copy whose corrupt flag is set fails client access with
+	 * `checksum mismatch' (§3.7's row).  The flag says a block does
+	 * not hash to its digest, so what this read would return is the
+	 * damaged bytes — the one thing layer-a §1.4's checksums exist to
+	 * stop — and a corrupt copy is out of arbitration anyway (§1.3),
+	 * so there is no caller left that wants them.
+	 */
+	if(s->idx[slot].flags & Icorrupt){
+		qunlock(&s->qlstate);
+		werrstr("checksum mismatch: slot %lud, corrupt flag set",
+			slot);
 		return -1;
 	}
 	e = s->idx[slot];
@@ -1755,7 +1836,8 @@ stagefinal(Stage *g, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 	if(absent){
 		if(updnew(&u, s, g->oid, g->oidlen, g->len) < 0)
 			return stagefail(g);
-	}else if(updopen(&u, s, g->oid, g->oidlen, g->len, Utomb|Ubad) < 0)
+	}else if(updopen(&u, s, g->oid, g->oidlen, g->len,
+		Utomb|Ubad|Ucorrupt) < 0)
 		return stagefail(g);
 	nokey = !absent && ((u.e.flags & Icorrupt) != 0 || u.e.bad);
 	/*

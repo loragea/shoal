@@ -1562,7 +1562,7 @@ own `not primary: n5.0` is the pattern. Callers can act on these:
 | a write, truncate or stage past `objmax`, at either bound | `object too large` |
 | an `op=full` at a key the receiver's own key defends (§3.6) | `stale version` |
 | an `op=full` at a version the object model forbids, and a chunk outside its stage's declared length | `bad ctl` |
-| a read, verify or update through an extent-map entry that failed its `csum128` (§5 step 9) | `checksum mismatch` |
+| a read, verify or update through an extent-map entry that failed its `csum128` (§5 step 9); a read, write or truncate of a copy whose `corrupt` flag is set (§8) | `checksum mismatch` |
 | a discard whose record fails layer-a §1.5's receiver checks: not a tombstone, not at exactly the named key, or its `wepoch` not strictly below the given epoch | `not discardable` |
 | no grain, index slot, extent-map slot, staged-grain budget, or log space after §6's bounded wait | `disk full` |
 
@@ -1614,7 +1614,11 @@ them obvious:
   verification, or a replicated op's resulting `csum` does not match
   the sender's"; an extent-map entry that fails its own `csum128` is
   content that failed verification, and D14 requires such a holder to
-  say so rather than to answer as though the object were absent.
+  say so rather than to answer as though the object were absent. A
+  copy whose `corrupt` flag is set is that same statement made
+  durably, so client access to it is answered the same way (§8), a
+  count-0 write included — it commits nothing, but answering it `ok`
+  is client access served.
 
 ## 4. Read path, holes and re-hashing
 
@@ -2315,9 +2319,26 @@ with every slot §5 step 10 condemned, since `/lost` is every copy
 this instance holds that fails local verification (layer-a §7.5) and
 is maintained by the set, the clear, the condemnation and start-up
 alike rather than built once — and fails client access with
-`checksum mismatch`. A corrupt
-copy loses arbitration against everything including absence (layer-a
-§1.3), which the server enforces by refusing to advertise it.
+`checksum mismatch`.
+
+A flagged copy fails client access with `checksum mismatch` (§3.7's
+row): read, write and truncate refuse, and so does a write of zero
+bytes, which commits nothing but is client access all the same. Three
+calls do not refuse, and each is how the flag is meant to be got rid
+of: `objstat`, because that is where the flag is read; verify,
+because finding every block matching is what licenses clearing it;
+and **delete**, because `op=delete` is self-contained — it arbitrates
+on the key it carries and replaces the content with none — so there
+is nothing left for the flag to defend, and the tombstone it commits
+holds no content to be suspect of and so carries the flag cleared. A
+create over a live flagged copy is still `object exists`. A slot §5
+step 10 condemned is not in the delete's set: the grains it holds are
+named by the damaged map alone, so a delete would leak every one of
+them (§3.6), and `op=full` remains its only repair.
+
+A corrupt copy loses arbitration against everything including absence
+(layer-a §1.3), which the server enforces by refusing to advertise
+it.
 
 **What a corrupt object answers to `op=meta`.** No available answer
 is right: reporting the key claims an arbitration position layer-a

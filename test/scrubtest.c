@@ -47,6 +47,22 @@ ostat(Store *s, char *name, Objinfo *oi)
 	return objstat(s, o, strlen(name), oi);
 }
 
+/* a call that must fail, and with the error the argument names */
+static void
+refused(char *what, int r, char *want)
+{
+	char e[ERRMAX];
+
+	checks++;
+	if(r >= 0){
+		fail("%s was accepted", what);
+		return;
+	}
+	rerrstr(e, sizeof e);
+	if(strncmp(e, want, strlen(want)) != 0)
+		fail("%s: %s, want %s", what, e, want);
+}
+
 /* the current geometry, for reaching past the API at the media */
 static void
 geom(Dev *d, Super *sup)
@@ -56,6 +72,97 @@ geom(Dev *d, Super *sup)
 	if(superselect(d, &sel) < 0)
 		sysfatal("superselect: %r");
 	*sup = sel.sb[sel.start];
+}
+
+/*
+ * Decision (1) of §8, through §3.7's row: a copy whose corrupt flag
+ * is set fails client access with layer-a §2.6's `checksum mismatch'.
+ * Read, write and truncate refuse; objstat, objverify and objdiscard
+ * do not, because they are how the flag is seen, how it is cleared
+ * and how a tombstone is dropped; a create of the live id is still
+ * `object exists'; and a delete applies, because op=delete is
+ * self-contained and a tombstone holds no content to be suspect of —
+ * which is also what takes the object out of /lost.
+ */
+static void
+taccess(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Objinfo oi;
+	Vfy v;
+	uchar *buf, oid[Oidmax];
+
+	d = newdisk();
+	if((s = mustopen(d, "corrupt-flagged access")) == nil)
+		return;
+	buf = mkbuf(2*Blk, 31);
+	mk(s, "a");
+	mustwr(s, "a", buf, 2*Blk, 0, 2);
+	oidof(oid, "a");
+	if(objcorrupt(s, oid, 1, 1, nil, 0) < 0)
+		fail("objcorrupt: %r");
+
+	refused("objread of a corrupt copy", objread(s, oid, 1, buf, Blk, 0),
+		"checksum mismatch");
+	refused("objwrite of a corrupt copy",
+		objwrite(s, oid, 1, buf, Blk, 0, 3, 1, nil, 0),
+		"checksum mismatch");
+	/*
+	 * A count-0 write commits nothing, so the refusal has to be made
+	 * before the shortcut that answers it ok — a zero-count Twrite is
+	 * an ordinary 9P client call, and answering it ok is client
+	 * access served on a copy that fails verification.
+	 */
+	refused("a count-0 objwrite of a corrupt copy",
+		objwrite(s, oid, 1, buf, 0, 0, 3, 1, nil, 0),
+		"checksum mismatch");
+	refused("objtrunc of a corrupt copy",
+		objtrunc(s, oid, 1, Blk, 3, 1, nil, 0), "checksum mismatch");
+	refused("objcreate over a live corrupt copy",
+		objcreate(s, oid, 1, 3, 1, nil, 0, nil), "object exists");
+
+	checks++;
+	if(objstat(s, oid, 1, &oi) < 0)
+		fail("objstat of a corrupt copy: %r");
+	else
+		eqv("objstat answers the flag", oi.corrupt, 1);
+	checks++;
+	if(objverify(s, oid, 1, &v) < 0)
+		fail("objverify of a corrupt copy: %r");
+	else{
+		eqv("objverify is not refused by the flag", v.nbad, 0);
+		eqv("and finds the content whole", v.arraybad, 0);
+		vfyfree(&v);
+	}
+	storestat(s, &st);
+	eqv("the corrupt copy is in /lost", st.nlost, 1);
+
+	/*
+	 * The delete applies and its tombstone clears the flag.  A
+	 * tombstone holds no content, so there is nothing left for the
+	 * flag to describe, and leaving it set would keep a slot in
+	 * /lost that names no failing copy.
+	 */
+	checks++;
+	if(objremove(s, oid, 1, 3, 1, nil, 0) < 0)
+		fail("objremove of a corrupt copy: %r");
+	if(objstat(s, oid, 1, &oi) < 0)
+		fail("objstat after the delete: %r");
+	else{
+		eqv("the delete tombstoned it", oi.state, Stomb);
+		eqv("and the tombstone clears the flag", oi.corrupt, 0);
+	}
+	storestat(s, &st);
+	eqv("so it leaves /lost", st.nlost, 0);
+	checks++;
+	if(objdiscard(s, oid, 1, 3, 1, 2) < 0)
+		fail("objdiscard of the tombstone: %r");
+
+	storeclose(s);
+	devclose(d);
+	free(buf);
 }
 
 /*
@@ -169,6 +276,7 @@ void
 main(int argc, char **argv)
 {
 	USED(argc); USED(argv);
+	taccess();
 	tlost();
 	killspawned();
 	if(fails > 0){
