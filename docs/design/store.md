@@ -3680,6 +3680,15 @@ the case in about 0.3 s. The 2.6·10^5 entries the row asks for are
 T2's, for the same reason §13's small geometry is: `mk test` stays
 within `AGENTS.md`'s seconds.
 
+One thing below the tier line is **§12's ordering inside each tool's
+`main`** — where `-z` sits relative to the guards and the geometry.
+Every refusal it orders is a library entry a T1 program drives
+directly (`geometry`, `superselect`, `monhdrsel`, `monfmtcheck`,
+`monfmt`), but the order itself lives in code no T1 program execs,
+so it is not covered here. A T2 case that runs the two commands over
+an image and compares its length before and after a refused run is
+what would close it.
+
 - **T1.1 crash matrix (R1–R4).** Every point above × {create,
   whole-block write, partial write, truncate, delete, 16 MiB
   `op=full`}: record the four-tuple and content before, crash,
