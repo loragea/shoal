@@ -840,6 +840,34 @@ int		objsnapent(Objsnap*, ulong i, uchar *oid, int *oidlen,
 			Objinfo*);
 void		objsnapclose(Objsnap*);
 
+/*
+ * The other two enumerations layer-a §2.2 makes a snapshot MUST, as
+ * copies taken at open rather than as cursors: /dirty and /lost are
+ * bounded by the dirty region and by what fails local verification,
+ * so a copy is the whole of what a renderer needs.
+ *
+ * dirtysnap answers a malloc'd array of every record in the dirty set
+ * (layer-a §7.1), taken under one hold of the lock that guards it;
+ * the Dirtyrec carries the record's oid, oidlen, peer, peerlen and
+ * epoch, and its op is 1 (add) because a record that is in the set is
+ * one that was added.  lostsnap answers the same for /lost (layer-a
+ * §7.5): one entry per slot storelost would name, with the oid and
+ * the Objinfo beside it so a renderer need not go back to the index.
+ * storelost stays: it is what a walker that wants the live list uses.
+ *
+ * Both answer 0 with *np 0 and *p nil when there is nothing to
+ * report, -1 on failure, and the array is the caller's to free.
+ */
+typedef struct Lostent Lostent;
+struct Lostent
+{
+	int	oidlen;
+	uchar	oid[Oidmax];
+	Objinfo	oi;		/* oi.slot is the slot storelost names */
+};
+
+int	dirtysnap(Store*, Dirtyrec **dp, ulong *np);
+int	lostsnap(Store*, Lostent **lp, ulong *np);
 
 /*
  * §8's block repair.  a is block blk as fetched from a holder of a

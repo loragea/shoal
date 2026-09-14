@@ -6,9 +6,10 @@
 #include "store.h"
 
 /*
- * docs/design/store.md §9's snapshot-at-open enumeration: what a
- * server's /obj, /tombs and /advert fids read.  R12, and layer-a
- * §2.2's SHOULD for /obj and /tombs.
+ * docs/design/store.md §9's snapshot-at-open enumeration and the two
+ * copies beside it: what a server's /obj, /tombs, /advert, /dirty and
+ * /lost fids read.  R12, layer-a §2.2's MUST for the last two and its
+ * SHOULD for /obj and /tombs.
  *
  * The object snapshot is a vector of names taken under one hold of
  * qlstate — {slot, qid.path} for every entry whose state the open
@@ -169,4 +170,94 @@ objsnapclose(Objsnap *sn)
 	free(sn->slot);
 	free(sn->qidpath);
 	free(sn);
+}
+
+/*
+ * /dirty, layer-a §2.2's snapshot MUST and §7.1's records.  The set
+ * is bounded by the dirty region, so a copy is the whole of what a
+ * renderer needs and there is no cursor to tear: everything below is
+ * read under one hold of the lock that guards the set.  The array is
+ * indexed by dirty-record slot and holed, so the walk counts what it
+ * copies rather than trusting the array to be dense.
+ */
+int
+dirtysnap(Store *s, Dirtyrec **dp, ulong *np)
+{
+	Dirtyrec *d;
+	Dirtent *t;
+	ulong i, n, used;
+
+	*dp = nil;
+	*np = 0;
+	if(!storeserving(s))
+		return -1;
+	qlock(&s->qlstate);
+	used = s->ndirtused;
+	d = nil;
+	if(used > 0 && (d = mallocz(used*sizeof *d, 1)) == nil){
+		qunlock(&s->qlstate);
+		werrstr("out of memory");
+		return -1;
+	}
+	n = 0;
+	for(i = 0; i < s->sb.ndirty && n < used; i++){
+		if((t = s->dirt[i]) == nil)
+			continue;
+		d[n].op = 1;		/* a record in the set is an add */
+		d[n].oidlen = t->oidlen;
+		d[n].peerlen = t->peerlen;
+		d[n].epoch = t->epoch;
+		memmove(d[n].oid, t->oid, t->oidlen);
+		memmove(d[n].peer, t->peer, t->peerlen);
+		n++;
+	}
+	qunlock(&s->qlstate);
+	*dp = d;
+	*np = n;
+	return 0;
+}
+
+/*
+ * /lost, layer-a §7.5 and §2.2's snapshot MUST: every copy this
+ * instance holds that fails local verification, with the oid and the
+ * Objinfo beside the slot so a renderer need not go back to the index
+ * — which it could not do consistently anyway, since storelost's list
+ * moves under a concurrent scrub.  Taken under one hold of qlstate,
+ * which is the lock storecondemn reallocs the list under.
+ */
+int
+lostsnap(Store *s, Lostent **lp, ulong *np)
+{
+	Lostent *l;
+	Ient *e;
+	ulong i, n, slot;
+
+	*lp = nil;
+	*np = 0;
+	if(!storeserving(s))
+		return -1;
+	qlock(&s->qlstate);
+	l = nil;
+	if(s->nlost > 0 && (l = mallocz(s->nlost*sizeof *l, 1)) == nil){
+		qunlock(&s->qlstate);
+		werrstr("out of memory");
+		return -1;
+	}
+	n = 0;
+	for(i = 0; i < s->nlost; i++){
+		slot = s->lost[i];
+		if(slot >= s->sb.nslots)
+			continue;
+		e = &s->idx[slot];
+		if(e->state == Sfree)
+			continue;
+		l[n].oidlen = e->oidlen;
+		memmove(l[n].oid, e->oid, e->oidlen);
+		ientinfo(s, slot, &l[n].oi);
+		n++;
+	}
+	qunlock(&s->qlstate);
+	*lp = l;
+	*np = n;
+	return 0;
 }

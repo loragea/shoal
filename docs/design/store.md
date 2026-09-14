@@ -2630,6 +2630,17 @@ the count and `/status` reports how many are open. A snapshot is the
 caller's, and `storeclose` frees nothing of the caller's, so every
 snapshot MUST be closed before the store it was taken from is.
 
+**`/dirty` and `/lost` are copies rather than cursors.** Both sets
+are bounded — by the dirty region (§2.6) and by what fails local
+verification (§8) — so a copy taken under one hold of the lock that
+guards each is the whole of what a renderer needs, and layer-a §2.2's
+MUST for these two costs nothing. The `/dirty` copy carries every
+record's `(oid, peer, epoch)`; the `/lost` copy carries every slot
+the membership list names, with that slot's oid and published record
+beside it, so a renderer never goes back to an index the scrub has
+moved under it. The slot-at-a-time accessor stays beside the copy: it
+is what a walker that wants the live list uses.
+
 §6's tombstone reclaim is the enumeration's first caller, and it is
 the caller's walk rather than the engine's: the engine holds no
 `tombdays` policy, because layer-a §3.1 makes `tombdays` a map-header
