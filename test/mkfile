@@ -9,6 +9,7 @@ TESTS=\
 	geomtest\
 	devtest\
 	supertest\
+	montest\
 	fmtcktest\
 	storetest\
 	objtest\

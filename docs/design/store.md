@@ -3197,7 +3197,8 @@ the header write, so the commit point is not reached), `postwrite`
 (after the header write returns, before the post-flush), `preack`,
 `ckpt:n` (after *n* checkpoint page writes), `super` (after a
 superblock write returns, before its flush — the two copies are
-written in sequence only by `shoalfmt`). A crash at a point is the end
+written in sequence only by `shoalfmt`), and the monitor store's three
+(§10): `monhist`, `monhistflush` and `moncur`. A crash at a point is the end
 of a run, so the simulated disk can be told to **stop the device** at
 the crash: every subsequent read, write and flush fails until the
 test brings the machine back. Without that the writes a schedule
@@ -3241,7 +3242,7 @@ T1 formats a **small geometry** — a partition image of a few MiB with
 over one header sector, not over the whole store, and the cases that
 need `nslots = 2^20` are T2's.
 
-**What T1 covers today.** Ten programs, all of them against the
+**What T1 covers today.** Eleven programs, all of them against the
 simulated disk except where a file-backed device is the point:
 `csumtest` (layer-a §1.4's block digests and object checksums against
 known-answer vectors), `structtest` (§2's byte layouts against
@@ -3259,7 +3260,28 @@ that stops the device, the recorded trace and eight procs sharing one
 device — and the file-backed device, including the read-only open and
 the `Wunit` split), `supertest` (§2.2's three clauses under torn
 superblock writes and under the `super` crash point, which is T1.9's
-first half), `fmtcktest` (`shoalfmt` to `shoalck` over both a
+first half), `montest` (§10's monitor map slot store and §12's
+`shoalmonfmt`: what a format leaves and that a fresh store holds no
+map, the header's byte layout, a commit and the restart that finds it,
+the ring newest-first with layer-a §5.2 clause 2's `E−1` entry present
+at every length and across a wrap, T1.13's flush shape for §10 read
+off the trace — one write and one flush into the ring, then one write
+and one flush into a current slot, and nothing else in a commit —
+**T1.9's second half**, a crash at `moncur` leaving the previous map
+current and the failed publish's ring entry a phantom, and a slot torn
+at a high `seq` not steering the next write onto the only good one;
+**T2.7's phantom case at T1 scale**, a crash at `monhistflush` after
+which the unpublished epoch answers nothing and the next commit
+reuses the phantom's slot; a ring write that fails and a crash at
+`monhist`, each leaving the current map untouched; `disk full` on an
+oversize map with the store unchanged, and the largest map that fits
+read back byte-exact; the header copies — one damaged, both damaged,
+and two valid copies that differ — a current slot whose `len` does not
+fit its slot, an open that writes nothing, a store reopened over a
+read-only file image, an epoch published twice with a regression
+between, and §12's refusals and its object-store superblock warning,
+driven through `monfmt` as `fmtcktest` drives `fmtstore`),
+`fmtcktest` (`shoalfmt` to `shoalck` over both a
 simulated disk and a file image; a store with a live one-block object
 and a live three-block one, built through the codecs, with each fault
 §2 and §5 name poked into it in turn and the checker's own words read
@@ -3346,12 +3368,10 @@ replay accepts, a multi-sector record at the region boundary, a
 header naming more sectors than that record, durable-before-ack for a
 batch's members, and `qid.path` across restarts).
 
-Against the list below that is T1.1–T1.8, T1.10–T1.14, T1.16, T1.17,
-T1.18–T1.20 and T1.22–T1.26. Three cases are not covered and each
-waits on something this store does not have yet: **T1.9**'s second
-half and **T2.7** wait on the monitor's slot store (§10); **T1.15**
-waits on the enumeration snapshot of §9 and the `/obj` fid that reads
-it; **T1.27** waits on the server's `Reqqueue` pool (§7), which is
+Against the list below that is T1.1–T1.14, T1.16, T1.17, T1.18–T1.20
+and T1.22–T1.26. Two cases are not covered and each waits on something
+this store does not have yet: **T1.15** waits on the enumeration
+snapshot of §9 and the `/obj` fid that reads it; **T1.27** waits on the server's `Reqqueue` pool (§7), which is
 what it is about — the engine's own scrub and cursor take the same
 `qlstate` snapshot every other call takes and hold no lock across a
 verify, but *that a scrubber pushes through the object's queue rather
@@ -3406,8 +3426,8 @@ rather than from concurrent procs.
   still inside the flush, and no crash point asks that.
 - **T1.9 two-slot validity (R2).** Tear a superblock copy, restart,
   commit again, tear again: the store still starts. The same for the
-  monitor's map slots. *Mutation:* choose the write victim by `gen`
-  alone.
+  monitor's map slots, in `montest`. *Mutation:* choose the write
+  victim by `gen` alone — by `seq` alone, for the map slots.
 - **T1.10 log reclaim (R2).** The `reclaim` point, then a restart
   that lands on the older superblock copy: its records must still be
   in the log. *Mutation:* reclaim before the checkpoint's superblock
@@ -3632,7 +3652,10 @@ property of the platform rather than of the store:
   torn publish. Including the phantom case: crash between the history
   write and the current-map write, restart, and assert no history
   entry survives with a `seq` above the current map's, so `/maps/<E>`
-  can never serve a placement that was never published.
+  can never serve a placement that was never published. Both halves
+  are discriminated at T1 scale in `montest` against the simulated
+  disk; what stays open here is the real device, which is the point
+  of a T2 row.
 - **T2.8 sustained throughput**, to confirm or refute §11's 6.7 MB/s
   extrapolation and the eight-way `op=full` figure.
 
