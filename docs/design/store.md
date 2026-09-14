@@ -3571,10 +3571,12 @@ bounds and `final=1` arbitration including D14's corrupt receiver,
 §6's four exhaustions with delete working throughout on the reserved
 tail, R7's dirty records across a restart and on every write-path
 commit, layer-a §1.2's `object too large` at the bounds where a sum
-would wrap, layer-a §2.6's tombstone errors and §1.5's create over a
-tombstone, §3.7's rule that every refusal the API makes is either
-§2.6's prefix or plainly not one, and the key-preserving `corrupt`
-flag), `scrubtest` (§8's engine half: what a corrupt-flagged copy
+would wrap, layer-a §2.6's tombstone errors, §1.5's create over a
+tombstone and each of its discard receiver checks refused on its
+own — the state check at the entry's own key, so that the key check
+cannot answer for it — §3.7's rule that every refusal the API makes
+is either §2.6's prefix or plainly not one, and the key-preserving
+`corrupt` flag), `scrubtest` (§8's engine half: what a corrupt-flagged copy
 answers on every path §3.7's row covers — the count-0 write
 included — and that a delete applies and clears the flag; the scrub's
 two durable transitions, each across a restart taken over a
