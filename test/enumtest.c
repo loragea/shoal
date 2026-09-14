@@ -1685,8 +1685,14 @@ treclaim(void)
 		if(objremove(s, o, 2, 2, i == 3 ? 9 : 1, nil, 0) < 0)
 			fail("objremove r%lud: %r", i);
 	}
-	if(ostat(s, "r0", &oi) < 0)
-		fail("objstat r0: %r");
+	/*
+	 * The cutoff is the LAST of the group, not the first: mtime is a
+	 * whole second (obj.c takes time(nil)), so a run that crosses a
+	 * second boundary while a group is made would leave the rest of
+	 * that group above a cutoff taken from its first member.
+	 */
+	if(ostat(s, "r4", &oi) < 0)
+		fail("objstat r4: %r");
 	t0 = oi.mtime;
 	/* group B: r5..r8, at least a second later */
 	sleep(1100);
@@ -1769,8 +1775,8 @@ treclaimrace(void)
 		mk(s, nm);
 		rmv(s, nm, 2);
 	}
-	if(ostat(s, "w0", &oi) < 0)
-		fail("objstat w0: %r");
+	if(ostat(s, "w5", &oi) < 0)		/* the last, per treclaim */
+		fail("objstat w5: %r");
 	cutoff = oi.mtime;
 	if((sn = mustsnap(s, Snaptomb, "the reclaim walk")) == nil)
 		goto out;
