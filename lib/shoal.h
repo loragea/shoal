@@ -673,7 +673,11 @@ Store*	storeopen(Dev*, Storecfg*);
  * Stop the procs and free the store; it writes nothing.  Every object
  * snapshot taken from it (objsnapopen, below) MUST be closed first: a
  * snapshot is the caller's, so this frees none of them, and the store
- * they name is gone underneath them after it returns.
+ * they name would be gone underneath them.  A store closed with one
+ * still open is a fid-lifetime bug in the caller, and this `sysfatal's
+ * naming the count rather than leaving the snapshot to answer from
+ * freed memory — which it would do plausibly, entry by entry, as
+ * "that entry is gone".
  */
 void	storeclose(Store*);
 int	storecheckpoint(Store*);
@@ -825,7 +829,11 @@ int	objslot(Store*, ulong slot, uchar *oid, int *oidlen, Objinfo*);
  * is per open fid; an open past it answers `disk full' (layer-a
  * §2.6).  objsnapclose releases the count.  A snapshot is the
  * caller's, and storeclose frees nothing of the caller's, so every
- * snapshot MUST be closed before the store it was taken from is.
+ * snapshot MUST be closed before the store it was taken from is:
+ * storeclose `sysfatal's on a store that still has one open, because
+ * the alternative is a snapshot answering "gone" for every entry out
+ * of freed memory.  Closing one twice is the same class of bug and
+ * cannot be caught: the second call reads a handle the first freed.
  */
 enum
 {

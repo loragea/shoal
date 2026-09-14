@@ -183,6 +183,7 @@ struct Store
 	ulong	nhash;
 	ulong	nlive, ntomb;
 	ulong	nobjsnap;		/* §9's open snapshots; qlstate's */
+	ulong	snapstale;		/* §13's snapstale point; qlstate's */
 
 	/* the two slot spaces, §6.  resv is a stage's reservation. */
 	uchar	*slotused;

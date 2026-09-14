@@ -2628,10 +2628,19 @@ are 96 MB, which is the number §14(9) says is answered for the Layer
 B envelope and not for this design's own maximum. A close releases
 the count and `/status` reports how many are open. A snapshot is the
 caller's, and `storeclose` frees nothing of the caller's, so every
-snapshot MUST be closed before the store it was taken from is.
+snapshot MUST be closed before the store it was taken from is —
+and a `storeclose` that finds one still open **`sysfatal`s, naming
+the count**. It is a programming error in the server's fid handling,
+and the alternative is worse than a crash: the snapshot's entries are
+then rendered from a freed `Store`, where the walk finds no `qidpath`
+match and answers *gone* for every one of them, so the bug surfaces
+as a silently short `/obj` listing rather than as a fault. Closing a
+snapshot twice is the same class of bug and is **not** detectable —
+the second call reads a handle the first freed — so the count guard
+in the close is a guard against wedging the bound, not a check.
 
-**`/dirty` and `/lost` are copies rather than cursors.** Both sets
-are bounded — by the dirty region (§2.6) and by what fails local
+**`/dirty` and `/lost` are copies rather than cursors.** Both sets are
+bounded — by the dirty region (§2.6) and by what fails local
 verification (§8) — so a copy taken under one hold of the lock that
 guards each is the whole of what a renderer needs, and layer-a §2.2's
 MUST for these two costs nothing. The `/dirty` copy carries every

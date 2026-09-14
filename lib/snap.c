@@ -17,13 +17,41 @@
  * entry it names is not refused or delayed; the entry simply becomes
  * gone.  Rendering happens afterwards, per entry, under the same
  * short hold of qlstate §8's cursor takes, so no lock spans a
- * caller's use of an entry and a walk of 2.6·10^5 entries never
- * blocks /status, /ctl or Tflush (§7 rule 2).
+ * caller's use of an entry: a full walk of 2.6·10^5 entries is
+ * 2.6·10^5 short holds and blocks nothing for longer than one of
+ * them.
+ *
+ * **What the OPEN costs is not small, and §7 rule 2's letter is what
+ * it satisfies rather than its number.**  The walk stops at the
+ * count, so the cost is the highest occupied slot and not nslots: a
+ * lightly-used 2^20 index opens in microseconds, but an index whose
+ * last entry sits at slot 2^20 costs a scan of them all, measured at
+ * ~22 ns a slot on the reference machine — **≈23 ms** — held under
+ * qlstate.  §2.3's 4x over-provision puts the envelope's 2.6·10^5
+ * objects on an nslots near 10^6, so that is the envelope case and
+ * not a corner.  Rule 2's letter holds: no device call, flush wait or
+ * Rendez sleep is reachable under the hold (the walk touches s->idx
+ * alone, and storeserving takes and releases qllog before it), and
+ * the allocation — 12 MB at nslots = 2^20 — is taken outside it.
+ * §16(a) carries the chunked scan under a generation counter that
+ * would bound the hold if T2 shows the 23 ms matters.
  *
  * §9 sizes the vector at 12 bytes an entry, so it is two parallel
  * arrays rather than one array of a padded struct: a {ulong, uvlong}
  * struct is 16 bytes on amd64, and the 4 in every 16 buys nothing.
  */
+
+enum
+{
+	/*
+	 * How many times an open re-counts when the index moves under
+	 * its allocation.  A partial vector is not an option (§9's
+	 * objsnap=full), and an index that moves under eight counts in
+	 * a row is a caller that will do better opening again than
+	 * spinning here under a lock every apply wants.
+	 */
+	Snaptries	= 8,
+};
 
 static int
 inkinds(int state, int kinds)
@@ -35,12 +63,31 @@ inkinds(int state, int kinds)
 	return 0;
 }
 
+/*
+ * How many entries the open will name.  nlive and ntomb are the
+ * index's own counts of the two states, maintained by every apply
+ * under qlstate, so the vector's size is known without a walk.
+ * Caller holds qlstate.
+ */
+static ulong
+snapwant(Store *s, int kinds)
+{
+	ulong want;
+
+	want = 0;
+	if(kinds & Snaplive)
+		want += s->nlive;
+	if(kinds & Snaptomb)
+		want += s->ntomb;
+	return want;
+}
+
 Objsnap*
 objsnapopen(Store *s, int kinds)
 {
 	Objsnap *sn;
 	Ient *e;
-	ulong i, n, want;
+	ulong i, n, want, try;
 
 	if(!storeserving(s))
 		return nil;
@@ -54,59 +101,95 @@ objsnapopen(Store *s, int kinds)
 	}
 	sn->s = s;
 	sn->kinds = kinds;
-	qlock(&s->qlstate);
-	/*
-	 * §9's bound.  The cost is per open fid — 12 MB at nslots =
-	 * 2^20 — so an open past the configured maximum answers layer-a
-	 * §2.6's `disk full' rather than growing without limit.  The
-	 * detail after the prefix names the cause for an operator; the
-	 * prefix is what a client matches on (§6).
-	 */
-	if(s->nobjsnap >= s->cfg.objsnapmax){
-		qunlock(&s->qlstate);
-		free(sn);
-		werrstr("disk full: %lud object snapshots already open",
-			s->nobjsnap);
-		return nil;
-	}
-	/*
-	 * nlive and ntomb are the index's own counts of the two states,
-	 * maintained by every apply under this lock, so the vector's
-	 * size is known before the walk and one allocation serves.  The
-	 * walk stops at that count as well as at nslots, so a count that
-	 * ever disagreed with the index would truncate the snapshot
-	 * rather than run off the end of the array.
-	 */
-	want = 0;
-	if(kinds & Snaplive)
-		want += s->nlive;
-	if(kinds & Snaptomb)
-		want += s->ntomb;
-	if(want > 0){
-		sn->slot = malloc(want*sizeof *sn->slot);
-		sn->qidpath = malloc(want*sizeof *sn->qidpath);
-		if(sn->slot == nil || sn->qidpath == nil){
+	for(try = 0; try < Snaptries; try++){
+		/*
+		 * The count, under the lock.  §9's bound is checked here
+		 * too, so that an open past it costs no allocation; the
+		 * check that decides it is the one under the fill below,
+		 * because that is where the count is taken.
+		 */
+		qlock(&s->qlstate);
+		if(s->nobjsnap >= s->cfg.objsnapmax){
 			qunlock(&s->qlstate);
-			free(sn->slot);
-			free(sn->qidpath);
-			free(sn);
-			werrstr("out of memory");
-			return nil;
+			werrstr("disk full: %lud object snapshots already open",
+				s->nobjsnap);
+			goto bad;
 		}
-	}
-	n = 0;
-	for(i = 0; i < s->sb.nslots && n < want; i++){
-		e = &s->idx[i];
-		if(!inkinds(e->state, kinds))
+		want = snapwant(s, kinds);
+		/*
+		 * §13's snapstale point: take the count one short, which is
+		 * what a create between this hold and the fill's leaves.
+		 * Inert unless a test asks for it.
+		 */
+		if(s->snapstale > 0 && want > 0){
+			s->snapstale--;
+			want--;
+		}
+		qunlock(&s->qlstate);
+
+		/*
+		 * The allocation, outside the lock.  12 MB at nslots = 2^20,
+		 * and §7 rule 2's whole point is that nothing a caller waits
+		 * on happens under qlstate.
+		 */
+		free(sn->slot);
+		free(sn->qidpath);
+		sn->slot = nil;
+		sn->qidpath = nil;
+		if(want > 0){
+			sn->slot = malloc(want*sizeof *sn->slot);
+			sn->qidpath = malloc(want*sizeof *sn->qidpath);
+			if(sn->slot == nil || sn->qidpath == nil){
+				werrstr("out of memory");
+				goto bad;
+			}
+		}
+
+		qlock(&s->qlstate);
+		if(s->nobjsnap >= s->cfg.objsnapmax){
+			qunlock(&s->qlstate);
+			werrstr("disk full: %lud object snapshots already open",
+				s->nobjsnap);
+			goto bad;
+		}
+		/*
+		 * The index may have moved while the allocation ran.  A
+		 * vector short of what the index now holds would be a
+		 * PARTIAL snapshot, which §9's objsnap=full refuses to
+		 * serve, so the answer is to count again rather than to
+		 * truncate.  The counts are exact, so this one comparison
+		 * settles it: equal counts mean the walk below finds
+		 * exactly want entries.
+		 */
+		if(snapwant(s, kinds) != want){
+			qunlock(&s->qlstate);
 			continue;
-		sn->slot[n] = i;
-		sn->qidpath[n] = e->qidpath;
-		n++;
+		}
+		n = 0;
+		for(i = 0; i < s->sb.nslots && n < want; i++){
+			e = &s->idx[i];
+			if(!inkinds(e->state, kinds))
+				continue;
+			sn->slot[n] = i;
+			sn->qidpath[n] = e->qidpath;
+			n++;
+		}
+		sn->n = n;
+		s->nobjsnap++;
+		qunlock(&s->qlstate);
+		return sn;
 	}
-	sn->n = n;
-	s->nobjsnap++;
-	qunlock(&s->qlstate);
-	return sn;
+	/*
+	 * An index that moved under every attempt.  A local error, not a
+	 * §2.6 wire one: nothing is full and nothing is broken, the
+	 * caller may simply open again.
+	 */
+	werrstr("object snapshot: the index moved under %d counts", Snaptries);
+bad:
+	free(sn->slot);
+	free(sn->qidpath);
+	free(sn);
+	return nil;
 }
 
 ulong
@@ -224,6 +307,17 @@ dirtysnap(Store *s, Dirtyrec **dp, ulong *np)
  * — which it could not do consistently anyway, since storelost's list
  * moves under a concurrent scrub.  Taken under one hold of qlstate,
  * which is the lock storecondemn reallocs the list under.
+ *
+ * The copy names EVERY slot storelost names, including §5 step 10's:
+ * an index entry that would not unpack leaves its slot `bad' with its
+ * state still Sfree (store.c's readindex), and that slot is on the
+ * list and counted in Storestat.nlost.  It has no oid to give — the
+ * entry that would have held one is the damage — so its Lostent
+ * carries oidlen 0 and an Objinfo that is the slot number and
+ * nothing else, and a renderer emits a line with no `oid=' (layer-a
+ * §2.2 fixes only `oid=' and `kind=' when they are present).  Any
+ * other rule would make the copy disagree with /status's own lost
+ * count on precisely the damage /lost exists for.
  */
 int
 lostsnap(Store *s, Lostent **lp, ulong *np)
@@ -249,8 +343,13 @@ lostsnap(Store *s, Lostent **lp, ulong *np)
 		if(slot >= s->sb.nslots)
 			continue;
 		e = &s->idx[slot];
-		if(e->state == Sfree)
-			continue;
+		/*
+		 * A free slot on the list is §5 step 10's: readindex left it
+		 * bad with no oid unpacked, so oidlen is 0 and ientinfo's
+		 * fill is the slot number, state Sfree and zeroes.  Nothing
+		 * else reaches the list free: lostupdate delists a slot the
+		 * moment an apply frees it.
+		 */
 		l[n].oidlen = e->oidlen;
 		memmove(l[n].oid, e->oid, e->oidlen);
 		ientinfo(s, slot, &l[n].oi);
@@ -258,6 +357,74 @@ lostsnap(Store *s, Lostent **lp, ulong *np)
 	}
 	qunlock(&s->qlstate);
 	*lp = l;
+	*np = n;
+	return 0;
+}
+
+/*
+ * The other half of /dirty (layer-a §2.2): one `fullsync peer=<iid>'
+ * line per peer carrying §7.1's coarse flag.  No fine-grained record
+ * names those peers — §2.6's exhaustion drop sets the flag on exactly
+ * the peer whose records it has just thrown away — so a renderer that
+ * had only dirtysnap would emit the file with its coarse half
+ * missing, and the copy is therefore two calls rather than one.
+ *
+ * Taken under qlstate, which is the lock every writer of the peer
+ * list holds: applydirty's addpeer and dropworstpeer (apply.c) run
+ * inside the commit's apply, start-up's step 12 and readdirty's
+ * addpeer are single-threaded, and storefullsync reads under it.  The
+ * allocation is under the hold, unlike the index vector's: the list
+ * is the cluster's instances (layer-a §3.3 bounds them at twelve),
+ * not a scan of nslots.
+ *
+ * The names are one allocation — the pointer array with the bytes
+ * after it — so one free releases the copy.  0 with *np 0 and *pp nil
+ * when no peer carries the flag.  Today that is rare: nothing clears
+ * the flag until the reconcile pass exists, and a peer is registered
+ * with it already set (apply.c's addpeer), so this names every peer
+ * the store knows of.  A peer it does not know of has no line, which
+ * is what storefullsync's answer of 1 for an unknown name means: the
+ * file states what this instance has recorded, not what it has
+ * concluded about names it has never seen.
+ */
+int
+fullsyncsnap(Store *s, char ***pp, ulong *np)
+{
+	Peer *p;
+	char **a, *q;
+	ulong n, nb;
+
+	*pp = nil;
+	*np = 0;
+	if(!storeserving(s))
+		return -1;
+	qlock(&s->qlstate);
+	n = 0;
+	nb = 0;
+	for(p = s->peers; p != nil; p = p->next)
+		if(p->fullsync){
+			n++;
+			nb += strlen(p->name) + 1;
+		}
+	if(n == 0){
+		qunlock(&s->qlstate);
+		return 0;
+	}
+	if((a = mallocz(n*sizeof *a + nb, 1)) == nil){
+		qunlock(&s->qlstate);
+		werrstr("out of memory");
+		return -1;
+	}
+	q = (char*)(a + n);
+	n = 0;
+	for(p = s->peers; p != nil; p = p->next)
+		if(p->fullsync){
+			a[n++] = q;
+			strcpy(q, p->name);
+			q += strlen(p->name) + 1;
+		}
+	qunlock(&s->qlstate);
+	*pp = a;
 	*np = n;
 	return 0;
 }

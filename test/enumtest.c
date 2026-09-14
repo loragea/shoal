@@ -571,7 +571,7 @@ tbound(void)
 	Dev *d;
 	Store *s;
 	Storestat st;
-	Objsnap *sn[Objsnapmaxdflt+1];
+	Objsnap *sn[Objsnapmaxdflt+1], *over;
 	int i;
 
 	d = newdisk();
@@ -588,8 +588,9 @@ tbound(void)
 	storestat(s, &st);
 	eqv("the store reports every open snapshot", st.nobjsnap,
 		Objsnapmaxdflt);
-	refused("an open past the bound", objsnapopen(s, Snaplive) != nil ?
-		0 : -1, "disk full");
+	over = objsnapopen(s, Snaplive);
+	refused("an open past the bound", over != nil ? 0 : -1, "disk full");
+	objsnapclose(over);		/* nil unless the bound failed */
 	objsnapclose(sn[0]);
 	storestat(s, &st);
 	eqv("a close releases the count", st.nobjsnap, Objsnapmaxdflt-1);
@@ -597,13 +598,92 @@ tbound(void)
 		fail("objsnapopen after a close: %r");
 	storestat(s, &st);
 	eqv("and the next open is admitted", st.nobjsnap, Objsnapmaxdflt);
-	refused("a snapshot of no kinds at all", objsnapopen(s, 0) != nil ?
-		0 : -1, "object snapshot");
+	over = objsnapopen(s, 0);
+	refused("a snapshot of no kinds at all", over != nil ? 0 : -1,
+		"object snapshot");
+	objsnapclose(over);
 	for(i = 0; i < Objsnapmaxdflt; i++)
 		objsnapclose(sn[i]);
 	storestat(s, &st);
 	eqv("closing them all releases every count", st.nobjsnap, 0);
 	storeclose(s);
+	devclose(d);
+}
+
+/*
+ * §9: every snapshot MUST be closed before the store is, and a
+ * storeclose that finds one open says so out loud.  Without that the
+ * entries are rendered from a freed Store, which does not fault: the
+ * walk finds no qid.path match and answers `gone' for every one of
+ * them, so a fid-lifetime bug in a server serves a silently short
+ * /obj listing.  The child is the proc that dies, so this one can
+ * watch it: RFMEM so it shares the store, RFFDG so the standard
+ * error it redirects is its own.
+ */
+static void
+tclosesnap(void)
+{
+	Dev *d;
+	Store *s;
+	Objsnap *sn;
+	Waitmsg *w;
+	int pid, fd, ok;
+
+	d = newdisk();
+	if((s = mustopen(d, "storeclose under an open snapshot")) == nil)
+		return;
+	mk(s, "e0");
+	mk(s, "e1");
+	if((sn = mustsnap(s, Snaplive, "storeclose")) == nil){
+		storeclose(s);
+		devclose(d);
+		return;
+	}
+	switch(pid = rfork(RFPROC|RFMEM|RFFDG)){
+	case -1:
+		fail("rfork: %r");
+		objsnapclose(sn);
+		storeclose(s);
+		devclose(d);
+		return;
+	case 0:
+		close(2);
+		if((fd = open("/dev/null", OWRITE)) >= 0 && fd != 2)
+			dup(fd, 2);
+		storeclose(s);
+		exits("storeclose returned");
+	}
+	ok = 0;
+	checks++;
+	if((w = wait()) == nil)
+		fail("wait for the closing child: %r");
+	else{
+		if(w->pid != pid)
+			fail("waited on pid %d, want the closing child %d",
+				w->pid, pid);
+		else if(w->msg[0] == '\0')
+			fail("storeclose under an open snapshot returned");
+		else if(strstr(w->msg, "object snapshot") == nil)
+			fail("storeclose under an open snapshot died with "
+				"`%s', want the snapshot count", w->msg);
+		else
+			ok = 1;
+		free(w);
+	}
+	/*
+	 * Only if the child really did die before storefree: under the
+	 * unguarded close it freed this proc's store, and touching it
+	 * again would fault over the FAIL line above.
+	 */
+	if(ok){
+		Storestat st;
+
+		objsnapclose(sn);
+		storestat(s, &st);
+		eqv("and the store closes once the count is back to nothing",
+			st.nobjsnap, 0);
+		storeclose(s);
+	}
 	devclose(d);
 }
 
@@ -1497,6 +1577,7 @@ main(int argc, char **argv)
 	ttombs();
 	tadvert();
 	tbound();
+	tclosesnap();
 	tdirty();
 	tlost();
 	tckpt();
