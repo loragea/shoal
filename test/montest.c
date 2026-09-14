@@ -1125,6 +1125,56 @@ theader(void)
 	devclose(d);
 }
 
+/*
+ * A header whose curoff/histoff do not describe the geometry is
+ * refused, naming them.  Such a header locates the slots anywhere at
+ * all — every offset below it is meaningless — so it is caught in
+ * hdrsane before a byte is read through it, and not left to whatever
+ * the wrong sectors happen to hold.  Both copies carry it, so the
+ * "copies differ" refusal is not what answers.
+ */
+static void
+thdroffsets(void)
+{
+	Dev *d;
+	Mon *m;
+	uchar hdr[Secsz];
+	char err[ERRMAX];
+
+	d = fresh();
+	simpeek(d, 0, hdr, Secsz);
+	PBIT64(hdr + 40, (uvlong)2);		/* curoff, which must be 1 */
+	reccsumset(hdr, Secsz, 16);
+	simpoke(d, 0, hdr, Secsz);
+	simpoke(d, d->size - Secsz, hdr, Secsz);
+	checks++;
+	if((m = monopen(d)) != nil){
+		fail("hdroffsets: a header whose offsets are wrong opened");
+		monclose(m);
+	}
+	rerrstr(err, sizeof err);
+	istrue("hdroffsets: the refusal names curoff",
+		strstr(err, "curoff") != nil);
+	devclose(d);
+
+	/* and the same for histoff, which must follow the two slots */
+	d = fresh();
+	simpeek(d, 0, hdr, Secsz);
+	PBIT64(hdr + 48, (uvlong)3);		/* histoff */
+	reccsumset(hdr, Secsz, 16);
+	simpoke(d, 0, hdr, Secsz);
+	simpoke(d, d->size - Secsz, hdr, Secsz);
+	checks++;
+	if((m = monopen(d)) != nil){
+		fail("hdroffsets: a header whose histoff is wrong opened");
+		monclose(m);
+	}
+	rerrstr(err, sizeof err);
+	istrue("hdroffsets: the refusal names histoff",
+		strstr(err, "histoff") != nil);
+	devclose(d);
+}
+
 /* neither current slot valid is damage, and it is refused */
 static void
 tnocur(void)
@@ -1488,6 +1538,7 @@ main(int, char**)
 	tring();
 	tfull();
 	theader();
+	thdroffsets();
 	tnocur();
 	tbadlen();
 	treadonly();

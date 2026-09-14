@@ -3402,7 +3402,9 @@ session*, where the phantom mark has to hold in memory with no restart
 to rebuild it; `disk full` on an
 oversize map with the store unchanged, and the largest map that fits
 read back byte-exact; the header copies — one damaged, both damaged,
-and two valid copies that differ — a current slot whose `len` does not
+and two valid copies that differ, and a pair whose `curoff`/`histoff`
+do not describe the geometry, refused by name before a slot is located
+through them — a current slot whose `len` does not
 fit its slot, an open that writes nothing, a store reopened over a
 read-only file image, an epoch published twice with a regression
 between, and §12's refusals and its object-store superblock warning,
