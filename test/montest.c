@@ -17,8 +17,10 @@
  * device under -X, is still open.
  *
  * Every crash schedule runs with the device stopped at the crash
- * (simcrashdead) and the dirty sectors dropped, which is the default
- * crash a device that lost its whole cache performs.
+ * (simcrashdead).  The named cases drop the dirty sectors, which is
+ * the crash a device that lost its whole cache performs; tcrashmatrix
+ * sweeps each of the three commit points against all four of the
+ * sim's crash policies.
  */
 
 enum
@@ -631,6 +633,100 @@ tslots(void)
 	eqtext("slots: on the surviving map", &mm, "map=B");
 	monclose(m);
 	devclose(d);
+}
+
+/*
+ * The whole crash argument, swept: each of §10's three commit points
+ * against each of the simulated disk's four crash policies.  The
+ * cases above take the Scdrop column, which is the crash a device
+ * that lost its whole cache performs; Sckeep, Scsome and Scnamed are
+ * the other things a cache can do with the sectors written since the
+ * last flush, and §10 claims all three invariants against every one
+ * of them.
+ *
+ * Whatever the schedule, after the restart: the current map is
+ * EXACTLY the old one or EXACTLY the new one and nothing in between;
+ * position 0 of the ring is the current map; and no ring entry sits
+ * above the current map's seq, since any that did is a phantom.
+ */
+static void
+tcrashcell(char *point, int mode, char *modename)
+{
+	Dev *d;
+	Mon *m;
+	Monstat st;
+	Monmap mm, h;
+	char what[64];
+	ulong i;
+	int old, new;
+
+	snprint(what, sizeof what, "crash %s %s", point, modename);
+	d = fresh();
+	if((m = mustopen(d, what)) == nil){
+		devclose(d);
+		return;
+	}
+	commit(m, what, "map=A", 1);
+	commit(m, what, "map=B", 2);
+	monstat(m, &st);
+
+	simcrashdead(d, 1);
+	if(mode == Scnamed){
+		/* keep only the first sector of the slot being written */
+		if(strcmp(point, "moncur") == 0)
+			simcrashkeep(d, curoffs(&st, st.cur == 0 ? 1 : 0),
+				Secsz);
+		else
+			simcrashkeep(d, histoffs(&st, 2), Secsz);
+	}else
+		simcrashmode(d, mode);
+	simarm(d, point, 0);
+	moncommit(m, "map=C", 5, 3);
+	monclose(m);
+	simrevive(d);
+
+	if((m = mustopen(d, what)) == nil){
+		devclose(d);
+		return;
+	}
+	monstat(m, &st);
+	old = new = 0;
+	if(moncurrent(m, &mm)){
+		old = mm.len == 5 && memcmp(mm.text, "map=B", 5) == 0
+			&& st.epoch == 2 && st.seq == 2;
+		new = mm.len == 5 && memcmp(mm.text, "map=C", 5) == 0
+			&& st.epoch == 3 && st.seq == 3;
+	}
+	eqi2(what, "the current map is exactly the old or the new",
+		old || new, 1);
+	eqi2(what, "position 0 is the current map",
+		monhistory(m, 0, &h) && h.seq == st.seq
+		&& h.epoch == st.epoch, 1);
+	for(i = 0; ; i++){
+		if(!monhistory(m, i, &h))
+			break;
+		if(h.seq > st.seq){
+			fail("%s: a ring entry sits above the current map: "
+				"seq %llud over %llud", what, h.seq, st.seq);
+			break;
+		}
+	}
+	checks++;
+	monclose(m);
+	devclose(d);
+}
+
+static void
+tcrashmatrix(void)
+{
+	static char *points[] = { "monhist", "monhistflush", "moncur" };
+	static int modes[] = { Scdrop, Sckeep, Scsome, Scnamed };
+	static char *modenames[] = { "Scdrop", "Sckeep", "Scsome", "Scnamed" };
+	int i, j;
+
+	for(i = 0; i < nelem(points); i++)
+		for(j = 0; j < nelem(modes); j++)
+			tcrashcell(points[i], modes[j], modenames[j]);
 }
 
 /*
@@ -1571,6 +1667,7 @@ main(int, char**)
 	tlostwrite(Sftearbyte, "Sftearbyte", 0);
 	tslots();
 	tphantom();
+	tcrashmatrix();
 	thistfail();
 	tringfailphantom();
 	tcurfailretry();

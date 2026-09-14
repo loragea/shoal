@@ -3393,7 +3393,12 @@ current and the failed publish's ring entry a phantom, and a slot torn
 at a high `seq` not steering the next write onto the only good one;
 **T2.7's phantom case at T1 scale**, a crash at `monhistflush` after
 which the unpublished epoch answers nothing and the next commit
-reuses the phantom's slot; a ring write that fails and a crash at
+reuses the phantom's slot; the whole crash argument swept — each of
+§10's three commit points against each of the sim's four crash
+policies, twelve cells, every one asserting that the current map is
+exactly the old one or exactly the new one, that position 0 is the
+current map, and that no ring entry sits above the current map's
+`seq`; a ring write that fails and a crash at
 `monhist`, each leaving the current map untouched; a ring write that
 fails *over a phantom victim*, after which the retry reuses that same
 slot and the never-published epoch is still unanswerable at the next
