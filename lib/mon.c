@@ -161,7 +161,14 @@ monhdrunpack(Monhdr *h, uchar *p, Dev *d)
 		return -1;
 	}
 	if(!reccsumok(p, d->secsz, Hcsumoff)){
-		werrstr("checksum mismatch");
+		/*
+		 * Not the bare `checksum mismatch' of layer-a §2.6: this
+		 * is a diagnostic about one header copy, captured into
+		 * Monhsel.why by the only caller, and §3.7 keeps an
+		 * internal-invariant error from beginning with a wire
+		 * error's prefix even where it cannot escape today.
+		 */
+		werrstr("the header checksum does not match");
 		return -1;
 	}
 	h->slotsz = GBIT32(p + 32);
@@ -304,11 +311,43 @@ slotread(Mon *m, vlong off, Monslot *sl)
 }
 
 /*
- * Write one slot and flush it, with the crash point §13 names after
- * the write returns and before the flush.  The write is rounded up to
- * roundup(secsz+len, secsz) and zero-padded, because devsd turns a
- * write whose byte count is not a sector multiple into a
- * read-modify-write; it is one devwrite, which splits at Wunit
+ * Read a slot back after its flush and check that it is the slot that
+ * was just written (§10).  A write that reports success, survives its
+ * flush and lands nothing would otherwise be invisible until the next
+ * open: the ring would hold no entry for the current map, so position
+ * 0 would not be the current map and layer-a §8.2's E−1 entry would
+ * be unanswerable.  The read-back is one read of at most slotsz
+ * against a flush that costs 8.6 ms (§10's cost model).
+ */
+static int
+slotverify(Mon *m, vlong off, ulong len, uvlong seq, uvlong epoch)
+{
+	Monslot sl;
+	char why[ERRMAX];
+
+	memset(&sl, 0, sizeof sl);
+	slotread(m, off, &sl);
+	if(!sl.valid)
+		snprint(why, sizeof why, "%s", sl.why);
+	else if(sl.len != len || sl.seq != seq || sl.epoch != epoch)
+		snprint(why, sizeof why, "it holds len %lud seq %llud "
+			"epoch %llud", sl.len, sl.seq, sl.epoch);
+	else{
+		slotclear(&sl);
+		return 0;
+	}
+	slotclear(&sl);
+	werrstr("the slot did not read back after its flush (len %lud "
+		"seq %llud epoch %llud): %s", len, seq, epoch, why);
+	return -1;
+}
+
+/*
+ * Write one slot, flush it and read it back, with the crash point §13
+ * names after the write returns and before the flush.  The write is
+ * rounded up to roundup(secsz+len, secsz) and zero-padded, because
+ * devsd turns a write whose byte count is not a sector multiple into
+ * a read-modify-write; it is one devwrite, which splits at Wunit
  * itself.
  */
 static int
@@ -333,6 +372,8 @@ slotwrite(Mon *m, vlong off, ulong len, uvlong seq, uvlong epoch,
 		return -1;
 	devpoint(d, point, 0);
 	if(devflush(d) < 0)
+		return -1;
+	if(slotverify(m, off, len, seq, epoch) < 0)
 		return -1;
 	if(after != nil)
 		devpoint(d, after, 0);
@@ -374,7 +415,10 @@ slotset(Monslot *sl, ulong len, uvlong seq, uvlong epoch, void *text)
  * for the reason §12 gives shoalfmt: a format cut short must leave no
  * valid header rather than a valid one locating slots that were never
  * written — which, after a reformat at a different slotsz, would be
- * the previous store's header over this one's bytes.
+ * the previous store's header over this one's bytes.  §13's monfmthdr
+ * point is exactly there — after the zeroing flush, before any other
+ * write — so that a test can stage that durable state and watch the
+ * open refuse it.
  */
 int
 monfmt(Dev *d, Monfmtcfg *c)
@@ -448,6 +492,7 @@ monfmt(Dev *d, Monfmtcfg *c)
 	|| devwrite(d, buf, d->secsz, hdr1off(d)) < 0
 	|| devflush(d) < 0)
 		goto bad;
+	devpoint(d, "monfmthdr", 0);
 
 	/* the header sector of every history slot: zero, so invalid */
 	for(i = 0; i < (int)c->retain; i++)
@@ -625,7 +670,7 @@ moncommit(Mon *m, void *text, ulong len, uvlong epoch)
 {
 	char err[ERRMAX];
 	uvlong seq;
-	int v, c;
+	int v, c, wasphantom;
 
 	if(len > m->h.slotsz - m->d->secsz){
 		/*
@@ -644,9 +689,27 @@ moncommit(Mon *m, void *text, ulong len, uvlong epoch)
 	if(slotwrite(m, slotoff(m, m->h.histoff, v), len, seq, epoch, text,
 		"monhist", "monhistflush") < 0){
 		rerrstr(err, sizeof err);
+		wasphantom = m->hist[v].phantom;
 		slotclear(&m->hist[v]);
 		snprint(m->hist[v].why, sizeof m->hist[v].why,
 			"the write that failed the commit: %s", err);
+		/*
+		 * The slot is invalid in memory, but the platter was not
+		 * told: a write that landed nothing leaves the victim's own
+		 * bytes there, and a victim that was a phantom is STILL a
+		 * phantom on the disk.  Forgetting that would send the next
+		 * commit's victim search past it to some other slot, the
+		 * next published map would raise seq above the phantom's,
+		 * and it would read back at the following open as ordinary
+		 * history for a map that was never published.  So the slot
+		 * stays first in line for reuse — invalid and phantom both —
+		 * and nphantom counts it exactly once.  The sibling path
+		 * below, for a failed current-slot write, keeps the same
+		 * books.
+		 */
+		m->hist[v].phantom = 1;
+		if(!wasphantom)
+			m->nphantom++;
 		errstr(err, sizeof err);
 		return -1;
 	}

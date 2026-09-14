@@ -17,8 +17,10 @@
  * device under -X, is still open.
  *
  * Every crash schedule runs with the device stopped at the crash
- * (simcrashdead) and the dirty sectors dropped, which is the default
- * crash a device that lost its whole cache performs.
+ * (simcrashdead).  The named cases drop the dirty sectors, which is
+ * the crash a device that lost its whole cache performs; tcrashmatrix
+ * sweeps each of the three commit points against all four of the
+ * sim's crash policies.
  */
 
 enum
@@ -62,6 +64,23 @@ eqi(char *what, int got, int want)
 	checks++;
 	if(got != want)
 		fail("%s: %d, want %d", what, got, want);
+}
+
+/* the same two, for a case that runs under several names */
+static void
+eqv2(char *pre, char *what, uvlong got, uvlong want)
+{
+	checks++;
+	if(got != want)
+		fail("%s: %s: %llud, want %llud", pre, what, got, want);
+}
+
+static void
+eqi2(char *pre, char *what, int got, int want)
+{
+	checks++;
+	if(got != want)
+		fail("%s: %s: %d, want %d", pre, what, got, want);
 }
 
 static void
@@ -231,6 +250,99 @@ tfresh(void)
 	devclose(d);
 }
 
+/*
+ * §10's format prologue: both header sectors are zeroed and flushed
+ * BEFORE anything else is written, and the slots are flushed before
+ * the real header copies are written over them.  A format cut short
+ * anywhere in between must leave no valid header rather than a valid
+ * one locating slots that were never written.
+ */
+static void
+tfmtprologue(void)
+{
+	Dev *d;
+	Mon *m;
+	Monfmtcfg c;
+	Simop *t, w[64];
+	vlong off1;
+	long n, j;
+	int nw;
+
+	if((d = simopen(Secsz, Nsec, Seed)) == nil)
+		sysfatal("simopen: %r");
+	off1 = d->size - Secsz;
+	moncfg(&c);
+	simtracereset(d);
+	checks++;
+	if(monfmt(d, &c) < 0){
+		fail("prologue: monfmt: %r");
+		devclose(d);
+		return;
+	}
+	n = simtrace(d, &t);
+	nw = 0;
+	for(j = 0; j < n; j++)
+		if(t[j].op != Sopread && nw < nelem(w))
+			w[nw++] = t[j];
+	/*
+	 * 2 header sectors + a flush, retain history headers, 2 current
+	 * slots + a flush, 2 header copies + a flush.
+	 */
+	eqi("prologue: writes and flushes in a format", nw, Retain + 9);
+	if(nw == Retain + 9){
+		eqi("prologue: header copy 0 is zeroed first", w[0].op,
+			Sopwrite);
+		eqv("prologue: at sector 0", w[0].off, 0);
+		eqv("prologue: one sector of it", w[0].n, Secsz);
+		eqi("prologue: then header copy 1", w[1].op, Sopwrite);
+		eqv("prologue: at the last sector", w[1].off, off1);
+		eqv("prologue: one sector of it", w[1].n, Secsz);
+		eqi("prologue: and the pair is flushed before anything else",
+			w[2].op, Sopflush);
+		/* and the slots are flushed before the real headers land */
+		eqi("prologue: the slots are flushed", w[nw-4].op, Sopflush);
+		eqi("prologue: then header copy 0", w[nw-3].op, Sopwrite);
+		eqv("prologue: at sector 0", w[nw-3].off, 0);
+		eqi("prologue: then header copy 1", w[nw-2].op, Sopwrite);
+		eqv("prologue: at the last sector", w[nw-2].off, off1);
+		eqi("prologue: and the format ends with a flush", w[nw-1].op,
+			Sopflush);
+	}
+	devclose(d);
+
+	/*
+	 * A reformat at a different geometry that dies at monfmthdr —
+	 * right after the zeroing flush — leaves the durable state the
+	 * prologue exists to leave: no valid header at all.  Without the
+	 * prologue the PREVIOUS store's header survives and locates
+	 * slots this format never wrote.
+	 */
+	d = fresh();
+	if((m = mustopen(d, "prologue store")) == nil){
+		devclose(d);
+		return;
+	}
+	commit(m, "prologue", "map=A", 1);
+	monclose(m);
+
+	simcrashdead(d, 1);
+	simarm(d, "monfmthdr", 0);
+	moncfg(&c);
+	c.slotsz = 4*Slotsz;
+	c.retain = Retain;
+	c.ream = 1;
+	checks++;
+	if(monfmt(d, &c) == 0)
+		fail("prologue: a format whose machine died reported success");
+	simrevive(d);
+	checks++;
+	if((m = monopen(d)) != nil){
+		fail("prologue: a format cut short left a valid header");
+		monclose(m);
+	}
+	devclose(d);
+}
+
 /* the first commit, a restart, and the ring newest-first */
 static void
 tcommit(void)
@@ -300,7 +412,10 @@ tcommit(void)
 /*
  * T1.13's shape for §10: from the recorded trace, one flush after the
  * history write and another after the current write, in that order,
- * and nothing else in a commit.
+ * and nothing else WRITTEN in a commit.  The reads between them are
+ * §10's read-back, which is checked by its own case below; here only
+ * their placement matters, so the writes and flushes are picked out
+ * of the trace in order.
  */
 static void
 tflushes(void)
@@ -308,9 +423,9 @@ tflushes(void)
 	Dev *d;
 	Mon *m;
 	Monstat st;
-	Simop *t;
-	long n;
-	int i;
+	Simop *t, w[8];
+	long n, j;
+	int i, nw;
 
 	d = fresh();
 	if((m = mustopen(d, "flushes")) == nil){
@@ -322,24 +437,89 @@ tflushes(void)
 		simtracereset(d);
 		commit(m, "flushes", "map=c", i);
 		n = simtrace(d, &t);
+		nw = 0;
+		for(j = 0; j < n; j++)
+			if(t[j].op != Sopread && nw < nelem(w))
+				w[nw++] = t[j];
 		checks++;
-		if(n != 4){
-			fail("flushes: commit %d took %ld device operations, "
-				"want 4", i, n);
+		if(nw != 4){
+			fail("flushes: commit %d wrote and flushed %d times, "
+				"want 4", i, nw);
 			continue;
 		}
-		eqi("flushes: the history slot is written first", t[0].op,
+		eqi("flushes: the history slot is written first", w[0].op,
 			Sopwrite);
 		istrue("flushes: written into the ring",
-			t[0].off >= histoffs(&st, 0)
-			&& t[0].off < histoffs(&st, Retain));
-		eqi("flushes: then a flush", t[1].op, Sopflush);
-		eqi("flushes: then the current slot", t[2].op, Sopwrite);
+			w[0].off >= histoffs(&st, 0)
+			&& w[0].off < histoffs(&st, Retain));
+		eqi("flushes: then a flush", w[1].op, Sopflush);
+		eqi("flushes: then the current slot", w[2].op, Sopwrite);
 		istrue("flushes: written into a current slot",
-			t[2].off >= curoffs(&st, 0)
-			&& t[2].off < curoffs(&st, 2));
-		eqi("flushes: then a flush", t[3].op, Sopflush);
+			w[2].off >= curoffs(&st, 0)
+			&& w[2].off < curoffs(&st, 2));
+		eqi("flushes: then a flush", w[3].op, Sopflush);
+		/* and the last thing a commit does is read its slot back */
+		eqi("flushes: the commit ends with a read", t[n-1].op, Sopread);
 	}
+	monclose(m);
+	devclose(d);
+}
+
+/*
+ * §10's read-back.  A device that takes a write, acknowledges the
+ * flush and lands nothing (Sfdrop), or lands a mix of old and new
+ * bytes (Sftearbyte), must fail the commit rather than leave the
+ * running monitor holding a map the platter does not.
+ */
+static void
+tlostwrite(int kind, char *kindname, int onring)
+{
+	Dev *d;
+	Mon *m;
+	Monstat st;
+	Monmap mm;
+	char what[64];
+	vlong off;
+
+	snprint(what, sizeof what, "lost %s on the %s write", kindname,
+		onring ? "ring" : "current");
+	d = fresh();
+	if((m = mustopen(d, what)) == nil){
+		devclose(d);
+		return;
+	}
+	commit(m, what, "map=A", 1);
+	commit(m, what, "map=B", 2);
+	monstat(m, &st);
+
+	if(onring)
+		simfault(d, kind, 1);
+	else{
+		/* the slot §2.2's clause 2 will choose: the lower seq */
+		off = curoffs(&st, st.cur == 0 ? 1 : 0);
+		simfaultat(d, kind, 1, off, st.slotsz);
+	}
+	checks++;
+	if(moncommit(m, "map=C", 5, 3) == 0)
+		fail("%s: a commit whose write was lost reported success",
+			what);
+	monstat(m, &st);
+	eqv2(what, "the live store is still B", st.epoch, 2);
+	monclose(m);
+
+	if((m = mustopen(d, what)) == nil){
+		devclose(d);
+		return;
+	}
+	monstat(m, &st);
+	eqv2(what, "the restart finds B", st.epoch, 2);
+	eqv2(what, "at its own seq", st.seq, 2);
+	eqi2(what, "moncurrent answers it", moncurrent(m, &mm), 1);
+	eqtext("the previous map's text", &mm, "map=B");
+	eqi2(what, "position 0 is present", monhistory(m, 0, &mm), 1);
+	eqv2(what, "position 0 is the current map", mm.seq, st.seq);
+	eqi2(what, "the unpublished epoch answers nothing",
+		monlookup(m, 3, &mm), 0);
 	monclose(m);
 	devclose(d);
 }
@@ -453,6 +633,100 @@ tslots(void)
 	eqtext("slots: on the surviving map", &mm, "map=B");
 	monclose(m);
 	devclose(d);
+}
+
+/*
+ * The whole crash argument, swept: each of §10's three commit points
+ * against each of the simulated disk's four crash policies.  The
+ * cases above take the Scdrop column, which is the crash a device
+ * that lost its whole cache performs; Sckeep, Scsome and Scnamed are
+ * the other things a cache can do with the sectors written since the
+ * last flush, and §10 claims all three invariants against every one
+ * of them.
+ *
+ * Whatever the schedule, after the restart: the current map is
+ * EXACTLY the old one or EXACTLY the new one and nothing in between;
+ * position 0 of the ring is the current map; and no ring entry sits
+ * above the current map's seq, since any that did is a phantom.
+ */
+static void
+tcrashcell(char *point, int mode, char *modename)
+{
+	Dev *d;
+	Mon *m;
+	Monstat st;
+	Monmap mm, h;
+	char what[64];
+	ulong i;
+	int old, new;
+
+	snprint(what, sizeof what, "crash %s %s", point, modename);
+	d = fresh();
+	if((m = mustopen(d, what)) == nil){
+		devclose(d);
+		return;
+	}
+	commit(m, what, "map=A", 1);
+	commit(m, what, "map=B", 2);
+	monstat(m, &st);
+
+	simcrashdead(d, 1);
+	if(mode == Scnamed){
+		/* keep only the first sector of the slot being written */
+		if(strcmp(point, "moncur") == 0)
+			simcrashkeep(d, curoffs(&st, st.cur == 0 ? 1 : 0),
+				Secsz);
+		else
+			simcrashkeep(d, histoffs(&st, 2), Secsz);
+	}else
+		simcrashmode(d, mode);
+	simarm(d, point, 0);
+	moncommit(m, "map=C", 5, 3);
+	monclose(m);
+	simrevive(d);
+
+	if((m = mustopen(d, what)) == nil){
+		devclose(d);
+		return;
+	}
+	monstat(m, &st);
+	old = new = 0;
+	if(moncurrent(m, &mm)){
+		old = mm.len == 5 && memcmp(mm.text, "map=B", 5) == 0
+			&& st.epoch == 2 && st.seq == 2;
+		new = mm.len == 5 && memcmp(mm.text, "map=C", 5) == 0
+			&& st.epoch == 3 && st.seq == 3;
+	}
+	eqi2(what, "the current map is exactly the old or the new",
+		old || new, 1);
+	eqi2(what, "position 0 is the current map",
+		monhistory(m, 0, &h) && h.seq == st.seq
+		&& h.epoch == st.epoch, 1);
+	for(i = 0; ; i++){
+		if(!monhistory(m, i, &h))
+			break;
+		if(h.seq > st.seq){
+			fail("%s: a ring entry sits above the current map: "
+				"seq %llud over %llud", what, h.seq, st.seq);
+			break;
+		}
+	}
+	checks++;
+	monclose(m);
+	devclose(d);
+}
+
+static void
+tcrashmatrix(void)
+{
+	static char *points[] = { "monhist", "monhistflush", "moncur" };
+	static int modes[] = { Scdrop, Sckeep, Scsome, Scnamed };
+	static char *modenames[] = { "Scdrop", "Sckeep", "Scsome", "Scnamed" };
+	int i, j;
+
+	for(i = 0; i < nelem(points); i++)
+		for(j = 0; j < nelem(modes); j++)
+			tcrashcell(points[i], modes[j], modenames[j]);
 }
 
 /*
@@ -597,6 +871,176 @@ thistfail(void)
 	eqv("monhist: at the same seq", st.seq, 2);
 	eqi("monhist: no entry for the failed epoch", monlookup(m, 3, &mm), 0);
 	eqv("monhist: no phantom either", st.nphantom, 0);
+	monclose(m);
+	devclose(d);
+}
+
+/*
+ * A ring write that fails over a PHANTOM victim.  The write landed
+ * nothing, so the phantom is still on the platter; if the store
+ * forgets that, the victim search walks past it, the next published
+ * map raises seq above it, and at the next open it is served as
+ * ordinary history for a map that was never published (§10's
+ * phantom-first rule is exactly what this defends).
+ *
+ * The schedule needs a second damaged ring slot, so that "the first
+ * invalid slot" and "the phantom's slot" are different slots and the
+ * retry's choice between them is visible.
+ */
+static void
+tringfailphantom(void)
+{
+	Dev *d;
+	Mon *m;
+	Monstat st;
+	Monmap mm;
+	uchar hdr[Secsz];
+	vlong phoff;
+	int i;
+
+	d = fresh();
+	if((m = mustopen(d, "ringfail")) == nil){
+		devclose(d);
+		return;
+	}
+	commit(m, "ringfail", "map=A", 1);
+	commit(m, "ringfail", "map=B", 2);
+	commit(m, "ringfail", "map=C", 3);
+	monstat(m, &st);
+
+	/* the publish of epoch 9 dies in the phantom window */
+	simcrashdead(d, 1);
+	simarm(d, "monhistflush", 0);
+	checks++;
+	if(moncommit(m, "map=PHANTOM", 11, 9) == 0)
+		fail("ringfail: a commit whose machine died reported success");
+	monclose(m);
+	simrevive(d);
+
+	/* an unrelated media fault damages ring slot 0 */
+	tearslot(d, histoffs(&st, 0));
+
+	if((m = mustopen(d, "ringfail restart")) == nil){
+		devclose(d);
+		return;
+	}
+	monstat(m, &st);
+	eqv("ringfail: the unpublished map is a phantom", st.nphantom, 1);
+	eqv("ringfail: two entries survive", st.nhist, 2);
+	eqv("ringfail: the current map is still C", st.epoch, 3);
+
+	/* the phantom's slot is the one carrying the unpublished seq */
+	phoff = -1;
+	for(i = 0; i < Retain; i++){
+		simpeek(d, histoffs(&st, i), hdr, Secsz);
+		if(memcmp(hdr, "shoalmap", 8) == 0 && GBIT64(hdr + 40) == 9)
+			phoff = histoffs(&st, i);
+	}
+	checks++;
+	if(phoff < 0){
+		fail("ringfail: the phantom's ring slot is not on the disk");
+		monclose(m);
+		devclose(d);
+		return;
+	}
+
+	/* the next commit's ring write is aimed at it, and fails */
+	simfaultat(d, Sfeio, 1, phoff, st.slotsz);
+	checks++;
+	if(moncommit(m, "map=D", 5, 4) == 0)
+		fail("ringfail: a commit whose ring write failed reported "
+			"success");
+	monstat(m, &st);
+	eqv("ringfail: the current map is untouched", st.epoch, 3);
+	eqv("ringfail: the phantom is still counted", st.nphantom, 1);
+
+	/* the monitor retries, as it must: the phantom's slot is reused */
+	checks++;
+	if(moncommit(m, "map=D", 5, 4) < 0)
+		fail("ringfail: the retry: %r");
+	monstat(m, &st);
+	eqv("ringfail: the retry consumed the phantom", st.nphantom, 0);
+	eqv("ringfail: three entries after the retry", st.nhist, 3);
+	monclose(m);
+
+	if((m = mustopen(d, "ringfail restart 2")) == nil){
+		devclose(d);
+		return;
+	}
+	monstat(m, &st);
+	eqv("ringfail: D is current after the restart", st.epoch, 4);
+	eqv("ringfail: no phantom is left", st.nphantom, 0);
+	eqv("ringfail: and three published maps", st.nhist, 3);
+	eqi("ringfail: the unpublished epoch answers nothing",
+		monlookup(m, 9, &mm), 0);
+	eqi("ringfail: position 0 is the current map",
+		monhistory(m, 0, &mm), 1);
+	eqv("ringfail: at the current seq", mm.seq, st.seq);
+	monclose(m);
+	devclose(d);
+}
+
+/*
+ * The monitor retries in the SAME session after a current-slot write
+ * fails.  Nothing restarts here, so the phantom mark that failure
+ * leaves has to hold in memory: the ring entry for the map that was
+ * never published must stay out of every accessor, and the retry must
+ * reuse that slot rather than spend a fresh one on it.  The crash
+ * cases all restart, so this path was never exercised.
+ */
+static void
+tcurfailretry(void)
+{
+	Dev *d;
+	Mon *m;
+	Monstat st;
+	Monmap mm;
+
+	d = fresh();
+	if((m = mustopen(d, "curfail")) == nil){
+		devclose(d);
+		return;
+	}
+	commit(m, "curfail", "map=A", 1);
+	commit(m, "curfail", "map=B", 2);
+	monstat(m, &st);
+
+	/* the current write, and only it, takes an i/o error */
+	simfaultat(d, Sfeio, 1, curoffs(&st, st.cur == 0 ? 1 : 0), st.slotsz);
+	checks++;
+	if(moncommit(m, "map=GHOST", 9, 7) == 0)
+		fail("curfail: a commit whose current write failed reported "
+			"success");
+	monstat(m, &st);
+	eqv("curfail: the current map is still B", st.epoch, 2);
+	eqv("curfail: the unpublished ring entry is a phantom", st.nphantom,
+		1);
+	eqv("curfail: and is not a history entry", st.nhist, 2);
+	eqi("curfail: the unpublished epoch answers nothing",
+		monlookup(m, 7, &mm), 0);
+
+	/* the retry, with no restart between */
+	checks++;
+	if(moncommit(m, "map=C", 5, 3) < 0)
+		fail("curfail: the retry: %r");
+	monstat(m, &st);
+	eqv("curfail: the retry is current", st.epoch, 3);
+	eqv("curfail: it consumed the phantom", st.nphantom, 0);
+	eqv("curfail: three published maps", st.nhist, 3);
+	eqi("curfail: the ghost is still unanswerable",
+		monlookup(m, 7, &mm), 0);
+	monclose(m);
+
+	if((m = mustopen(d, "curfail restart")) == nil){
+		devclose(d);
+		return;
+	}
+	monstat(m, &st);
+	eqv("curfail: the restart finds the retry", st.epoch, 3);
+	eqv("curfail: no phantom after it", st.nphantom, 0);
+	eqv("curfail: three published maps after it", st.nhist, 3);
+	eqi("curfail: and the ghost is gone from the disk",
+		monlookup(m, 7, &mm), 0);
 	monclose(m);
 	devclose(d);
 }
@@ -774,6 +1218,95 @@ theader(void)
 		fail("header: a store whose header copies differ opened");
 		monclose(m);
 	}
+	devclose(d);
+}
+
+/*
+ * A header whose curoff/histoff do not describe the geometry is
+ * refused, naming them.  Such a header locates the slots anywhere at
+ * all — every offset below it is meaningless — so it is caught in
+ * hdrsane before a byte is read through it, and not left to whatever
+ * the wrong sectors happen to hold.  Both copies carry it, so the
+ * "copies differ" refusal is not what answers.
+ */
+static void
+thdroffsets(void)
+{
+	Dev *d;
+	Mon *m;
+	uchar hdr[Secsz];
+	char err[ERRMAX];
+
+	d = fresh();
+	simpeek(d, 0, hdr, Secsz);
+	PBIT64(hdr + 40, (uvlong)2);		/* curoff, which must be 1 */
+	reccsumset(hdr, Secsz, 16);
+	simpoke(d, 0, hdr, Secsz);
+	simpoke(d, d->size - Secsz, hdr, Secsz);
+	checks++;
+	if((m = monopen(d)) != nil){
+		fail("hdroffsets: a header whose offsets are wrong opened");
+		monclose(m);
+	}
+	rerrstr(err, sizeof err);
+	istrue("hdroffsets: the refusal names curoff",
+		strstr(err, "curoff") != nil);
+	devclose(d);
+
+	/* and the same for histoff, which must follow the two slots */
+	d = fresh();
+	simpeek(d, 0, hdr, Secsz);
+	PBIT64(hdr + 48, (uvlong)3);		/* histoff */
+	reccsumset(hdr, Secsz, 16);
+	simpoke(d, 0, hdr, Secsz);
+	simpoke(d, d->size - Secsz, hdr, Secsz);
+	checks++;
+	if((m = monopen(d)) != nil){
+		fail("hdroffsets: a header whose histoff is wrong opened");
+		monclose(m);
+	}
+	rerrstr(err, sizeof err);
+	istrue("hdroffsets: the refusal names histoff",
+		strstr(err, "histoff") != nil);
+	devclose(d);
+}
+
+/*
+ * §10's tie: a fresh format leaves both current slots valid at seq 0,
+ * so the open takes slot 0 and the first commit writes slot 1.  With
+ * the tie the other way a fresh store would open on the very slot the
+ * first commit overwrites.
+ */
+static void
+topentie(void)
+{
+	Dev *d;
+	Mon *m;
+	Monstat st;
+	Simop *t;
+	vlong slot1;
+	long n, i;
+	int wrote;
+
+	d = fresh();
+	if((m = mustopen(d, "opentie")) == nil){
+		devclose(d);
+		return;
+	}
+	monstat(m, &st);
+	eqi("opentie: a fresh store opens on slot 0", st.cur, 0);
+	slot1 = curoffs(&st, 1);
+	simtracereset(d);
+	commit(m, "opentie", "map=A", 1);
+	n = simtrace(d, &t);
+	wrote = 0;
+	for(i = 0; i < n; i++)
+		if(t[i].op == Sopwrite && t[i].off == slot1)
+			wrote = 1;
+	istrue("opentie: the first commit writes current slot 1", wrote);
+	monstat(m, &st);
+	eqi("opentie: which is then the current slot", st.cur, 1);
+	monclose(m);
 	devclose(d);
 }
 
@@ -1125,14 +1658,24 @@ main(int, char**)
 	atexit(cleanup);
 
 	tfresh();
+	tfmtprologue();
 	tcommit();
 	tflushes();
+	tlostwrite(Sfdrop, "Sfdrop", 1);
+	tlostwrite(Sfdrop, "Sfdrop", 0);
+	tlostwrite(Sftearbyte, "Sftearbyte", 1);
+	tlostwrite(Sftearbyte, "Sftearbyte", 0);
 	tslots();
 	tphantom();
+	tcrashmatrix();
 	thistfail();
+	tringfailphantom();
+	tcurfailretry();
 	tring();
 	tfull();
 	theader();
+	thdroffsets();
+	topentie();
 	tnocur();
 	tbadlen();
 	treadonly();

@@ -929,7 +929,6 @@ enum
 	Monretaindflt	= 8,		/* §10's default ring length */
 	Monretainmin	= 2,		/* layer-a §5.2 clause 2 reads E−1 */
 	Monminbytes	= 1024*1024,	/* §10: shoalmonfmt refuses less */
-	Monsizedflt	= 4*1024*1024,	/* §10: what -z sizes an image to */
 };
 
 typedef struct Mon Mon;
@@ -1039,7 +1038,11 @@ struct Monstat
  * moncommit is §10's two steps with one flush each; it answers
  * `disk full' and leaves the store unchanged when secsz+len exceeds
  * slotsz, and a failed ring write fails the commit with the current
- * map untouched.  moncurrent answers 0 for "this store holds no map".
+ * map untouched.  Each slot is READ BACK after its flush and checked,
+ * so a write that reports success and does not land fails the commit
+ * exactly as a failed one does (§10); a device that loses the bytes
+ * after acknowledging the flush is outside the model.  moncurrent
+ * answers 0 for "this store holds no map".
  * monhistory walks the ring newest-first, position 0 being the
  * current map itself, and answers 0 past the end.  monlookup answers
  * the entry for an epoch, taking the greater seq when two carry one

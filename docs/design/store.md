@@ -2764,6 +2764,28 @@ than as an empty map text.
    valid, refuse. `seq` is `max(valid seq) + 1` over both slots and
    the ring. Flush.
 
+**Each slot is read back after its flush** and checked — magic,
+`vers`, `len` within the slot, the checksum over `secsz+len`, and the
+`seq`, `len` and `epoch` just written. A read-back that does not
+verify fails the commit exactly as a failed write does: step 1's
+victim stays invalid and a phantom, step 2's slot is left invalid and
+the ring entry becomes a phantom, and the in-memory state matches the
+disk either way. That is what makes step 1's "a torn ring write …
+fails the commit" true rather than hopeful: a `Sfdrop` or a torn
+write reports success, survives its flush and lands nothing, and
+without the read-back the running monitor holds a ring entry the
+platter does not — so position 0 would stop being the current map and
+layer-a §8.2's `E−1` entry would be unanswerable at the next start.
+The cost is one read of at most `slotsz` against a flush that costs
+8.6 ms.
+
+The read-back catches a device that loses the write *before*
+acknowledging the flush. A device that acknowledges a flush and then
+loses the bytes anyway is outside this store's model, exactly as it is
+outside the object store's: §13's simulated disk makes durability
+after a flush its contract, and §3.2's `-w` assertion is what an
+operator gives for a unit whose flush does not reach the platter.
+
 **Choose on start:** read both current-map slots, take the valid one
 with the greater `seq`; two valid slots at equal `seq` — which is what
 a fresh format leaves — are §2.2's tie too, so the start is slot 0 and
@@ -2798,6 +2820,18 @@ commit — which either completes, making the entry real, or does not,
 making it the phantom again — is what keeps both halves of the rule
 above true.
 
+**A ring write that fails leaves its victim a phantom.** The slot is
+invalid in memory, but the platter was never told: a write that landed
+nothing leaves the victim's own bytes there, and a victim that was a
+phantom is still a phantom on the disk. So the failed write marks the
+slot *both* invalid and a phantom, which keeps it first in line for
+reuse whatever it now holds — its old bytes, or the half of the new
+map that did land. Dropping the mark instead would send the next
+commit's victim search past it to some other slot, the next published
+map would raise `seq` above it, and the following start would read the
+never-published map back as ordinary history: precisely the outcome
+the rule above exists to prevent.
+
 **The store never compares epochs.** It records the epoch it is given
 beside the map and orders nothing by it: layer-a §8.3's `forceepoch`
 and §8.6's rebuild path can each legitimately publish an epoch that is
@@ -2818,11 +2852,15 @@ commit reaches them: `monhist`, after the history slot's write returns
 and before its flush; `monhistflush`, after that flush returns and
 before the current slot's write — the phantom window above; and
 `moncur`, after the current slot's write returns and before its flush.
+A format has one of its own, `monfmthdr`, after the flush that zeroes
+both header sectors and before any other write: a crash there is the
+durable state the prologue above exists to leave, and the open must
+refuse it.
 
 **Sizing.** A map at twelve instances is a few KiB; `slotsz` 65536 is
 a twentyfold margin and a whole number of 16 KiB units. With
 `retain=8` the store needs 2 header sectors + 10 slots ≈ 640 KiB;
-`shoalmonfmt` defaults the partition to 4 MiB and refuses less than
+the partition is sized at 4 MiB, and `shoalmonfmt` refuses less than
 1 MiB. `retain` MUST be at least 2 — layer-a §5.2 clause 2 reads
 epoch `E−1`, so one history slot is a floor rather than a preference
 — and `shoalmonfmt -R` refuses less.
@@ -2830,8 +2868,10 @@ epoch `E−1`, so one history slot is a floor rather than a preference
 **Cost.** One 16 KiB write plus one flush per slot written: **8.6 ms**
 for the current-map slot, and the same again for the history slot
 that precedes it, so a publish is ~17 ms whether it carries a
-placement change or a single `stale` mark. That is what makes
-layer-a §5.4 step 5a affordable — the alternative
+placement change or a single `stale` mark. The read-back of each slot
+is one read of at most `slotsz` — the sector the checksum needs plus
+`len` bytes — which is noise beside the flush it follows. That is what
+makes layer-a §5.4 step 5a affordable — the alternative
 `docs/platform/9front-storage.md` measured, a file plus a gefs sync,
 costs 530–620 ms and would blow `replms` regularly.
 
@@ -2945,6 +2985,16 @@ is what lets the T1 cases of §13 drive format and check with no disk
 at all. `shoalfmt -z` and `shoalmonfmt -z` size such an image;
 nothing else in any of them depends on which kind of device it was
 given, because §0's vtable is the only thing they call.
+
+**A `-z` never runs ahead of the refusal that would have stopped the
+run.** Resizing an image truncates what it already holds, so both
+commands open the file at its own length first, let their reformat
+guard decide — `shoalfmt`'s ream guard, `shoalmonfmt`'s refusal over
+a valid monitor header — and reopen at `-z`'s size only once that
+guard has passed or `-r` has waived it: a run either one refuses
+leaves the file byte-identical, its length included. `-z` on a path
+with no file there creates it at that size, where there is nothing to
+destroy, and `-z` against an `sd` partition is refused by both.
 
 **`shoalfmt`** — format or ream an object-store partition.
 
@@ -3120,11 +3170,13 @@ it writes.
     shoalmonfmt [-r] [-s slotsz] [-R retain] [-z size] /dev/sdXX/name
 
 `-s` sets the slot size and `-R` the ring length, defaulting to §10's
-65536 and 8; `-z` sizes a file image and defaults to 4 MiB, which is
-what §10 sizes the partition at. It prints the geometry it chose — the
-two values, the sectors the header copies, the current slots and the
-ring start at, and the bytes the format occupies — the way `shoalfmt`
-prints its own.
+65536 and 8. `-z` sizes a file image and has no default: a partition
+carries its own length, and an image that already exists is formatted
+at the length it has. Formatting an image that does not exist yet
+therefore needs `-z`, and is refused without it. It prints the
+geometry it chose — the two values, the sectors the header copies, the
+current slots and the ring start at, and the bytes the format occupies
+— the way `shoalfmt` prints its own.
 
 It refuses a `slotsz` that is not a multiple of the device's sector
 or is under two sectors, a `retain` under 2 (layer-a §5.2 clause 2
@@ -3256,10 +3308,13 @@ the header write, so the commit point is not reached), `postwrite`
 (after the header write returns, before the post-flush), `preack`,
 `ckpt:n` (after *n* checkpoint page writes), `super` (after a
 superblock write returns, before its flush — the two copies are
-written in sequence only by `shoalfmt`), and the monitor store's three
-(§10): `monhist`, `monhistflush` and `moncur`. A crash at a point is the end
-of a run, so the simulated disk can be told to **stop the device** at
-the crash: every subsequent read, write and flush fails until the
+written in sequence only by `shoalfmt`), and the monitor store's four
+(§10): `monfmthdr`, inside `monfmt` after the flush that zeroes both
+header sectors and before any other write, and `monhist`,
+`monhistflush` and `moncur` inside a commit. A crash at a point is the
+end of a run, so the simulated disk can be told to **stop the
+device** at the crash: every subsequent read, write and flush fails
+until the
 test brings the machine back. Without that the writes a schedule
 places *after* its crash point would still land, and a crash at
 `commit` would still leave a committed record. The schedules that
@@ -3321,25 +3376,48 @@ the `Wunit` split), `supertest` (§2.2's three clauses under torn
 superblock writes and under the `super` crash point, which is T1.9's
 first half), `montest` (§10's monitor map slot store and §12's
 `shoalmonfmt`: what a format leaves and that a fresh store holds no
-map, the header's byte layout, a commit and the restart that finds it,
+map, the format's own write and flush order read off the trace — both
+header sectors zeroed and flushed before any other write, the slots
+flushed before the real header copies land — with a format cut short
+at `monfmthdr` leaving no valid header for the open to take; the
+header's byte layout, a commit and the restart that finds it,
 the ring newest-first with layer-a §5.2 clause 2's `E−1` entry present
 at every length and across a wrap, T1.13's flush shape for §10 read
 off the trace — one write and one flush into the ring, then one write
-and one flush into a current slot, and nothing else in a commit —
-**T1.9's second half**, a crash at `moncur` leaving the previous map
-current and the failed publish's ring entry a phantom, and a slot torn
+and one flush into a current slot, and nothing else written in a
+commit — §10's read-back under a write that reports success and lands
+nothing (`Sfdrop`) or lands a mix of old and new bytes
+(`Sftearbyte`), on the ring slot and on the current slot in turn,
+each failing the commit and leaving the restart on the previous map
+with position 0 still equal to it; **T1.9's second half**, a crash at
+`moncur` leaving the previous map current and the failed publish's
+ring entry a phantom, and a slot torn
 at a high `seq` not steering the next write onto the only good one;
 **T2.7's phantom case at T1 scale**, a crash at `monhistflush` after
 which the unpublished epoch answers nothing and the next commit
-reuses the phantom's slot; a ring write that fails and a crash at
-`monhist`, each leaving the current map untouched; `disk full` on an
+reuses the phantom's slot; the whole crash argument swept — each of
+§10's three commit points against each of the sim's four crash
+policies, twelve cells, every one asserting that the current map is
+exactly the old one or exactly the new one, that position 0 is the
+current map, and that no ring entry sits above the current map's
+`seq`; a ring write that fails and a crash at
+`monhist`, each leaving the current map untouched; a ring write that
+fails *over a phantom victim*, after which the retry reuses that same
+slot and the never-published epoch is still unanswerable at the next
+start; a current-slot write that fails and is retried *in the same
+session*, where the phantom mark has to hold in memory with no restart
+to rebuild it; `disk full` on an
 oversize map with the store unchanged, and the largest map that fits
 read back byte-exact; the header copies — one damaged, both damaged,
-and two valid copies that differ — a current slot whose `len` does not
+and two valid copies that differ, and a pair whose `curoff`/`histoff`
+do not describe the geometry, refused by name before a slot is located
+through them — a current slot whose `len` does not
 fit its slot, an open that writes nothing, a store reopened over a
-read-only file image, an epoch published twice with a regression
-between, and §12's refusals and its object-store superblock warning,
-driven through `monfmt` as `fmtcktest` drives `fmtstore`),
+read-only file image, §10's equal-`seq` tie — a fresh store opens on
+slot 0 and its first commit writes slot 1 — an epoch published twice
+with a regression between, and §12's refusals and its object-store
+superblock warning, driven through `monfmt` as `fmtcktest` drives
+`fmtstore`),
 `fmtcktest` (`shoalfmt` to `shoalck` over both a
 simulated disk and a file image; a store with a live one-block object
 and a live three-block one, built through the codecs, with each fault

@@ -12,6 +12,14 @@
  * partitions, and a plain file otherwise; a file is the image form the
  * T1 tests and an operator inspecting a copy both work against, and -z
  * gives it a size.
+ *
+ * -z truncates whatever the image already holds, so it must not run
+ * before the ream guard below has had its say: `shoalfmt -z' over a
+ * store it then refuses to ream would otherwise leave the operator a
+ * shortened image and a store that no longer checks.  The order is
+ * open-at-the-file's-own-length, guard, and only then reopen at -z's
+ * size; a refused run leaves the file byte-identical, length
+ * included.
  */
 
 static void
@@ -174,9 +182,16 @@ main(int argc, char **argv)
 			sysfatal("-z sizes a file image, not a partition");
 		if((d = sdopen(path, noflush ? Dnoflush : 0)) == nil)
 			sysfatal("%s: %r", path);
-	}else{
+	}else if((d = fileopen(path, c.secsz, 0, 0)) == nil){
+		/*
+		 * No image there yet: a new one has nothing to destroy,
+		 * so -z creates it at its size.
+		 */
+		if(size == 0)
+			sysfatal("%s: %r", path);
 		if((d = fileopen(path, c.secsz, size, 0)) == nil)
 			sysfatal("%s: %r", path);
+		size = 0;
 	}
 	c.secsz = d->secsz;
 
@@ -190,6 +205,13 @@ main(int argc, char **argv)
 			sysfatal("%s already carries a valid superblock "
 				"(copy %d, gen %llud); -r to ream it", path,
 				sel.start, sel.sb[sel.start].gen);
+	}
+
+	/* the guard has passed: now the image may be resized */
+	if(size != 0){
+		devclose(d);
+		if((d = fileopen(path, c.secsz, size, 0)) == nil)
+			sysfatal("%s: %r", path);
 	}
 
 	if(geometry(&s, &c, d->size) < 0)
