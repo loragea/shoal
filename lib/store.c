@@ -896,6 +896,8 @@ setdefaults(Storecfg *c)
 		c->stagems = Stagemsdflt;
 	if(c->emapcache == 0)
 		c->emapcache = Emapcachedflt;
+	if(c->objsnapmax == 0)
+		c->objsnapmax = Objsnapmaxdflt;
 	/*
 	 * §2.8's triggers.  They only ever fire in the checkpointer
 	 * proc, so a caller that wants no automatic checkpoint at all —
@@ -1159,6 +1161,7 @@ storestat(Store *s, Storestat *st)
 	st->nslots = s->sb.nslots;
 	st->nlive = s->nlive;
 	st->ntomb = s->ntomb;
+	st->nobjsnap = s->nobjsnap;
 	st->ndirty = s->ndirtused;
 	st->nlost = s->nlost;
 	qunlock(&s->qlstate);

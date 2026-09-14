@@ -2583,23 +2583,63 @@ workload.
 MUST for `/status`, `/map`, `/dirty`, `/stale`, `/lost` and `/jobs`
 and a SHOULD for `/obj` and `/tombs`. The six MUSTs are small — a
 few hundred lines at the envelope — and are rendered into a buffer
-at open, which is the one-line implementation. For `/obj`, `/tombs`
-and `/advert` the store takes, under `qlstate` (§7), a vector of
-`{u32 slot, u64 qidpath}` — 12 bytes an entry, **3.1 MB at 2.6·10^5
-objects and 12 MB at `nslots = 2^20`**. Each `Tread` renders entries
-from the *live* index, skipping any whose `qidpath` no longer matches
-the snapshot: that is an object deleted since the open, which a
-listing of live objects should not show anyway. Nothing shifts under
-the reader, so no entry is skipped or duplicated because of an index
-shift.
+at open, which is the one-line implementation.
+
+For `/obj`, `/tombs` and `/advert` an open takes, under **one** hold
+of `qlstate` (§7), the vector of `{u32 slot, u64 qidpath}` of every
+entry whose state it asked for — live for `/obj`, tomb for `/tombs`,
+both for `/advert` — and releases the lock before it returns. That is
+12 bytes an entry, **3.1 MB at 2.6·10^5 objects and 12 MB at
+`nslots = 2^20`**, held as two parallel arrays rather than one array
+of a struct, because a `{u32, u64}` struct is 16 bytes on amd64 and
+the 4 in every 16 buys nothing. The vector is a list of names and not
+a reference the engine must honour: a discard of an entry it names is
+neither refused nor delayed by it.
+
+Entries are addressed **by position**, not by slot. That is what lets
+a server map a `Tread` offset onto an entry and restart from 0 on a
+re-read, which is how a Plan 9 directory read works. Entry *i* is
+rendered from the *live* index under the same short hold of `qlstate`
+§8's cursor takes, so no lock spans a caller's use of an entry and a
+full walk never blocks `/status`, `/ctl` or `Tflush` (§7 rule 2).
+Nothing shifts under the reader, so no entry is skipped or duplicated
+because of an index shift, and an entry created after the open is not
+in the vector at all.
+
+**An entry is gone under either of two conditions, and the second is
+not a refinement of the first.** Either its slot's `qidpath` no
+longer matches the vector's — the object was discarded and the slot
+freed, or freed and handed to a different object — or the slot's
+state is no longer one the snapshot asked for. §2.3 keeps an object's
+`qid.path` across delete, tombstone and re-create, so an object
+deleted after a `/obj` open still matches on `qidpath` and is now a
+tombstone, which layer-a §2.2 says `/obj` MUST NOT list; a tombstone
+created over after a `/tombs` open matches too and is now live. A
+snapshot that tested `qidpath` alone would list both.
 
 The store reports `objsnap=full` and never uses layer-a §2.2's
-`objsnap=partial` escape. The cost is per open fid, so the server
-bounds the number of concurrently open enumeration fids (policy,
-default 8) and answers further opens `disk full` rather than growing
-without limit; at 2^20 slots eight of them are 96 MB, which is the
-number §14(9) says is answered for the Layer B envelope and not for
-this design's own maximum.
+`objsnap=partial` escape: the engine takes the whole vector or
+refuses the open. Reporting the field in `/status` is the server's
+half and waits on the 9P surface. The cost is per open fid, so the
+store bounds how many snapshots may be open at once (`objsnapmax`,
+policy, default 8) and answers a further open `disk full` (layer-a
+§2.6) rather than growing without limit; at 2^20 slots eight of them
+are 96 MB, which is the number §14(9) says is answered for the Layer
+B envelope and not for this design's own maximum. A close releases
+the count and `/status` reports how many are open. A snapshot is the
+caller's, and `storeclose` frees nothing of the caller's, so every
+snapshot MUST be closed before the store it was taken from is.
+
+§6's tombstone reclaim is the enumeration's first caller, and it is
+the caller's walk rather than the engine's: the engine holds no
+`tombdays` policy, because layer-a §3.1 makes `tombdays` a map-header
+attribute. The caller opens a `/tombs` snapshot, tests each entry's
+`mtime` against its own cutoff and the entry's `wepoch` against its
+own map epoch, and discards by the entry's **own key** rather than by
+its slot — which is what makes the walk safe under concurrent
+mutation, since §6's receiver checks then refuse a record that is not
+the one the walk inspected instead of removing whatever the slot came
+to hold.
 
 ## 10. The monitor's map slot store
 

@@ -140,6 +140,24 @@ struct Omap
 	Emape	*c;
 };
 
+/*
+ * A directory snapshot, §9.  The two parallel arrays are the vector
+ * of {slot, qid.path} §9 sizes at 12 bytes an entry, taken under one
+ * hold of qlstate at open; kinds is the set of states that open asked
+ * for, and is the other half of what makes an entry gone.  Nothing
+ * here is a reference the engine must honour: the slot may be freed,
+ * reused or re-stated under it, which is exactly what the two tests
+ * in objsnapent detect.
+ */
+struct Objsnap
+{
+	Store	*s;
+	int	kinds;
+	ulong	n;
+	ulong	*slot;
+	uvlong	*qidpath;
+};
+
 struct Store
 {
 	Dev	*d;
@@ -164,6 +182,7 @@ struct Store
 	ulong	*hash;
 	ulong	nhash;
 	ulong	nlive, ntomb;
+	ulong	nobjsnap;		/* §9's open snapshots; qlstate's */
 
 	/* the two slot spaces, §6.  resv is a stage's reservation. */
 	uchar	*slotused;
