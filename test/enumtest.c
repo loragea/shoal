@@ -197,6 +197,28 @@ posof(Objsnap *sn, char *name)
 }
 
 /*
+ * The position an entry must be at.  A lookup that fails is one
+ * failed check and not the end of the test: a mutation that makes
+ * every entry gone would otherwise take the checks below it out of
+ * the run as well, so a run's FAIL count would understate what the
+ * mutation broke.  Position 0 is always in range here — every caller
+ * has opened a snapshot of several entries — so the checks below
+ * still judge something.
+ */
+static ulong
+mustpos(Objsnap *sn, char *name, char *what)
+{
+	long p;
+
+	checks++;
+	if((p = posof(sn, name)) < 0){
+		fail("%s does not answer %s", what, name);
+		return 0;
+	}
+	return p;
+}
+
+/*
  * One full position walk.  seen[] is indexed by the digits at the end
  * of each oid, which is how every name below is built; nother counts
  * entries whose name is not of that shape, and ngone the positions
@@ -352,10 +374,7 @@ tobj(void)
 	 * what makes this entry gone — and layer-a §2.2 says /obj MUST
 	 * NOT list a tombstone.
 	 */
-	if((p2 = posof(sn, "o2")) < 0){
-		fail("/obj does not answer o2");
-		goto closed;
-	}
+	p2 = mustpos(sn, "o2", "/obj");
 	if(ostat(s, "o2", &oi) < 0)
 		fail("objstat o2: %r");
 	rmv(s, "o2", 2);
@@ -372,10 +391,7 @@ tobj(void)
 	 * object.  The entry is live again and in the snapshot's kinds,
 	 * so only the qid.path half can make it gone.
 	 */
-	if((p5 = posof(sn, "o5")) < 0){
-		fail("/obj does not answer o5");
-		goto closed;
-	}
+	p5 = mustpos(sn, "o5", "/obj");
 	if(ostat(s, "o5", &oi5) < 0)
 		fail("objstat o5: %r");
 	rmv(s, "o5", 2);
@@ -407,7 +423,6 @@ tobj(void)
 	eqv("and nothing new has crept into the walk", w->nother, 0);
 	eqv("and still nothing is answered twice", w->ndup, 0);
 	walkfree(w);
-closed:
 	objsnapclose(sn);
 out:
 	storeclose(s);
@@ -464,10 +479,7 @@ ttombs(void)
 	eqv("a tombstone made after the open is absent", w->nlive, 6);
 
 	/* created over after the open: same qid.path, no longer a tomb */
-	if((p1 = posof(sn, "t1")) < 0){
-		fail("/tombs does not answer t1");
-		goto closed;
-	}
+	p1 = mustpos(sn, "t1", "/tombs");
 	if(ostat(s, "t1", &before) < 0)
 		fail("objstat t1: %r");
 	remk(s, "t1", 3);
@@ -479,10 +491,7 @@ ttombs(void)
 		objsnapent(sn, p1, got, &oidlen, &oi), 0);
 
 	/* discarded after the open: the qid.path half */
-	if((p4 = posof(sn, "t4")) < 0){
-		fail("/tombs does not answer t4");
-		goto closed;
-	}
+	p4 = mustpos(sn, "t4", "/tombs");
 	disc(s, "t4", 2, 2);
 	eqv("a discard after the open answers gone",
 		objsnapent(sn, p4, got, &oidlen, &oi), 0);
@@ -490,7 +499,6 @@ ttombs(void)
 	eqv("and those two are the only ones gone", w->ngone, 2);
 	eqv("the count never moved", objsnapcount(sn), 6);
 	walkfree(w);
-closed:
 	objsnapclose(sn);
 out:
 	storeclose(s);
@@ -522,11 +530,13 @@ tadvert(void)
 	/*
 	 * /advert asks for both kinds, so every occupied slot is in it:
 	 * a freed slot below them is what makes a position differ from a
-	 * slot here.
+	 * slot here.  The gap is discarded LAST, after the entries above
+	 * it exist — a slot freed before them is simply handed back to
+	 * the next create (alloc.c's cursor follows the free), which
+	 * would leave every position equal to its slot and this test
+	 * blind to a snapshot rendered by position.
 	 */
 	mk(s, "gap");
-	rmv(s, "gap", 2);
-	disc(s, "gap", 2, 2);
 	for(i = 0; i < 5; i++){
 		snprint(nm, sizeof nm, "a%lud", i);
 		mk(s, nm);
@@ -536,14 +546,24 @@ tadvert(void)
 		mk(s, nm);
 		rmv(s, nm, 2);
 	}
+	rmv(s, "gap", 2);
+	disc(s, "gap", 2, 2);
 	if((sn = mustsnap(s, Snapboth, "/advert")) == nil)
 		goto out;
 	eqv("/advert lists live objects and tombstones alike",
 		objsnapcount(sn), 8);
-	if((pa = posof(sn, "a0")) < 0 || (pb = posof(sn, "b0")) < 0){
-		fail("/advert does not answer a0 and b0");
-		goto closed;
-	}
+	pa = mustpos(sn, "a0", "/advert");
+	pb = mustpos(sn, "b0", "/advert");
+	/*
+	 * Every entry the snapshot names sits a slot above its position,
+	 * because the discarded gap is below them all: a snapshot
+	 * rendered from the live index by position answers the wrong
+	 * object for every one of them.
+	 */
+	if(objsnapent(sn, 0, got, &oidlen, &oi) != 1)
+		fail("/advert does not answer its first entry: %r");
+	else
+		eqv("no position in this snapshot is its own slot", oi.slot, 1);
 	rmv(s, "a0", 2);
 	eqv("a delete after the open is still in kinds, so not gone",
 		objsnapent(sn, pa, got, &oidlen, &oi), 1);
@@ -552,7 +572,6 @@ tadvert(void)
 	eqv("a discard after the open is gone",
 		objsnapent(sn, pb, got, &oidlen, &oi), 0);
 	eqv("the count is the open-time count", objsnapcount(sn), 8);
-closed:
 	objsnapclose(sn);
 out:
 	storeclose(s);
