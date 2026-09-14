@@ -1737,8 +1737,15 @@ treclaimconc(void)
 		snprint(nm, sizeof nm, "m%04lud", i);
 		mk(s, nm);
 	}
-	if(ostat(s, "z0000", &oi) < 0)
-		fail("objstat z0000: %r");
+	/*
+	 * The cutoff is the LAST tombstone's mtime, not the first's:
+	 * mtime is a whole second (obj.c takes time(nil)), so a run that
+	 * straddles a second boundary while these 200 are made would
+	 * leave the later ones above a cutoff taken from the first and
+	 * silently halve what the walk is given.
+	 */
+	if(ostat(s, "z0199", &oi) < 0)
+		fail("objstat z0199: %r");
 	cutoff = oi.mtime;
 	for(k = 0; k < Nproc; k++){
 		if((c[k] = mallocz(sizeof *c[k], 1)) == nil)
@@ -1747,13 +1754,14 @@ treclaimconc(void)
 		c[k]->lo = k*50;
 		c[k]->hi = (k+1)*50;
 		/*
-		 * Above the epoch the reclaim walk below runs at, so that
-		 * walk's /tombs snapshot skips whatever tombstone the churn
-		 * is holding when it is taken: layer-a §1.5's condition 3
-		 * is the caller's, and this caller is not the churn's
-		 * primary.
+		 * Not below the epoch the reclaim walk below runs at, so
+		 * that walk skips whatever tombstone the churn is holding
+		 * when its snapshot is taken: layer-a §1.5's condition 3 is
+		 * the caller's, and this caller is not the churn's primary.
+		 * The epoch is what separates the two sets and not the
+		 * cutoff, because the churn's mtimes are this same second.
 		 */
-		c[k]->we = 4;
+		c[k]->we = 5;
 		if(spawnproc(churnproc, c[k]) < 0){
 			fail("spawn: %r");
 			c[k]->done = 1;
@@ -1772,6 +1780,8 @@ treclaimconc(void)
 	for(k = 0; k < Nproc; k++)
 		c[k]->stop = 1;
 	eqv("the walk discarded every tombstone it was given", r.ndisc, 200);
+	eqv("and skipped every one the churn's epoch reserves", r.nskip,
+		r.nseen - 200);
 	eqv("and was refused none of them", r.nrefused, 0);
 	for(i = 0; i < 200; i += 37){
 		snprint(nm, sizeof nm, "z%04lud", i);
