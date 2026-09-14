@@ -578,6 +578,7 @@ typedef struct Storecfg Storecfg;
 typedef struct Storestat Storestat;
 typedef struct Objinfo Objinfo;
 typedef struct Stage Stage;
+typedef struct Objsnap Objsnap;
 
 /*
  * Store and Stage are opaque outside lib/: their definitions are in
@@ -588,6 +589,7 @@ typedef struct Stage Stage;
  */
 #pragma incomplete Store
 #pragma incomplete Stage
+#pragma incomplete Objsnap
 
 enum
 {
@@ -601,6 +603,7 @@ enum
 	Stagetotdflt	= 16384,	/* §3.6, grains per process */
 	Stagemsdflt	= 30000,
 	Emapcachedflt	= 4096,		/* §9's LRU */
+	Objsnapmaxdflt	= 8,		/* §9's concurrent-snapshot bound */
 	Qidbatch	= 1024,		/* §2.2's qidnext batch */
 };
 
@@ -618,6 +621,7 @@ struct Storecfg
 	ulong	ckwaitms;
 	ulong	stagemax, stagetot, stagems;
 	ulong	emapcache;
+	ulong	objsnapmax;		/* §9's bound on open snapshots */
 };
 
 struct Storestat
@@ -635,6 +639,7 @@ struct Storestat
 	int	broken;			/* a log write failed: §3.2 */
 	uvlong	nslots;			/* the index's size, for §8's cursor */
 	uvlong	nlive, ntomb, nlost;	/* nlost: /lost, §8 */
+	uvlong	nobjsnap;		/* §9's open object snapshots */
 	uvlong	ndirty, ndirtydrop;
 	uvlong	nreplay, pmax;
 	/*
@@ -664,7 +669,13 @@ struct Objinfo
 };
 
 Store*	storeopen(Dev*, Storecfg*);
-void	storeclose(Store*);	/* stop the procs; write nothing */
+/*
+ * Stop the procs and free the store; it writes nothing.  Every object
+ * snapshot taken from it (objsnapopen, below) MUST be closed first: a
+ * snapshot is the caller's, so this frees none of them, and the store
+ * they name is gone underneath them after it returns.
+ */
+void	storeclose(Store*);
 int	storecheckpoint(Store*);
 void	storestat(Store*, Storestat*);
 void	storehook(Store*, char *name, uvlong n);	/* §13's -X hooks */
@@ -673,9 +684,9 @@ void	storehook(Store*, char *name, uvlong n);	/* §13's -X hooks */
  * local verification — §5 step 10's condemned slots and §8's
  * corrupt-flagged entries alike.  storelost answers the i'th slot, or
  * ~0 past the end; Storestat.nlost is how many there are.  The two
- * are read together and the list moves under a concurrent scrub, so a
- * walker that wants a consistent picture is the caller's problem, as
- * every other enumeration here is.
+ * are read together and the list moves under a concurrent scrub, so
+ * this is a cursor over the live list rather than a picture of it: a
+ * caller that needs a picture takes lostsnap's copy (below).
  */
 ulong	storelost(Store*, ulong i);
 int	storefullsync(Store*, char *peer);
@@ -777,6 +788,86 @@ int	objscrub(Store*, uchar *oid, int oidlen, Vfy*);
  * rather than the slot.
  */
 int	objslot(Store*, ulong slot, uchar *oid, int *oidlen, Objinfo*);
+
+/*
+ * §9's snapshot-at-open enumeration: what a server's /obj, /tombs and
+ * /advert fids read, and layer-a §2.2's SHOULD for the first two.
+ *
+ * objsnapopen takes, under one hold of the state lock, the vector of
+ * {slot, qid.path} of every index entry whose state is in kinds —
+ * Snaplive for /obj, Snaptomb for /tombs, both for /advert — and
+ * releases the lock before it returns.  12 bytes an entry, §9's
+ * sizing.  Nothing is locked afterwards and the snapshot holds no
+ * reference the engine must honour: it is a list of names, and an
+ * entry a later discard removes simply becomes gone.
+ *
+ * Access is by POSITION, not by slot, which is what lets a server map
+ * a Tread offset onto an entry and restart from 0 on a re-read, the
+ * way a Plan 9 directory read works.  objsnapent answers entry i: 1
+ * with the oid, *oidlen and the Objinfo rendered from the LIVE index
+ * under a short hold of the state lock, exactly as objslot does; 0
+ * when that entry is gone; -1 past the end or on a condemned store.
+ * objsnapcount is the number of entries, and it does not change: an
+ * object created after the open is not in the vector at all.
+ *
+ * **Gone is two conditions.**  The slot's qid.path no longer matches
+ * the snapshot's — the object was discarded and the slot reused, or
+ * the slot was freed — OR the slot's state is no longer in the
+ * snapshot's kinds.  The second is not a refinement of the first:
+ * §2.3 keeps an object's qid.path across delete, tombstone and
+ * re-create, so a live object deleted after a /obj open still matches
+ * on qid.path and is now a tombstone, which layer-a §2.2 says /obj
+ * MUST NOT list; a tombstone re-created over after a /tombs open
+ * matches too and is now live.
+ *
+ * The number of snapshots open at once is bounded by Storecfg's
+ * objsnapmax (§9: policy, default Objsnapmaxdflt), because the cost
+ * is per open fid; an open past it answers `disk full' (layer-a
+ * §2.6).  objsnapclose releases the count.  A snapshot is the
+ * caller's, and storeclose frees nothing of the caller's, so every
+ * snapshot MUST be closed before the store it was taken from is.
+ */
+enum
+{
+	Snaplive	= 1<<0,		/* /obj */
+	Snaptomb	= 1<<1,		/* /tombs */
+	Snapboth	= Snaplive|Snaptomb,	/* /advert */
+};
+
+Objsnap*	objsnapopen(Store*, int kinds);
+ulong		objsnapcount(Objsnap*);
+int		objsnapent(Objsnap*, ulong i, uchar *oid, int *oidlen,
+			Objinfo*);
+void		objsnapclose(Objsnap*);
+
+/*
+ * The other two enumerations layer-a §2.2 makes a snapshot MUST, as
+ * copies taken at open rather than as cursors: /dirty and /lost are
+ * bounded by the dirty region and by what fails local verification,
+ * so a copy is the whole of what a renderer needs.
+ *
+ * dirtysnap answers a malloc'd array of every record in the dirty set
+ * (layer-a §7.1), taken under one hold of the lock that guards it;
+ * the Dirtyrec carries the record's oid, oidlen, peer, peerlen and
+ * epoch, and its op is 1 (add) because a record that is in the set is
+ * one that was added.  lostsnap answers the same for /lost (layer-a
+ * §7.5): one entry per slot storelost would name, with the oid and
+ * the Objinfo beside it so a renderer need not go back to the index.
+ * storelost stays: it is what a walker that wants the live list uses.
+ *
+ * Both answer 0 with *np 0 and *p nil when there is nothing to
+ * report, -1 on failure, and the array is the caller's to free.
+ */
+typedef struct Lostent Lostent;
+struct Lostent
+{
+	int	oidlen;
+	uchar	oid[Oidmax];
+	Objinfo	oi;		/* oi.slot is the slot storelost names */
+};
+
+int	dirtysnap(Store*, Dirtyrec **dp, ulong *np);
+int	lostsnap(Store*, Lostent **lp, ulong *np);
 
 /*
  * §8's block repair.  a is block blk as fetched from a holder of a

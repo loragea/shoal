@@ -2583,23 +2583,74 @@ workload.
 MUST for `/status`, `/map`, `/dirty`, `/stale`, `/lost` and `/jobs`
 and a SHOULD for `/obj` and `/tombs`. The six MUSTs are small — a
 few hundred lines at the envelope — and are rendered into a buffer
-at open, which is the one-line implementation. For `/obj`, `/tombs`
-and `/advert` the store takes, under `qlstate` (§7), a vector of
-`{u32 slot, u64 qidpath}` — 12 bytes an entry, **3.1 MB at 2.6·10^5
-objects and 12 MB at `nslots = 2^20`**. Each `Tread` renders entries
-from the *live* index, skipping any whose `qidpath` no longer matches
-the snapshot: that is an object deleted since the open, which a
-listing of live objects should not show anyway. Nothing shifts under
-the reader, so no entry is skipped or duplicated because of an index
-shift.
+at open, which is the one-line implementation.
+
+For `/obj`, `/tombs` and `/advert` an open takes, under **one** hold
+of `qlstate` (§7), the vector of `{u32 slot, u64 qidpath}` of every
+entry whose state it asked for — live for `/obj`, tomb for `/tombs`,
+both for `/advert` — and releases the lock before it returns. That is
+12 bytes an entry, **3.1 MB at 2.6·10^5 objects and 12 MB at
+`nslots = 2^20`**, held as two parallel arrays rather than one array
+of a struct, because a `{u32, u64}` struct is 16 bytes on amd64 and
+the 4 in every 16 buys nothing. The vector is a list of names and not
+a reference the engine must honour: a discard of an entry it names is
+neither refused nor delayed by it.
+
+Entries are addressed **by position**, not by slot. That is what lets
+a server map a `Tread` offset onto an entry and restart from 0 on a
+re-read, which is how a Plan 9 directory read works. Entry *i* is
+rendered from the *live* index under the same short hold of `qlstate`
+§8's cursor takes, so no lock spans a caller's use of an entry and a
+full walk never blocks `/status`, `/ctl` or `Tflush` (§7 rule 2).
+Nothing shifts under the reader, so no entry is skipped or duplicated
+because of an index shift, and an entry created after the open is not
+in the vector at all.
+
+**An entry is gone under either of two conditions, and the second is
+not a refinement of the first.** Either its slot's `qidpath` no
+longer matches the vector's — the object was discarded and the slot
+freed, or freed and handed to a different object — or the slot's
+state is no longer one the snapshot asked for. §2.3 keeps an object's
+`qid.path` across delete, tombstone and re-create, so an object
+deleted after a `/obj` open still matches on `qidpath` and is now a
+tombstone, which layer-a §2.2 says `/obj` MUST NOT list; a tombstone
+created over after a `/tombs` open matches too and is now live. A
+snapshot that tested `qidpath` alone would list both.
 
 The store reports `objsnap=full` and never uses layer-a §2.2's
-`objsnap=partial` escape. The cost is per open fid, so the server
-bounds the number of concurrently open enumeration fids (policy,
-default 8) and answers further opens `disk full` rather than growing
-without limit; at 2^20 slots eight of them are 96 MB, which is the
-number §14(9) says is answered for the Layer B envelope and not for
-this design's own maximum.
+`objsnap=partial` escape: the engine takes the whole vector or
+refuses the open. Reporting the field in `/status` is the server's
+half and waits on the 9P surface. The cost is per open fid, so the
+store bounds how many snapshots may be open at once (`objsnapmax`,
+policy, default 8) and answers a further open `disk full` (layer-a
+§2.6) rather than growing without limit; at 2^20 slots eight of them
+are 96 MB, which is the number §14(9) says is answered for the Layer
+B envelope and not for this design's own maximum. A close releases
+the count and `/status` reports how many are open. A snapshot is the
+caller's, and `storeclose` frees nothing of the caller's, so every
+snapshot MUST be closed before the store it was taken from is.
+
+**`/dirty` and `/lost` are copies rather than cursors.** Both sets
+are bounded — by the dirty region (§2.6) and by what fails local
+verification (§8) — so a copy taken under one hold of the lock that
+guards each is the whole of what a renderer needs, and layer-a §2.2's
+MUST for these two costs nothing. The `/dirty` copy carries every
+record's `(oid, peer, epoch)`; the `/lost` copy carries every slot
+the membership list names, with that slot's oid and published record
+beside it, so a renderer never goes back to an index the scrub has
+moved under it. The slot-at-a-time accessor stays beside the copy: it
+is what a walker that wants the live list uses.
+
+§6's tombstone reclaim is the enumeration's first caller, and it is
+the caller's walk rather than the engine's: the engine holds no
+`tombdays` policy, because layer-a §3.1 makes `tombdays` a map-header
+attribute. The caller opens a `/tombs` snapshot, tests each entry's
+`mtime` against its own cutoff and the entry's `wepoch` against its
+own map epoch, and discards by the entry's **own key** rather than by
+its slot — which is what makes the walk safe under concurrent
+mutation, since §6's receiver checks then refuse a record that is not
+the one the walk inspected instead of removing whatever the slot came
+to hold.
 
 ## 10. The monitor's map slot store
 
@@ -2819,8 +2870,9 @@ four rather than sixteen and makes every block write exactly one
 device request, so there is no "issue the grain four ways" question
 to answer and no proc pool to size for it. A cluster that chose a
 larger `blksz` would pay `ceil(blksz/Wunit)` requests per grain and
-every row below scales with it; the table is the default's. The workload this store is built for — Layer B striping
-through an `msize`-sized 9P path — writes whole blocks.
+every row below scales with it; the table is the default's. The
+workload this store is built for — Layer B striping through an
+`msize`-sized 9P path — writes whole blocks.
 
 **A 16 MiB `op=full` is disk-bound, not wire-bound.** Layer-a §5.5
 puts it at 185–545 ms of wire time; the receiving disk costs 8.6 s of
@@ -2968,7 +3020,13 @@ entry's checksum and every bitmap page's, reports `Pmax` and whether
 the bitmap is stamped ahead of the superblock, and cross-checks the
 bitmap against the grains every live map references, scanning each
 object to `nblk` and not beyond; it exits non-zero on any
-inconsistency. `-l` dumps the log records and their entries; a second
+inconsistency. A slot §5 step 10 condemned is reported twice over,
+and both reports are the state of the disk rather than a second
+fault: its extent-map entry does not unpack, so the cross-check finds
+nothing referencing the grains it held and calls them marked and
+unreferenced. They stay that way — a tombstone over such a slot frees
+none of them either (§6) — until `-R` rebuilds the bitmap from the
+maps that do unpack. `-l` dumps the log records and their entries; a second
 `-l` dumps each `Eobj`'s block map. `-q` prints the problems and
 nothing else. `-o` dumps one object's index entry and extent map.
 
@@ -3041,9 +3099,10 @@ grains it held are named by no readable structure, and holding an
 unknown set of grains out of the allocator for ever would leak the
 disk instead. Until such a rebuild runs they stay marked from the
 bitmap as it was found, which is what §3.6 means by a condemned
-copy's grains staying marked used until a rebuild. It opens the device read-write — the open
-`shoalfmt` takes, with the flush channel, and `-w` as §3.2's operator
-assertion for a unit whose raw channel will not open — so `-w`
+copy's grains staying marked used until a rebuild. It opens the
+device read-write — the open `shoalfmt` takes, with the flush
+channel, and `-w` as §3.2's operator assertion for a unit whose raw
+channel will not open — so `-w`
 without `-R` is refused rather than ignored. `-R` with `-v` rebuilds
 first and then verifies. `-R` with `-o` is refused: `-o` dumps one
 object, and a rebuild driven from one object's map would clear every
@@ -3242,7 +3301,7 @@ T1 formats a **small geometry** — a partition image of a few MiB with
 over one header sector, not over the whole store, and the cases that
 need `nslots = 2^20` are T2's.
 
-**What T1 covers today.** Eleven programs, all of them against the
+**What T1 covers today.** Twelve programs, all of them against the
 simulated disk except where a file-backed device is the point:
 `csumtest` (layer-a §1.4's block digests and object checksums against
 known-answer vectors), `structtest` (§2's byte layouts against
@@ -3366,19 +3425,31 @@ reclaim rule run both ways, the checkpoint mark against a concurrent
 publish and under a held batch, a group commit at the largest record
 replay accepts, a multi-sector record at the region boundary, a
 header naming more sectors than that record, durable-before-ack for a
-batch's members, and `qid.path` across restarts).
+batch's members, and `qid.path` across restarts) and `enumtest` (§9's
+snapshot-at-open enumeration: a `/obj`, a `/tombs` and an `/advert`
+snapshot each walked by position with an entry created, deleted,
+created over and discarded under it, both halves of the gone rule
+discriminated one at a time, the bound on open snapshots and the
+`disk full` past it, a checkpoint taken mid-walk, the `/dirty` and
+`/lost` copies against a moving set, and §6's tombstone reclaim walk
+— single-proc and with the record replaced under it).
 
-Against the list below that is T1.1–T1.14, T1.16, T1.17, T1.18–T1.20
-and T1.22–T1.26. Two cases are not covered and each waits on something
-this store does not have yet: **T1.15** waits on the enumeration
-snapshot of §9 and the `/obj` fid that reads it; **T1.27** waits on the server's `Reqqueue` pool (§7), which is
-what it is about — the engine's own scrub and cursor take the same
-`qlstate` snapshot every other call takes and hold no lock across a
-verify, but *that a scrubber pushes through the object's queue rather
-than reading grains beside it* is a property of the server, and there
-is no server to hold it wrong yet. T1.21 is covered for the orderings
-and the fields, but drives the four publish triggers in sequence
-rather than from concurrent procs.
+Against the list below that is T1.1–T1.26. One case is not covered
+and waits on something this store does not have yet: **T1.27** waits
+on the server's `Reqqueue` pool (§7), which is what it is about — the
+engine's own scrub and cursor take the same `qlstate` snapshot every
+other call takes and hold no lock across a verify, but *that a
+scrubber pushes through the object's queue rather than reading grains
+beside it* is a property of the server, and there is no server to
+hold it wrong yet. T1.21 is covered for the orderings and the fields,
+but drives the four publish triggers in sequence rather than from
+concurrent procs. **T1.15** is covered at T1's geometry and not at
+the scale its row names: `enumtest` walks a snapshot of 1500 entries
+over 4096 slots while four procs create, delete and discard beside
+it, and reads `/dirty` under the same churn, which is the shape of
+the case in about 0.3 s. The 2.6·10^5 entries the row asks for are
+T2's, for the same reason §13's small geometry is: `mk test` stays
+within `AGENTS.md`'s seconds.
 
 - **T1.1 crash matrix (R1–R4).** Every point above × {create,
   whole-block write, partial write, truncate, delete, 16 MiB
@@ -3529,8 +3600,9 @@ rather than from concurrent procs.
   once with block 0 holding its own bytes, and once with **block 0 a
   hole** — create, truncate to `blksz`, then write past it — which is
   the case a rule that exempts holes from `nmap` gets wrong once
-  clause 4 is wrong as well. Crash at `commit:0`; restart. Block 0 must read what
-  it held — its own bytes in the first variant, zeros in the second —
+  clause 4 is wrong as well. Crash at `commit:0`; restart. Block 0
+  must read what it held — its own bytes in the first variant, zeros
+  in the second —
   every unwritten block must read zeros, and `verify` must pass,
   which is what catches a hole left with sixteen zero bytes for a
   digest. Then the re-replay

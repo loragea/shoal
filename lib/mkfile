@@ -19,6 +19,7 @@ OFILES=\
 	mon.$O\
 	obj.$O\
 	ondisk.$O\
+	snap.$O\
 	store.$O\
 	super.$O\
 
