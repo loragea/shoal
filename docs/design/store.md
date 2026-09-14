@@ -2970,7 +2970,13 @@ entry's checksum and every bitmap page's, reports `Pmax` and whether
 the bitmap is stamped ahead of the superblock, and cross-checks the
 bitmap against the grains every live map references, scanning each
 object to `nblk` and not beyond; it exits non-zero on any
-inconsistency. `-l` dumps the log records and their entries; a second
+inconsistency. A slot §5 step 10 condemned is reported twice over,
+and both reports are the state of the disk rather than a second
+fault: its extent-map entry does not unpack, so the cross-check finds
+nothing referencing the grains it held and calls them marked and
+unreferenced. They stay that way — a tombstone over such a slot frees
+none of them either (§6) — until `-R` rebuilds the bitmap from the
+maps that do unpack. `-l` dumps the log records and their entries; a second
 `-l` dumps each `Eobj`'s block map. `-q` prints the problems and
 nothing else. `-o` dumps one object's index entry and extent map.
 
