@@ -3608,15 +3608,18 @@ discriminated one at a time, a live copy condemned under an open
 `/obj` and still answered with `corrupt=1` rather than dropped (D14),
 the bound on open snapshots, the `disk full` past it and the refusal
 of a `kinds` the engine has no state for, a `storeclose` under an
-open snapshot, an open whose index count goes stale between the count
-and the fill, every one of the five enumerations refusing on a
-condemned store, a checkpoint taken mid-walk, the `/dirty` copy
-against a moving set and the `fullsync` peer enumeration beside it
-after §2.6's exhaustion drop, the `/lost` copy against a moving list
-and over the one slot whose own index entry is the damage, and §6's
-tombstone reclaim walk — single-proc, with the record replaced under
-it, with the record put back at a higher key under it, and under
-concurrent churn).
+open snapshot, an open whose vector the index outgrows between the
+count and the fill, two thousand opens under four churning procs with
+not one refused and no count outside what the churn can produce,
+every one of the five enumerations refusing on a condemned store, a
+checkpoint taken mid-walk, the `/dirty` copy against a moving set and
+the `fullsync` peer enumeration beside it after §2.6's exhaustion
+drop, the `/lost` copy against a moving list and over the one slot
+whose own index entry is the damage, and §6's tombstone reclaim walk
+— single-proc, with the record replaced under it, with the record put
+back at a higher key under it, and under concurrent churn with one
+churn proc parked on a tombstone of its own making, so that the
+walk's epoch condition is what holds it off and not its cutoff).
 
 Against the list below that is T1.1–T1.26. One case is not covered
 and waits on something this store does not have yet: **T1.27** waits
