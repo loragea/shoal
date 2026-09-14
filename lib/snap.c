@@ -127,20 +127,28 @@ objsnapopen(Store *s, int kinds)
 	}
 	sn->s = s;
 	sn->kinds = kinds;
+	/*
+	 * §9's bound, tested and taken in one step under one hold: the
+	 * slot is this open's from the moment the test passes, so two
+	 * opens racing cannot both find room, and an open past the bound
+	 * costs no allocation.  Every way out of here that is not a
+	 * snapshot gives the slot back at `bad'.  One check and not two —
+	 * a second one anywhere else would be a check no test could
+	 * discriminate, and so a check that could be deleted in silence.
+	 */
+	qlock(&s->qlstate);
+	if(s->nobjsnap >= s->cfg.objsnapmax){
+		qunlock(&s->qlstate);
+		werrstr("disk full: %lud object snapshots already open",
+			s->nobjsnap);
+		free(sn);
+		return nil;
+	}
+	s->nobjsnap++;
+	qunlock(&s->qlstate);
 	for(try = 0; try < Snaptries; try++){
-		/*
-		 * The count, under the lock.  §9's bound is checked here
-		 * too, so that an open past it costs no allocation; the
-		 * check that decides it is the one under the fill below,
-		 * because that is where the count is taken.
-		 */
+		/* the count, under the lock */
 		qlock(&s->qlstate);
-		if(s->nobjsnap >= s->cfg.objsnapmax){
-			qunlock(&s->qlstate);
-			werrstr("disk full: %lud object snapshots already open",
-				s->nobjsnap);
-			goto bad;
-		}
 		want = snapwant(s, kinds);
 		qunlock(&s->qlstate);
 		cap = want + want/Snapslackdiv + Snapslackmin;
@@ -160,12 +168,6 @@ objsnapopen(Store *s, int kinds)
 		}
 
 		qlock(&s->qlstate);
-		if(s->nobjsnap >= s->cfg.objsnapmax){
-			qunlock(&s->qlstate);
-			werrstr("disk full: %lud object snapshots already open",
-				s->nobjsnap);
-			goto bad;
-		}
 		/*
 		 * The index has very likely moved while the allocation ran,
 		 * and all but one of the ways it can move are harmless.  A
@@ -209,7 +211,6 @@ objsnapopen(Store *s, int kinds)
 			n++;
 		}
 		sn->n = n;
-		s->nobjsnap++;
 		qunlock(&s->qlstate);
 		return sn;
 	}
@@ -224,6 +225,9 @@ objsnapopen(Store *s, int kinds)
 	 */
 	werrstr("object snapshot: the index moved under %d counts", Snaptries);
 bad:
+	qlock(&s->qlstate);
+	s->nobjsnap--;
+	qunlock(&s->qlstate);
 	free(sn->slot);
 	free(sn->qidpath);
 	free(sn);

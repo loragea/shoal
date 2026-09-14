@@ -2677,8 +2677,12 @@ store bounds how many snapshots may be open at once (`objsnapmax`,
 policy, default 8) and answers a further open `disk full` (layer-a
 §2.6) rather than growing without limit; at 2^20 slots eight of them
 are 96 MB, which is the number §14(9) says is answered for the Layer
-B envelope and not for this design's own maximum. A close releases
-the count and `/status` reports how many are open. A snapshot is the
+B envelope and not for this design's own maximum. The test and the
+count are **one step under one hold** of `qlstate` — the open takes
+its slot the moment it passes the bound, so two opens racing cannot
+both find room — and an open that then fails gives the slot back, so
+`/status` counts an open in flight along with the opens that
+completed. A close releases the count. A snapshot is the
 caller's, and `storeclose` frees nothing of the caller's, so every
 snapshot MUST be closed before the store it was taken from is —
 and a `storeclose` that finds one still open **`sysfatal`s, naming

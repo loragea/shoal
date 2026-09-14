@@ -838,7 +838,11 @@ int	objslot(Store*, ulong slot, uchar *oid, int *oidlen, Objinfo*);
  * The number of snapshots open at once is bounded by Storecfg's
  * objsnapmax (§9: policy, default Objsnapmaxdflt), because the cost
  * is per open fid; an open past it answers `disk full' (layer-a
- * §2.6).  objsnapclose releases the count.  A snapshot is the
+ * §2.6).  The bound is tested and the count taken in one step under
+ * one hold of the state lock, so two opens racing cannot both find
+ * room; an open that fails after that gives the count back, and
+ * Storestat counts an open in flight.  objsnapclose releases the
+ * count.  A snapshot is the
  * caller's, and storeclose frees nothing of the caller's, so every
  * snapshot MUST be closed before the store it was taken from is:
  * storeclose `sysfatal's on a store that still has one open, because
