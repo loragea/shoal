@@ -863,6 +863,12 @@ void		objsnapclose(Objsnap*);
  * the Objinfo beside it so a renderer need not go back to the index.
  * storelost stays: it is what a walker that wants the live list uses.
  *
+ * The /lost copy names every one of those slots, §5 step 10's
+ * included — an index entry that would not unpack is itself the
+ * damage, so that entry has no oid to give: its oidlen is 0 and its
+ * Objinfo is the slot number, state Sfree and zeroes, and a renderer
+ * emits the line with no `oid='.  Any other rule would make the copy
+ * disagree with Storestat.nlost.
  * Both answer 0 with *np 0 and *p nil when there is nothing to
  * report, -1 on failure, and the array is the caller's to free.
  */

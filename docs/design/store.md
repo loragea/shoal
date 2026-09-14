@@ -2646,9 +2646,23 @@ guards each is the whole of what a renderer needs, and layer-a §2.2's
 MUST for these two costs nothing. The `/dirty` copy carries every
 record's `(oid, peer, epoch)`; the `/lost` copy carries every slot
 the membership list names, with that slot's oid and published record
-beside it, so a renderer never goes back to an index the scrub has
-moved under it. The slot-at-a-time accessor stays beside the copy: it
-is what a walker that wants the live list uses.
+beside it, so a renderer never goes back to an index the scrub has moved
+under it. The slot-at-a-time accessor stays beside the copy: it is what
+a walker that wants the live list uses.
+
+The `/lost` copy names **every** slot the membership list names,
+including §5 step 10's: an index entry that would not unpack leaves
+its slot marked bad with its state still free, and that slot is on
+the list and in `/status`'s `lost=` count. It has no oid to give —
+the entry that would have carried one is the damage — so its copy
+carries an oid length of 0 and an `Objinfo` that is the slot number,
+state free and zeroes, and a renderer emits `slot=<n> kind=lost`
+with no `oid=`. Layer-a §2.2 fixes only `oid=` and `kind=` for that
+file, and does so for the fields a line *has*: a slot with no
+readable oid has none to give, and the rest of the line is
+implementation policy. Dropping it instead would make the copy and
+`/status`'s own count disagree on precisely the damage `/lost`
+exists for.
 
 §6's tombstone reclaim is the enumeration's first caller, and it is
 the caller's walk rather than the engine's: the engine holds no

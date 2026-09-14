@@ -991,6 +991,68 @@ tlost(void)
 	devclose(d);
 }
 
+/*
+ * The other condemnation, §5 step 10's: an index entry that does not
+ * unpack.  The slot is left bad with its state still free, and it is
+ * the one slot on the /lost list whose own entry is the damage — so
+ * it has no oid, and a copy that skipped it would disagree with
+ * /status's own lost count on exactly the case /lost exists for.
+ * The geometry is storetest's: damage an entry the log no longer
+ * describes, so replay does not repair it.
+ */
+static void
+tlostbadent(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Lostent *l;
+	Super sup;
+	uchar *buf, o[Oidmax], junk[8];
+	ulong n;
+
+	d = newdisk();
+	if((s = mustopen(d, "the /lost copy of a damaged entry")) == nil)
+		return;
+	buf = mkbuf(64, 9);
+	mk(s, "g0");
+	oidof(o, "g0");
+	if(objwrite(s, o, 2, buf, 64, 0, 2, 1, nil, 0) < 0)
+		fail("objwrite g0: %r");
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	storeclose(s);
+	geom(d, &sup);
+	memset(junk, 0xff, sizeof junk);
+	simpoke(d, idxentoff(&sup, 0), junk, sizeof junk);
+	if((s = mustopen(d, "a store with a damaged index entry")) == nil){
+		devclose(d);
+		free(buf);
+		return;
+	}
+	storestat(s, &st);
+	eqv("the damaged entry is condemned", st.nlost, 1);
+	eqv("and storelost names its slot", storelost(s, 0), 0);
+	if(lostsnap(s, &l, &n) < 0)
+		fail("lostsnap: %r");
+	else{
+		eqv("the copy names it too", n, st.nlost);
+		if(n == 1){
+			eqv("by the slot storelost named", l[0].oi.slot, 0);
+			eqv("with no oid, because the entry is the damage",
+				l[0].oidlen, 0);
+			eqv("and a state of free", l[0].oi.state, Sfree);
+			eqv("with nothing else invented", l[0].oi.qidpath, 0);
+			eqv("not even a corrupt flag it cannot read",
+				l[0].oi.corrupt, 0);
+		}
+		free(l);
+	}
+	storeclose(s);
+	devclose(d);
+	free(buf);
+}
+
 /* ---- T1.15: a full walk under concurrent creates and deletes ---- */
 
 typedef struct Churn Churn;
@@ -1580,6 +1642,7 @@ main(int argc, char **argv)
 	tclosesnap();
 	tdirty();
 	tlost();
+	tlostbadent();
 	tckpt();
 	treclaim();
 	treclaimrace();
