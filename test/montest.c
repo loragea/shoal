@@ -602,6 +602,111 @@ thistfail(void)
 }
 
 /*
+ * A ring write that fails over a PHANTOM victim.  The write landed
+ * nothing, so the phantom is still on the platter; if the store
+ * forgets that, the victim search walks past it, the next published
+ * map raises seq above it, and at the next open it is served as
+ * ordinary history for a map that was never published (§10's
+ * phantom-first rule is exactly what this defends).
+ *
+ * The schedule needs a second damaged ring slot, so that "the first
+ * invalid slot" and "the phantom's slot" are different slots and the
+ * retry's choice between them is visible.
+ */
+static void
+tringfailphantom(void)
+{
+	Dev *d;
+	Mon *m;
+	Monstat st;
+	Monmap mm;
+	uchar hdr[Secsz];
+	vlong phoff;
+	int i;
+
+	d = fresh();
+	if((m = mustopen(d, "ringfail")) == nil){
+		devclose(d);
+		return;
+	}
+	commit(m, "ringfail", "map=A", 1);
+	commit(m, "ringfail", "map=B", 2);
+	commit(m, "ringfail", "map=C", 3);
+	monstat(m, &st);
+
+	/* the publish of epoch 9 dies in the phantom window */
+	simcrashdead(d, 1);
+	simarm(d, "monhistflush", 0);
+	checks++;
+	if(moncommit(m, "map=PHANTOM", 11, 9) == 0)
+		fail("ringfail: a commit whose machine died reported success");
+	monclose(m);
+	simrevive(d);
+
+	/* an unrelated media fault damages ring slot 0 */
+	tearslot(d, histoffs(&st, 0));
+
+	if((m = mustopen(d, "ringfail restart")) == nil){
+		devclose(d);
+		return;
+	}
+	monstat(m, &st);
+	eqv("ringfail: the unpublished map is a phantom", st.nphantom, 1);
+	eqv("ringfail: two entries survive", st.nhist, 2);
+	eqv("ringfail: the current map is still C", st.epoch, 3);
+
+	/* the phantom's slot is the one carrying the unpublished seq */
+	phoff = -1;
+	for(i = 0; i < Retain; i++){
+		simpeek(d, histoffs(&st, i), hdr, Secsz);
+		if(memcmp(hdr, "shoalmap", 8) == 0 && GBIT64(hdr + 40) == 9)
+			phoff = histoffs(&st, i);
+	}
+	checks++;
+	if(phoff < 0){
+		fail("ringfail: the phantom's ring slot is not on the disk");
+		monclose(m);
+		devclose(d);
+		return;
+	}
+
+	/* the next commit's ring write is aimed at it, and fails */
+	simfaultat(d, Sfeio, 1, phoff, st.slotsz);
+	checks++;
+	if(moncommit(m, "map=D", 5, 4) == 0)
+		fail("ringfail: a commit whose ring write failed reported "
+			"success");
+	monstat(m, &st);
+	eqv("ringfail: the current map is untouched", st.epoch, 3);
+	eqv("ringfail: the phantom is still counted", st.nphantom, 1);
+
+	/* the monitor retries, as it must: the phantom's slot is reused */
+	checks++;
+	if(moncommit(m, "map=D", 5, 4) < 0)
+		fail("ringfail: the retry: %r");
+	monstat(m, &st);
+	eqv("ringfail: the retry consumed the phantom", st.nphantom, 0);
+	eqv("ringfail: three entries after the retry", st.nhist, 3);
+	monclose(m);
+
+	if((m = mustopen(d, "ringfail restart 2")) == nil){
+		devclose(d);
+		return;
+	}
+	monstat(m, &st);
+	eqv("ringfail: D is current after the restart", st.epoch, 4);
+	eqv("ringfail: no phantom is left", st.nphantom, 0);
+	eqv("ringfail: and three published maps", st.nhist, 3);
+	eqi("ringfail: the unpublished epoch answers nothing",
+		monlookup(m, 9, &mm), 0);
+	eqi("ringfail: position 0 is the current map",
+		monhistory(m, 0, &mm), 1);
+	eqv("ringfail: at the current seq", mm.seq, st.seq);
+	monclose(m);
+	devclose(d);
+}
+
+/*
  * Ring wrap.  More commits than retain: the oldest seq is the victim
  * each time, so the ring always holds the newest retain maps and
  * layer-a §5.2 clause 2's E-1 entry is always one of them.
@@ -1130,6 +1235,7 @@ main(int, char**)
 	tslots();
 	tphantom();
 	thistfail();
+	tringfailphantom();
 	tring();
 	tfull();
 	theader();

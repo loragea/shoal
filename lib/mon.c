@@ -625,7 +625,7 @@ moncommit(Mon *m, void *text, ulong len, uvlong epoch)
 {
 	char err[ERRMAX];
 	uvlong seq;
-	int v, c;
+	int v, c, wasphantom;
 
 	if(len > m->h.slotsz - m->d->secsz){
 		/*
@@ -644,9 +644,27 @@ moncommit(Mon *m, void *text, ulong len, uvlong epoch)
 	if(slotwrite(m, slotoff(m, m->h.histoff, v), len, seq, epoch, text,
 		"monhist", "monhistflush") < 0){
 		rerrstr(err, sizeof err);
+		wasphantom = m->hist[v].phantom;
 		slotclear(&m->hist[v]);
 		snprint(m->hist[v].why, sizeof m->hist[v].why,
 			"the write that failed the commit: %s", err);
+		/*
+		 * The slot is invalid in memory, but the platter was not
+		 * told: a write that landed nothing leaves the victim's own
+		 * bytes there, and a victim that was a phantom is STILL a
+		 * phantom on the disk.  Forgetting that would send the next
+		 * commit's victim search past it to some other slot, the
+		 * next published map would raise seq above the phantom's,
+		 * and it would read back at the following open as ordinary
+		 * history for a map that was never published.  So the slot
+		 * stays first in line for reuse — invalid and phantom both —
+		 * and nphantom counts it exactly once.  The sibling path
+		 * below, for a failed current-slot write, keeps the same
+		 * books.
+		 */
+		m->hist[v].phantom = 1;
+		if(!wasphantom)
+			m->nphantom++;
 		errstr(err, sizeof err);
 		return -1;
 	}

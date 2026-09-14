@@ -2798,6 +2798,18 @@ commit — which either completes, making the entry real, or does not,
 making it the phantom again — is what keeps both halves of the rule
 above true.
 
+**A ring write that fails leaves its victim a phantom.** The slot is
+invalid in memory, but the platter was never told: a write that landed
+nothing leaves the victim's own bytes there, and a victim that was a
+phantom is still a phantom on the disk. So the failed write marks the
+slot *both* invalid and a phantom, which keeps it first in line for
+reuse whatever it now holds — its old bytes, or the half of the new
+map that did land. Dropping the mark instead would send the next
+commit's victim search past it to some other slot, the next published
+map would raise `seq` above it, and the following start would read the
+never-published map back as ordinary history: precisely the outcome
+the rule above exists to prevent.
+
 **The store never compares epochs.** It records the epoch it is given
 beside the map and orders nothing by it: layer-a §8.3's `forceepoch`
 and §8.6's rebuild path can each legitimately publish an epoch that is
@@ -3332,7 +3344,10 @@ at a high `seq` not steering the next write onto the only good one;
 **T2.7's phantom case at T1 scale**, a crash at `monhistflush` after
 which the unpublished epoch answers nothing and the next commit
 reuses the phantom's slot; a ring write that fails and a crash at
-`monhist`, each leaving the current map untouched; `disk full` on an
+`monhist`, each leaving the current map untouched; a ring write that
+fails *over a phantom victim*, after which the retry reuses that same
+slot and the never-published epoch is still unanswerable at the next
+start; `disk full` on an
 oversize map with the store unchanged, and the largest map that fits
 read back byte-exact; the header copies — one damaged, both damaged,
 and two valid copies that differ — a current slot whose `len` does not
