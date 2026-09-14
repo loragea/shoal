@@ -621,10 +621,72 @@ tbound(void)
 	refused("a snapshot of no kinds at all", over != nil ? 0 : -1,
 		"object snapshot");
 	objsnapclose(over);
+	/*
+	 * kinds is a set of states and not a bag of bits: a caller that
+	 * asks for a state the engine does not have is asking for
+	 * something it will not get, and a snapshot that quietly dropped
+	 * the bit would answer a different question from the one asked.
+	 */
+	over = objsnapopen(s, 1<<4);
+	refused("a snapshot of a state that does not exist",
+		over != nil ? 0 : -1, "object snapshot: kinds");
+	objsnapclose(over);
+	over = objsnapopen(s, Snapboth|1<<4);
+	refused("both kinds and one that does not exist",
+		over != nil ? 0 : -1, "object snapshot: kinds");
+	objsnapclose(over);
 	for(i = 0; i < Objsnapmaxdflt; i++)
 		objsnapclose(sn[i]);
 	storestat(s, &st);
 	eqv("closing them all releases every count", st.nobjsnap, 0);
+	storeclose(s);
+	devclose(d);
+}
+
+/*
+ * §3.2's condemned store, which answers nothing until it has been
+ * opened again and replayed: every one of the five enumerations
+ * refuses through storeserving, the open included, and a snapshot
+ * taken before the condemnation stops answering entries.  Serving a
+ * listing out of memory the store has itself declared untrustworthy
+ * is exactly what the flag exists to stop.
+ */
+static void
+tsnapcondemned(void)
+{
+	Dev *d;
+	Store *s;
+	Objsnap *sn, *over;
+	Objinfo oi;
+	Dirtyrec *dr;
+	Lostent *l;
+	uchar got[Oidmax];
+	char **pe, *w;
+	ulong n;
+	int oidlen;
+
+	d = newdisk();
+	if((s = mustopen(d, "the enumerations on a condemned store")) == nil)
+		return;
+	mk(s, "y0");
+	mk(s, "y1");
+	if((sn = mustsnap(s, Snaplive, "a condemned store")) == nil)
+		goto out;
+	eqv("the snapshot answers while the store serves",
+		objsnapent(sn, 0, got, &oidlen, &oi), 1);
+	storehook(s, "fatal", 1);
+	w = "store condemned";
+	over = objsnapopen(s, Snaplive);
+	refused("objsnapopen on a condemned store", over != nil ? 0 : -1, w);
+	objsnapclose(over);
+	refused("objsnapent on a condemned store",
+		objsnapent(sn, 0, got, &oidlen, &oi), w);
+	refused("dirtysnap on a condemned store", dirtysnap(s, &dr, &n), w);
+	refused("lostsnap on a condemned store", lostsnap(s, &l, &n), w);
+	refused("fullsyncsnap on a condemned store",
+		fullsyncsnap(s, &pe, &n), w);
+	objsnapclose(sn);
+out:
 	storeclose(s);
 	devclose(d);
 }
@@ -1817,6 +1879,7 @@ main(int argc, char **argv)
 	ttombs();
 	tadvert();
 	tbound();
+	tsnapcondemned();
 	tsnapstale();
 	tclosesnap();
 	tdirty();
