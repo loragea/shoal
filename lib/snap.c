@@ -280,6 +280,15 @@ objsnapent(Objsnap *sn, ulong i, uchar *oid, int *oidlen, Objinfo *oi)
 	return 1;
 }
 
+/*
+ * Releases the bound's slot and frees the handle.  nil is a no-op, so
+ * a caller can close whatever an open handed it.  Closing the same
+ * snapshot twice is undefined exactly as freeing the same pointer
+ * twice is, and for the same reason: Objsnap.s is the handle's first
+ * word, which the pool overwrites with its free-list links the moment
+ * the first close returns, so the second call has no store to
+ * decrement a count under and nothing here can tell it so.
+ */
 void
 objsnapclose(Objsnap *sn)
 {
@@ -289,8 +298,7 @@ objsnapclose(Objsnap *sn)
 		return;
 	s = sn->s;
 	qlock(&s->qlstate);
-	if(s->nobjsnap > 0)
-		s->nobjsnap--;
+	s->nobjsnap--;
 	qunlock(&s->qlstate);
 	free(sn->slot);
 	free(sn->qidpath);

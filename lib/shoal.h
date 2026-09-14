@@ -847,8 +847,10 @@ int	objslot(Store*, ulong slot, uchar *oid, int *oidlen, Objinfo*);
  * snapshot MUST be closed before the store it was taken from is:
  * storeclose `sysfatal's on a store that still has one open, because
  * the alternative is a snapshot answering "gone" for every entry out
- * of freed memory.  Closing one twice is the same class of bug and
- * cannot be caught: the second call reads a handle the first freed.
+ * of freed memory.  Closing one twice is UNDEFINED, exactly as
+ * freeing the same pointer twice is: the second call reads a handle
+ * the first freed, whose first word the pool has already overwritten,
+ * so there is nothing it can check and no guard that would help.
  */
 enum
 {

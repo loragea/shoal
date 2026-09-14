@@ -2691,9 +2691,12 @@ and the alternative is worse than a crash: the snapshot's entries are
 then rendered from a freed `Store`, where the walk finds no `qidpath`
 match and answers *gone* for every one of them, so the bug surfaces
 as a silently short `/obj` listing rather than as a fault. Closing a
-snapshot twice is the same class of bug and is **not** detectable —
-the second call reads a handle the first freed — so the count guard
-in the close is a guard against wedging the bound, not a check.
+snapshot twice is **undefined**, exactly as freeing the same pointer
+twice is, and for the same reason: the second call reads a handle the
+first freed, whose first word — the store pointer everything in the
+close goes through — the allocator has already overwritten with its
+own free-list links. There is nothing a guard in the close could
+test, so there is none.
 
 **`/dirty` and `/lost` are copies rather than cursors.** Both sets are
 bounded — by the dirty region (§2.6) and by what fails local
