@@ -684,9 +684,9 @@ void	storehook(Store*, char *name, uvlong n);	/* §13's -X hooks */
  * local verification — §5 step 10's condemned slots and §8's
  * corrupt-flagged entries alike.  storelost answers the i'th slot, or
  * ~0 past the end; Storestat.nlost is how many there are.  The two
- * are read together and the list moves under a concurrent scrub, so a
- * walker that wants a consistent picture is the caller's problem, as
- * every other enumeration here is.
+ * are read together and the list moves under a concurrent scrub, so
+ * this is a cursor over the live list rather than a picture of it: a
+ * caller that needs a picture takes lostsnap's copy (below).
  */
 ulong	storelost(Store*, ulong i);
 int	storefullsync(Store*, char *peer);
