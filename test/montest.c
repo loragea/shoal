@@ -248,6 +248,99 @@ tfresh(void)
 	devclose(d);
 }
 
+/*
+ * §10's format prologue: both header sectors are zeroed and flushed
+ * BEFORE anything else is written, and the slots are flushed before
+ * the real header copies are written over them.  A format cut short
+ * anywhere in between must leave no valid header rather than a valid
+ * one locating slots that were never written.
+ */
+static void
+tfmtprologue(void)
+{
+	Dev *d;
+	Mon *m;
+	Monfmtcfg c;
+	Simop *t, w[64];
+	vlong off1;
+	long n, j;
+	int nw;
+
+	if((d = simopen(Secsz, Nsec, Seed)) == nil)
+		sysfatal("simopen: %r");
+	off1 = d->size - Secsz;
+	moncfg(&c);
+	simtracereset(d);
+	checks++;
+	if(monfmt(d, &c) < 0){
+		fail("prologue: monfmt: %r");
+		devclose(d);
+		return;
+	}
+	n = simtrace(d, &t);
+	nw = 0;
+	for(j = 0; j < n; j++)
+		if(t[j].op != Sopread && nw < nelem(w))
+			w[nw++] = t[j];
+	/*
+	 * 2 header sectors + a flush, retain history headers, 2 current
+	 * slots + a flush, 2 header copies + a flush.
+	 */
+	eqi("prologue: writes and flushes in a format", nw, Retain + 9);
+	if(nw == Retain + 9){
+		eqi("prologue: header copy 0 is zeroed first", w[0].op,
+			Sopwrite);
+		eqv("prologue: at sector 0", w[0].off, 0);
+		eqv("prologue: one sector of it", w[0].n, Secsz);
+		eqi("prologue: then header copy 1", w[1].op, Sopwrite);
+		eqv("prologue: at the last sector", w[1].off, off1);
+		eqv("prologue: one sector of it", w[1].n, Secsz);
+		eqi("prologue: and the pair is flushed before anything else",
+			w[2].op, Sopflush);
+		/* and the slots are flushed before the real headers land */
+		eqi("prologue: the slots are flushed", w[nw-4].op, Sopflush);
+		eqi("prologue: then header copy 0", w[nw-3].op, Sopwrite);
+		eqv("prologue: at sector 0", w[nw-3].off, 0);
+		eqi("prologue: then header copy 1", w[nw-2].op, Sopwrite);
+		eqv("prologue: at the last sector", w[nw-2].off, off1);
+		eqi("prologue: and the format ends with a flush", w[nw-1].op,
+			Sopflush);
+	}
+	devclose(d);
+
+	/*
+	 * A reformat at a different geometry that dies at monfmthdr —
+	 * right after the zeroing flush — leaves the durable state the
+	 * prologue exists to leave: no valid header at all.  Without the
+	 * prologue the PREVIOUS store's header survives and locates
+	 * slots this format never wrote.
+	 */
+	d = fresh();
+	if((m = mustopen(d, "prologue store")) == nil){
+		devclose(d);
+		return;
+	}
+	commit(m, "prologue", "map=A", 1);
+	monclose(m);
+
+	simcrashdead(d, 1);
+	simarm(d, "monfmthdr", 0);
+	moncfg(&c);
+	c.slotsz = 4*Slotsz;
+	c.retain = Retain;
+	c.ream = 1;
+	checks++;
+	if(monfmt(d, &c) == 0)
+		fail("prologue: a format whose machine died reported success");
+	simrevive(d);
+	checks++;
+	if((m = monopen(d)) != nil){
+		fail("prologue: a format cut short left a valid header");
+		monclose(m);
+	}
+	devclose(d);
+}
+
 /* the first commit, a restart, and the ring newest-first */
 static void
 tcommit(void)
@@ -1315,6 +1408,7 @@ main(int, char**)
 	atexit(cleanup);
 
 	tfresh();
+	tfmtprologue();
 	tcommit();
 	tflushes();
 	tlostwrite(Sfdrop, "Sfdrop", 1);

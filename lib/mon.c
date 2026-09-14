@@ -415,7 +415,10 @@ slotset(Monslot *sl, ulong len, uvlong seq, uvlong epoch, void *text)
  * for the reason §12 gives shoalfmt: a format cut short must leave no
  * valid header rather than a valid one locating slots that were never
  * written — which, after a reformat at a different slotsz, would be
- * the previous store's header over this one's bytes.
+ * the previous store's header over this one's bytes.  §13's monfmthdr
+ * point is exactly there — after the zeroing flush, before any other
+ * write — so that a test can stage that durable state and watch the
+ * open refuse it.
  */
 int
 monfmt(Dev *d, Monfmtcfg *c)
@@ -489,6 +492,7 @@ monfmt(Dev *d, Monfmtcfg *c)
 	|| devwrite(d, buf, d->secsz, hdr1off(d)) < 0
 	|| devflush(d) < 0)
 		goto bad;
+	devpoint(d, "monfmthdr", 0);
 
 	/* the header sector of every history slot: zero, so invalid */
 	for(i = 0; i < (int)c->retain; i++)

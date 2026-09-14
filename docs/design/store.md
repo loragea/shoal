@@ -2852,6 +2852,10 @@ commit reaches them: `monhist`, after the history slot's write returns
 and before its flush; `monhistflush`, after that flush returns and
 before the current slot's write — the phantom window above; and
 `moncur`, after the current slot's write returns and before its flush.
+A format has one of its own, `monfmthdr`, after the flush that zeroes
+both header sectors and before any other write: a crash there is the
+durable state the prologue above exists to leave, and the open must
+refuse it.
 
 **Sizing.** A map at twelve instances is a few KiB; `slotsz` 65536 is
 a twentyfold margin and a whole number of 16 KiB units. With
@@ -3304,8 +3308,10 @@ the header write, so the commit point is not reached), `postwrite`
 (after the header write returns, before the post-flush), `preack`,
 `ckpt:n` (after *n* checkpoint page writes), `super` (after a
 superblock write returns, before its flush — the two copies are
-written in sequence only by `shoalfmt`), and the monitor store's three
-(§10): `monhist`, `monhistflush` and `moncur`. A crash at a point is the end
+written in sequence only by `shoalfmt`), and the monitor store's four
+(§10): `monfmthdr`, inside `monfmt` after the flush that zeroes both
+header sectors and before any other write, and `monhist`,
+`monhistflush` and `moncur` inside a commit. A crash at a point is the end
 of a run, so the simulated disk can be told to **stop the device** at
 the crash: every subsequent read, write and flush fails until the
 test brings the machine back. Without that the writes a schedule
@@ -3369,7 +3375,11 @@ the `Wunit` split), `supertest` (§2.2's three clauses under torn
 superblock writes and under the `super` crash point, which is T1.9's
 first half), `montest` (§10's monitor map slot store and §12's
 `shoalmonfmt`: what a format leaves and that a fresh store holds no
-map, the header's byte layout, a commit and the restart that finds it,
+map, the format's own write and flush order read off the trace — both
+header sectors zeroed and flushed before any other write, the slots
+flushed before the real header copies land — with a format cut short
+at `monfmthdr` leaving no valid header for the open to take; the
+header's byte layout, a commit and the restart that finds it,
 the ring newest-first with layer-a §5.2 clause 2's `E−1` entry present
 at every length and across a wrap, T1.13's flush shape for §10 read
 off the trace — one write and one flush into the ring, then one write
