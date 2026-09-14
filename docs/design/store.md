@@ -2834,7 +2834,7 @@ before the current slot's write — the phantom window above; and
 **Sizing.** A map at twelve instances is a few KiB; `slotsz` 65536 is
 a twentyfold margin and a whole number of 16 KiB units. With
 `retain=8` the store needs 2 header sectors + 10 slots ≈ 640 KiB;
-`shoalmonfmt` defaults the partition to 4 MiB and refuses less than
+the partition is sized at 4 MiB, and `shoalmonfmt` refuses less than
 1 MiB. `retain` MUST be at least 2 — layer-a §5.2 clause 2 reads
 epoch `E−1`, so one history slot is a floor rather than a preference
 — and `shoalmonfmt -R` refuses less.
@@ -2959,12 +2959,14 @@ nothing else in any of them depends on which kind of device it was
 given, because §0's vtable is the only thing they call.
 
 **A `-z` never runs ahead of the refusal that would have stopped the
-run.** Resizing an image truncates what it already holds, so
-`shoalfmt` opens the file at its own length first, lets the ream
-guard below decide, and reopens at `-z`'s size only once that guard
-has passed or `-r` has waived it: a run it refuses leaves the file
-byte-identical, its length included. `-z` on a path with no file
-there creates it at that size, where there is nothing to destroy.
+run.** Resizing an image truncates what it already holds, so both
+commands open the file at its own length first, let their reformat
+guard decide — `shoalfmt`'s ream guard, `shoalmonfmt`'s refusal over
+a valid monitor header — and reopen at `-z`'s size only once that
+guard has passed or `-r` has waived it: a run either one refuses
+leaves the file byte-identical, its length included. `-z` on a path
+with no file there creates it at that size, where there is nothing to
+destroy, and `-z` against an `sd` partition is refused by both.
 
 **`shoalfmt`** — format or ream an object-store partition.
 
@@ -3140,11 +3142,13 @@ it writes.
     shoalmonfmt [-r] [-s slotsz] [-R retain] [-z size] /dev/sdXX/name
 
 `-s` sets the slot size and `-R` the ring length, defaulting to §10's
-65536 and 8; `-z` sizes a file image and defaults to 4 MiB, which is
-what §10 sizes the partition at. It prints the geometry it chose — the
-two values, the sectors the header copies, the current slots and the
-ring start at, and the bytes the format occupies — the way `shoalfmt`
-prints its own.
+65536 and 8. `-z` sizes a file image and has no default: a partition
+carries its own length, and an image that already exists is formatted
+at the length it has. Formatting an image that does not exist yet
+therefore needs `-z`, and is refused without it. It prints the
+geometry it chose — the two values, the sectors the header copies, the
+current slots and the ring start at, and the bytes the format occupies
+— the way `shoalfmt` prints its own.
 
 It refuses a `slotsz` that is not a multiple of the device's sector
 or is under two sectors, a `retain` under 2 (layer-a §5.2 clause 2

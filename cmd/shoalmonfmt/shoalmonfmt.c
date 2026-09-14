@@ -13,6 +13,15 @@
  * it; -z sizes a file image.  Every refusal below is monfmt's — the
  * tool is argument parsing and a report, so that a T1 program drives
  * the decisions without exec'ing anything.
+ *
+ * -z is destructive on its own: it truncates whatever the image
+ * already holds, before monfmt has seen a byte of it.  So the order
+ * here is open-at-the-file's-own-length, ask monfmt's guard whether
+ * this image may be reformatted, and only then reopen at the size -z
+ * asks for.  A run monfmt refuses leaves the file byte-identical,
+ * length included.  monfmt still owns the refusal and still makes it;
+ * monhdrsel below is the same question asked early, and asked only to
+ * decide whether resizing is safe.
  */
 
 static void
@@ -68,11 +77,12 @@ main(int argc, char **argv)
 {
 	Dev *d;
 	Monfmtcfg c;
+	Monhsel hs;
 	char *path;
 	vlong size;
 
 	memset(&c, 0, sizeof c);
-	size = Monsizedflt;
+	size = 0;
 
 	ARGBEGIN{
 	case 'r':
@@ -96,9 +106,32 @@ main(int argc, char **argv)
 	path = argv[0];
 
 	if(sdpart(path)){
+		if(size != 0)
+			sysfatal("-z sizes a file image, not a partition");
 		if((d = sdopen(path, 0)) == nil)
 			sysfatal("%s: %r", path);
-	}else{
+	}else if((d = fileopen(path, Secszdflt, 0, 0)) == nil){
+		/*
+		 * No image there yet.  A new one has nothing to destroy,
+		 * so -z creates it at its size; without -z there is no
+		 * size to create it at, and a partition's own length is
+		 * what a partition would have supplied.
+		 */
+		if(size == 0)
+			sysfatal("%s: %r; -z sizes a new file image", path);
+		if((d = fileopen(path, Secszdflt, size, 0)) == nil)
+			sysfatal("%s: %r", path);
+		size = 0;
+	}
+
+	/*
+	 * The image exists and -z would resize it: safe only once the
+	 * reformat guard has passed.  When it has not, the resize is
+	 * skipped and monfmt below issues the refusal over the file as
+	 * it stands.
+	 */
+	if(size != 0 && (c.ream || monhdrsel(d, &hs) < 0)){
+		devclose(d);
 		if((d = fileopen(path, Secszdflt, size, 0)) == nil)
 			sysfatal("%s: %r", path);
 	}

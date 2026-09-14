@@ -929,7 +929,6 @@ enum
 	Monretaindflt	= 8,		/* §10's default ring length */
 	Monretainmin	= 2,		/* layer-a §5.2 clause 2 reads E−1 */
 	Monminbytes	= 1024*1024,	/* §10: shoalmonfmt refuses less */
-	Monsizedflt	= 4*1024*1024,	/* §10: what -z sizes an image to */
 };
 
 typedef struct Mon Mon;
