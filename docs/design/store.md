@@ -3406,8 +3406,9 @@ and two valid copies that differ, and a pair whose `curoff`/`histoff`
 do not describe the geometry, refused by name before a slot is located
 through them — a current slot whose `len` does not
 fit its slot, an open that writes nothing, a store reopened over a
-read-only file image, an epoch published twice with a regression
-between, and §12's refusals and its object-store superblock warning,
+read-only file image, §10's equal-`seq` tie — a fresh store opens on
+slot 0 and its first commit writes slot 1 — an epoch published twice
+with a regression between, and §12's refusals and its object-store superblock warning,
 driven through `monfmt` as `fmtcktest` drives `fmtstore`),
 `fmtcktest` (`shoalfmt` to `shoalck` over both a
 simulated disk and a file image; a store with a live one-block object

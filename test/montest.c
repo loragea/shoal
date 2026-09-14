@@ -1175,6 +1175,45 @@ thdroffsets(void)
 	devclose(d);
 }
 
+/*
+ * §10's tie: a fresh format leaves both current slots valid at seq 0,
+ * so the open takes slot 0 and the first commit writes slot 1.  With
+ * the tie the other way a fresh store would open on the very slot the
+ * first commit overwrites.
+ */
+static void
+topentie(void)
+{
+	Dev *d;
+	Mon *m;
+	Monstat st;
+	Simop *t;
+	vlong slot1;
+	long n, i;
+	int wrote;
+
+	d = fresh();
+	if((m = mustopen(d, "opentie")) == nil){
+		devclose(d);
+		return;
+	}
+	monstat(m, &st);
+	eqi("opentie: a fresh store opens on slot 0", st.cur, 0);
+	slot1 = curoffs(&st, 1);
+	simtracereset(d);
+	commit(m, "opentie", "map=A", 1);
+	n = simtrace(d, &t);
+	wrote = 0;
+	for(i = 0; i < n; i++)
+		if(t[i].op == Sopwrite && t[i].off == slot1)
+			wrote = 1;
+	istrue("opentie: the first commit writes current slot 1", wrote);
+	monstat(m, &st);
+	eqi("opentie: which is then the current slot", st.cur, 1);
+	monclose(m);
+	devclose(d);
+}
+
 /* neither current slot valid is damage, and it is refused */
 static void
 tnocur(void)
@@ -1539,6 +1578,7 @@ main(int, char**)
 	tfull();
 	theader();
 	thdroffsets();
+	topentie();
 	tnocur();
 	tbadlen();
 	treadonly();
