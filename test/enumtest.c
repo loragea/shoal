@@ -962,6 +962,13 @@ tdirty(void)
 			"n1.0"), i == 3 ? 0 : 1);
 	}
 	eqv("and the epoch comes with it", c1[0].epoch, 5);
+	/*
+	 * A record that is IN the set is one that was added: layer-a
+	 * §7.1's op is what a renderer would emit, and a copy that said
+	 * remove would describe the set it is not.
+	 */
+	for(i = 0; i < n1; i++)
+		eqv("every record in the copy is an add", c1[i].op, 1);
 
 	/* the copy is the caller's; later mutation cannot reach it */
 	dadd(s, "d3", "n1.0", 9);
