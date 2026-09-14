@@ -2600,11 +2600,32 @@ Entries are addressed **by position**, not by slot. That is what lets
 a server map a `Tread` offset onto an entry and restart from 0 on a
 re-read, which is how a Plan 9 directory read works. Entry *i* is
 rendered from the *live* index under the same short hold of `qlstate`
-§8's cursor takes, so no lock spans a caller's use of an entry and a
-full walk never blocks `/status`, `/ctl` or `Tflush` (§7 rule 2).
-Nothing shifts under the reader, so no entry is skipped or duplicated
-because of an index shift, and an entry created after the open is not
-in the vector at all.
+§8's cursor takes, so no lock spans a caller's use of an entry: a
+full walk of 2.6·10^5 entries is 2.6·10^5 short holds and blocks
+`/status`, `/ctl` or `Tflush` for no longer than one of them (§7
+rule 2). Nothing shifts under the reader, so no entry is skipped or
+duplicated because of an index shift, and an entry created after the
+open is not in the vector at all.
+
+**What the open costs.** The walk stops at the count, so the cost is
+the highest occupied slot and not `nslots`: a lightly-used 2^20 index
+opens in microseconds, and an index whose last entry sits near slot
+2^20 costs a scan of them all — measured at **~22 ns a slot on the
+reference machine, ≈23 ms at `nslots = 2^20`** — under one hold of
+`qlstate`. §2.3's 4× over-provision puts the envelope's 2.6·10^5
+objects on an `nslots` near 10^6, so that is the envelope case rather
+than a corner, and it is the one place in the store where a state
+lock is held for milliseconds. §7 rule 2's letter holds — no device
+call, flush wait or `Rendez` sleep is reachable under the hold, and
+the vector's 12 MB is allocated *outside* it — but its number, an
+8.4 ms write, is the thing this is comparable to rather than the
+thing it avoids. The open takes the counts under the lock, releases
+it, allocates, and re-takes it to fill; if the counts moved in
+between it counts again rather than serve a short vector, because a
+vector short of the index is `objsnap=partial` and the engine does
+not have that escape. §16(a) carries the chunked scan under a
+generation counter that would bound the hold if T2 shows the 23 ms
+matters; it is not built.
 
 **An entry is gone under either of two conditions, and the second is
 not a refinement of the first.** Either its slot's `qidpath` no
@@ -3295,9 +3316,9 @@ record is written and then a byte-wise mixture of its old and its new
 header bytes is placed on the platter, which is what a torn write
 leaves and what the sweep must be exhaustive over.
 
-Six of §13's points are *mutations* or schedules rather than crashes,
-and are built into the store as hooks that are inert unless a test
-asks for them: `reclaim` (reclaim log space before the checkpoint's
+Seven of §13's points are *mutations* or schedules rather than
+crashes, and are built into the store as hooks that are inert unless
+a test asks for them: `reclaim` (reclaim log space before the checkpoint's
 superblock write returns), `publish` (force an `epochhigh` publish
 after the *n*'th checkpoint page write, so it can be combined with
 `ckpt:n`), `batch:n` (hold batch *n*'s record write and let *n+1*
@@ -3314,7 +3335,10 @@ while the committer is still inside the flush), and `fatal` (put the
 store into §3.2's condemned state, which the commit path itself
 reaches only from an apply that failed after its record was durable —
 a case §3.2 makes unreachable, so a test cannot arrive at it any
-other way). Each T1 test names the requirement it discriminates
+other way), and `snapstale:n` (take the next *n* enumeration opens'
+index counts one entry short, which is what a create between the
+count and the fill leaves, so a test can drive §9's re-count without
+racing for it). Each T1 test names the requirement it discriminates
 and the mutation that must break it; **each mutation is run**, per
 `AGENTS.md`.
 
@@ -4092,6 +4116,19 @@ rather than an amendment, because it touches the wire.
 10. **BLAKE2s throughput on the fleet**, to confirm the 50–59 MB/s
     measured here — every hashing term in §5, §8 and §11 scales with
     it.
+11. **Whether the enumeration open's `qlstate` hold has to be
+    chunked.** §9 measures it at ~22 ns a slot up to the highest
+    occupied one, so ≈23 ms at `nslots = 2^20` — the one state-lock
+    hold in the store of the same order as a commit's write. If T2
+    shows it delaying `/status`, `/ctl` or a `Tflush` behind a
+    `/obj` open, the shape that fixes it is a **chunked scan under a
+    generation counter**: take the index in bounded runs, dropping
+    and re-taking `qlstate` between them, and restart the scan when
+    a counter bumped by every apply that creates, frees or re-states
+    a slot shows the index moved under it. That keeps `objsnap=full`
+    — a restart is not a partial vector — at the price of a scan
+    that can be made to starve by a continuous create rate, which is
+    why it is not built on speculation. T2.
 
 ### (b) Product calls
 

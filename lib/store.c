@@ -130,6 +130,18 @@ storehook(Store *s, char *name, uvlong n)
 		s->fatal = n != 0;
 		s->broken = n != 0;
 		qunlock(&s->qllog);
+	}else if(strcmp(name, "snapstale") == 0){
+		/*
+		 * §9's snapshot open counts the index, allocates the vector
+		 * outside the lock and fills it under a second hold, so the
+		 * count can be stale by the time the fill runs.  This makes
+		 * the next n counts short by one, which is what a create in
+		 * that window leaves, so a test can drive the re-count
+		 * without racing for it.
+		 */
+		qlock(&s->qlstate);
+		s->snapstale = n;
+		qunlock(&s->qlstate);
 	}else if(strcmp(name, "reclaim") == 0)
 		s->reclaimearly = n != 0;
 	else if(strcmp(name, "publish") == 0)

@@ -611,6 +611,72 @@ tbound(void)
 }
 
 /*
+ * §9's open counts the index under qlstate, releases it to allocate
+ * the vector — 12 MB at nslots = 2^20, which §7 rule 2 will not have
+ * under a state lock — and re-takes it to fill.  The count can be
+ * stale by then, and a vector short of the index is objsnap=partial,
+ * which the engine does not have: it counts again.  §13's snapstale
+ * point takes the count one short, which is what a create in that
+ * window leaves, so this does not have to race for it.
+ */
+static void
+tsnapstale(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Objsnap *sn;
+	Walk *w;
+	char nm[32];
+	ulong i;
+
+	d = newdisk();
+	if((s = mustopen(d, "a stale count under an open")) == nil)
+		return;
+	for(i = 0; i < 10; i++){
+		snprint(nm, sizeof nm, "s%lud", i);
+		mk(s, nm);
+	}
+	storehook(s, "snapstale", 1);
+	if((sn = mustsnap(s, Snaplive, "a stale count")) == nil)
+		goto out;
+	eqv("an open whose count went stale names every entry",
+		objsnapcount(sn), 10);
+	w = newwalk(16);
+	walkall(sn, w, 's');
+	eqv("and the walk answers them all", w->nlive, 10);
+	eqv("none of them twice", w->ndup, 0);
+	eqv("and nothing else", w->nother, 0);
+	for(i = 0; i < 10; i++)
+		eqv("each object exactly once", w->seen[i], 1);
+	walkfree(w);
+	objsnapclose(sn);
+
+	/*
+	 * The re-count is bounded: an index that moves under every
+	 * attempt is refused rather than spun on under a lock every
+	 * apply wants, and the refusal is local — nothing is full.
+	 */
+	storehook(s, "snapstale", 1000);
+	sn = objsnapopen(s, Snaplive);
+	refused("an open whose count never settles", sn != nil ? 0 : -1,
+		"object snapshot: the index moved");
+	objsnapclose(sn);		/* nil unless the refusal failed */
+	storestat(s, &st);
+	eqv("and the refusal took no count with it", st.nobjsnap, 0);
+	storehook(s, "snapstale", 0);
+	if((sn = objsnapopen(s, Snaplive)) == nil)
+		fail("objsnapopen once the index settles: %r");
+	else{
+		eqv("an open after it is whole again", objsnapcount(sn), 10);
+		objsnapclose(sn);
+	}
+out:
+	storeclose(s);
+	devclose(d);
+}
+
+/*
  * §9: every snapshot MUST be closed before the store is, and a
  * storeclose that finds one open says so out loud.  Without that the
  * entries are rendered from a freed Store, which does not fault: the
@@ -1639,6 +1705,7 @@ main(int argc, char **argv)
 	ttombs();
 	tadvert();
 	tbound();
+	tsnapstale();
 	tclosesnap();
 	tdirty();
 	tlost();
