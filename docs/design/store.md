@@ -2819,8 +2819,9 @@ four rather than sixteen and makes every block write exactly one
 device request, so there is no "issue the grain four ways" question
 to answer and no proc pool to size for it. A cluster that chose a
 larger `blksz` would pay `ceil(blksz/Wunit)` requests per grain and
-every row below scales with it; the table is the default's. The workload this store is built for — Layer B striping
-through an `msize`-sized 9P path — writes whole blocks.
+every row below scales with it; the table is the default's. The
+workload this store is built for — Layer B striping through an
+`msize`-sized 9P path — writes whole blocks.
 
 **A 16 MiB `op=full` is disk-bound, not wire-bound.** Layer-a §5.5
 puts it at 185–545 ms of wire time; the receiving disk costs 8.6 s of
@@ -3042,9 +3043,10 @@ grains it held are named by no readable structure, and holding an
 unknown set of grains out of the allocator for ever would leak the
 disk instead. Until such a rebuild runs they stay marked from the
 bitmap as it was found, which is what §3.6 means by a condemned
-copy's grains staying marked used until a rebuild. It opens the device read-write — the open
-`shoalfmt` takes, with the flush channel, and `-w` as §3.2's operator
-assertion for a unit whose raw channel will not open — so `-w`
+copy's grains staying marked used until a rebuild. It opens the
+device read-write — the open `shoalfmt` takes, with the flush
+channel, and `-w` as §3.2's operator assertion for a unit whose raw
+channel will not open — so `-w`
 without `-R` is refused rather than ignored. `-R` with `-v` rebuilds
 first and then verifies. `-R` with `-o` is refused: `-o` dumps one
 object, and a rebuild driven from one object's map would clear every
@@ -3498,8 +3500,9 @@ geometry is: `mk test` stays within `AGENTS.md`'s seconds.
   once with block 0 holding its own bytes, and once with **block 0 a
   hole** — create, truncate to `blksz`, then write past it — which is
   the case a rule that exempts holes from `nmap` gets wrong once
-  clause 4 is wrong as well. Crash at `commit:0`; restart. Block 0 must read what
-  it held — its own bytes in the first variant, zeros in the second —
+  clause 4 is wrong as well. Crash at `commit:0`; restart. Block 0
+  must read what it held — its own bytes in the first variant, zeros
+  in the second —
   every unwritten block must read zeros, and `verify` must pass,
   which is what catches a hole left with sixteen zero bytes for a
   digest. Then the re-replay
