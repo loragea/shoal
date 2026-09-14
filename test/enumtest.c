@@ -1290,6 +1290,80 @@ tlostbadent(void)
 	free(buf);
 }
 
+/*
+ * The transition the gone rule does NOT make: live -> condemned.
+ * §5 step 10 at run time leaves the entry's state alone and sets bad
+ * and Icorrupt, so the copy is still live, still in /obj's kinds and
+ * still at its qid.path — and D14 makes answering it a MUST: a copy
+ * that fails local verification answers corrupt=1 and never absent,
+ * because absence is a §1.5 positive confirmation this holder cannot
+ * give.  A snapshot that dropped it would be spelling exactly that
+ * absence.
+ */
+static void
+tobjcondemned(void)
+{
+	Dev *d;
+	Store *s;
+	Objsnap *sn;
+	Objinfo oi, before;
+	Super sup;
+	uchar *buf, o[Oidmax], got[Oidmax], junk[8];
+	long p;
+	int oidlen;
+
+	d = newdisk();
+	if((s = mustopen(d, "a condemned copy in /obj")) == nil)
+		return;
+	buf = mkbuf(3*Blk, 43);
+	mk(s, "u0");
+	mk(s, "u1");
+	oidof(o, "u1");
+	if(objwrite(s, o, 2, buf, 3*Blk, 0, 2, 1, nil, 0) < 0)
+		fail("objwrite u1: %r");
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	if(ostat(s, "u1", &before) < 0)
+		fail("objstat u1: %r");
+	geom(d, &sup);
+	memset(junk, 0xa5, sizeof junk);
+	simpoke(d, emapentoff(&sup, before.emapslot) + sup.emapsz - sizeof junk,
+		junk, sizeof junk);
+	storeclose(s);
+	if((s = mustopen(d, "a condemned copy in /obj, reopened")) == nil){
+		devclose(d);
+		free(buf);
+		return;
+	}
+	if((sn = mustsnap(s, Snaplive, "/obj over a condemnable copy")) == nil)
+		goto out;
+	p = mustpos(sn, "u1", "/obj");
+	eqv("the copy is sound as far as anything knows", objsnapent(sn, p,
+		got, &oidlen, &oi), 1);
+	eqv("and answers corrupt=0", oi.corrupt, 0);
+	/* the first read of the damaged map is what condemns the slot */
+	if(objread(s, o, 2, buf, Blk, 0) >= 0)
+		fail("a damaged extent map was served");
+	eqv("a condemned copy is still named by the snapshot",
+		objsnapent(sn, p, got, &oidlen, &oi), 1);
+	eqv("with its state unchanged", oi.state, Slive);
+	eqv("and corrupt=1 rather than absent (D14)", oi.corrupt, 1);
+	eqv("at the qid.path it always had", oi.qidpath, before.qidpath);
+	objsnapclose(sn);
+	/* and an open taken after the condemnation names it too */
+	if((sn = mustsnap(s, Snaplive, "/obj over a condemned copy")) == nil)
+		goto out;
+	eqv("a later open names it as well", objsnapcount(sn), 2);
+	p = mustpos(sn, "u1", "/obj");
+	eqv("and answers it", objsnapent(sn, p, got, &oidlen, &oi), 1);
+	eqv("still corrupt=1", oi.corrupt, 1);
+	objsnapclose(sn);
+out:
+	storeclose(s);
+	devclose(d);
+	free(buf);
+}
+
 /* ---- T1.15: a full walk under concurrent creates and deletes ---- */
 
 typedef struct Churn Churn;
@@ -1893,6 +1967,7 @@ main(int argc, char **argv)
 	tfullsync();
 	tlost();
 	tlostbadent();
+	tobjcondemned();
 	tckpt();
 	treclaim();
 	treclaimrace();
