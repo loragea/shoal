@@ -360,3 +360,71 @@ lostsnap(Store *s, Lostent **lp, ulong *np)
 	*np = n;
 	return 0;
 }
+
+/*
+ * The other half of /dirty (layer-a §2.2): one `fullsync peer=<iid>'
+ * line per peer carrying §7.1's coarse flag.  No fine-grained record
+ * names those peers — §2.6's exhaustion drop sets the flag on exactly
+ * the peer whose records it has just thrown away — so a renderer that
+ * had only dirtysnap would emit the file with its coarse half
+ * missing, and the copy is therefore two calls rather than one.
+ *
+ * Taken under qlstate, which is the lock every writer of the peer
+ * list holds: applydirty's addpeer and dropworstpeer (apply.c) run
+ * inside the commit's apply, start-up's step 12 and readdirty's
+ * addpeer are single-threaded, and storefullsync reads under it.  The
+ * allocation is under the hold, unlike the index vector's: the list
+ * is the cluster's instances (layer-a §3.3 bounds them at twelve),
+ * not a scan of nslots.
+ *
+ * The names are one allocation — the pointer array with the bytes
+ * after it — so one free releases the copy.  0 with *np 0 and *pp nil
+ * when no peer carries the flag.  Today that is rare: nothing clears
+ * the flag until the reconcile pass exists, and a peer is registered
+ * with it already set (apply.c's addpeer), so this names every peer
+ * the store knows of.  A peer it does not know of has no line, which
+ * is what storefullsync's answer of 1 for an unknown name means: the
+ * file states what this instance has recorded, not what it has
+ * concluded about names it has never seen.
+ */
+int
+fullsyncsnap(Store *s, char ***pp, ulong *np)
+{
+	Peer *p;
+	char **a, *q;
+	ulong n, nb;
+
+	*pp = nil;
+	*np = 0;
+	if(!storeserving(s))
+		return -1;
+	qlock(&s->qlstate);
+	n = 0;
+	nb = 0;
+	for(p = s->peers; p != nil; p = p->next)
+		if(p->fullsync){
+			n++;
+			nb += strlen(p->name) + 1;
+		}
+	if(n == 0){
+		qunlock(&s->qlstate);
+		return 0;
+	}
+	if((a = mallocz(n*sizeof *a + nb, 1)) == nil){
+		qunlock(&s->qlstate);
+		werrstr("out of memory");
+		return -1;
+	}
+	q = (char*)(a + n);
+	n = 0;
+	for(p = s->peers; p != nil; p = p->next)
+		if(p->fullsync){
+			a[n++] = q;
+			strcpy(q, p->name);
+			q += strlen(p->name) + 1;
+		}
+	qunlock(&s->qlstate);
+	*pp = a;
+	*np = n;
+	return 0;
+}

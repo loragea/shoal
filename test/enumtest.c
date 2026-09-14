@@ -980,6 +980,89 @@ tdirty(void)
 	devclose(d);
 }
 
+static int
+haspeer(char **p, ulong n, char *name)
+{
+	ulong i, seen;
+
+	seen = 0;
+	for(i = 0; i < n; i++)
+		if(strcmp(p[i], name) == 0)
+			seen++;
+	return seen;
+}
+
+/*
+ * The coarse half of /dirty (layer-a §2.2): one `fullsync peer=' line
+ * per peer carrying §7.1's flag.  §2.6's exhaustion drop is what
+ * makes this a separate enumeration rather than a field of a record
+ * — it throws away every fine-grained record for the peer it marks,
+ * so the peer that most needs the line is the one the record copy
+ * cannot name.
+ */
+static void
+tfullsync(void)
+{
+	Dev *d;
+	Store *s;
+	Dirtyrec *c;
+	char **pe, nm[32];
+	ulong n, np, i;
+
+	d = makedisk(Tnsec, 128, 64, 512*1024);
+	if((s = openstoreck(d)) == nil){
+		fail("the fullsync copy: storeopen: %r");
+		devclose(d);
+		return;
+	}
+	if(fullsyncsnap(s, &pe, &np) < 0)
+		fail("fullsyncsnap of a store with no peers: %r");
+	eqv("a store that has heard of no peer names none", np, 0);
+	istrue("and hands back no array", pe == nil);
+
+	/* fill the region: 40 records for one peer, 24 for the other */
+	for(i = 0; i < 64; i++){
+		snprint(nm, sizeof nm, "f%lud", i);
+		mk(s, nm);
+		dadd(s, nm, i < 40 ? "n1.0" : "n2.0", 5);
+	}
+	eqv("the dirty region is full", dirtycount(s), 64);
+	if(fullsyncsnap(s, &pe, &np) < 0)
+		fail("fullsyncsnap: %r");
+	eqv("both peers are named", np, 2);
+	free(pe);
+
+	/*
+	 * One record past the region.  §2.6 drops every record of the
+	 * peer holding the most of them and marks that peer fullsync,
+	 * which is layer-a §7.1's explicit licence.
+	 */
+	mk(s, "f64");
+	dadd(s, "f64", "n2.0", 5);
+	if(dirtysnap(s, &c, &n) < 0)
+		fail("dirtysnap after the drop: %r");
+	eqv("the drop took every record of its victim", hasrec(c, n,
+		"f0", "n1.0"), 0);
+	eqv("and left the other peer's alone", hasrec(c, n, "f40", "n2.0"),
+		1);
+	eqv("so the record copy names one peer and not two", n, 25);
+	free(c);
+	if(fullsyncsnap(s, &pe, &np) < 0)
+		fail("fullsyncsnap after the drop: %r");
+	else{
+		istrue("the copy names the peer the drop marked, which no "
+			"record left names", haspeer(pe, np, "n1.0") == 1);
+		istrue("and the peer whose records survived, which carries "
+			"the flag too", haspeer(pe, np, "n2.0") == 1);
+		eqv("and nothing the store has never heard of", np, 2);
+		free(pe);
+	}
+	eqv("storefullsync agrees about the victim",
+		storefullsync(s, "n1.0"), 1);
+	storeclose(s);
+	devclose(d);
+}
+
 /*
  * /lost, layer-a §2.2's other snapshot MUST.  The copy names the same
  * slots storelost does and carries the oid and the Objinfo beside
@@ -1727,6 +1810,7 @@ main(int argc, char **argv)
 	tsnapstale();
 	tclosesnap();
 	tdirty();
+	tfullsync();
 	tlost();
 	tlostbadent();
 	tckpt();

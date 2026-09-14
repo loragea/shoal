@@ -2664,8 +2664,19 @@ in the close is a guard against wedging the bound, not a check.
 bounded — by the dirty region (§2.6) and by what fails local
 verification (§8) — so a copy taken under one hold of the lock that
 guards each is the whole of what a renderer needs, and layer-a §2.2's
-MUST for these two costs nothing. The `/dirty` copy carries every
-record's `(oid, peer, epoch)`; the `/lost` copy carries every slot
+MUST for these two costs nothing. **`/dirty` is two copies**, because
+layer-a §2.2's file is two kinds of line: the record lines, and one
+`fullsync peer=<iid>` line per peer carrying §7.1's coarse flag. No
+record names those peers — §2.6's exhaustion drop sets the flag on
+exactly the peer whose fine-grained records it has just thrown away, so
+the peers that most need the line are the ones with no record left to
+name them — so the peer list is enumerated by a second call under the
+same lock, and a renderer takes both. Today nothing clears the flag
+until the reconcile pass exists and a peer is registered with it already
+set, so that enumeration names every peer the store knows of; a peer it
+has never seen has no line, which is what `storefullsync`'s answer of 1
+for an unknown name already means. The `/dirty` record copy carries
+every record's `(oid, peer, epoch)`; the `/lost` copy carries every slot
 the membership list names, with that slot's oid and published record
 beside it, so a renderer never goes back to an index the scrub has moved
 under it. The slot-at-a-time accessor stays beside the copy: it is what

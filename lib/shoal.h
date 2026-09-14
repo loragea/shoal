@@ -869,7 +869,15 @@ void		objsnapclose(Objsnap*);
  * Objinfo is the slot number, state Sfree and zeroes, and a renderer
  * emits the line with no `oid='.  Any other rule would make the copy
  * disagree with Storestat.nlost.
- * Both answer 0 with *np 0 and *p nil when there is nothing to
+ *
+ * fullsyncsnap answers the other half of /dirty: a malloc'd array of
+ * the names of the peers carrying §7.1's coarse fullsync flag, which
+ * no record in the dirty set names — the exhaustion drop sets it on
+ * the peer whose records it has just dropped.  A renderer of /dirty
+ * therefore takes two copies, one call each.  The names live in the
+ * same allocation as the pointer array, so one free releases both.
+ *
+ * All three answer 0 with *np 0 and *p nil when there is nothing to
  * report, -1 on failure, and the array is the caller's to free.
  */
 typedef struct Lostent Lostent;
@@ -882,6 +890,7 @@ struct Lostent
 
 int	dirtysnap(Store*, Dirtyrec **dp, ulong *np);
 int	lostsnap(Store*, Lostent **lp, ulong *np);
+int	fullsyncsnap(Store*, char ***pp, ulong *np);
 
 /*
  * §8's block repair.  a is block blk as fetched from a holder of a
