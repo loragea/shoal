@@ -2585,16 +2585,19 @@ and a SHOULD for `/obj` and `/tombs`. The six MUSTs are small — a
 few hundred lines at the envelope — and are rendered into a buffer
 at open, which is the one-line implementation.
 
-For `/obj`, `/tombs` and `/advert` an open takes, under **one** hold
-of `qlstate` (§7), the vector of `{u32 slot, u64 qidpath}` of every
-entry whose state it asked for — live for `/obj`, tomb for `/tombs`,
-both for `/advert` — and releases the lock before it returns. That is
-12 bytes an entry, **3.1 MB at 2.6·10^5 objects and 12 MB at
-`nslots = 2^20`**, held as two parallel arrays rather than one array
-of a struct, because a `{u32, u64}` struct is 16 bytes on amd64 and
-the 4 in every 16 buys nothing. The vector is a list of names and not
-a reference the engine must honour: a discard of an entry it names is
-neither refused nor delayed by it.
+For `/obj`, `/tombs` and `/advert` an open takes the vector of
+`{u32 slot, u64 qidpath}` of every entry whose state it asked for —
+live for `/obj`, tomb for `/tombs`, both for `/advert` — and holds no
+lock once it returns. That is 12 bytes an entry, **3.1 MB at 2.6·10^5
+objects and 12 MB at `nslots = 2^20`**, held as two parallel arrays
+rather than one array of a struct, because a `{u32, u64}` struct is
+16 bytes on amd64 and the 4 in every 16 buys nothing. It takes
+**two** holds of `qlstate` (§7) to do that on the happy path and up
+to `Snaptries` pairs of holds when the index keeps growing under it —
+the count under one, the 12 MB allocated outside any, the fill under
+the next — and it can fail: see "What the open costs" below. The
+vector is a list of names and not a reference the engine must honour:
+a discard of an entry it names is neither refused nor delayed by it.
 
 Entries are addressed **by position**, not by slot. That is what lets
 a server map a `Tread` offset onto an entry and restart from 0 on a
@@ -2619,13 +2622,41 @@ lock is held for milliseconds. §7 rule 2's letter holds — no device
 call, flush wait or `Rendez` sleep is reachable under the hold, and
 the vector's 12 MB is allocated *outside* it — but its number, an
 8.4 ms write, is the thing this is comparable to rather than the
-thing it avoids. The open takes the counts under the lock, releases
-it, allocates, and re-takes it to fill; if the counts moved in
-between it counts again rather than serve a short vector, because a
-vector short of the index is `objsnap=partial` and the engine does
-not have that escape. §16(a) carries the chunked scan under a
-generation counter that would bound the hold if T2 shows the 23 ms
-matters; it is not built.
+thing it avoids. §16(a) carries the chunked scan under a generation
+counter that would bound the hold if T2 shows the 23 ms matters; it
+is not built.
+
+**The second hold, and the one way the open can fail.** The open
+counts the index under `qlstate`, releases it, allocates, and re-takes
+it to fill. The index moves in between as a matter of course, because
+releasing `qlstate` puts the open *behind* every apply already queued
+for it; this is the common case, not a corner. Three of the four
+things that can have happened cost nothing:
+
+- the count **shrank** — the fill walks until it has taken every
+  matching entry and then stops, so an over-sized vector yields the
+  true count and a *complete* snapshot;
+- the count **grew** but still fits — the vector is allocated with
+  **slack**, a sixteenth of the count and never fewer than 16
+  entries, so ordinary churn needs no second attempt at all;
+- the count did not move.
+
+The fourth is an index that grew past the slack. The vector cannot
+hold what the index now has, and a short vector is `objsnap=partial`,
+which the engine does not have as an escape — so the open counts and
+allocates again, up to `Snaptries` (8) times, and then **fails** with
+`object snapshot: the index moved under 8 counts`. That is the only
+failure `objsnapopen` has beyond the bound's `disk full` and out of
+memory, and it is **pathological rather than ordinary**: it needs a
+create rate that outruns a `malloc` eight times in a row. Sizing the
+vector to the count with no slack is what makes it ordinary — that
+refused about 6% of opens with four procs churning 1200 objects over
+4096 slots, and with the slack the same churn refuses none. Nothing
+is full and nothing is broken, so §3.7 makes it an internal-invariant
+error carrying no §2.6 prefix: no §2.6 condition describes it, and
+`not ready` is normative for handoff and the currency check (§5.2)
+rather than for this. A server SHOULD retry the open once before
+answering the client at all.
 
 **An entry is gone under either of two conditions, and the second is
 not a refinement of the first.** Either its slot's `qidpath` no
@@ -3398,11 +3429,13 @@ while the committer is still inside the flush), and `fatal` (put the
 store into §3.2's condemned state, which the commit path itself
 reaches only from an apply that failed after its record was durable —
 a case §3.2 makes unreachable, so a test cannot arrive at it any
-other way), and `snapstale:n` (take the next *n* enumeration opens'
-index counts one entry short, which is what a create between the
-count and the fill leaves, so a test can drive §9's re-count without
-racing for it). Each T1 test names the requirement it discriminates
-and the mutation that must break it; **each mutation is run**, per
+other way), and `snapstale:n` (give the next *n* enumeration
+fill attempts a vector one entry short of the index, which is what an
+index that grew past the vector's slack leaves, so a test can drive
+§9's re-count without racing for it — one is spent per fill attempt
+rather than per open, and an open makes up to `Snaptries` of them).
+Each T1 test names the requirement it discriminates and the mutation
+that must break it; **each mutation is run**, per
 `AGENTS.md`.
 
 T1 formats a **small geometry** — a partition image of a few MiB with

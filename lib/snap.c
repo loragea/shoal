@@ -11,15 +11,25 @@
  * /lost fids read.  R12, layer-a §2.2's MUST for the last two and its
  * SHOULD for /obj and /tombs.
  *
- * The object snapshot is a vector of names taken under one hold of
- * qlstate — {slot, qid.path} for every entry whose state the open
- * asked for — and nothing more.  It pins nothing, so a discard of an
- * entry it names is not refused or delayed; the entry simply becomes
- * gone.  Rendering happens afterwards, per entry, under the same
- * short hold of qlstate §8's cursor takes, so no lock spans a
- * caller's use of an entry: a full walk of 2.6·10^5 entries is
- * 2.6·10^5 short holds and blocks nothing for longer than one of
- * them.
+ * The object snapshot is a vector of names — {slot, qid.path} for
+ * every entry whose state the open asked for — and nothing more.  It
+ * pins nothing, so a discard of an entry it names is not refused or
+ * delayed; the entry simply becomes gone.  Rendering happens
+ * afterwards, per entry, under the same short hold of qlstate §8's
+ * cursor takes, so no lock spans a caller's use of an entry: a full
+ * walk of 2.6·10^5 entries is 2.6·10^5 short holds and blocks nothing
+ * for longer than one of them.
+ *
+ * **The open takes TWO holds on the happy path**, not one: it counts
+ * the index under the first, releases it to allocate the vector —
+ * 12 MB at nslots = 2^20, which §7 rule 2 will not have under a state
+ * lock — and fills under the second.  The index moves between them
+ * routinely, because dropping qlstate puts this open behind every
+ * apply already queued for it, so the vector is allocated with slack
+ * (below) and the fill is refused only when the index outgrew even
+ * that.  A refused fill counts and allocates again, up to Snaptries
+ * times, and an open that never settles fails — the one failure
+ * objsnapopen has that is neither a §2.6 condition nor out of memory.
  *
  * **What the OPEN costs is not small, and §7 rule 2's letter is what
  * it satisfies rather than its number.**  The walk stops at the
@@ -44,13 +54,29 @@
 enum
 {
 	/*
-	 * How many times an open re-counts when the index moves under
-	 * its allocation.  A partial vector is not an option (§9's
-	 * objsnap=full), and an index that moves under eight counts in
-	 * a row is a caller that will do better opening again than
-	 * spinning here under a lock every apply wants.
+	 * How many times an open counts and allocates again when the
+	 * index has outgrown the vector by the time the fill runs.  A
+	 * partial vector is not an option (§9's objsnap=full), and an
+	 * index that outgrows the slack eight times in a row is a caller
+	 * that will do better opening again than spinning here under a
+	 * lock every apply wants.
 	 */
 	Snaptries	= 8,
+
+	/*
+	 * The slack the vector carries over the count it was sized from:
+	 * a sixteenth, and never fewer than sixteen entries.  Without it
+	 * an open under ordinary churn refuses several times in a
+	 * hundred — measured at ~6% with four procs creating and
+	 * discarding over 4096 slots — because the count and the fill
+	 * take qlstate separately and an apply gets in between.  Slack
+	 * costs 192 bytes on an empty index and a sixteenth of 12 MB at
+	 * nslots = 2^20, and turns that 6% into nothing: the fill needs
+	 * a retry only when the index grew by more than a sixteenth of
+	 * itself in the time one malloc takes.
+	 */
+	Snapslackdiv	= 16,
+	Snapslackmin	= 16,
 };
 
 static int
@@ -87,7 +113,7 @@ objsnapopen(Store *s, int kinds)
 {
 	Objsnap *sn;
 	Ient *e;
-	ulong i, n, want, try;
+	ulong i, n, want, cap, have, lim, try;
 
 	if(!storeserving(s))
 		return nil;
@@ -116,16 +142,8 @@ objsnapopen(Store *s, int kinds)
 			goto bad;
 		}
 		want = snapwant(s, kinds);
-		/*
-		 * §13's snapstale point: take the count one short, which is
-		 * what a create between this hold and the fill's leaves.
-		 * Inert unless a test asks for it.
-		 */
-		if(s->snapstale > 0 && want > 0){
-			s->snapstale--;
-			want--;
-		}
 		qunlock(&s->qlstate);
+		cap = want + want/Snapslackdiv + Snapslackmin;
 
 		/*
 		 * The allocation, outside the lock.  12 MB at nslots = 2^20,
@@ -134,15 +152,11 @@ objsnapopen(Store *s, int kinds)
 		 */
 		free(sn->slot);
 		free(sn->qidpath);
-		sn->slot = nil;
-		sn->qidpath = nil;
-		if(want > 0){
-			sn->slot = malloc(want*sizeof *sn->slot);
-			sn->qidpath = malloc(want*sizeof *sn->qidpath);
-			if(sn->slot == nil || sn->qidpath == nil){
-				werrstr("out of memory");
-				goto bad;
-			}
+		sn->slot = malloc(cap*sizeof *sn->slot);
+		sn->qidpath = malloc(cap*sizeof *sn->qidpath);
+		if(sn->slot == nil || sn->qidpath == nil){
+			werrstr("out of memory");
+			goto bad;
 		}
 
 		qlock(&s->qlstate);
@@ -153,20 +167,40 @@ objsnapopen(Store *s, int kinds)
 			goto bad;
 		}
 		/*
-		 * The index may have moved while the allocation ran.  A
-		 * vector short of what the index now holds would be a
-		 * PARTIAL snapshot, which §9's objsnap=full refuses to
-		 * serve, so the answer is to count again rather than to
-		 * truncate.  The counts are exact, so this one comparison
-		 * settles it: equal counts mean the walk below finds
-		 * exactly want entries.
+		 * The index has very likely moved while the allocation ran,
+		 * and all but one of the ways it can move are harmless.  A
+		 * count that SHRANK needs nothing: the walk below stops when
+		 * it has taken every matching entry, so an over-sized vector
+		 * yields the true count and a complete snapshot, not §9's
+		 * objsnap=partial.  A count that GREW is harmless too while
+		 * it fits in the slack.  The one case left is an index that
+		 * grew past the slack, where the vector cannot hold what the
+		 * index now has and a truncated fill would be the partial
+		 * snapshot the engine does not serve: count and allocate
+		 * again.  The counts are exact, so this one comparison
+		 * settles it.
 		 */
-		if(snapwant(s, kinds) != want){
+		have = snapwant(s, kinds);
+		lim = cap;
+		/*
+		 * §13's snapstale point: pretend the vector came back one
+		 * entry short of the index, which is what an index that grew
+		 * past the slack leaves, so a test can drive the re-count
+		 * without racing for it.  One armed count is spent per fill
+		 * attempt, so an open spends up to Snaptries of them.  Inert
+		 * unless a test asks for it.
+		 */
+		if(s->snapstale > 0){
+			s->snapstale--;
+			if(have > 0 && have - 1 < lim)
+				lim = have - 1;
+		}
+		if(have > lim){
 			qunlock(&s->qlstate);
 			continue;
 		}
 		n = 0;
-		for(i = 0; i < s->sb.nslots && n < want; i++){
+		for(i = 0; i < s->sb.nslots && n < have; i++){
 			e = &s->idx[i];
 			if(!inkinds(e->state, kinds))
 				continue;
@@ -180,9 +214,13 @@ objsnapopen(Store *s, int kinds)
 		return sn;
 	}
 	/*
-	 * An index that moved under every attempt.  A local error, not a
-	 * §2.6 wire one: nothing is full and nothing is broken, the
-	 * caller may simply open again.
+	 * An index that outgrew the slack under every attempt: a create
+	 * rate that beats a malloc, eight times running.  A local error,
+	 * not a §2.6 wire one (§3.7: nothing is full and nothing is
+	 * broken), and pathological rather than ordinary — with the slack
+	 * in place a churn that refused ~6% of opens without it refuses
+	 * none.  A server SHOULD retry the open once before answering the
+	 * client, since there is no §2.6 string that says this.
 	 */
 	werrstr("object snapshot: the index moved under %d counts", Snaptries);
 bad:

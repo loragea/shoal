@@ -134,10 +134,12 @@ storehook(Store *s, char *name, uvlong n)
 		/*
 		 * §9's snapshot open counts the index, allocates the vector
 		 * outside the lock and fills it under a second hold, so the
-		 * count can be stale by the time the fill runs.  This makes
-		 * the next n counts short by one, which is what a create in
-		 * that window leaves, so a test can drive the re-count
-		 * without racing for it.
+		 * index can have grown by the time the fill runs.  This makes
+		 * the next n fill attempts find the vector one entry short of
+		 * the index, which is what a growth past the vector's slack
+		 * leaves, so a test can drive the re-count without racing for
+		 * it.  One is spent per fill attempt, not per open, and an
+		 * open makes up to Snaptries of those.
 		 */
 		qlock(&s->qlstate);
 		s->snapstale = n;
