@@ -3218,7 +3218,7 @@ T1 formats a **small geometry** — a partition image of a few MiB with
 over one header sector, not over the whole store, and the cases that
 need `nslots = 2^20` are T2's.
 
-**What T1 covers today.** Ten programs, all of them against the
+**What T1 covers today.** Eleven programs, all of them against the
 simulated disk except where a file-backed device is the point:
 `csumtest` (layer-a §1.4's block digests and object checksums against
 known-answer vectors), `structtest` (§2's byte layouts against
@@ -3321,21 +3321,33 @@ reclaim rule run both ways, the checkpoint mark against a concurrent
 publish and under a held batch, a group commit at the largest record
 replay accepts, a multi-sector record at the region boundary, a
 header naming more sectors than that record, durable-before-ack for a
-batch's members, and `qid.path` across restarts).
+batch's members, and `qid.path` across restarts) and `enumtest` (§9's
+snapshot-at-open enumeration: a `/obj`, a `/tombs` and an `/advert`
+snapshot each walked by position with an entry created, deleted,
+created over and discarded under it, both halves of the gone rule
+discriminated one at a time, the bound on open snapshots and the
+`disk full` past it, a checkpoint taken mid-walk, the `/dirty` and
+`/lost` copies against a moving set, and §6's tombstone reclaim walk
+— single-proc and with the record replaced under it).
 
-Against the list below that is T1.1–T1.8, T1.10–T1.14, T1.16, T1.17,
-T1.18–T1.20 and T1.22–T1.26. Three cases are not covered and each
-waits on something this store does not have yet: **T1.9**'s second
-half and **T2.7** wait on the monitor's slot store (§10); **T1.15**
-waits on the enumeration snapshot of §9 and the `/obj` fid that reads
-it; **T1.27** waits on the server's `Reqqueue` pool (§7), which is
-what it is about — the engine's own scrub and cursor take the same
-`qlstate` snapshot every other call takes and hold no lock across a
-verify, but *that a scrubber pushes through the object's queue rather
-than reading grains beside it* is a property of the server, and there
-is no server to hold it wrong yet. T1.21 is covered for the orderings
-and the fields, but drives the four publish triggers in sequence
-rather than from concurrent procs.
+Against the list below that is T1.1–T1.8, T1.10–T1.20 and
+T1.22–T1.26. Two cases are not covered and each waits on something
+this store does not have yet: **T1.9**'s second half and **T2.7**
+wait on the monitor's slot store (§10); **T1.27** waits on the
+server's `Reqqueue` pool (§7), which is what it is about — the
+engine's own scrub and cursor take the same `qlstate` snapshot every
+other call takes and hold no lock across a verify, but *that a
+scrubber pushes through the object's queue rather than reading grains
+beside it* is a property of the server, and there is no server to
+hold it wrong yet. T1.21 is covered for the orderings and the fields,
+but drives the four publish triggers in sequence rather than from
+concurrent procs. **T1.15** is covered at T1's
+geometry and not at the scale its row names: `enumtest` walks a
+snapshot of 1500 entries over 4096 slots while four procs create,
+delete and discard beside it, and reads `/dirty` under the same
+churn, which is the shape of the case in about 0.3 s. The 2.6·10^5
+entries the row asks for are T2's, for the same reason §13's small
+geometry is: `mk test` stays within `AGENTS.md`'s seconds.
 
 - **T1.1 crash matrix (R1–R4).** Every point above × {create,
   whole-block write, partial write, truncate, delete, 16 MiB
