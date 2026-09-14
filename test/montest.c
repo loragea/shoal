@@ -64,6 +64,23 @@ eqi(char *what, int got, int want)
 		fail("%s: %d, want %d", what, got, want);
 }
 
+/* the same two, for a case that runs under several names */
+static void
+eqv2(char *pre, char *what, uvlong got, uvlong want)
+{
+	checks++;
+	if(got != want)
+		fail("%s: %s: %llud, want %llud", pre, what, got, want);
+}
+
+static void
+eqi2(char *pre, char *what, int got, int want)
+{
+	checks++;
+	if(got != want)
+		fail("%s: %s: %d, want %d", pre, what, got, want);
+}
+
 static void
 istrue(char *what, int ok)
 {
@@ -300,7 +317,10 @@ tcommit(void)
 /*
  * T1.13's shape for §10: from the recorded trace, one flush after the
  * history write and another after the current write, in that order,
- * and nothing else in a commit.
+ * and nothing else WRITTEN in a commit.  The reads between them are
+ * §10's read-back, which is checked by its own case below; here only
+ * their placement matters, so the writes and flushes are picked out
+ * of the trace in order.
  */
 static void
 tflushes(void)
@@ -308,9 +328,9 @@ tflushes(void)
 	Dev *d;
 	Mon *m;
 	Monstat st;
-	Simop *t;
-	long n;
-	int i;
+	Simop *t, w[8];
+	long n, j;
+	int i, nw;
 
 	d = fresh();
 	if((m = mustopen(d, "flushes")) == nil){
@@ -322,24 +342,89 @@ tflushes(void)
 		simtracereset(d);
 		commit(m, "flushes", "map=c", i);
 		n = simtrace(d, &t);
+		nw = 0;
+		for(j = 0; j < n; j++)
+			if(t[j].op != Sopread && nw < nelem(w))
+				w[nw++] = t[j];
 		checks++;
-		if(n != 4){
-			fail("flushes: commit %d took %ld device operations, "
-				"want 4", i, n);
+		if(nw != 4){
+			fail("flushes: commit %d wrote and flushed %d times, "
+				"want 4", i, nw);
 			continue;
 		}
-		eqi("flushes: the history slot is written first", t[0].op,
+		eqi("flushes: the history slot is written first", w[0].op,
 			Sopwrite);
 		istrue("flushes: written into the ring",
-			t[0].off >= histoffs(&st, 0)
-			&& t[0].off < histoffs(&st, Retain));
-		eqi("flushes: then a flush", t[1].op, Sopflush);
-		eqi("flushes: then the current slot", t[2].op, Sopwrite);
+			w[0].off >= histoffs(&st, 0)
+			&& w[0].off < histoffs(&st, Retain));
+		eqi("flushes: then a flush", w[1].op, Sopflush);
+		eqi("flushes: then the current slot", w[2].op, Sopwrite);
 		istrue("flushes: written into a current slot",
-			t[2].off >= curoffs(&st, 0)
-			&& t[2].off < curoffs(&st, 2));
-		eqi("flushes: then a flush", t[3].op, Sopflush);
+			w[2].off >= curoffs(&st, 0)
+			&& w[2].off < curoffs(&st, 2));
+		eqi("flushes: then a flush", w[3].op, Sopflush);
+		/* and the last thing a commit does is read its slot back */
+		eqi("flushes: the commit ends with a read", t[n-1].op, Sopread);
 	}
+	monclose(m);
+	devclose(d);
+}
+
+/*
+ * §10's read-back.  A device that takes a write, acknowledges the
+ * flush and lands nothing (Sfdrop), or lands a mix of old and new
+ * bytes (Sftearbyte), must fail the commit rather than leave the
+ * running monitor holding a map the platter does not.
+ */
+static void
+tlostwrite(int kind, char *kindname, int onring)
+{
+	Dev *d;
+	Mon *m;
+	Monstat st;
+	Monmap mm;
+	char what[64];
+	vlong off;
+
+	snprint(what, sizeof what, "lost %s on the %s write", kindname,
+		onring ? "ring" : "current");
+	d = fresh();
+	if((m = mustopen(d, what)) == nil){
+		devclose(d);
+		return;
+	}
+	commit(m, what, "map=A", 1);
+	commit(m, what, "map=B", 2);
+	monstat(m, &st);
+
+	if(onring)
+		simfault(d, kind, 1);
+	else{
+		/* the slot §2.2's clause 2 will choose: the lower seq */
+		off = curoffs(&st, st.cur == 0 ? 1 : 0);
+		simfaultat(d, kind, 1, off, st.slotsz);
+	}
+	checks++;
+	if(moncommit(m, "map=C", 5, 3) == 0)
+		fail("%s: a commit whose write was lost reported success",
+			what);
+	monstat(m, &st);
+	eqv2(what, "the live store is still B", st.epoch, 2);
+	monclose(m);
+
+	if((m = mustopen(d, what)) == nil){
+		devclose(d);
+		return;
+	}
+	monstat(m, &st);
+	eqv2(what, "the restart finds B", st.epoch, 2);
+	eqv2(what, "at its own seq", st.seq, 2);
+	eqi2(what, "moncurrent answers it", moncurrent(m, &mm), 1);
+	eqtext("the previous map's text", &mm, "map=B");
+	eqi2(what, "position 0 is present", monhistory(m, 0, &mm), 1);
+	eqv2(what, "position 0 is the current map", mm.seq, st.seq);
+	eqi2(what, "the unpublished epoch answers nothing",
+		monlookup(m, 3, &mm), 0);
 	monclose(m);
 	devclose(d);
 }
@@ -1232,6 +1317,10 @@ main(int, char**)
 	tfresh();
 	tcommit();
 	tflushes();
+	tlostwrite(Sfdrop, "Sfdrop", 1);
+	tlostwrite(Sfdrop, "Sfdrop", 0);
+	tlostwrite(Sftearbyte, "Sftearbyte", 1);
+	tlostwrite(Sftearbyte, "Sftearbyte", 0);
 	tslots();
 	tphantom();
 	thistfail();

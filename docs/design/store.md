@@ -2764,6 +2764,28 @@ than as an empty map text.
    valid, refuse. `seq` is `max(valid seq) + 1` over both slots and
    the ring. Flush.
 
+**Each slot is read back after its flush** and checked — magic,
+`vers`, `len` within the slot, the checksum over `secsz+len`, and the
+`seq`, `len` and `epoch` just written. A read-back that does not
+verify fails the commit exactly as a failed write does: step 1's
+victim stays invalid and a phantom, step 2's slot is left invalid and
+the ring entry becomes a phantom, and the in-memory state matches the
+disk either way. That is what makes step 1's "a torn ring write …
+fails the commit" true rather than hopeful: a `Sfdrop` or a torn
+write reports success, survives its flush and lands nothing, and
+without the read-back the running monitor holds a ring entry the
+platter does not — so position 0 would stop being the current map and
+layer-a §8.2's `E−1` entry would be unanswerable at the next start.
+The cost is one read of at most `slotsz` against a flush that costs
+8.6 ms.
+
+The read-back catches a device that loses the write *before*
+acknowledging the flush. A device that acknowledges a flush and then
+loses the bytes anyway is outside this store's model, exactly as it is
+outside the object store's: §13's simulated disk makes durability
+after a flush its contract, and §3.2's `-w` assertion is what an
+operator gives for a unit whose flush does not reach the platter.
+
 **Choose on start:** read both current-map slots, take the valid one
 with the greater `seq`; two valid slots at equal `seq` — which is what
 a fresh format leaves — are §2.2's tie too, so the start is slot 0 and
@@ -2842,7 +2864,9 @@ epoch `E−1`, so one history slot is a floor rather than a preference
 **Cost.** One 16 KiB write plus one flush per slot written: **8.6 ms**
 for the current-map slot, and the same again for the history slot
 that precedes it, so a publish is ~17 ms whether it carries a
-placement change or a single `stale` mark. That is what makes
+placement change or a single `stale` mark. The read-back of each slot
+is one read of at most `slotsz` — the sector the checksum needs plus
+`len` bytes — which is noise beside the flush it follows. That is what makes
 layer-a §5.4 step 5a affordable — the alternative
 `docs/platform/9front-storage.md` measured, a file plus a gefs sync,
 costs 530–620 ms and would blow `replms` regularly.
@@ -3349,8 +3373,12 @@ map, the header's byte layout, a commit and the restart that finds it,
 the ring newest-first with layer-a §5.2 clause 2's `E−1` entry present
 at every length and across a wrap, T1.13's flush shape for §10 read
 off the trace — one write and one flush into the ring, then one write
-and one flush into a current slot, and nothing else in a commit —
-**T1.9's second half**, a crash at `moncur` leaving the previous map
+and one flush into a current slot, and nothing else written in a
+commit — §10's read-back under a write that reports success and lands
+nothing (`Sfdrop`) or lands a mix of old and new bytes
+(`Sftearbyte`), on the ring slot and on the current slot in turn,
+each failing the commit and leaving the restart on the previous map
+with position 0 still equal to it; **T1.9's second half**, a crash at `moncur` leaving the previous map
 current and the failed publish's ring entry a phantom, and a slot torn
 at a high `seq` not steering the next write onto the only good one;
 **T2.7's phantom case at T1 scale**, a crash at `monhistflush` after

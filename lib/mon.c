@@ -304,11 +304,43 @@ slotread(Mon *m, vlong off, Monslot *sl)
 }
 
 /*
- * Write one slot and flush it, with the crash point §13 names after
- * the write returns and before the flush.  The write is rounded up to
- * roundup(secsz+len, secsz) and zero-padded, because devsd turns a
- * write whose byte count is not a sector multiple into a
- * read-modify-write; it is one devwrite, which splits at Wunit
+ * Read a slot back after its flush and check that it is the slot that
+ * was just written (§10).  A write that reports success, survives its
+ * flush and lands nothing would otherwise be invisible until the next
+ * open: the ring would hold no entry for the current map, so position
+ * 0 would not be the current map and layer-a §8.2's E−1 entry would
+ * be unanswerable.  The read-back is one read of at most slotsz
+ * against a flush that costs 8.6 ms (§10's cost model).
+ */
+static int
+slotverify(Mon *m, vlong off, ulong len, uvlong seq, uvlong epoch)
+{
+	Monslot sl;
+	char why[ERRMAX];
+
+	memset(&sl, 0, sizeof sl);
+	slotread(m, off, &sl);
+	if(!sl.valid)
+		snprint(why, sizeof why, "%s", sl.why);
+	else if(sl.len != len || sl.seq != seq || sl.epoch != epoch)
+		snprint(why, sizeof why, "it holds len %lud seq %llud "
+			"epoch %llud", sl.len, sl.seq, sl.epoch);
+	else{
+		slotclear(&sl);
+		return 0;
+	}
+	slotclear(&sl);
+	werrstr("the slot did not read back after its flush (len %lud "
+		"seq %llud epoch %llud): %s", len, seq, epoch, why);
+	return -1;
+}
+
+/*
+ * Write one slot, flush it and read it back, with the crash point §13
+ * names after the write returns and before the flush.  The write is
+ * rounded up to roundup(secsz+len, secsz) and zero-padded, because
+ * devsd turns a write whose byte count is not a sector multiple into
+ * a read-modify-write; it is one devwrite, which splits at Wunit
  * itself.
  */
 static int
@@ -333,6 +365,8 @@ slotwrite(Mon *m, vlong off, ulong len, uvlong seq, uvlong epoch,
 		return -1;
 	devpoint(d, point, 0);
 	if(devflush(d) < 0)
+		return -1;
+	if(slotverify(m, off, len, seq, epoch) < 0)
 		return -1;
 	if(after != nil)
 		devpoint(d, after, 0);
