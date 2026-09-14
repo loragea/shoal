@@ -2670,6 +2670,28 @@ writing them back, so the unrounded write costs a hidden device read
 and rewrites the tail sector with bytes the store never chose. One
 map commit is then one device request for any map under 16 KiB.
 
+**What a format leaves.** `shoalmonfmt` zeroes both header sectors
+and flushes before it writes anything else, for the reason §12 gives
+`shoalfmt`: a format cut short must leave no valid header rather than
+a valid one locating slots that were never written — which, after a
+reformat at a different `slotsz`, would be the previous store's
+header over this one's bytes. It then writes **both current-map slots
+as valid empty slots** — `len=0`, `seq=0`, `epoch=0` — and the header
+sector of every history slot as zeroes, and writes the two header
+copies last, with a flush before the format is reported complete.
+
+The empty current slots are what make the third clause of the commit
+rule mean anything. §2.2's "if neither is valid, refuse" is copied
+into step 2 below, and nothing else would give a freshly formatted
+store a valid slot, so a fresh store and a doubly damaged one would be
+indistinguishable at the first commit. With them, **neither current
+slot valid always means damage**, and it is refused at start and at
+commit alike. Zeroing the history headers is the other half: no slot
+an earlier format on the same bytes left behind survives as valid.
+"The store holds no map" is then the chosen current slot carrying
+`len=0`, and nothing else — an accessor answers that as no map rather
+than as an empty map text.
+
 **Commit.** In this order:
 
 1. Write the history ring slot for the new epoch, **stamped with the
@@ -2680,10 +2702,11 @@ map commit is then one device request for any map under 16 KiB.
    2 depends on. Writing it first means a torn ring write damages
    only the map being published, which fails the commit, rather than
    the previous map, which nothing else can supply. If it cannot be
-   written, the commit fails. The slot it overwrites is any invalid
-   slot, and failing that the valid slot with the lowest `seq` — one
-   `seq` space for the whole store is what makes "oldest" and
-   "newer than the current map" both well defined.
+   written, the commit fails. The slot it overwrites is the phantom
+   below if there is one, then any invalid slot, and failing both the
+   valid slot with the lowest `seq` — one `seq` space for the whole
+   store is what makes "oldest" and "newer than the current map" both
+   well defined.
 2. Write the current-map slot, choosing by the same three-clause rule
    as §2.2: if exactly one slot is valid, write the invalid one; if
    both are valid, write the one with the lower `seq`; if neither is
@@ -2691,7 +2714,9 @@ map commit is then one device request for any map under 16 KiB.
    the ring. Flush.
 
 **Choose on start:** read both current-map slots, take the valid one
-with the greater `seq`. A torn write to the slot being written fails
+with the greater `seq`; two valid slots at equal `seq` — which is what
+a fresh format leaves — are §2.2's tie too, so the start is slot 0 and
+the next write is slot 1. A torn write to the slot being written fails
 its checksum and the other slot is untouched, so the previous map
 survives; that is the entire crash argument, and it is §2.2's rule
 again — including the clause that keeps a torn slot from steering the
@@ -2708,7 +2733,27 @@ against a placement that never existed. The `seq` stamp is what makes
 this decidable without a durable ring cursor: at start the monitor
 **ignores, and marks reusable, every history slot whose `seq` exceeds
 the chosen current slot's**. Exactly the entries written by publishes
-that did not complete are erased, and no committed history is.
+that did not complete are erased, and no committed history is. The
+start itself writes nothing: a phantom is erased by the write that
+reuses its slot, which is what lets a monitor store be opened on a
+device opened read-only.
+
+A phantom is the **first** slot the next commit overwrites, ahead of
+an invalid one, and that ordering is what bounds the disk to one of
+them: a phantom's `seq` is above the current map's only until the next
+map is published, after which the same bytes would read back as an
+ordinary entry for a map that never existed. Consuming it at the next
+commit — which either completes, making the entry real, or does not,
+making it the phantom again — is what keeps both halves of the rule
+above true.
+
+**The store never compares epochs.** It records the epoch it is given
+beside the map and orders nothing by it: layer-a §8.3's `forceepoch`
+and §8.6's rebuild path can each legitimately publish an epoch that is
+not above the last, so a rule here would refuse a recovery the cluster
+depends on. `seq` is the only order. Where two ring entries carry one
+epoch, a lookup by epoch answers the one with the greater `seq`, which
+is the later publish.
 
 **A map that does not fit.** If `secsz + len` exceeds `slotsz` the
 commit fails with `disk full` (layer-a §2.6: any operation that must
@@ -2716,6 +2761,12 @@ store bytes may return it), and the monitor reports the sizes in
 `/status`. It is not `bad map`: the text is valid, the partition is
 too small, and telling an operator the map is malformed would send
 them to the wrong place.
+
+**Crash points.** §13's named points inside a commit, in the order a
+commit reaches them: `monhist`, after the history slot's write returns
+and before its flush; `monhistflush`, after that flush returns and
+before the current slot's write — the phantom window above; and
+`moncur`, after the current slot's write returns and before its flush.
 
 **Sizing.** A map at twelve instances is a few KiB; `slotsz` 65536 is
 a twentyfold margin and a whole number of 16 KiB units. With

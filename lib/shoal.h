@@ -810,3 +810,154 @@ void	stagediscard(Stage*);
  * still calls stagediscard, which then finds nothing left to release.
  */
 void	stagesweep(Store*, vlong now);
+
+/*
+ * The monitor's map slot store, docs/design/store.md §10.
+ *
+ * A raw partition of a few MiB through which the monitor makes a
+ * published cluster map durable before it acknowledges the publish
+ * (layer-a §8.2).  The map text is opaque to it: this store keeps
+ * bytes and a length and never parses, compares or orders them —
+ * including their epochs, which layer-a §8.3's forceepoch and §8.6's
+ * rebuild path may legitimately republish out of order.
+ *
+ *	sector 0	header, copy 0
+ *	hdr.curoff	current-map slot 0
+ *			current-map slot 1
+ *	hdr.histoff	retain history slots, a ring
+ *	last sector	header, copy 1
+ *
+ * Error strings: only an oversize map answers a layer-a §2.6 wire
+ * error, `disk full', which §10 requires of it.  Every other refusal
+ * here is local to the monitor and carries no §2.6 prefix (§3.7).
+ */
+enum
+{
+	Monvers		= 1,		/* format version of every header */
+	Monslotszdflt	= 65536,	/* §10's default slotsz */
+	Monretaindflt	= 8,		/* §10's default ring length */
+	Monretainmin	= 2,		/* layer-a §5.2 clause 2 reads E−1 */
+	Monminbytes	= 1024*1024,	/* §10: shoalmonfmt refuses less */
+	Monsizedflt	= 4*1024*1024,	/* §10: what -z sizes an image to */
+};
+
+typedef struct Mon Mon;
+typedef struct Monhdr Monhdr;
+typedef struct Monhsel Monhsel;
+typedef struct Monfmtcfg Monfmtcfg;
+typedef struct Monmap Monmap;
+typedef struct Monstat Monstat;
+
+/*
+ * Mon is opaque outside lib/, like Store: 2c(1) signs a function
+ * taking a pointer to it from the type's definition, so a file that
+ * has the definition and one that has not would disagree.
+ */
+#pragma incomplete Mon
+
+/* the header, written only at format */
+struct Monhdr
+{
+	ulong	vers;
+	ulong	slotsz;
+	ulong	retain;
+	uvlong	curoff;		/* sector of current-map slot 0 */
+	uvlong	histoff;	/* sector of history slot 0 */
+};
+
+/*
+ * Both header copies.  Nothing writes either after format, so they
+ * are identical by construction: the rule is "take either valid copy,
+ * refuse if neither", and two valid copies that DIFFER are a refusal
+ * naming the field rather than a choice — the operator has mixed two
+ * partitions' halves, or the media is lying.
+ */
+struct Monhsel
+{
+	Monhdr	h[2];
+	int	valid[2];
+	char	why[2][ERRMAX];	/* why a copy is invalid */
+	int	use;		/* copy to take, -1 if neither */
+};
+
+int	monhdrsel(Dev*, Monhsel*);
+
+/*
+ * Format.  Every refusal shoalmonfmt makes it makes here, so that a
+ * T1 program drives the tool's decisions and not its argument
+ * parsing: a slotsz that is not a multiple of secsz or is under two
+ * sectors, a retain under Monretainmin, a device under Monminbytes or
+ * too small for 2 header sectors and 2+retain slots, and a valid
+ * monitor header without ream.  warnsuper reports §12's warning — the
+ * target already carries a valid object-store superblock, so the unit
+ * is an instance's — which is a warning and not a refusal.
+ *
+ * A fresh store holds both current slots as VALID empty maps at len 0,
+ * seq 0, epoch 0, and the header sector of every history slot zeroed.
+ * "The store holds no map" is then the chosen slot's len being 0, and
+ * "neither current slot valid" always means damage.
+ */
+struct Monfmtcfg
+{
+	ulong	slotsz;		/* 0: Monslotszdflt; on return, what was used */
+	ulong	retain;		/* 0: Monretaindflt; on return, what was used */
+	int	ream;		/* format over a valid monitor header */
+	int	warnsuper;	/* out: §12's object-store superblock warning */
+	uvlong	curoff, histoff;/* out: sectors */
+	uvlong	used;		/* out: bytes the format occupies */
+};
+
+int	monfmt(Dev*, Monfmtcfg*);
+
+/*
+ * One published map.  text is the store's own and is valid until the
+ * next commit or monclose; a caller that wants it longer copies it.
+ */
+struct Monmap
+{
+	uchar	*text;
+	ulong	len;
+	uvlong	seq;
+	uvlong	epoch;
+};
+
+struct Monstat
+{
+	ulong	slotsz, retain;
+	uvlong	curoff, histoff;
+	ulong	nhist;		/* valid history entries, phantoms apart */
+	ulong	nphantom;	/* ring slots ignored at open (§10) */
+	uvlong	seq, epoch;
+	ulong	len;		/* of the current map */
+	int	hasmap;		/* 0 on a fresh store: len is 0 */
+	int	cur;		/* current-map slot in use */
+	int	hdr;		/* header copy the open took */
+	int	hdrother;	/* the other copy was valid too */
+};
+
+/*
+ * Open reads both header copies, both current slots and the whole
+ * ring, chooses the current map by §2.2's rule keyed on seq, and
+ * marks every history slot whose seq exceeds the chosen current
+ * slot's as a phantom — a publish that wrote its ring entry and never
+ * published its map.  A phantom is ignored by every accessor and is
+ * the first slot the next commit reuses.  Open WRITES NOTHING and
+ * works on a Drdonly device.  It refuses a store with no valid header
+ * and one with neither current slot valid.
+ *
+ * moncommit is §10's two steps with one flush each; it answers
+ * `disk full' and leaves the store unchanged when secsz+len exceeds
+ * slotsz, and a failed ring write fails the commit with the current
+ * map untouched.  moncurrent answers 0 for "this store holds no map".
+ * monhistory walks the ring newest-first, position 0 being the
+ * current map itself, and answers 0 past the end.  monlookup answers
+ * the entry for an epoch, taking the greater seq when two carry one
+ * epoch.
+ */
+Mon*	monopen(Dev*);
+void	monclose(Mon*);
+int	moncommit(Mon*, void *text, ulong len, uvlong epoch);
+int	moncurrent(Mon*, Monmap*);
+int	monhistory(Mon*, ulong i, Monmap*);
+int	monlookup(Mon*, uvlong epoch, Monmap*);
+void	monstat(Mon*, Monstat*);
