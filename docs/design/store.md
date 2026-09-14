@@ -2857,27 +2857,64 @@ than as an empty map text.
    valid, refuse. `seq` is `max(valid seq) + 1` over both slots and
    the ring. Flush.
 
+The third clause is **§2.2's symmetry and not a path**: a store the
+start accepted has a valid current slot, and after one failed write
+here the selection re-targets the slot it has just invalidated, so
+the valid one is never written and cannot become invalid. It stays
+because the rule it states is the rule, and the code says it is
+unreachable where it makes it.
+
 **Each slot is read back after its flush** and checked — magic,
 `vers`, `len` within the slot, the checksum over `secsz+len`, and the
-`seq`, `len` and `epoch` just written. A read-back that does not
-verify fails the commit exactly as a failed write does: step 1's
-victim stays invalid and a phantom, step 2's slot is left invalid and
-the ring entry becomes a phantom, and the in-memory state matches the
-disk either way. That is what makes step 1's "a torn ring write …
-fails the commit" true rather than hopeful: a `Sfdrop` or a torn
-write reports success, survives its flush and lands nothing, and
-without the read-back the running monitor holds a ring entry the
-platter does not — so position 0 would stop being the current map and
-layer-a §8.2's `E−1` entry would be unanswerable at the next start.
-The cost is one read of at most `slotsz` against a flush that costs
-8.6 ms.
+`seq`, `len` and `epoch` just written. That is what makes step 1's "a
+torn ring write … fails the commit" true rather than hopeful: a
+`Sfdrop` or a torn write reports success, survives its flush and
+lands nothing, and without the read-back the running monitor holds a
+ring entry the platter does not — so position 0 would stop being the
+current map and layer-a §8.2's `E−1` entry would be unanswerable at
+the next start.
 
-The read-back catches a device that loses the write *before*
-acknowledging the flush. A device that acknowledges a flush and then
-loses the bytes anyway is outside this store's model, exactly as it is
-outside the object store's: §13's simulated disk makes durability
-after a flush its contract, and §3.2's `-w` assertion is what an
-operator gives for a unit whose flush does not reach the platter.
+A slot that **reads back and is not the one written** says the map is
+not durable, and the commit fails exactly as a failed write does:
+step 1's victim stays invalid and a phantom, step 2's slot is left
+invalid and the ring entry becomes a phantom, and nothing the monitor
+serves claims a map the platter does not hold.
+
+A read-back whose **read fails** is a different fact, and this store
+does not confuse the two: a read that failed says nothing about the
+write under it, so the slot may be on the platter. The read is
+**retried once**; if it fails again the commit fails with the publish
+declared *indeterminate* — written and flushed, and not readable
+back. The in-memory state is then made safe against whatever landed:
+the slot is not served, its `seq` is **spent** so that the next
+commit's is above it — a retry outranks anything that did land, and
+no two entries share one `seq` — and a ring victim is phantom-first
+for reuse besides. A failed commit therefore means **the map is not
+served by this monitor process**. It may be on the platter, and then
+the next open serves it; that is exactly the outcome of a crash
+between step 2's flush and the monitor's acknowledgement, which the
+crash argument above already covers, because layer-a §8.2 requires
+durable-before-ack and not ack-iff-durable. The operator's retry
+publishes above it either way.
+
+The read-back is **two device reads per slot** — the header sector,
+then the text — and not one, because it goes through the same slot
+reader the start does, which must bounds-check `len` before it reads
+the `len` bytes that field names (a torn length field must not drive
+a read past the slot). Reading `roundup(secsz+len, secsz)` in one
+request would be possible here, where `len` is known, at the price of
+a second reader; the four extra requests a commit makes are noise
+beside its two flushes, so it keeps the one reader.
+
+What the read-back proves is that the device **accepted** the bytes,
+not that they are on the platter: the read is answered by the same
+write cache the flush was meant to drain. So it catches a device that
+loses the write *before* acknowledging the flush, which is the case
+it exists for. A device that acknowledges a flush and then loses the
+bytes anyway is outside this store's model, exactly as it is outside
+the object store's: §13's simulated disk makes durability after a
+flush its contract, and §3.2's `-w` assertion is what an operator
+gives for a unit whose flush does not reach the platter.
 
 **Choose on start:** read both current-map slots, take the valid one
 with the greater `seq`; two valid slots at equal `seq` — which is what
@@ -2925,6 +2962,18 @@ map would raise `seq` above it, and the following start would read the
 never-published map back as ordinary history: precisely the outcome
 the rule above exists to prevent.
 
+There is a third thing the victim can hold, and the failure path
+**reads the slot once to find out**. When the ring is full the victim
+is not an invalid slot or a phantom but an ordinary committed entry,
+and a write that landed nothing left it there intact. An entry read
+back valid whose `seq` is not above the current map's is history this
+store can still answer, so it goes back into memory as it is found:
+the live store keeps answering that epoch and counts no phantom it
+does not hold, instead of both until the next open. A slot that reads
+back unreadable or invalid, and a slot whose write was indeterminate —
+where the read-back has already failed twice and this read is not
+attempted — take the invalid-and-phantom mark above.
+
 **The store never compares epochs.** It records the epoch it is given
 beside the map and orders nothing by it: layer-a §8.3's `forceepoch`
 and §8.6's rebuild path can each legitimately publish an epoch that is
@@ -2962,8 +3011,9 @@ epoch `E−1`, so one history slot is a floor rather than a preference
 for the current-map slot, and the same again for the history slot
 that precedes it, so a publish is ~17 ms whether it carries a
 placement change or a single `stale` mark. The read-back of each slot
-is one read of at most `slotsz` — the sector the checksum needs plus
-`len` bytes — which is noise beside the flush it follows. That is what
+is two reads — the checksum's sector, then `len` bytes rounded up —
+so a commit issues four beside its two flushes, which is noise beside
+them. That is what
 makes layer-a §5.4 step 5a affordable — the alternative
 `docs/platform/9front-storage.md` measured, a file plus a gefs sync,
 costs 530–620 ms and would blow `replms` regularly.
@@ -3080,14 +3130,32 @@ nothing else in any of them depends on which kind of device it was
 given, because §0's vtable is the only thing they call.
 
 **A `-z` never runs ahead of the refusal that would have stopped the
-run.** Resizing an image truncates what it already holds, so both
-commands open the file at its own length first, let their reformat
-guard decide — `shoalfmt`'s ream guard, `shoalmonfmt`'s refusal over
-a valid monitor header — and reopen at `-z`'s size only once that
-guard has passed or `-r` has waived it: a run either one refuses
-leaves the file byte-identical, its length included. `-z` on a path
-with no file there creates it at that size, where there is nothing to
-destroy, and `-z` against an `sd` partition is refused by both.
+run** — of *any* of them, not only the reformat guard. Resizing an
+image truncates what it already holds, so both commands run in one
+order:
+
+1. validate the flags;
+2. open the image **at its own length** — a first open that fails for
+   any reason but the path not being there is the end of the run, and
+   never a fall-through to the create `-z` would do, because a path
+   that exists and will not open read-write would be truncated by it
+   with no guard run at all;
+3. run **both reformat guards**: an image carrying a valid
+   object-store superblock (§2.2) or a valid monitor header (§10) is
+   a store, and **either command refuses to format over — or shorten
+   — either kind without `-r`**;
+4. size the geometry against the length **`-z` asks for**, not the
+   one the image has: `shoalfmt`'s `geometry`, `shoalmonfmt`'s
+   `monfmtcheck`;
+5. only then resize, and format.
+
+A run refused at any step leaves the file **byte-identical, its
+length included**, and the lengths a refusal quotes are the file's
+own rather than the sector-rounded device size. `-z` on a path with
+no file there creates it at that size, where there is nothing to
+destroy — and the hint that `-z` is what sizes a new image belongs to
+that refusal alone, not to a path that is there and will not open.
+`-z` against an `sd` partition is refused by both.
 
 **`shoalfmt`** — format or ream an object-store partition.
 
@@ -3130,6 +3198,9 @@ generates a random `uuid` unless given one, and **refuses a partition
 that already carries a valid superblock unless `-r`** — reaming a
 disk destroys an instance's identity, and layer-a §1.5 makes that a
 reformat-before-rejoin event, so it should take a flag. It refuses a
+partition that carries a valid **monitor** header (§10) unless `-r`
+for the same reason: that is a store too, and one this command would
+destroy just as completely. It refuses a
 geometry whose maximal `Eobj` record exceeds an eighth of the log
 region, one whose `ngrains` reaches 2^32, one whose `nblkmax`
 (`objmax`/`blksz`) reaches 2^32, one whose `blksz` is not a power of
@@ -3274,16 +3345,23 @@ reads epoch `E−1`, so one history slot is a floor rather than a
 preference), a device under §10's 1 MiB, one too small for 2 header
 sectors and 2+`retain` slots, and **a partition that already carries a
 valid monitor header unless `-r`** — reformatting discards every
-published map the partition holds. It **warns** rather than refuses
-when the target already carries a valid object-store superblock: that
-means the unit is an object-store instance's and §2.1's deployment
-rule forbids the monitor's partition being one, but an operator
-reclaiming a decommissioned unit is doing exactly this on purpose.
+published map the partition holds. It refuses a target that carries a
+valid **object-store superblock** unless `-r`, by the rule above: that
+is a store, and `-r` is how an operator says to destroy one. When `-r`
+is given and the superblock is there, the format proceeds and
+**warns**, because §2.1's deployment rule forbids the monitor's
+partition being an object-store instance's unit — but an operator
+reclaiming a decommissioned unit is doing exactly this on purpose, and
+that is a warning about the unit rather than about these bytes.
 
-Every one of those decisions is `monfmt`'s rather than the command's,
-so that a T1 program drives them without exec'ing anything — the same
-constraint on the code layout that puts the store engine in
-`libshoal` above.
+Every one of those decisions is `monfmt`'s or `monfmtcheck`'s rather
+than the command's, so that a T1 program drives them without exec'ing
+anything — the same constraint on the code layout that puts the store
+engine in `libshoal` above. Three are the command's, and all three
+are about a file image the library is never handed: the length to
+open it at, whether `-z` may shorten it, and the refusal over an
+object-store superblock, which `monfmt` reports to its caller as
+§2.1's warning and leaves the caller to decide.
 
 **Carving the partitions** is the operator's step and uses stock
 tools. On a whole disk, `disk/fdisk -aw /dev/sdXX/data` creates a
@@ -3484,7 +3562,13 @@ commit — §10's read-back under a write that reports success and lands
 nothing (`Sfdrop`) or lands a mix of old and new bytes
 (`Sftearbyte`), on the ring slot and on the current slot in turn,
 each failing the commit and leaving the restart on the previous map
-with position 0 still equal to it; **T1.9's second half**, a crash at
+with position 0 still equal to it; the read-back's own READ failing,
+on each slot in turn — once, where the retry carries the commit
+through, and twice, where the publish is indeterminate: the commit
+fails saying so, the slot is not served, its `seq` is spent, and the
+retry of the same session is what the restart serves rather than the
+orphan, with no two ring entries carrying one `seq`;
+**T1.9's second half**, a crash at
 `moncur` leaving the previous map current and the failed publish's
 ring entry a phantom, and a slot torn
 at a high `seq` not steering the next write onto the only good one;
@@ -3499,7 +3583,10 @@ current map, and that no ring entry sits above the current map's
 `monhist`, each leaving the current map untouched; a ring write that
 fails *over a phantom victim*, after which the retry reuses that same
 slot and the never-published epoch is still unanswerable at the next
-start; a current-slot write that fails and is retried *in the same
+start; a ring write that fails *over a valid victim*, with the ring
+full, after which the live store still answers the oldest epoch,
+counts no phantom, and agrees with the restart; a current-slot write
+that fails and is retried *in the same
 session*, where the phantom mark has to hold in memory with no restart
 to rebuild it; `disk full` on an
 oversize map with the store unchanged, and the largest map that fits
@@ -3637,6 +3724,15 @@ it, and reads `/dirty` under the same churn, which is the shape of
 the case in about 0.3 s. The 2.6·10^5 entries the row asks for are
 T2's, for the same reason §13's small geometry is: `mk test` stays
 within `AGENTS.md`'s seconds.
+
+One thing below the tier line is **§12's ordering inside each tool's
+`main`** — where `-z` sits relative to the guards and the geometry.
+Every refusal it orders is a library entry a T1 program drives
+directly (`geometry`, `superselect`, `monhdrsel`, `monfmtcheck`,
+`monfmt`), but the order itself lives in code no T1 program execs,
+so it is not covered here. A T2 case that runs the two commands over
+an image and compares its length before and after a refused run is
+what would close it.
 
 - **T1.1 crash matrix (R1–R4).** Every point above × {create,
   whole-block write, partial write, truncate, delete, 16 MiB

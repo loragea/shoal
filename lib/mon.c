@@ -46,6 +46,7 @@ struct Monslot
 {
 	int	valid;
 	int	phantom;	/* seq above the current map's: never published */
+	int	unread;		/* the device read failed: nothing was seen */
 	ulong	len;
 	uvlong	seq;
 	uvlong	epoch;
@@ -96,7 +97,7 @@ slotoff(Mon *m, uvlong sec, int i)
  * every offset below meaningless, and §10 makes both MUSTs.
  */
 static int
-hdrsane(Monhdr *h, Dev *d)
+hdrsane(Monhdr *h, Dev *d, vlong size)
 {
 	if(h->slotsz == 0 || h->slotsz % d->secsz != 0){
 		werrstr("slotsz %lud is not a multiple of the %lud-byte sector",
@@ -118,10 +119,10 @@ hdrsane(Monhdr *h, Dev *d)
 			h->curoff, h->histoff);
 		return -1;
 	}
-	if(monbytes(d->secsz, h->slotsz, h->retain) > (uvlong)d->size){
+	if(monbytes(d->secsz, h->slotsz, h->retain) > (uvlong)size){
 		werrstr("a slotsz of %lud and retain of %lud need %llud bytes "
 			"of a %lld-byte device", h->slotsz, h->retain,
-			monbytes(d->secsz, h->slotsz, h->retain), d->size);
+			monbytes(d->secsz, h->slotsz, h->retain), size);
 		return -1;
 	}
 	return 0;
@@ -175,7 +176,7 @@ monhdrunpack(Monhdr *h, uchar *p, Dev *d)
 	h->retain = GBIT32(p + 36);
 	h->curoff = GBIT64(p + 40);
 	h->histoff = GBIT64(p + 48);
-	return hdrsane(h, d);
+	return hdrsane(h, d, d->size);
 }
 
 static vlong
@@ -201,6 +202,22 @@ monhdrsel(Dev *d, Monhsel *sel)
 
 	memset(sel, 0, sizeof *sel);
 	sel->use = -1;
+	/*
+	 * Copy 1 is the LAST sector, so a device with fewer than two of
+	 * them has nowhere to read it from and hdr1off would name an
+	 * offset before the start.  The guard is here rather than in
+	 * the callers because every one of them — monfmt, and both
+	 * commands asking whether an image is a store — may be handed
+	 * an empty or truncated file.
+	 */
+	if(d->size < 2*(vlong)d->secsz){
+		for(i = 0; i < 2; i++)
+			snprint(sel->why[i], sizeof sel->why[i],
+				"a %lld-byte device holds no header sector",
+				d->size);
+		werrstr("no valid monitor header: %s", sel->why[0]);
+		return -1;
+	}
 	if((buf = malloc(d->secsz)) == nil)
 		return -1;
 	for(i = 0; i < 2; i++){
@@ -270,6 +287,7 @@ slotread(Mon *m, vlong off, Monslot *sl)
 	slotclear(sl);
 	if(devread(d, m->buf, d->secsz, off) < 0){
 		snprint(sl->why, sizeof sl->why, "unreadable: %r");
+		sl->unread = 1;
 		return;
 	}
 	if(memcmp(m->buf, mapmagic, 8) != 0){
@@ -291,6 +309,7 @@ slotread(Mon *m, vlong off, Monslot *sl)
 	if(len > 0 && devread(d, m->buf + d->secsz,
 		roundup(len, d->secsz), off + d->secsz) < 0){
 		snprint(sl->why, sizeof sl->why, "unreadable: %r");
+		sl->unread = 1;
 		return;
 	}
 	if(!reccsumok(m->buf, d->secsz + len, Hcsumoff)){
@@ -316,9 +335,29 @@ slotread(Mon *m, vlong off, Monslot *sl)
  * flush and lands nothing would otherwise be invisible until the next
  * open: the ring would hold no entry for the current map, so position
  * 0 would not be the current map and layer-a §8.2's E−1 entry would
- * be unanswerable.  The read-back is one read of at most slotsz
- * against a flush that costs 8.6 ms (§10's cost model).
+ * be unanswerable.  What it proves is that the device ACCEPTED the
+ * bytes and not that they are on the platter — the read is answered
+ * by the same write cache the flush was meant to drain — which is
+ * the case §10 keeps it for.  It is two reads, slotread's, because
+ * that reader is the start's too and must bounds-check len before
+ * reading the bytes len names.
+ *
+ * The read-back has two outcomes that are not the same fact, and §10
+ * separates them.  A slot that reads back and is not the one written
+ * says the map is NOT durable.  A read that FAILS says nothing about
+ * the write at all: the slot may be on the platter.  The read is
+ * retried once — a media read has its own transients, and the write
+ * and the flush under it have already reported success — and if it
+ * fails again the answer is Vunknown, which §10 calls an
+ * indeterminate publish.
  */
+enum
+{
+	Vok	= 0,	/* the platter holds the slot that was written */
+	Vwrong,		/* it read back, and it is not that slot */
+	Vunknown,	/* it could not be read back, twice */
+};
+
 static int
 slotverify(Mon *m, vlong off, ulong len, uvlong seq, uvlong epoch)
 {
@@ -327,6 +366,17 @@ slotverify(Mon *m, vlong off, ulong len, uvlong seq, uvlong epoch)
 
 	memset(&sl, 0, sizeof sl);
 	slotread(m, off, &sl);
+	if(sl.unread)
+		slotread(m, off, &sl);
+	if(sl.unread){
+		snprint(why, sizeof why, "%s", sl.why);
+		slotclear(&sl);
+		/* short enough that ERRMAX leaves room for why */
+		werrstr("indeterminate publish: seq %llud epoch %llud was "
+			"written and flushed but would not read back: %s",
+			seq, epoch, why);
+		return Vunknown;
+	}
 	if(!sl.valid)
 		snprint(why, sizeof why, "%s", sl.why);
 	else if(sl.len != len || sl.seq != seq || sl.epoch != epoch)
@@ -334,12 +384,12 @@ slotverify(Mon *m, vlong off, ulong len, uvlong seq, uvlong epoch)
 			"epoch %llud", sl.len, sl.seq, sl.epoch);
 	else{
 		slotclear(&sl);
-		return 0;
+		return Vok;
 	}
 	slotclear(&sl);
 	werrstr("the slot did not read back after its flush (len %lud "
 		"seq %llud epoch %llud): %s", len, seq, epoch, why);
-	return -1;
+	return Vwrong;
 }
 
 /*
@@ -349,6 +399,11 @@ slotverify(Mon *m, vlong off, ulong len, uvlong seq, uvlong epoch)
  * devsd turns a write whose byte count is not a sector multiple into
  * a read-modify-write; it is one devwrite, which splits at Wunit
  * itself.
+ *
+ * It answers 0, -1 for a slot the platter does not hold, and -2 when
+ * the read-back could not say (§10's indeterminate publish): the
+ * caller's bookkeeping differs, because -2 leaves bytes that may be
+ * durable and -1 does not.
  */
 static int
 slotwrite(Mon *m, vlong off, ulong len, uvlong seq, uvlong epoch,
@@ -373,8 +428,12 @@ slotwrite(Mon *m, vlong off, ulong len, uvlong seq, uvlong epoch,
 	devpoint(d, point, 0);
 	if(devflush(d) < 0)
 		return -1;
-	if(slotverify(m, off, len, seq, epoch) < 0)
+	switch(slotverify(m, off, len, seq, epoch)){
+	case Vwrong:
 		return -1;
+	case Vunknown:
+		return -2;
+	}
 	if(after != nil)
 		devpoint(d, after, 0);
 	return 0;
@@ -396,9 +455,54 @@ slotset(Monslot *sl, ulong len, uvlong seq, uvlong epoch, void *text)
 }
 
 /*
+ * Every geometry and size refusal a format makes, asked of a size
+ * that need not be the device's own.  `shoalmonfmt -z' asks it about
+ * the length the image would be given, BEFORE resizing it, because
+ * §12 has a refused run leave the file byte-identical; monfmt below
+ * asks it about the device it is about to write.  It fills in c's
+ * defaults, so a caller may report what would be used.
+ *
+ * §10 sizes the partition at 4 MiB and refuses less than 1 MiB.  That
+ * floor is about the deployment and not about the arithmetic — a
+ * 1 MiB partition holds the default geometry with room to spare — so
+ * it is checked before the geometry, whose own refusal would
+ * otherwise answer for it.  It is asked of the size as given, not of
+ * the sector-rounded device length, so that a 40-byte image is
+ * refused as 40 bytes and not as 0.
+ */
+int
+monfmtcheck(Dev *d, vlong size, Monfmtcfg *c)
+{
+	Monhdr h;
+	ulong slotsecs;
+
+	if(c->slotsz == 0)
+		c->slotsz = Monslotszdflt;
+	if(c->retain == 0)
+		c->retain = Monretaindflt;
+	memset(&h, 0, sizeof h);
+	h.vers = Monvers;
+	h.slotsz = c->slotsz;
+	h.retain = c->retain;
+	slotsecs = 0;
+	if(c->slotsz % d->secsz == 0)
+		slotsecs = c->slotsz / d->secsz;
+	h.curoff = 1;
+	h.histoff = 1 + 2*(uvlong)slotsecs;
+	if(size < Monminbytes){
+		werrstr("%lld bytes is under the %d-byte minimum §10 sets",
+			size, Monminbytes);
+		return -1;
+	}
+	return hdrsane(&h, d, size - size % (vlong)d->secsz);
+}
+
+/*
  * Format, §10 and §12.  Every refusal shoalmonfmt makes it makes
  * here, so that a T1 program drives the tool's decisions rather than
- * its argument parsing.
+ * its argument parsing — with the two exceptions §12 names, both of
+ * them about a file image the library never sees: which length to
+ * open it at, and whether `-z' may shorten it.
  *
  * What a fresh store holds is §10's format-time contents and is not
  * arbitrary: both current slots are written as VALID empty maps at
@@ -427,42 +531,16 @@ monfmt(Dev *d, Monfmtcfg *c)
 	Sbsel sel;
 	uchar *buf;
 	uvlong need;
-	ulong slotsecs;
 	int i;
 
-	if(c->slotsz == 0)
-		c->slotsz = Monslotszdflt;
-	if(c->retain == 0)
-		c->retain = Monretaindflt;
 	c->warnsuper = 0;
-	memset(&h, 0, sizeof h);
-	h.vers = Monvers;
-	h.slotsz = c->slotsz;
-	h.retain = c->retain;
-	slotsecs = 0;
-	if(c->slotsz % d->secsz == 0)
-		slotsecs = c->slotsz / d->secsz;
-	h.curoff = 1;
-	h.histoff = 1 + 2*(uvlong)slotsecs;
-	/*
-	 * §10 sizes the partition at 4 MiB and refuses less than
-	 * 1 MiB.  That floor is about the deployment and not about the
-	 * arithmetic — a 1 MiB partition holds the default geometry
-	 * with room to spare — so it is checked before the geometry,
-	 * whose own refusal would otherwise answer for it.
-	 */
-	if(d->size < Monminbytes){
-		werrstr("%lld bytes is under the %d-byte minimum §10 sets",
-			d->size, Monminbytes);
-		return -1;
-	}
-	if(hdrsane(&h, d) < 0)
-		return -1;
-	need = monbytes(d->secsz, c->slotsz, c->retain);
-
 	/*
 	 * Reformatting destroys every published map this partition
-	 * holds, so it takes a flag, exactly as shoalfmt -r does.
+	 * holds, so it takes a flag, exactly as shoalfmt -r does.  It
+	 * is asked BEFORE the geometry and the size, so that a run
+	 * refused for either of those is refused over a store still
+	 * standing: §12 has the tools resize an image only past this
+	 * point, and a refusal here must be the one they report.
 	 */
 	if(!c->ream){
 		Monhsel hs;
@@ -479,11 +557,22 @@ monfmt(Dev *d, Monfmtcfg *c)
 	 * §12: a unit that carries a valid object-store superblock is
 	 * an object-store instance's, and §2.1's deployment rule says
 	 * the monitor's partition MUST NOT be one.  It is a warning
-	 * and not a refusal — the operator may be reclaiming a
+	 * and not a refusal here — the operator may be reclaiming a
 	 * decommissioned unit — so the caller is told and decides.
+	 * `shoalmonfmt' is the caller that decides it needs -r.
 	 */
 	if(superselect(d, &sel) == 0)
 		c->warnsuper = 1;
+
+	if(monfmtcheck(d, d->size, c) < 0)
+		return -1;
+	memset(&h, 0, sizeof h);
+	h.vers = Monvers;
+	h.slotsz = c->slotsz;
+	h.retain = c->retain;
+	h.curoff = 1;
+	h.histoff = 1 + 2*(uvlong)(c->slotsz/d->secsz);
+	need = monbytes(d->secsz, c->slotsz, c->retain);
 
 	if((buf = mallocz(d->secsz, 1)) == nil)
 		return -1;
@@ -649,6 +738,56 @@ histvictim(Mon *m)
 }
 
 /*
+ * The books after a ring write that failed.  The slot is invalid in
+ * memory, but the platter was not told: a write that landed nothing
+ * leaves the victim's own bytes there, and a victim that was a
+ * phantom is STILL a phantom on the disk.  Forgetting that would send
+ * the next commit's victim search past it to some other slot, the
+ * next published map would raise seq above the phantom's, and it
+ * would read back at the following open as ordinary history for a map
+ * that was never published.  So the slot stays first in line for
+ * reuse — invalid and phantom both — and nphantom counts it once.
+ *
+ * Unless the platter says otherwise.  When the ring is full the
+ * victim is an ordinary committed entry, and a write that landed
+ * nothing left it exactly where it was: one read says so, and an
+ * entry whose seq is not above the current map's is history this
+ * store can still answer, so it goes back into memory as it is found
+ * rather than vanishing from monhistory and monlookup — and counting
+ * as a phantom the disk does not hold — until the next open.  The
+ * read is not made after an INDETERMINATE write (§10): the read-back
+ * has already failed twice on this slot, so whatever is there is not
+ * to be trusted as the victim's own bytes, and the slot must be the
+ * next one reused.
+ */
+static void
+histfail(Mon *m, int v, char *err, int indet)
+{
+	Monslot sl;
+	int wasphantom;
+
+	wasphantom = m->hist[v].phantom;
+	if(!indet){
+		memset(&sl, 0, sizeof sl);
+		slotread(m, slotoff(m, m->h.histoff, v), &sl);
+		if(sl.valid && sl.seq <= m->cur[m->curi].seq){
+			slotclear(&m->hist[v]);
+			m->hist[v] = sl;
+			if(wasphantom && m->nphantom > 0)
+				m->nphantom--;
+			return;
+		}
+		slotclear(&sl);
+	}
+	slotclear(&m->hist[v]);
+	snprint(m->hist[v].why, sizeof m->hist[v].why,
+		"the write that failed the commit: %s", err);
+	m->hist[v].phantom = 1;
+	if(!wasphantom)
+		m->nphantom++;
+}
+
+/*
  * Commit, §10, in two steps with one flush each.
  *
  * Step 1 writes the ring entry for the new map, stamped with the seq
@@ -670,7 +809,7 @@ moncommit(Mon *m, void *text, ulong len, uvlong epoch)
 {
 	char err[ERRMAX];
 	uvlong seq;
-	int v, c, wasphantom;
+	int v, c, r;
 
 	if(len > m->h.slotsz - m->d->secsz){
 		/*
@@ -686,30 +825,23 @@ moncommit(Mon *m, void *text, ulong len, uvlong epoch)
 	}
 	seq = m->seqnext;
 	v = histvictim(m);
-	if(slotwrite(m, slotoff(m, m->h.histoff, v), len, seq, epoch, text,
-		"monhist", "monhistflush") < 0){
+	r = slotwrite(m, slotoff(m, m->h.histoff, v), len, seq, epoch, text,
+		"monhist", "monhistflush");
+	if(r < 0){
 		rerrstr(err, sizeof err);
-		wasphantom = m->hist[v].phantom;
-		slotclear(&m->hist[v]);
-		snprint(m->hist[v].why, sizeof m->hist[v].why,
-			"the write that failed the commit: %s", err);
 		/*
-		 * The slot is invalid in memory, but the platter was not
-		 * told: a write that landed nothing leaves the victim's own
-		 * bytes there, and a victim that was a phantom is STILL a
-		 * phantom on the disk.  Forgetting that would send the next
-		 * commit's victim search past it to some other slot, the
-		 * next published map would raise seq above the phantom's,
-		 * and it would read back at the following open as ordinary
-		 * history for a map that was never published.  So the slot
-		 * stays first in line for reuse — invalid and phantom both —
-		 * and nphantom counts it exactly once.  The sibling path
-		 * below, for a failed current-slot write, keeps the same
-		 * books.
+		 * An indeterminate write may be on the platter carrying
+		 * this seq, so the seq is spent whether it is or not: the
+		 * next commit's is above it, which makes a retry outrank
+		 * anything that landed and keeps two entries from sharing
+		 * one seq.  A determinate failure landed nothing and
+		 * leaves the number to be used again.  histfail keeps the
+		 * rest of the books; the sibling path below, for a failed
+		 * current-slot write, keeps them for that case.
 		 */
-		m->hist[v].phantom = 1;
-		if(!wasphantom)
-			m->nphantom++;
+		if(r == -2)
+			m->seqnext = seq + 1;
+		histfail(m, v, err, r == -2);
 		errstr(err, sizeof err);
 		return -1;
 	}
@@ -727,12 +859,31 @@ moncommit(Mon *m, void *text, ulong len, uvlong epoch)
 	else if(m->cur[0].valid || m->cur[1].valid)
 		c = m->cur[0].valid ? 1 : 0;
 	else{
+		/*
+		 * §2.2's third clause, copied into §10's step 2, and not
+		 * a path: monopen refuses a store with neither current
+		 * slot valid, and after one failed write here the
+		 * selection above re-targets the slot it has just
+		 * invalidated, so the valid one is never written and
+		 * cannot become invalid.  It is unreachable from a store
+		 * this process opened — its phantom bookkeeping is for a
+		 * case that does not arrive — and it stays because the
+		 * rule it states is the rule.
+		 */
 		werrstr("no valid current-map slot: slot 0 %s; slot 1 %s",
 			m->cur[0].why, m->cur[1].why);
 		m->hist[v].phantom = 1;
 		m->nphantom++;
 		return -1;
 	}
+	/*
+	 * A failure here — the write, the flush or the read-back, and
+	 * INDETERMINATE or not — leaves the slot unserved in memory and
+	 * the ring entry a phantom.  The seq was spent above, so a
+	 * retry in this session outranks an indeterminate slot that did
+	 * land, and the retry writes over it: the selection above takes
+	 * the invalid slot, which is this one.
+	 */
 	if(slotwrite(m, slotoff(m, m->h.curoff, c), len, seq, epoch, text,
 		"moncur", nil) < 0){
 		rerrstr(err, sizeof err);
