@@ -46,6 +46,7 @@ struct Monslot
 {
 	int	valid;
 	int	phantom;	/* seq above the current map's: never published */
+	int	unread;		/* the device read failed: nothing was seen */
 	ulong	len;
 	uvlong	seq;
 	uvlong	epoch;
@@ -270,6 +271,7 @@ slotread(Mon *m, vlong off, Monslot *sl)
 	slotclear(sl);
 	if(devread(d, m->buf, d->secsz, off) < 0){
 		snprint(sl->why, sizeof sl->why, "unreadable: %r");
+		sl->unread = 1;
 		return;
 	}
 	if(memcmp(m->buf, mapmagic, 8) != 0){
@@ -291,6 +293,7 @@ slotread(Mon *m, vlong off, Monslot *sl)
 	if(len > 0 && devread(d, m->buf + d->secsz,
 		roundup(len, d->secsz), off + d->secsz) < 0){
 		snprint(sl->why, sizeof sl->why, "unreadable: %r");
+		sl->unread = 1;
 		return;
 	}
 	if(!reccsumok(m->buf, d->secsz + len, Hcsumoff)){
@@ -316,9 +319,24 @@ slotread(Mon *m, vlong off, Monslot *sl)
  * flush and lands nothing would otherwise be invisible until the next
  * open: the ring would hold no entry for the current map, so position
  * 0 would not be the current map and layer-a §8.2's E−1 entry would
- * be unanswerable.  The read-back is one read of at most slotsz
- * against a flush that costs 8.6 ms (§10's cost model).
+ * be unanswerable.
+ *
+ * The read-back has two outcomes that are not the same fact, and §10
+ * separates them.  A slot that reads back and is not the one written
+ * says the map is NOT durable.  A read that FAILS says nothing about
+ * the write at all: the slot may be on the platter.  The read is
+ * retried once — a media read has its own transients, and the write
+ * and the flush under it have already reported success — and if it
+ * fails again the answer is Vunknown, which §10 calls an
+ * indeterminate publish.
  */
+enum
+{
+	Vok	= 0,	/* the platter holds the slot that was written */
+	Vwrong,		/* it read back, and it is not that slot */
+	Vunknown,	/* it could not be read back, twice */
+};
+
 static int
 slotverify(Mon *m, vlong off, ulong len, uvlong seq, uvlong epoch)
 {
@@ -327,6 +345,17 @@ slotverify(Mon *m, vlong off, ulong len, uvlong seq, uvlong epoch)
 
 	memset(&sl, 0, sizeof sl);
 	slotread(m, off, &sl);
+	if(sl.unread)
+		slotread(m, off, &sl);
+	if(sl.unread){
+		snprint(why, sizeof why, "%s", sl.why);
+		slotclear(&sl);
+		/* short enough that ERRMAX leaves room for why */
+		werrstr("indeterminate publish: seq %llud epoch %llud was "
+			"written and flushed but would not read back: %s",
+			seq, epoch, why);
+		return Vunknown;
+	}
 	if(!sl.valid)
 		snprint(why, sizeof why, "%s", sl.why);
 	else if(sl.len != len || sl.seq != seq || sl.epoch != epoch)
@@ -334,12 +363,12 @@ slotverify(Mon *m, vlong off, ulong len, uvlong seq, uvlong epoch)
 			"epoch %llud", sl.len, sl.seq, sl.epoch);
 	else{
 		slotclear(&sl);
-		return 0;
+		return Vok;
 	}
 	slotclear(&sl);
 	werrstr("the slot did not read back after its flush (len %lud "
 		"seq %llud epoch %llud): %s", len, seq, epoch, why);
-	return -1;
+	return Vwrong;
 }
 
 /*
@@ -349,6 +378,11 @@ slotverify(Mon *m, vlong off, ulong len, uvlong seq, uvlong epoch)
  * devsd turns a write whose byte count is not a sector multiple into
  * a read-modify-write; it is one devwrite, which splits at Wunit
  * itself.
+ *
+ * It answers 0, -1 for a slot the platter does not hold, and -2 when
+ * the read-back could not say (§10's indeterminate publish): the
+ * caller's bookkeeping differs, because -2 leaves bytes that may be
+ * durable and -1 does not.
  */
 static int
 slotwrite(Mon *m, vlong off, ulong len, uvlong seq, uvlong epoch,
@@ -373,8 +407,12 @@ slotwrite(Mon *m, vlong off, ulong len, uvlong seq, uvlong epoch,
 	devpoint(d, point, 0);
 	if(devflush(d) < 0)
 		return -1;
-	if(slotverify(m, off, len, seq, epoch) < 0)
+	switch(slotverify(m, off, len, seq, epoch)){
+	case Vwrong:
 		return -1;
+	case Vunknown:
+		return -2;
+	}
 	if(after != nil)
 		devpoint(d, after, 0);
 	return 0;
@@ -649,6 +687,31 @@ histvictim(Mon *m)
 }
 
 /*
+ * The books after a ring write that failed.  The slot is invalid in
+ * memory, but the platter was not told: a write that landed nothing
+ * leaves the victim's own bytes there, and a victim that was a
+ * phantom is STILL a phantom on the disk.  Forgetting that would send
+ * the next commit's victim search past it to some other slot, the
+ * next published map would raise seq above the phantom's, and it
+ * would read back at the following open as ordinary history for a map
+ * that was never published.  So the slot stays first in line for
+ * reuse — invalid and phantom both — and nphantom counts it once.
+ */
+static void
+histfail(Mon *m, int v, char *err)
+{
+	int wasphantom;
+
+	wasphantom = m->hist[v].phantom;
+	slotclear(&m->hist[v]);
+	snprint(m->hist[v].why, sizeof m->hist[v].why,
+		"the write that failed the commit: %s", err);
+	m->hist[v].phantom = 1;
+	if(!wasphantom)
+		m->nphantom++;
+}
+
+/*
  * Commit, §10, in two steps with one flush each.
  *
  * Step 1 writes the ring entry for the new map, stamped with the seq
@@ -670,7 +733,7 @@ moncommit(Mon *m, void *text, ulong len, uvlong epoch)
 {
 	char err[ERRMAX];
 	uvlong seq;
-	int v, c, wasphantom;
+	int v, c, r;
 
 	if(len > m->h.slotsz - m->d->secsz){
 		/*
@@ -686,30 +749,23 @@ moncommit(Mon *m, void *text, ulong len, uvlong epoch)
 	}
 	seq = m->seqnext;
 	v = histvictim(m);
-	if(slotwrite(m, slotoff(m, m->h.histoff, v), len, seq, epoch, text,
-		"monhist", "monhistflush") < 0){
+	r = slotwrite(m, slotoff(m, m->h.histoff, v), len, seq, epoch, text,
+		"monhist", "monhistflush");
+	if(r < 0){
 		rerrstr(err, sizeof err);
-		wasphantom = m->hist[v].phantom;
-		slotclear(&m->hist[v]);
-		snprint(m->hist[v].why, sizeof m->hist[v].why,
-			"the write that failed the commit: %s", err);
 		/*
-		 * The slot is invalid in memory, but the platter was not
-		 * told: a write that landed nothing leaves the victim's own
-		 * bytes there, and a victim that was a phantom is STILL a
-		 * phantom on the disk.  Forgetting that would send the next
-		 * commit's victim search past it to some other slot, the
-		 * next published map would raise seq above the phantom's,
-		 * and it would read back at the following open as ordinary
-		 * history for a map that was never published.  So the slot
-		 * stays first in line for reuse — invalid and phantom both —
-		 * and nphantom counts it exactly once.  The sibling path
-		 * below, for a failed current-slot write, keeps the same
-		 * books.
+		 * An indeterminate write may be on the platter carrying
+		 * this seq, so the seq is spent whether it is or not: the
+		 * next commit's is above it, which makes a retry outrank
+		 * anything that landed and keeps two entries from sharing
+		 * one seq.  A determinate failure landed nothing and
+		 * leaves the number to be used again.  histfail keeps the
+		 * rest of the books; the sibling path below, for a failed
+		 * current-slot write, keeps them for that case.
 		 */
-		m->hist[v].phantom = 1;
-		if(!wasphantom)
-			m->nphantom++;
+		if(r == -2)
+			m->seqnext = seq + 1;
+		histfail(m, v, err);
 		errstr(err, sizeof err);
 		return -1;
 	}
@@ -733,6 +789,14 @@ moncommit(Mon *m, void *text, ulong len, uvlong epoch)
 		m->nphantom++;
 		return -1;
 	}
+	/*
+	 * A failure here — the write, the flush or the read-back, and
+	 * INDETERMINATE or not — leaves the slot unserved in memory and
+	 * the ring entry a phantom.  The seq was spent above, so a
+	 * retry in this session outranks an indeterminate slot that did
+	 * land, and the retry writes over it: the selection above takes
+	 * the invalid slot, which is this one.
+	 */
 	if(slotwrite(m, slotoff(m, m->h.curoff, c), len, seq, epoch, text,
 		"moncur", nil) < 0){
 		rerrstr(err, sizeof err);

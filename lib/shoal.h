@@ -1064,8 +1064,13 @@ struct Monstat
  * map untouched.  Each slot is READ BACK after its flush and checked,
  * so a write that reports success and does not land fails the commit
  * exactly as a failed one does (§10); a device that loses the bytes
- * after acknowledging the flush is outside the model.  moncurrent
- * answers 0 for "this store holds no map".
+ * after acknowledging the flush is outside the model.  A read-back
+ * whose READ fails, twice, is a third outcome: the commit fails
+ * saying the publish is INDETERMINATE, because the slot may be on the
+ * platter.  Such a slot is not served by this process and its seq is
+ * spent, so a retry outranks it; a monitor that fails a publish has
+ * not acknowledged it, and the map may still be there at the next
+ * open (§10).  moncurrent answers 0 for "this store holds no map".
  * monhistory walks the ring newest-first, position 0 being the
  * current map itself, and answers 0 past the end.  monlookup answers
  * the entry for an epoch, taking the greater seq when two carry one

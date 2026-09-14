@@ -2821,18 +2821,36 @@ than as an empty map text.
 
 **Each slot is read back after its flush** and checked — magic,
 `vers`, `len` within the slot, the checksum over `secsz+len`, and the
-`seq`, `len` and `epoch` just written. A read-back that does not
-verify fails the commit exactly as a failed write does: step 1's
-victim stays invalid and a phantom, step 2's slot is left invalid and
-the ring entry becomes a phantom, and the in-memory state matches the
-disk either way. That is what makes step 1's "a torn ring write …
-fails the commit" true rather than hopeful: a `Sfdrop` or a torn
-write reports success, survives its flush and lands nothing, and
-without the read-back the running monitor holds a ring entry the
-platter does not — so position 0 would stop being the current map and
-layer-a §8.2's `E−1` entry would be unanswerable at the next start.
-The cost is one read of at most `slotsz` against a flush that costs
-8.6 ms.
+`seq`, `len` and `epoch` just written. That is what makes step 1's "a
+torn ring write … fails the commit" true rather than hopeful: a
+`Sfdrop` or a torn write reports success, survives its flush and
+lands nothing, and without the read-back the running monitor holds a
+ring entry the platter does not — so position 0 would stop being the
+current map and layer-a §8.2's `E−1` entry would be unanswerable at
+the next start.
+
+A slot that **reads back and is not the one written** says the map is
+not durable, and the commit fails exactly as a failed write does:
+step 1's victim stays invalid and a phantom, step 2's slot is left
+invalid and the ring entry becomes a phantom, and nothing the monitor
+serves claims a map the platter does not hold.
+
+A read-back whose **read fails** is a different fact, and this store
+does not confuse the two: a read that failed says nothing about the
+write under it, so the slot may be on the platter. The read is
+**retried once**; if it fails again the commit fails with the publish
+declared *indeterminate* — written and flushed, and not readable
+back. The in-memory state is then made safe against whatever landed:
+the slot is not served, its `seq` is **spent** so that the next
+commit's is above it — a retry outranks anything that did land, and
+no two entries share one `seq` — and a ring victim is phantom-first
+for reuse besides. A failed commit therefore means **the map is not
+served by this monitor process**. It may be on the platter, and then
+the next open serves it; that is exactly the outcome of a crash
+between step 2's flush and the monitor's acknowledgement, which the
+crash argument above already covers, because layer-a §8.2 requires
+durable-before-ack and not ack-iff-durable. The operator's retry
+publishes above it either way.
 
 The read-back catches a device that loses the write *before*
 acknowledging the flush. A device that acknowledges a flush and then
@@ -3444,7 +3462,13 @@ commit — §10's read-back under a write that reports success and lands
 nothing (`Sfdrop`) or lands a mix of old and new bytes
 (`Sftearbyte`), on the ring slot and on the current slot in turn,
 each failing the commit and leaving the restart on the previous map
-with position 0 still equal to it; **T1.9's second half**, a crash at
+with position 0 still equal to it; the read-back's own READ failing,
+on each slot in turn — once, where the retry carries the commit
+through, and twice, where the publish is indeterminate: the commit
+fails saying so, the slot is not served, its `seq` is spent, and the
+retry of the same session is what the restart serves rather than the
+orphan, with no two ring entries carrying one `seq`;
+**T1.9's second half**, a crash at
 `moncur` leaving the previous map current and the failed publish's
 ring entry a phantom, and a slot torn
 at a high `seq` not steering the next write onto the only good one;
