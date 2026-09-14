@@ -885,6 +885,71 @@ tringfailphantom(void)
 }
 
 /*
+ * The monitor retries in the SAME session after a current-slot write
+ * fails.  Nothing restarts here, so the phantom mark that failure
+ * leaves has to hold in memory: the ring entry for the map that was
+ * never published must stay out of every accessor, and the retry must
+ * reuse that slot rather than spend a fresh one on it.  The crash
+ * cases all restart, so this path was never exercised.
+ */
+static void
+tcurfailretry(void)
+{
+	Dev *d;
+	Mon *m;
+	Monstat st;
+	Monmap mm;
+
+	d = fresh();
+	if((m = mustopen(d, "curfail")) == nil){
+		devclose(d);
+		return;
+	}
+	commit(m, "curfail", "map=A", 1);
+	commit(m, "curfail", "map=B", 2);
+	monstat(m, &st);
+
+	/* the current write, and only it, takes an i/o error */
+	simfaultat(d, Sfeio, 1, curoffs(&st, st.cur == 0 ? 1 : 0), st.slotsz);
+	checks++;
+	if(moncommit(m, "map=GHOST", 9, 7) == 0)
+		fail("curfail: a commit whose current write failed reported "
+			"success");
+	monstat(m, &st);
+	eqv("curfail: the current map is still B", st.epoch, 2);
+	eqv("curfail: the unpublished ring entry is a phantom", st.nphantom,
+		1);
+	eqv("curfail: and is not a history entry", st.nhist, 2);
+	eqi("curfail: the unpublished epoch answers nothing",
+		monlookup(m, 7, &mm), 0);
+
+	/* the retry, with no restart between */
+	checks++;
+	if(moncommit(m, "map=C", 5, 3) < 0)
+		fail("curfail: the retry: %r");
+	monstat(m, &st);
+	eqv("curfail: the retry is current", st.epoch, 3);
+	eqv("curfail: it consumed the phantom", st.nphantom, 0);
+	eqv("curfail: three published maps", st.nhist, 3);
+	eqi("curfail: the ghost is still unanswerable",
+		monlookup(m, 7, &mm), 0);
+	monclose(m);
+
+	if((m = mustopen(d, "curfail restart")) == nil){
+		devclose(d);
+		return;
+	}
+	monstat(m, &st);
+	eqv("curfail: the restart finds the retry", st.epoch, 3);
+	eqv("curfail: no phantom after it", st.nphantom, 0);
+	eqv("curfail: three published maps after it", st.nhist, 3);
+	eqi("curfail: and the ghost is gone from the disk",
+		monlookup(m, 7, &mm), 0);
+	monclose(m);
+	devclose(d);
+}
+
+/*
  * Ring wrap.  More commits than retain: the oldest seq is the victim
  * each time, so the ring always holds the newest retain maps and
  * layer-a §5.2 clause 2's E-1 entry is always one of them.
@@ -1419,6 +1484,7 @@ main(int, char**)
 	tphantom();
 	thistfail();
 	tringfailphantom();
+	tcurfailretry();
 	tring();
 	tfull();
 	theader();

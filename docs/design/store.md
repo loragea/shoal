@@ -3397,7 +3397,9 @@ reuses the phantom's slot; a ring write that fails and a crash at
 `monhist`, each leaving the current map untouched; a ring write that
 fails *over a phantom victim*, after which the retry reuses that same
 slot and the never-published epoch is still unanswerable at the next
-start; `disk full` on an
+start; a current-slot write that fails and is retried *in the same
+session*, where the phantom mark has to hold in memory with no restart
+to rebuild it; `disk full` on an
 oversize map with the store unchanged, and the largest map that fits
 read back byte-exact; the header copies — one damaged, both damaged,
 and two valid copies that differ — a current slot whose `len` does not
