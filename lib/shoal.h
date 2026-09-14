@@ -797,13 +797,24 @@ int	objslot(Store*, ulong slot, uchar *oid, int *oidlen, Objinfo*);
  * §9's snapshot-at-open enumeration: what a server's /obj, /tombs and
  * /advert fids read, and layer-a §2.2's SHOULD for the first two.
  *
- * objsnapopen takes, under one hold of the state lock, the vector of
- * {slot, qid.path} of every index entry whose state is in kinds —
- * Snaplive for /obj, Snaptomb for /tombs, both for /advert — and
- * releases the lock before it returns.  12 bytes an entry, §9's
- * sizing.  Nothing is locked afterwards and the snapshot holds no
- * reference the engine must honour: it is a list of names, and an
- * entry a later discard removes simply becomes gone.
+ * objsnapopen takes the vector of {slot, qid.path} of every index
+ * entry whose state is in kinds — Snaplive for /obj, Snaptomb for
+ * /tombs, both for /advert — and holds no lock once it returns.  12
+ * bytes an entry, §9's sizing.  The snapshot holds no reference the
+ * engine must honour: it is a list of names, and an entry a later
+ * discard removes simply becomes gone.
+ *
+ * It takes TWO holds of the state lock to do that — the count under
+ * one, the vector allocated outside any, the fill under the next —
+ * and up to Snaptries pairs of them when the index grows past the
+ * vector's slack in between, which is why it can fail with `object
+ * snapshot: the index moved under 8 counts'.  That failure is
+ * pathological and not ordinary: the vector is allocated with slack
+ * over the count, so a create rate would have to outrun a malloc
+ * eight times running to provoke it.  It is not a layer-a §2.6
+ * condition — nothing is full and nothing is broken — so it carries
+ * no §2.6 prefix (§3.7), and a server SHOULD retry the open once
+ * before answering a client at all.
  *
  * Access is by POSITION, not by slot, which is what lets a server map
  * a Tread offset onto an entry and restart from 0 on a re-read, the
@@ -827,13 +838,19 @@ int	objslot(Store*, ulong slot, uchar *oid, int *oidlen, Objinfo*);
  * The number of snapshots open at once is bounded by Storecfg's
  * objsnapmax (§9: policy, default Objsnapmaxdflt), because the cost
  * is per open fid; an open past it answers `disk full' (layer-a
- * §2.6).  objsnapclose releases the count.  A snapshot is the
+ * §2.6).  The bound is tested and the count taken in one step under
+ * one hold of the state lock, so two opens racing cannot both find
+ * room; an open that fails after that gives the count back, and
+ * Storestat counts an open in flight.  objsnapclose releases the
+ * count.  A snapshot is the
  * caller's, and storeclose frees nothing of the caller's, so every
  * snapshot MUST be closed before the store it was taken from is:
  * storeclose `sysfatal's on a store that still has one open, because
  * the alternative is a snapshot answering "gone" for every entry out
- * of freed memory.  Closing one twice is the same class of bug and
- * cannot be caught: the second call reads a handle the first freed.
+ * of freed memory.  Closing one twice is UNDEFINED, exactly as
+ * freeing the same pointer twice is: the second call reads a handle
+ * the first freed, whose first word the pool has already overwritten,
+ * so there is nothing it can check and no guard that would help.
  */
 enum
 {

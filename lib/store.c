@@ -134,10 +134,12 @@ storehook(Store *s, char *name, uvlong n)
 		/*
 		 * §9's snapshot open counts the index, allocates the vector
 		 * outside the lock and fills it under a second hold, so the
-		 * count can be stale by the time the fill runs.  This makes
-		 * the next n counts short by one, which is what a create in
-		 * that window leaves, so a test can drive the re-count
-		 * without racing for it.
+		 * index can have grown by the time the fill runs.  This makes
+		 * the next n fill attempts find the vector one entry short of
+		 * the index, which is what a growth past the vector's slack
+		 * leaves, so a test can drive the re-count without racing for
+		 * it.  One is spent per fill attempt, not per open, and an
+		 * open makes up to Snaptries of those.
 		 */
 		qlock(&s->qlstate);
 		s->snapstale = n;
@@ -1124,6 +1126,7 @@ void
 storeclose(Store *s)
 {
 	ulong n;
+	int die;
 
 	if(s == nil)
 		return;
@@ -1135,11 +1138,29 @@ storeclose(Store *s)
 	 * is a plausible lie: a fid-lifetime bug in a server becomes a
 	 * silently short /obj listing.  There is no answer this can give
 	 * that is not one, so it says so out loud instead.
+	 *
+	 * The count is read and the decision taken under one hold of
+	 * qlstate, but the death is outside it, and that is not an
+	 * oversight.  sysfatal ends with exits(), which on Plan 9 ends
+	 * the calling PROC and not its rfork(RFMEM) group: a qlstate
+	 * carried into it is a QLock no one will ever unlock, and every
+	 * sibling that touches the store afterwards sleeps in Rendez for
+	 * ever.  Measured, with the sysfatal moved inside the hold: the
+	 * T1 case for this call wedges two procs and never returns.
+	 *
+	 * What the window between the unlock and the death costs is
+	 * nothing a conforming caller can see.  It is reachable only by
+	 * opening or closing a snapshot concurrently with storeclose,
+	 * and a caller doing that has already broken the contract this
+	 * call exists to enforce — every snapshot MUST be closed before
+	 * the store is, which orders them, so there is no legitimate
+	 * concurrent open or close for the window to mis-judge.
 	 */
 	qlock(&s->qlstate);
 	n = s->nobjsnap;
+	die = n > 0;
 	qunlock(&s->qlstate);
-	if(n > 0)
+	if(die)
 		sysfatal("storeclose: %lud object snapshot%s still open",
 			n, n == 1 ? "" : "s");
 	qlock(&s->cklk);

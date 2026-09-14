@@ -42,6 +42,16 @@ enum
 	Nconc		= 1000,			/* untouched at open */
 	Nchurn		= 500,			/* churned under the walk */
 	Nproc		= 4,
+
+	/*
+	 * tsnapchurn's geometry: how many opens it makes under the same
+	 * four churning procs, and the two sets beside the churned one.
+	 * 2000 is enough to see a per-open refusal rate of a few percent
+	 * many times over and still run in well under a second.
+	 */
+	Nsnapopen	= 2000,
+	Nfixed		= 700,			/* live, never touched */
+	Nfixtomb	= 200,			/* tombstones, never touched */
 };
 
 static Dev*
@@ -694,11 +704,13 @@ out:
 /*
  * §9's open counts the index under qlstate, releases it to allocate
  * the vector — 12 MB at nslots = 2^20, which §7 rule 2 will not have
- * under a state lock — and re-takes it to fill.  The count can be
- * stale by then, and a vector short of the index is objsnap=partial,
- * which the engine does not have: it counts again.  §13's snapstale
- * point takes the count one short, which is what a create in that
- * window leaves, so this does not have to race for it.
+ * under a state lock — and re-takes it to fill.  The index can have
+ * outgrown the vector by then, and a vector short of the index is
+ * objsnap=partial, which the engine does not have: it counts and
+ * allocates again.  The vector's slack makes that rare enough that a
+ * test cannot race for it, so §13's snapstale point hands the fill a
+ * vector one entry short of the index instead — one per fill attempt,
+ * so an open spends up to Snaptries of them.
  */
 static void
 tsnapstale(void)
@@ -721,7 +733,7 @@ tsnapstale(void)
 	storehook(s, "snapstale", 1);
 	if((sn = mustsnap(s, Snaplive, "a stale count")) == nil)
 		goto out;
-	eqv("an open whose count went stale names every entry",
+	eqv("an open the index outgrew names every entry",
 		objsnapcount(sn), 10);
 	w = newwalk(16);
 	walkall(sn, w, 's');
@@ -734,9 +746,10 @@ tsnapstale(void)
 	objsnapclose(sn);
 
 	/*
-	 * The re-count is bounded: an index that moves under every
-	 * attempt is refused rather than spun on under a lock every
-	 * apply wants, and the refusal is local — nothing is full.
+	 * The re-count is bounded: an index that outgrows the vector
+	 * under every attempt is refused rather than spun on under a
+	 * lock every apply wants, and the refusal is local — nothing is
+	 * full, so §3.7 gives it no §2.6 prefix.
 	 */
 	storehook(s, "snapstale", 1000);
 	sn = objsnapopen(s, Snaplive);
@@ -1376,6 +1389,15 @@ struct Churn
 	int	done;
 	int	err;
 	int	ops;
+	/*
+	 * Park between the first delete and its discard and stay there
+	 * until unpark, so that a walk overlapping this proc is given a
+	 * tombstone of ITS making — at its wepoch — and not merely the
+	 * tombstones the test made before spawning it.
+	 */
+	int	park;
+	int	parked;
+	int	unpark;
 };
 
 /*
@@ -1400,10 +1422,19 @@ churnproc(void *a)
 			oidof(o, nm);
 			if(objremove(c->s, o, 5, 2, c->we, nil, 0) < 0)
 				c->err++;
-			else if(objdiscard(c->s, o, 5, 2, c->we, c->we+1) < 0)
-				c->err++;
-			else if(objcreate(c->s, o, 5, 1, c->we, nil, 0, nil) < 0)
-				c->err++;
+			else{
+				if(c->park && !c->parked){
+					c->parked = 1;
+					while(!c->unpark)
+						sleep(1);
+				}
+				if(objdiscard(c->s, o, 5, 2, c->we,
+					c->we+1) < 0)
+					c->err++;
+				else if(objcreate(c->s, o, 5, 1, c->we, nil,
+					0, nil) < 0)
+					c->err++;
+			}
 			c->ops++;
 		}
 	c->done = 1;
@@ -1518,6 +1549,170 @@ tconc(void)
 	walkfree(w);
 	objsnapclose(sn);
 out:
+	killspawned();
+	storeclose(s);
+	devclose(d);
+}
+
+/*
+ * §9: what the OPEN does under churn, as against what the walk does.
+ * The open counts the index under qlstate, drops the lock to
+ * allocate, and re-takes it to fill — and dropping qlstate puts it
+ * behind every apply already queued for that lock, so by the time it
+ * fills, the index has moved.  Sizing the vector to the count alone
+ * made that a refusal: this geometry, with the re-count keyed on the
+ * count having *changed* rather than having *grown past the vector*,
+ * refuses several opens in every hundred.  A legitimate open must
+ * never fail because other procs were busy, so:
+ *
+ *   - not one of Nsnapopen opens is refused, and
+ *   - every snapshot's count is one the store could really have had.
+ *
+ * The second is exact here and not a bracket around a sample.  Every
+ * object in the store belongs to one of three fixed sets, and the
+ * only one that moves is the churn's: a churn proc holds exactly one
+ * of its objects between its discard and its create, so the store
+ * holds between Nfixed+Nfixtomb+Nchurn-Nproc and Nfixed+Nfixtomb+
+ * Nchurn objects at every instant, and a Snapboth count outside that
+ * range is one no instant could have produced — which is what a
+ * silently truncated vector would look like.  Storestat either side
+ * of the loop is the same bound read from the engine's own counters.
+ *
+ * Finally one more snapshot is walked in full, so that "no refusals"
+ * cannot have been bought by serving short vectors.
+ */
+static void
+tsnapchurn(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat b, a;
+	Objsnap *sn;
+	Walk *w;
+	Churn *c[Nproc];
+	char nm[32], e[ERRMAX];
+	vlong t0;
+	ulong i, base, cnt, nopen, nrefuse, cmin, cmax;
+	int k, live;
+
+	live = 0;
+	d = bigdisk();
+	if((s = openstoreck(d)) == nil){
+		fail("the open under churn: storeopen: %r");
+		devclose(d);
+		return;
+	}
+	spawnforget();
+	t0 = nsec();
+	for(i = 0; i < Nfixed; i++){
+		snprint(nm, sizeof nm, "u%04lud", i);
+		mk(s, nm);
+	}
+	for(i = 0; i < Nfixtomb; i++){
+		snprint(nm, sizeof nm, "v%04lud", i);
+		mk(s, nm);
+		rmv(s, nm, 2);
+	}
+	for(i = 0; i < Nchurn; i++){
+		snprint(nm, sizeof nm, "m%04lud", i);
+		mk(s, nm);
+	}
+	base = Nfixed + Nfixtomb + Nchurn;
+	storestat(s, &b);
+	eqv("the store holds every object before the churn starts",
+		b.nlive + b.ntomb, base);
+	for(k = 0; k < Nproc; k++){
+		if((c[k] = mallocz(sizeof *c[k], 1)) == nil)
+			sysfatal("mallocz: %r");
+		c[k]->s = s;
+		c[k]->lo = k*(Nchurn/Nproc);
+		c[k]->hi = (k+1)*(Nchurn/Nproc);
+		c[k]->we = 1;
+		if(spawnproc(churnproc, c[k]) < 0){
+			fail("spawn: %r");
+			c[k]->done = 1;
+		}
+	}
+	for(i = 0; i < 5000; i++){
+		live = 0;
+		for(k = 0; k < Nproc; k++)
+			if(c[k]->ops > 0)
+				live++;
+		if(live == Nproc)
+			break;
+		sleep(1);
+	}
+	eqv("every churn proc is running", live, Nproc);
+
+	nopen = nrefuse = 0;
+	cmin = ~0UL;
+	cmax = 0;
+	*e = 0;
+	for(i = 0; i < Nsnapopen; i++){
+		if((sn = objsnapopen(s, Snapboth)) == nil){
+			if(nrefuse == 0)
+				rerrstr(e, sizeof e);
+			nrefuse++;
+			continue;
+		}
+		nopen++;
+		cnt = objsnapcount(sn);
+		if(cnt < cmin)
+			cmin = cnt;
+		if(cnt > cmax)
+			cmax = cnt;
+		objsnapclose(sn);
+	}
+	storestat(s, &a);
+	checks++;
+	if(nrefuse != 0)
+		fail("%lud of %d opens under churn were refused: %s",
+			nrefuse, Nsnapopen, e);
+	eqv("and every one of them was admitted", nopen, Nsnapopen);
+	istrue("no snapshot names more entries than the store can hold",
+		cmax <= base);
+	istrue("and none names fewer than the churn can be hiding",
+		cmin + Nproc >= base);
+	istrue("the engine's own counts stayed inside the same bound",
+		b.nlive + b.ntomb <= base && b.nlive + b.ntomb + Nproc >= base
+		&& a.nlive + a.ntomb <= base
+		&& a.nlive + a.ntomb + Nproc >= base);
+
+	/* and the vectors are whole, not short */
+	if((sn = mustsnap(s, Snaplive, "the open under churn")) != nil){
+		w = newwalk(Nfixed);
+		walkall(sn, w, 'u');
+		eqv("a snapshot taken under the churn is complete",
+			w->nlive - w->nother, Nfixed);
+		eqv("with no entry answered twice", w->ndup, 0);
+		for(i = 0; i < Nfixed; i++)
+			if(w->seen[i] != 1){
+				fail("u%04lud answered %d times, want 1", i,
+					w->seen[i]);
+				break;
+			}
+		checks++;		/* the loop above is one check */
+		walkfree(w);
+		objsnapclose(sn);
+	}
+	for(k = 0; k < Nproc; k++)
+		c[k]->stop = 1;
+	for(i = 0; i < 20000; i++){
+		live = 0;
+		for(k = 0; k < Nproc; k++)
+			if(!c[k]->done)
+				live++;
+		if(live == 0)
+			break;
+		sleep(1);
+	}
+	for(k = 0; k < Nproc; k++){
+		istrue("the churn proc finished", c[k]->done);
+		eqv("with no failed operation", c[k]->err, 0);
+		free(c[k]);
+	}
+	print("enumtest: %d opens under %d churning procs: %lldms\n",
+		Nsnapopen, Nproc, (nsec() - t0)/1000000);
 	killspawned();
 	storeclose(s);
 	devclose(d);
@@ -1895,6 +2090,7 @@ treclaimconc(void)
 	vlong cutoff;
 	int k, live;
 
+	live = 0;
 	d = bigdisk();
 	if((s = openstoreck(d)) == nil){
 		fail("the concurrent reclaim: storeopen: %r");
@@ -1916,16 +2112,6 @@ treclaimconc(void)
 		snprint(nm, sizeof nm, "m%04lud", i);
 		mk(s, nm);
 	}
-	/*
-	 * The cutoff is the LAST tombstone's mtime, not the first's:
-	 * mtime is a whole second (obj.c takes time(nil)), so a run that
-	 * straddles a second boundary while these 200 are made would
-	 * leave the later ones above a cutoff taken from the first and
-	 * silently halve what the walk is given.
-	 */
-	if(ostat(s, "z0199", &oi) < 0)
-		fail("objstat z0199: %r");
-	cutoff = oi.mtime;
 	for(k = 0; k < Nproc; k++){
 		if((c[k] = mallocz(sizeof *c[k], 1)) == nil)
 			sysfatal("mallocz: %r");
@@ -1941,6 +2127,15 @@ treclaimconc(void)
 		 * cutoff, because the churn's mtimes are this same second.
 		 */
 		c[k]->we = 5;
+		/*
+		 * One proc parks between its delete and its discard, so the
+		 * walk is GIVEN a churn tombstone rather than merely racing
+		 * for one.  Without it the walk's 200 commits outrun the
+		 * churn's window every time, condition 3 is never reached,
+		 * and the nskip assertion below reads 0 == 0.
+		 */
+		if(k == 0)
+			c[k]->park = 1;
 		if(spawnproc(churnproc, c[k]) < 0){
 			fail("spawn: %r");
 			c[k]->done = 1;
@@ -1949,18 +2144,46 @@ treclaimconc(void)
 	for(i = 0; i < 5000; i++){
 		live = 0;
 		for(k = 0; k < Nproc; k++)
-			if(c[k]->ops > 0)
+			if(c[k]->ops > 0 || c[k]->parked)
 				live++;
-		if(live == Nproc)
+		if(live == Nproc && c[0]->parked)
 			break;
 		sleep(1);
 	}
+	eqv("every churn proc is running", live, Nproc);
+	istrue("and one of them is holding a tombstone of its own",
+		c[0]->parked);
+	/*
+	 * The cutoff is the LAST tombstone's mtime, not the first's:
+	 * mtime is a whole second (obj.c takes time(nil)), so a run that
+	 * straddles a second boundary while these 200 are made would
+	 * leave the later ones above a cutoff taken from the first and
+	 * silently halve what the walk is given.  The parked proc's own
+	 * tombstone is younger still, and the cutoff has to reach it too
+	 * — otherwise the cutoff, not the epoch, is what reserves it,
+	 * and condition 3 goes untested again.
+	 */
+	if(ostat(s, "z0199", &oi) < 0)
+		fail("objstat z0199: %r");
+	cutoff = oi.mtime;
+	if(ostat(s, "m0000", &oi) < 0)
+		fail("objstat m0000: %r");
+	else if(oi.mtime > cutoff)
+		cutoff = oi.mtime;
 	reclaimwalk(s, cutoff, 5, &r);
+	c[0]->unpark = 1;
 	for(k = 0; k < Nproc; k++)
 		c[k]->stop = 1;
 	eqv("the walk discarded every tombstone it was given", r.ndisc, 200);
 	eqv("and skipped every one the churn's epoch reserves", r.nskip,
 		r.nseen - 200);
+	/*
+	 * And that set is not empty: the parked proc's tombstone is in
+	 * the snapshot, at the walk's own epoch and under its cutoff, so
+	 * layer-a §1.5's condition 3 is the only thing that can hold the
+	 * walk off it.
+	 */
+	istrue("and there was one for it to reserve", r.nskip > 0);
 	eqv("and was refused none of them", r.nrefused, 0);
 	for(i = 0; i < 200; i += 37){
 		snprint(nm, sizeof nm, "z%04lud", i);
@@ -2008,6 +2231,7 @@ main(int argc, char **argv)
 	treclaim();
 	treclaimrace();
 	tconc();
+	tsnapchurn();
 	treclaimconc();
 	killspawned();
 	if(fails > 0){

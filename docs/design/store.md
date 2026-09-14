@@ -2585,16 +2585,19 @@ and a SHOULD for `/obj` and `/tombs`. The six MUSTs are small — a
 few hundred lines at the envelope — and are rendered into a buffer
 at open, which is the one-line implementation.
 
-For `/obj`, `/tombs` and `/advert` an open takes, under **one** hold
-of `qlstate` (§7), the vector of `{u32 slot, u64 qidpath}` of every
-entry whose state it asked for — live for `/obj`, tomb for `/tombs`,
-both for `/advert` — and releases the lock before it returns. That is
-12 bytes an entry, **3.1 MB at 2.6·10^5 objects and 12 MB at
-`nslots = 2^20`**, held as two parallel arrays rather than one array
-of a struct, because a `{u32, u64}` struct is 16 bytes on amd64 and
-the 4 in every 16 buys nothing. The vector is a list of names and not
-a reference the engine must honour: a discard of an entry it names is
-neither refused nor delayed by it.
+For `/obj`, `/tombs` and `/advert` an open takes the vector of
+`{u32 slot, u64 qidpath}` of every entry whose state it asked for —
+live for `/obj`, tomb for `/tombs`, both for `/advert` — and holds no
+lock once it returns. That is 12 bytes an entry, **3.1 MB at 2.6·10^5
+objects and 12 MB at `nslots = 2^20`**, held as two parallel arrays
+rather than one array of a struct, because a `{u32, u64}` struct is
+16 bytes on amd64 and the 4 in every 16 buys nothing. It takes
+**two** holds of `qlstate` (§7) to do that on the happy path and up
+to `Snaptries` pairs of holds when the index keeps growing under it —
+the count under one, the 12 MB allocated outside any, the fill under
+the next — and it can fail: see "What the open costs" below. The
+vector is a list of names and not a reference the engine must honour:
+a discard of an entry it names is neither refused nor delayed by it.
 
 Entries are addressed **by position**, not by slot. That is what lets
 a server map a `Tread` offset onto an entry and restart from 0 on a
@@ -2619,13 +2622,41 @@ lock is held for milliseconds. §7 rule 2's letter holds — no device
 call, flush wait or `Rendez` sleep is reachable under the hold, and
 the vector's 12 MB is allocated *outside* it — but its number, an
 8.4 ms write, is the thing this is comparable to rather than the
-thing it avoids. The open takes the counts under the lock, releases
-it, allocates, and re-takes it to fill; if the counts moved in
-between it counts again rather than serve a short vector, because a
-vector short of the index is `objsnap=partial` and the engine does
-not have that escape. §16(a) carries the chunked scan under a
-generation counter that would bound the hold if T2 shows the 23 ms
-matters; it is not built.
+thing it avoids. §16(a) carries the chunked scan under a generation
+counter that would bound the hold if T2 shows the 23 ms matters; it
+is not built.
+
+**The second hold, and the one way the open can fail.** The open
+counts the index under `qlstate`, releases it, allocates, and re-takes
+it to fill. The index moves in between as a matter of course, because
+releasing `qlstate` puts the open *behind* every apply already queued
+for it; this is the common case, not a corner. Three of the four
+things that can have happened cost nothing:
+
+- the count **shrank** — the fill walks until it has taken every
+  matching entry and then stops, so an over-sized vector yields the
+  true count and a *complete* snapshot;
+- the count **grew** but still fits — the vector is allocated with
+  **slack**, a sixteenth of the count and never fewer than 16
+  entries, so ordinary churn needs no second attempt at all;
+- the count did not move.
+
+The fourth is an index that grew past the slack. The vector cannot
+hold what the index now has, and a short vector is `objsnap=partial`,
+which the engine does not have as an escape — so the open counts and
+allocates again, up to `Snaptries` (8) times, and then **fails** with
+`object snapshot: the index moved under 8 counts`. That is the only
+failure `objsnapopen` has beyond the bound's `disk full` and out of
+memory, and it is **pathological rather than ordinary**: it needs a
+create rate that outruns a `malloc` eight times in a row. Sizing the
+vector to the count with no slack is what makes it ordinary — that
+refused about 6% of opens with four procs churning 1200 objects over
+4096 slots, and with the slack the same churn refuses none. Nothing
+is full and nothing is broken, so §3.7 makes it an internal-invariant
+error carrying no §2.6 prefix: no §2.6 condition describes it, and
+`not ready` is normative for handoff and the currency check (§5.2)
+rather than for this. A server SHOULD retry the open once before
+answering the client at all.
 
 **An entry is gone under either of two conditions, and the second is
 not a refinement of the first.** Either its slot's `qidpath` no
@@ -2646,8 +2677,12 @@ store bounds how many snapshots may be open at once (`objsnapmax`,
 policy, default 8) and answers a further open `disk full` (layer-a
 §2.6) rather than growing without limit; at 2^20 slots eight of them
 are 96 MB, which is the number §14(9) says is answered for the Layer
-B envelope and not for this design's own maximum. A close releases
-the count and `/status` reports how many are open. A snapshot is the
+B envelope and not for this design's own maximum. The test and the
+count are **one step under one hold** of `qlstate` — the open takes
+its slot the moment it passes the bound, so two opens racing cannot
+both find room — and an open that then fails gives the slot back, so
+`/status` counts an open in flight along with the opens that
+completed. A close releases the count. A snapshot is the
 caller's, and `storeclose` frees nothing of the caller's, so every
 snapshot MUST be closed before the store it was taken from is —
 and a `storeclose` that finds one still open **`sysfatal`s, naming
@@ -2656,9 +2691,12 @@ and the alternative is worse than a crash: the snapshot's entries are
 then rendered from a freed `Store`, where the walk finds no `qidpath`
 match and answers *gone* for every one of them, so the bug surfaces
 as a silently short `/obj` listing rather than as a fault. Closing a
-snapshot twice is the same class of bug and is **not** detectable —
-the second call reads a handle the first freed — so the count guard
-in the close is a guard against wedging the bound, not a check.
+snapshot twice is **undefined**, exactly as freeing the same pointer
+twice is, and for the same reason: the second call reads a handle the
+first freed, whose first word — the store pointer everything in the
+close goes through — the allocator has already overwritten with its
+own free-list links. There is nothing a guard in the close could
+test, so there is none.
 
 **`/dirty` and `/lost` are copies rather than cursors.** Both sets are
 bounded — by the dirty region (§2.6) and by what fails local
@@ -3398,11 +3436,13 @@ while the committer is still inside the flush), and `fatal` (put the
 store into §3.2's condemned state, which the commit path itself
 reaches only from an apply that failed after its record was durable —
 a case §3.2 makes unreachable, so a test cannot arrive at it any
-other way), and `snapstale:n` (take the next *n* enumeration opens'
-index counts one entry short, which is what a create between the
-count and the fill leaves, so a test can drive §9's re-count without
-racing for it). Each T1 test names the requirement it discriminates
-and the mutation that must break it; **each mutation is run**, per
+other way), and `snapstale:n` (give the next *n* enumeration
+fill attempts a vector one entry short of the index, which is what an
+index that grew past the vector's slack leaves, so a test can drive
+§9's re-count without racing for it — one is spent per fill attempt
+rather than per open, and an open makes up to `Snaptries` of them).
+Each T1 test names the requirement it discriminates and the mutation
+that must break it; **each mutation is run**, per
 `AGENTS.md`.
 
 T1 formats a **small geometry** — a partition image of a few MiB with
@@ -3531,10 +3571,12 @@ bounds and `final=1` arbitration including D14's corrupt receiver,
 §6's four exhaustions with delete working throughout on the reserved
 tail, R7's dirty records across a restart and on every write-path
 commit, layer-a §1.2's `object too large` at the bounds where a sum
-would wrap, layer-a §2.6's tombstone errors and §1.5's create over a
-tombstone, §3.7's rule that every refusal the API makes is either
-§2.6's prefix or plainly not one, and the key-preserving `corrupt`
-flag), `scrubtest` (§8's engine half: what a corrupt-flagged copy
+would wrap, layer-a §2.6's tombstone errors, §1.5's create over a
+tombstone and each of its discard receiver checks refused on its
+own — the state check at the entry's own key, so that the key check
+cannot answer for it — §3.7's rule that every refusal the API makes
+is either §2.6's prefix or plainly not one, and the key-preserving
+`corrupt` flag), `scrubtest` (§8's engine half: what a corrupt-flagged copy
 answers on every path §3.7's row covers — the count-0 write
 included — and that a delete applies and clears the flag; the scrub's
 two durable transitions, each across a restart taken over a
@@ -3566,15 +3608,18 @@ discriminated one at a time, a live copy condemned under an open
 `/obj` and still answered with `corrupt=1` rather than dropped (D14),
 the bound on open snapshots, the `disk full` past it and the refusal
 of a `kinds` the engine has no state for, a `storeclose` under an
-open snapshot, an open whose index count goes stale between the count
-and the fill, every one of the five enumerations refusing on a
-condemned store, a checkpoint taken mid-walk, the `/dirty` copy
-against a moving set and the `fullsync` peer enumeration beside it
-after §2.6's exhaustion drop, the `/lost` copy against a moving list
-and over the one slot whose own index entry is the damage, and §6's
-tombstone reclaim walk — single-proc, with the record replaced under
-it, with the record put back at a higher key under it, and under
-concurrent churn).
+open snapshot, an open whose vector the index outgrows between the
+count and the fill, two thousand opens under four churning procs with
+not one refused and no count outside what the churn can produce,
+every one of the five enumerations refusing on a condemned store, a
+checkpoint taken mid-walk, the `/dirty` copy against a moving set and
+the `fullsync` peer enumeration beside it after §2.6's exhaustion
+drop, the `/lost` copy against a moving list and over the one slot
+whose own index entry is the damage, and §6's tombstone reclaim walk
+— single-proc, with the record replaced under it, with the record put
+back at a higher key under it, and under concurrent churn with one
+churn proc parked on a tombstone of its own making, so that the
+walk's epoch condition is what holds it off and not its cutoff).
 
 Against the list below that is T1.1–T1.26. One case is not covered
 and waits on something this store does not have yet: **T1.27** waits

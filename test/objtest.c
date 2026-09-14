@@ -2054,6 +2054,21 @@ tbounds(void)
 	/* ... and a discard of something that is not a tombstone */
 	refused("a discard of a live object", objdiscard(s, o, 1, 2, 1, 2),
 		"not discardable");
+	/*
+	 * The same, at the object's OWN key.  The line above names a
+	 * version the live entry does not carry, so layer-a §1.5's key
+	 * check answers it before check (i) — "is it a tombstone?" — is
+	 * ever reached, and dropping check (i) altogether leaves it
+	 * green.  Naming the key the entry really has leaves check (i)
+	 * as the only thing that can refuse the call, so the whole
+	 * string is asserted and not just §2.6's prefix.
+	 */
+	if(objstat(s, o, 1, &oi) < 0)
+		fail("objstat w: %r");
+	else
+		refused("a discard of a live object at its own key",
+			objdiscard(s, o, 1, oi.ver, oi.wepoch, oi.wepoch + 1),
+			"not discardable: not a tombstone");
 
 	/*
 	 * The refusal is the whole of what happened: no record was
