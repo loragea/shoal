@@ -3129,45 +3129,42 @@ problem: the flag is durable and it is §8's online scrub that clears
 it, with a key-preserving `Eobj` this tool does not write. `-q`
 prints the problems and nothing else.
 
-**`-R`** rebuilds the free-grain bitmap from the live maps and
-rewrites the checkpoint — the offline form of §5 step 11's automatic
-rebuild. A page that fails its checksum is already rebuilt at every
-start (§2.5); `-R` is for the page that is **valid and wrong**, which
-no start repairs, and for the operator who wants the scan done now
-rather than at the next one. It prints how many grains the on-disk
-bitmap left free and how many the rebuild leaves, so what changed is
-visible — the first of those numbers comes from the checker's own
-bitmap pass, so it is printed only when every bitmap page was read
-and passed its checksum, and otherwise the line says how many pages
-did not read **or** did not pass their checksum — both are counted,
-and a page that reads cleanly and fails its checksum is the commoner
-— and gives no number. It reports `bmaprebuild` and any
-refusal from the store in the store's own words. An extent-map entry
-that fails its own `csum128` is not rebuilt from: every grain number
-in it is the damaged bytes', so §5 step 10 condemns the slot and the
-rebuild skips its map. The **slot** stays out of the allocator —
-`completemaps` counts a condemned slot as used — but the **grains**
-the damaged map named are not marked and so return to the free set,
-because nothing knows which they were. That is safe and it is the
-only answer available: the copy is unrecoverable (§3.6, D14), the
+**`-R`** rebuilds the free-grain bitmap from the live maps and rewrites
+the checkpoint — the offline form of §5 step 11's automatic rebuild. A
+page that fails its checksum is already rebuilt at every start (§2.5);
+`-R` is for the page that is **valid and wrong**, which no start
+repairs, and for the operator who wants the scan done now rather than at
+the next one. It prints how many grains the on-disk bitmap left free and
+how many the rebuild leaves, so what changed is visible — the first of
+those numbers comes from the checker's own bitmap pass, so it is printed
+only when every bitmap page was read and passed its checksum, and
+otherwise the line says how many pages did not read **or** did not pass
+their checksum — both are counted, and a page that reads cleanly and
+fails its checksum is the commoner — and gives no number. It reports
+`bmaprebuild` and any refusal from the store in the store's own words.
+An extent-map entry that fails its own `csum128` is not rebuilt from:
+every grain number in it is the damaged bytes', so §5 step 10 condemns
+the slot and the rebuild skips its map. The **slot** stays out of the
+allocator — `completemaps` counts a condemned slot as used — but the
+**grains** the damaged map named are not marked and so return to the
+free set, because nothing knows which they were. That is safe and it is
+the only answer available: the copy is unrecoverable (§3.6, D14), the
 grains it held are named by no readable structure, and holding an
-unknown set of grains out of the allocator for ever would leak the
-disk instead. Until such a rebuild runs they stay marked from the
-bitmap as it was found, which is what §3.6 means by a condemned
-copy's grains staying marked used until a rebuild. It opens the
-device read-write — the open `shoalfmt` takes, with the flush
-channel, and `-w` as §3.2's operator assertion for a unit whose raw
-channel will not open — so `-w`
+unknown set of grains out of the allocator for ever would leak the disk
+instead. Until such a rebuild runs they stay marked from the bitmap as
+it was found, which is what §3.6 means by a condemned copy's grains
+staying marked used until a rebuild. It opens the device read-write —
+the open `shoalfmt` takes, with the flush channel, and `-w` as §3.2's
+operator assertion for a unit whose raw channel will not open — so `-w`
 without `-R` is refused rather than ignored. `-R` with `-v` rebuilds
 first and then verifies. `-R` with `-o` is refused: `-o` dumps one
 object, and a rebuild driven from one object's map would clear every
-grain the rest of the store holds. The passes above run first and
-report the bitmap they found, so a `-R` run that repairs a wrong
-bitmap still exits non-zero on what it repaired; the run after it is
-the clean one. `-R -v` can exit non-zero for either reason at once —
-the bitmap it repaired, an object that failed its verify, or both —
-so the exit code alone does not say which, and the report is what
-does.
+grain the rest of the store holds. The passes above run first and report
+the bitmap they found, so a `-R` run that repairs a wrong bitmap still
+exits non-zero on what it repaired; the run after it is the clean one.
+`-R -v` can exit non-zero for either reason at once — the bitmap it
+repaired, an object that failed its verify, or both — so the exit code
+alone does not say which, and the report is what does.
 
 **`shoalmonfmt`** — format a monitor map partition. §10 is the format
 it writes.
@@ -3660,11 +3657,10 @@ within `AGENTS.md`'s seconds.
   the case a rule that exempts holes from `nmap` gets wrong once
   clause 4 is wrong as well. Crash at `commit:0`; restart. Block 0
   must read what it held — its own bytes in the first variant, zeros
-  in the second —
-  every unwritten block must read zeros, and `verify` must pass,
-  which is what catches a hole left with sixteen zero bytes for a
-  digest. Then the re-replay
-  schedule: with the hole variant, crash at `ckpt:n` with the
+  in the second — every unwritten block must read zeros, and
+  `verify` must pass, which is what catches a hole left with sixteen
+  zero bytes for a digest. Then the re-replay schedule: with the hole
+  variant, crash at `ckpt:n` with the
   object's index page written and its extent-map entry not, restart,
   and assert the same — replay must zero the map it inherits even
   though the entry it is applying to already carries the record's
