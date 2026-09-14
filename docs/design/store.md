@@ -2958,6 +2958,14 @@ at all. `shoalfmt -z` and `shoalmonfmt -z` size such an image;
 nothing else in any of them depends on which kind of device it was
 given, because §0's vtable is the only thing they call.
 
+**A `-z` never runs ahead of the refusal that would have stopped the
+run.** Resizing an image truncates what it already holds, so
+`shoalfmt` opens the file at its own length first, lets the ream
+guard below decide, and reopens at `-z`'s size only once that guard
+has passed or `-r` has waived it: a run it refuses leaves the file
+byte-identical, its length included. `-z` on a path with no file
+there creates it at that size, where there is nothing to destroy.
+
 **`shoalfmt`** — format or ream an object-store partition.
 
     shoalfmt [-rw] [-b blksz] [-o objmax] [-c csumalg] [-n nslots]
