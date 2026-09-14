@@ -10,18 +10,29 @@
  *
  * The path is an sd(3) partition when it names one of an sd unit's
  * partitions, and a plain file otherwise, exactly as shoalfmt decides
- * it; -z sizes a file image.  Every refusal below is monfmt's — the
- * tool is argument parsing and a report, so that a T1 program drives
- * the decisions without exec'ing anything.
+ * it; -z sizes a file image.  The geometry and reformat refusals are
+ * monfmt's and monfmtcheck's, so that a T1 program drives them
+ * without exec'ing anything; what is left here is argument parsing,
+ * a report, and the two decisions about the image itself that the
+ * library never sees.
  *
- * -z is destructive on its own: it truncates whatever the image
- * already holds, before monfmt has seen a byte of it.  So the order
- * here is open-at-the-file's-own-length, ask monfmt's guard whether
- * this image may be reformatted, and only then reopen at the size -z
- * asks for.  A run monfmt refuses leaves the file byte-identical,
- * length included.  monfmt still owns the refusal and still makes it;
- * monhdrsel below is the same question asked early, and asked only to
- * decide whether resizing is safe.
+ * Those two are the order below.  -z is destructive on its own: it
+ * truncates whatever the image already holds before a byte of it has
+ * been looked at.  So a refused run must refuse BEFORE the resize,
+ * whatever the refusal — and the refusals are not all in one place.
+ * The order is: open the image at its own length; run both reformat
+ * guards over it, since an image carrying a valid monitor header or
+ * a valid object-store superblock is a store and neither is
+ * overwritten or shortened without -r; ask monfmtcheck about the
+ * length -z would give it; and only then resize and format.  A run
+ * refused at any of those leaves the file byte-identical, length
+ * included.
+ *
+ * A first open that fails is not by itself "no image there yet": a
+ * path that exists and will not open READ-WRITE would be CREATED by
+ * the second open, truncating it with no guard run at all.  So the
+ * path is stat'd, and only a path that is not there falls through to
+ * -z's create.
  */
 
 static void
@@ -72,14 +83,30 @@ num32(char *s)
 	return v;
 }
 
+/* the image's own length, which is not the device's rounded size */
+static vlong
+ownlen(char *path, Dev *d)
+{
+	Dir *dir;
+	vlong n;
+
+	if((dir = dirstat(path)) == nil)
+		return d->size;
+	n = dir->length;
+	free(dir);
+	return n;
+}
+
 void
 main(int argc, char **argv)
 {
 	Dev *d;
 	Monfmtcfg c;
 	Monhsel hs;
-	char *path;
-	vlong size;
+	Sbsel sb;
+	Dir *dir;
+	char *path, err[ERRMAX];
+	vlong size, have;
 
 	memset(&c, 0, sizeof c);
 	size = 0;
@@ -110,7 +137,19 @@ main(int argc, char **argv)
 			sysfatal("-z sizes a file image, not a partition");
 		if((d = sdopen(path, 0)) == nil)
 			sysfatal("%s: %r", path);
+		have = d->size;
 	}else if((d = fileopen(path, Secszdflt, 0, 0)) == nil){
+		rerrstr(err, sizeof err);
+		if((dir = dirstat(path)) != nil){
+			/*
+			 * It is there and will not open read-write: a
+			 * directory, a permission, a file server saying no.
+			 * -z cannot help, and creating over it would be
+			 * the truncation this order exists to prevent.
+			 */
+			free(dir);
+			sysfatal("%s: %s", path, err);
+		}
 		/*
 		 * No image there yet.  A new one has nothing to destroy,
 		 * so -z creates it at its size; without -z there is no
@@ -118,19 +157,44 @@ main(int argc, char **argv)
 		 * what a partition would have supplied.
 		 */
 		if(size == 0)
-			sysfatal("%s: %r; -z sizes a new file image", path);
+			sysfatal("%s: %s; -z sizes a new file image", path,
+				err);
 		if((d = fileopen(path, Secszdflt, size, 0)) == nil)
 			sysfatal("%s: %r", path);
 		size = 0;
-	}
+		have = d->size;
+	}else
+		have = ownlen(path, d);
 
 	/*
-	 * The image exists and -z would resize it: safe only once the
-	 * reformat guard has passed.  When it has not, the resize is
-	 * skipped and monfmt below issues the refusal over the file as
-	 * it stands.
+	 * Both reformat guards, over the image as it stands.  Either
+	 * kind of valid header means this image is a store, and -r is
+	 * what says to destroy one — by formatting over it or by
+	 * shortening it.  monfmt refuses the monitor header again for
+	 * a library caller; the object-store superblock it only warns
+	 * about, because §2.1's co-location rule is about the unit and
+	 * not about these bytes, and the refusal that guards the bytes
+	 * is this one.
 	 */
-	if(size != 0 && (c.ream || monhdrsel(d, &hs) < 0)){
+	if(!c.ream){
+		if(monhdrsel(d, &hs) == 0)
+			sysfatal("%s already carries a valid monitor header "
+				"(copy %d, slotsz %lud, retain %lud); -r to "
+				"reformat it", path, hs.use,
+				hs.h[hs.use].slotsz, hs.h[hs.use].retain);
+		if(superselect(d, &sb) == 0)
+			sysfatal("%s already carries a valid shoal "
+				"object-store superblock (copy %d, gen %llud); "
+				"-r to format over it", path, sb.start,
+				sb.sb[sb.start].gen);
+	}
+
+	/* the geometry and the size, against the size asked for */
+	if(monfmtcheck(d, size != 0 ? size : have, &c) < 0)
+		sysfatal("%s: %r", path);
+
+	/* every refusal is past: now the image may be resized */
+	if(size != 0){
 		devclose(d);
 		if((d = fileopen(path, Secszdflt, size, 0)) == nil)
 			sysfatal("%s: %r", path);

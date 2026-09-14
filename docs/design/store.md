@@ -3072,14 +3072,32 @@ nothing else in any of them depends on which kind of device it was
 given, because §0's vtable is the only thing they call.
 
 **A `-z` never runs ahead of the refusal that would have stopped the
-run.** Resizing an image truncates what it already holds, so both
-commands open the file at its own length first, let their reformat
-guard decide — `shoalfmt`'s ream guard, `shoalmonfmt`'s refusal over
-a valid monitor header — and reopen at `-z`'s size only once that
-guard has passed or `-r` has waived it: a run either one refuses
-leaves the file byte-identical, its length included. `-z` on a path
-with no file there creates it at that size, where there is nothing to
-destroy, and `-z` against an `sd` partition is refused by both.
+run** — of *any* of them, not only the reformat guard. Resizing an
+image truncates what it already holds, so both commands run in one
+order:
+
+1. validate the flags;
+2. open the image **at its own length** — a first open that fails for
+   any reason but the path not being there is the end of the run, and
+   never a fall-through to the create `-z` would do, because a path
+   that exists and will not open read-write would be truncated by it
+   with no guard run at all;
+3. run **both reformat guards**: an image carrying a valid
+   object-store superblock (§2.2) or a valid monitor header (§10) is
+   a store, and **either command refuses to format over — or shorten
+   — either kind without `-r`**;
+4. size the geometry against the length **`-z` asks for**, not the
+   one the image has: `shoalfmt`'s `geometry`, `shoalmonfmt`'s
+   `monfmtcheck`;
+5. only then resize, and format.
+
+A run refused at any step leaves the file **byte-identical, its
+length included**, and the lengths a refusal quotes are the file's
+own rather than the sector-rounded device size. `-z` on a path with
+no file there creates it at that size, where there is nothing to
+destroy — and the hint that `-z` is what sizes a new image belongs to
+that refusal alone, not to a path that is there and will not open.
+`-z` against an `sd` partition is refused by both.
 
 **`shoalfmt`** — format or ream an object-store partition.
 
@@ -3122,6 +3140,9 @@ generates a random `uuid` unless given one, and **refuses a partition
 that already carries a valid superblock unless `-r`** — reaming a
 disk destroys an instance's identity, and layer-a §1.5 makes that a
 reformat-before-rejoin event, so it should take a flag. It refuses a
+partition that carries a valid **monitor** header (§10) unless `-r`
+for the same reason: that is a store too, and one this command would
+destroy just as completely. It refuses a
 geometry whose maximal `Eobj` record exceeds an eighth of the log
 region, one whose `ngrains` reaches 2^32, one whose `nblkmax`
 (`objmax`/`blksz`) reaches 2^32, one whose `blksz` is not a power of
@@ -3266,16 +3287,23 @@ reads epoch `E−1`, so one history slot is a floor rather than a
 preference), a device under §10's 1 MiB, one too small for 2 header
 sectors and 2+`retain` slots, and **a partition that already carries a
 valid monitor header unless `-r`** — reformatting discards every
-published map the partition holds. It **warns** rather than refuses
-when the target already carries a valid object-store superblock: that
-means the unit is an object-store instance's and §2.1's deployment
-rule forbids the monitor's partition being one, but an operator
-reclaiming a decommissioned unit is doing exactly this on purpose.
+published map the partition holds. It refuses a target that carries a
+valid **object-store superblock** unless `-r`, by the rule above: that
+is a store, and `-r` is how an operator says to destroy one. When `-r`
+is given and the superblock is there, the format proceeds and
+**warns**, because §2.1's deployment rule forbids the monitor's
+partition being an object-store instance's unit — but an operator
+reclaiming a decommissioned unit is doing exactly this on purpose, and
+that is a warning about the unit rather than about these bytes.
 
-Every one of those decisions is `monfmt`'s rather than the command's,
-so that a T1 program drives them without exec'ing anything — the same
-constraint on the code layout that puts the store engine in
-`libshoal` above.
+Every one of those decisions is `monfmt`'s or `monfmtcheck`'s rather
+than the command's, so that a T1 program drives them without exec'ing
+anything — the same constraint on the code layout that puts the store
+engine in `libshoal` above. Three are the command's, and all three
+are about a file image the library is never handed: the length to
+open it at, whether `-z` may shorten it, and the refusal over an
+object-store superblock, which `monfmt` reports to its caller as
+§2.1's warning and leaves the caller to decide.
 
 **Carving the partitions** is the operator's step and uses stock
 tools. On a whole disk, `disk/fdisk -aw /dev/sdXX/data` creates a

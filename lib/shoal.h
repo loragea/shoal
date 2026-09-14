@@ -1023,6 +1023,15 @@ struct Monfmtcfg
 int	monfmt(Dev*, Monfmtcfg*);
 
 /*
+ * The geometry and size half of those refusals, against a size that
+ * need not be the device's own, filling in c's defaults.  It is what
+ * lets `shoalmonfmt -z' refuse the size it was asked for before it
+ * shortens the image to it (§12): a refused run leaves the file
+ * byte-identical.  monfmt makes the same check of the device itself.
+ */
+int	monfmtcheck(Dev*, vlong size, Monfmtcfg*);
+
+/*
  * One published map.  text is the store's own and is valid until the
  * next commit or monclose; a caller that wants it longer copies it.
  */

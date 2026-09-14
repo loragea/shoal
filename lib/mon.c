@@ -97,7 +97,7 @@ slotoff(Mon *m, uvlong sec, int i)
  * every offset below meaningless, and §10 makes both MUSTs.
  */
 static int
-hdrsane(Monhdr *h, Dev *d)
+hdrsane(Monhdr *h, Dev *d, vlong size)
 {
 	if(h->slotsz == 0 || h->slotsz % d->secsz != 0){
 		werrstr("slotsz %lud is not a multiple of the %lud-byte sector",
@@ -119,10 +119,10 @@ hdrsane(Monhdr *h, Dev *d)
 			h->curoff, h->histoff);
 		return -1;
 	}
-	if(monbytes(d->secsz, h->slotsz, h->retain) > (uvlong)d->size){
+	if(monbytes(d->secsz, h->slotsz, h->retain) > (uvlong)size){
 		werrstr("a slotsz of %lud and retain of %lud need %llud bytes "
 			"of a %lld-byte device", h->slotsz, h->retain,
-			monbytes(d->secsz, h->slotsz, h->retain), d->size);
+			monbytes(d->secsz, h->slotsz, h->retain), size);
 		return -1;
 	}
 	return 0;
@@ -176,7 +176,7 @@ monhdrunpack(Monhdr *h, uchar *p, Dev *d)
 	h->retain = GBIT32(p + 36);
 	h->curoff = GBIT64(p + 40);
 	h->histoff = GBIT64(p + 48);
-	return hdrsane(h, d);
+	return hdrsane(h, d, d->size);
 }
 
 static vlong
@@ -202,6 +202,22 @@ monhdrsel(Dev *d, Monhsel *sel)
 
 	memset(sel, 0, sizeof *sel);
 	sel->use = -1;
+	/*
+	 * Copy 1 is the LAST sector, so a device with fewer than two of
+	 * them has nowhere to read it from and hdr1off would name an
+	 * offset before the start.  The guard is here rather than in
+	 * the callers because every one of them — monfmt, and both
+	 * commands asking whether an image is a store — may be handed
+	 * an empty or truncated file.
+	 */
+	if(d->size < 2*(vlong)d->secsz){
+		for(i = 0; i < 2; i++)
+			snprint(sel->why[i], sizeof sel->why[i],
+				"a %lld-byte device holds no header sector",
+				d->size);
+		werrstr("no valid monitor header: %s", sel->why[0]);
+		return -1;
+	}
 	if((buf = malloc(d->secsz)) == nil)
 		return -1;
 	for(i = 0; i < 2; i++){
@@ -434,9 +450,54 @@ slotset(Monslot *sl, ulong len, uvlong seq, uvlong epoch, void *text)
 }
 
 /*
+ * Every geometry and size refusal a format makes, asked of a size
+ * that need not be the device's own.  `shoalmonfmt -z' asks it about
+ * the length the image would be given, BEFORE resizing it, because
+ * §12 has a refused run leave the file byte-identical; monfmt below
+ * asks it about the device it is about to write.  It fills in c's
+ * defaults, so a caller may report what would be used.
+ *
+ * §10 sizes the partition at 4 MiB and refuses less than 1 MiB.  That
+ * floor is about the deployment and not about the arithmetic — a
+ * 1 MiB partition holds the default geometry with room to spare — so
+ * it is checked before the geometry, whose own refusal would
+ * otherwise answer for it.  It is asked of the size as given, not of
+ * the sector-rounded device length, so that a 40-byte image is
+ * refused as 40 bytes and not as 0.
+ */
+int
+monfmtcheck(Dev *d, vlong size, Monfmtcfg *c)
+{
+	Monhdr h;
+	ulong slotsecs;
+
+	if(c->slotsz == 0)
+		c->slotsz = Monslotszdflt;
+	if(c->retain == 0)
+		c->retain = Monretaindflt;
+	memset(&h, 0, sizeof h);
+	h.vers = Monvers;
+	h.slotsz = c->slotsz;
+	h.retain = c->retain;
+	slotsecs = 0;
+	if(c->slotsz % d->secsz == 0)
+		slotsecs = c->slotsz / d->secsz;
+	h.curoff = 1;
+	h.histoff = 1 + 2*(uvlong)slotsecs;
+	if(size < Monminbytes){
+		werrstr("%lld bytes is under the %d-byte minimum §10 sets",
+			size, Monminbytes);
+		return -1;
+	}
+	return hdrsane(&h, d, size - size % (vlong)d->secsz);
+}
+
+/*
  * Format, §10 and §12.  Every refusal shoalmonfmt makes it makes
  * here, so that a T1 program drives the tool's decisions rather than
- * its argument parsing.
+ * its argument parsing — with the two exceptions §12 names, both of
+ * them about a file image the library never sees: which length to
+ * open it at, and whether `-z' may shorten it.
  *
  * What a fresh store holds is §10's format-time contents and is not
  * arbitrary: both current slots are written as VALID empty maps at
@@ -465,42 +526,16 @@ monfmt(Dev *d, Monfmtcfg *c)
 	Sbsel sel;
 	uchar *buf;
 	uvlong need;
-	ulong slotsecs;
 	int i;
 
-	if(c->slotsz == 0)
-		c->slotsz = Monslotszdflt;
-	if(c->retain == 0)
-		c->retain = Monretaindflt;
 	c->warnsuper = 0;
-	memset(&h, 0, sizeof h);
-	h.vers = Monvers;
-	h.slotsz = c->slotsz;
-	h.retain = c->retain;
-	slotsecs = 0;
-	if(c->slotsz % d->secsz == 0)
-		slotsecs = c->slotsz / d->secsz;
-	h.curoff = 1;
-	h.histoff = 1 + 2*(uvlong)slotsecs;
-	/*
-	 * §10 sizes the partition at 4 MiB and refuses less than
-	 * 1 MiB.  That floor is about the deployment and not about the
-	 * arithmetic — a 1 MiB partition holds the default geometry
-	 * with room to spare — so it is checked before the geometry,
-	 * whose own refusal would otherwise answer for it.
-	 */
-	if(d->size < Monminbytes){
-		werrstr("%lld bytes is under the %d-byte minimum §10 sets",
-			d->size, Monminbytes);
-		return -1;
-	}
-	if(hdrsane(&h, d) < 0)
-		return -1;
-	need = monbytes(d->secsz, c->slotsz, c->retain);
-
 	/*
 	 * Reformatting destroys every published map this partition
-	 * holds, so it takes a flag, exactly as shoalfmt -r does.
+	 * holds, so it takes a flag, exactly as shoalfmt -r does.  It
+	 * is asked BEFORE the geometry and the size, so that a run
+	 * refused for either of those is refused over a store still
+	 * standing: §12 has the tools resize an image only past this
+	 * point, and a refusal here must be the one they report.
 	 */
 	if(!c->ream){
 		Monhsel hs;
@@ -517,11 +552,22 @@ monfmt(Dev *d, Monfmtcfg *c)
 	 * §12: a unit that carries a valid object-store superblock is
 	 * an object-store instance's, and §2.1's deployment rule says
 	 * the monitor's partition MUST NOT be one.  It is a warning
-	 * and not a refusal — the operator may be reclaiming a
+	 * and not a refusal here — the operator may be reclaiming a
 	 * decommissioned unit — so the caller is told and decides.
+	 * `shoalmonfmt' is the caller that decides it needs -r.
 	 */
 	if(superselect(d, &sel) == 0)
 		c->warnsuper = 1;
+
+	if(monfmtcheck(d, d->size, c) < 0)
+		return -1;
+	memset(&h, 0, sizeof h);
+	h.vers = Monvers;
+	h.slotsz = c->slotsz;
+	h.retain = c->retain;
+	h.curoff = 1;
+	h.histoff = 1 + 2*(uvlong)(c->slotsz/d->secsz);
+	need = monbytes(d->secsz, c->slotsz, c->retain);
 
 	if((buf = mallocz(d->secsz, 1)) == nil)
 		return -1;
