@@ -161,7 +161,14 @@ monhdrunpack(Monhdr *h, uchar *p, Dev *d)
 		return -1;
 	}
 	if(!reccsumok(p, d->secsz, Hcsumoff)){
-		werrstr("checksum mismatch");
+		/*
+		 * Not the bare `checksum mismatch' of layer-a §2.6: this
+		 * is a diagnostic about one header copy, captured into
+		 * Monhsel.why by the only caller, and §3.7 keeps an
+		 * internal-invariant error from beginning with a wire
+		 * error's prefix even where it cannot escape today.
+		 */
+		werrstr("the header checksum does not match");
 		return -1;
 	}
 	h->slotsz = GBIT32(p + 32);
