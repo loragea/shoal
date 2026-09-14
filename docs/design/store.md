@@ -2856,9 +2856,8 @@ only the constant, and the hashing terms stop being negligible.
 ## 12. Tooling
 
 *Policy.* Three commands under `cmd/`, each an `mkone` directory
-listed in `cmd/mkfile`'s `DIRS`. `shoalfmt` and `shoalck` are built;
-`shoalmonfmt` is not, and the two flags of `shoalck` that write or
-read object content are marked below.
+listed in `cmd/mkfile`'s `DIRS`. All three are built; the two flags of
+`shoalck` that write or read object content are marked below.
 
 **Where the code lives, and why the test tier decides it.** Every
 T1 case in §13 drives format, commit, replay, checkpoint, allocation
@@ -2882,7 +2881,7 @@ the only way to name a partition at all. A partition mistaken for a
 file is silent and expensive — the sector size falls back to the
 default, so every write becomes a read-modify-write of the sectors
 it touches (§0), and there is no flush channel to refuse to open —
-so the question is settled by what is there. Both tools take either
+so the question is settled by what is there. All three take either
 kind, and the classification is not a preference: a path the
 directory says is a partition is opened as one, and a failure there
 — no `ctl`, no permission, a raw channel that will not open — is
@@ -2891,9 +2890,9 @@ falling back would be the silent misreading the question exists to
 prevent. A file image is not a deployment target — D13 makes that a raw
 partition — but it is what lets an operator inspect a copy, and it
 is what lets the T1 cases of §13 drive format and check with no disk
-at all. `shoalfmt -z` sizes such an image; nothing else in either
-tool depends on which kind of device it was given, because §0's
-vtable is the only thing either of them calls.
+at all. `shoalfmt -z` and `shoalmonfmt -z` size such an image;
+nothing else in any of them depends on which kind of device it was
+given, because §0's vtable is the only thing they call.
 
 **`shoalfmt`** — format or ream an object-store partition.
 
@@ -3056,10 +3055,34 @@ the bitmap it repaired, an object that failed its verify, or both —
 so the exit code alone does not say which, and the report is what
 does.
 
-**`shoalmonfmt`** — format a monitor map partition. Not built yet;
-§10 is the format it will write.
+**`shoalmonfmt`** — format a monitor map partition. §10 is the format
+it writes.
 
-    shoalmonfmt [-r] [-s slotsz] [-R retain] /dev/sdXX/name
+    shoalmonfmt [-r] [-s slotsz] [-R retain] [-z size] /dev/sdXX/name
+
+`-s` sets the slot size and `-R` the ring length, defaulting to §10's
+65536 and 8; `-z` sizes a file image and defaults to 4 MiB, which is
+what §10 sizes the partition at. It prints the geometry it chose — the
+two values, the sectors the header copies, the current slots and the
+ring start at, and the bytes the format occupies — the way `shoalfmt`
+prints its own.
+
+It refuses a `slotsz` that is not a multiple of the device's sector
+or is under two sectors, a `retain` under 2 (layer-a §5.2 clause 2
+reads epoch `E−1`, so one history slot is a floor rather than a
+preference), a device under §10's 1 MiB, one too small for 2 header
+sectors and 2+`retain` slots, and **a partition that already carries a
+valid monitor header unless `-r`** — reformatting discards every
+published map the partition holds. It **warns** rather than refuses
+when the target already carries a valid object-store superblock: that
+means the unit is an object-store instance's and §2.1's deployment
+rule forbids the monitor's partition being one, but an operator
+reclaiming a decommissioned unit is doing exactly this on purpose.
+
+Every one of those decisions is `monfmt`'s rather than the command's,
+so that a T1 program drives them without exec'ing anything — the same
+constraint on the code layout that puts the store engine in
+`libshoal` above.
 
 **Carving the partitions** is the operator's step and uses stock
 tools. On a whole disk, `disk/fdisk -aw /dev/sdXX/data` creates a
