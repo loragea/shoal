@@ -2819,6 +2819,13 @@ than as an empty map text.
    valid, refuse. `seq` is `max(valid seq) + 1` over both slots and
    the ring. Flush.
 
+The third clause is **§2.2's symmetry and not a path**: a store the
+start accepted has a valid current slot, and after one failed write
+here the selection re-targets the slot it has just invalidated, so
+the valid one is never written and cannot become invalid. It stays
+because the rule it states is the rule, and the code says it is
+unreachable where it makes it.
+
 **Each slot is read back after its flush** and checked — magic,
 `vers`, `len` within the slot, the checksum over `secsz+len`, and the
 `seq`, `len` and `epoch` just written. That is what makes step 1's "a
@@ -2852,12 +2859,24 @@ crash argument above already covers, because layer-a §8.2 requires
 durable-before-ack and not ack-iff-durable. The operator's retry
 publishes above it either way.
 
-The read-back catches a device that loses the write *before*
-acknowledging the flush. A device that acknowledges a flush and then
-loses the bytes anyway is outside this store's model, exactly as it is
-outside the object store's: §13's simulated disk makes durability
-after a flush its contract, and §3.2's `-w` assertion is what an
-operator gives for a unit whose flush does not reach the platter.
+The read-back is **two device reads per slot** — the header sector,
+then the text — and not one, because it goes through the same slot
+reader the start does, which must bounds-check `len` before it reads
+the `len` bytes that field names (a torn length field must not drive
+a read past the slot). Reading `roundup(secsz+len, secsz)` in one
+request would be possible here, where `len` is known, at the price of
+a second reader; the four extra requests a commit makes are noise
+beside its two flushes, so it keeps the one reader.
+
+What the read-back proves is that the device **accepted** the bytes,
+not that they are on the platter: the read is answered by the same
+write cache the flush was meant to drain. So it catches a device that
+loses the write *before* acknowledging the flush, which is the case
+it exists for. A device that acknowledges a flush and then loses the
+bytes anyway is outside this store's model, exactly as it is outside
+the object store's: §13's simulated disk makes durability after a
+flush its contract, and §3.2's `-w` assertion is what an operator
+gives for a unit whose flush does not reach the platter.
 
 **Choose on start:** read both current-map slots, take the valid one
 with the greater `seq`; two valid slots at equal `seq` — which is what
@@ -2954,8 +2973,9 @@ epoch `E−1`, so one history slot is a floor rather than a preference
 for the current-map slot, and the same again for the history slot
 that precedes it, so a publish is ~17 ms whether it carries a
 placement change or a single `stale` mark. The read-back of each slot
-is one read of at most `slotsz` — the sector the checksum needs plus
-`len` bytes — which is noise beside the flush it follows. That is what
+is two reads — the checksum's sector, then `len` bytes rounded up —
+so a commit issues four beside its two flushes, which is noise beside
+them. That is what
 makes layer-a §5.4 step 5a affordable — the alternative
 `docs/platform/9front-storage.md` measured, a file plus a gefs sync,
 costs 530–620 ms and would blow `replms` regularly.

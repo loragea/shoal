@@ -335,7 +335,12 @@ slotread(Mon *m, vlong off, Monslot *sl)
  * flush and lands nothing would otherwise be invisible until the next
  * open: the ring would hold no entry for the current map, so position
  * 0 would not be the current map and layer-a §8.2's E−1 entry would
- * be unanswerable.
+ * be unanswerable.  What it proves is that the device ACCEPTED the
+ * bytes and not that they are on the platter — the read is answered
+ * by the same write cache the flush was meant to drain — which is
+ * the case §10 keeps it for.  It is two reads, slotread's, because
+ * that reader is the start's too and must bounds-check len before
+ * reading the bytes len names.
  *
  * The read-back has two outcomes that are not the same fact, and §10
  * separates them.  A slot that reads back and is not the one written
@@ -854,6 +859,17 @@ moncommit(Mon *m, void *text, ulong len, uvlong epoch)
 	else if(m->cur[0].valid || m->cur[1].valid)
 		c = m->cur[0].valid ? 1 : 0;
 	else{
+		/*
+		 * §2.2's third clause, copied into §10's step 2, and not
+		 * a path: monopen refuses a store with neither current
+		 * slot valid, and after one failed write here the
+		 * selection above re-targets the slot it has just
+		 * invalidated, so the valid one is never written and
+		 * cannot become invalid.  It is unreachable from a store
+		 * this process opened — its phantom bookkeeping is for a
+		 * case that does not arrive — and it stays because the
+		 * rule it states is the rule.
+		 */
 		werrstr("no valid current-map slot: slot 0 %s; slot 1 %s",
 			m->cur[0].why, m->cur[1].why);
 		m->hist[v].phantom = 1;
