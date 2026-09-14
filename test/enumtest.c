@@ -1800,6 +1800,30 @@ treclaimrace(void)
 			remk(s, "w2", 3);
 		if(oidlen == 2 && memcmp(oid, "w3", 2) == 0)
 			disc(s, "w3", 2, 2);
+		/*
+		 * And the shape neither of those reaches: tomb -> live ->
+		 * tomb again, at a HIGHER key, between the render and the
+		 * discard.  The entry is a tombstone again and §2.3 kept
+		 * its qid.path, so neither half of the gone rule fires and
+		 * the snapshot must still name it — and the discard must
+		 * still be refused, because the record it names is not the
+		 * one this walk inspected.  Only the key says so.
+		 */
+		if(oidlen == 2 && memcmp(oid, "w5", 2) == 0){
+			Objinfo now;
+			uchar again[Oidmax];
+			int alen;
+
+			remk(s, "w5", 3);
+			rmv(s, "w5", 4);
+			eqv("a tombstone re-made at a higher key is still "
+				"named", objsnapent(sn, i, again, &alen, &now),
+				1);
+			eqv("as the tombstone it is again", now.state, Stomb);
+			eqv("at the key it now carries", now.ver, 4);
+			eqv("and the qid.path it has always had (§2.3)",
+				now.qidpath, oi.qidpath);
+		}
 		if(objdiscard(s, oid, oidlen, oi.ver, oi.wepoch, 5) < 0){
 			nrefused++;
 			if(oidlen == 2 && memcmp(oid, "w2", 2) == 0)
@@ -1810,6 +1834,11 @@ treclaimrace(void)
 				refused("a discard of a record another proc "
 					"already discarded", -1,
 					"no such object");
+			else if(oidlen == 2 && memcmp(oid, "w5", 2) == 0)
+				refused("a discard naming the stale key of a "
+					"tombstone re-made under the walk", -1,
+					"not discardable: tombstone at (1, 4), "
+					"discard names (1, 2)");
 			else
 				fail("objdiscard: %r");
 			continue;
@@ -1818,8 +1847,8 @@ treclaimrace(void)
 	}
 	eqv("a tombstone created over before the walk reached it is gone",
 		ngone, 1);
-	eqv("the two interfered-with entries are refused", nrefused, 2);
-	eqv("and the other three are discarded", ndisc, 3);
+	eqv("the three interfered-with entries are refused", nrefused, 3);
+	eqv("and the other two are discarded", ndisc, 2);
 	/* the refusals removed nothing that was not the record inspected */
 	if(ostat(s, "w1", &oi) < 0)
 		fail("objstat w1: %r");
@@ -1832,6 +1861,7 @@ treclaimrace(void)
 			oi.state, Slive);
 	gone(s, "w0");
 	gone(s, "w3");
+	stilltomb(s, "w5");		/* the refusal left the new record */
 	objsnapclose(sn);
 out:
 	storeclose(s);

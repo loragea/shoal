@@ -3484,10 +3484,19 @@ batch's members, and `qid.path` across restarts) and `enumtest` (§9's
 snapshot-at-open enumeration: a `/obj`, a `/tombs` and an `/advert`
 snapshot each walked by position with an entry created, deleted,
 created over and discarded under it, both halves of the gone rule
-discriminated one at a time, the bound on open snapshots and the
-`disk full` past it, a checkpoint taken mid-walk, the `/dirty` and
-`/lost` copies against a moving set, and §6's tombstone reclaim walk
-— single-proc and with the record replaced under it).
+discriminated one at a time, a live copy condemned under an open
+`/obj` and still answered with `corrupt=1` rather than dropped (D14),
+the bound on open snapshots, the `disk full` past it and the refusal
+of a `kinds` the engine has no state for, a `storeclose` under an
+open snapshot, an open whose index count goes stale between the count
+and the fill, every one of the five enumerations refusing on a
+condemned store, a checkpoint taken mid-walk, the `/dirty` copy
+against a moving set and the `fullsync` peer enumeration beside it
+after §2.6's exhaustion drop, the `/lost` copy against a moving list
+and over the one slot whose own index entry is the damage, and §6's
+tombstone reclaim walk — single-proc, with the record replaced under
+it, with the record put back at a higher key under it, and under
+concurrent churn).
 
 Against the list below that is T1.1–T1.26. One case is not covered
 and waits on something this store does not have yet: **T1.27** waits
