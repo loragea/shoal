@@ -673,7 +673,11 @@ Store*	storeopen(Dev*, Storecfg*);
  * Stop the procs and free the store; it writes nothing.  Every object
  * snapshot taken from it (objsnapopen, below) MUST be closed first: a
  * snapshot is the caller's, so this frees none of them, and the store
- * they name is gone underneath them after it returns.
+ * they name would be gone underneath them.  A store closed with one
+ * still open is a fid-lifetime bug in the caller, and this `sysfatal's
+ * naming the count rather than leaving the snapshot to answer from
+ * freed memory — which it would do plausibly, entry by entry, as
+ * "that entry is gone".
  */
 void	storeclose(Store*);
 int	storecheckpoint(Store*);
@@ -825,7 +829,11 @@ int	objslot(Store*, ulong slot, uchar *oid, int *oidlen, Objinfo*);
  * is per open fid; an open past it answers `disk full' (layer-a
  * §2.6).  objsnapclose releases the count.  A snapshot is the
  * caller's, and storeclose frees nothing of the caller's, so every
- * snapshot MUST be closed before the store it was taken from is.
+ * snapshot MUST be closed before the store it was taken from is:
+ * storeclose `sysfatal's on a store that still has one open, because
+ * the alternative is a snapshot answering "gone" for every entry out
+ * of freed memory.  Closing one twice is the same class of bug and
+ * cannot be caught: the second call reads a handle the first freed.
  */
 enum
 {
@@ -855,7 +863,21 @@ void		objsnapclose(Objsnap*);
  * the Objinfo beside it so a renderer need not go back to the index.
  * storelost stays: it is what a walker that wants the live list uses.
  *
- * Both answer 0 with *np 0 and *p nil when there is nothing to
+ * The /lost copy names every one of those slots, §5 step 10's
+ * included — an index entry that would not unpack is itself the
+ * damage, so that entry has no oid to give: its oidlen is 0 and its
+ * Objinfo is the slot number, state Sfree and zeroes, and a renderer
+ * emits the line with no `oid='.  Any other rule would make the copy
+ * disagree with Storestat.nlost.
+ *
+ * fullsyncsnap answers the other half of /dirty: a malloc'd array of
+ * the names of the peers carrying §7.1's coarse fullsync flag, which
+ * no record in the dirty set names — the exhaustion drop sets it on
+ * the peer whose records it has just dropped.  A renderer of /dirty
+ * therefore takes two copies, one call each.  The names live in the
+ * same allocation as the pointer array, so one free releases both.
+ *
+ * All three answer 0 with *np 0 and *p nil when there is nothing to
  * report, -1 on failure, and the array is the caller's to free.
  */
 typedef struct Lostent Lostent;
@@ -868,6 +890,7 @@ struct Lostent
 
 int	dirtysnap(Store*, Dirtyrec **dp, ulong *np);
 int	lostsnap(Store*, Lostent **lp, ulong *np);
+int	fullsyncsnap(Store*, char ***pp, ulong *np);
 
 /*
  * §8's block repair.  a is block blk as fetched from a holder of a

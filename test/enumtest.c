@@ -197,6 +197,28 @@ posof(Objsnap *sn, char *name)
 }
 
 /*
+ * The position an entry must be at.  A lookup that fails is one
+ * failed check and not the end of the test: a mutation that makes
+ * every entry gone would otherwise take the checks below it out of
+ * the run as well, so a run's FAIL count would understate what the
+ * mutation broke.  Position 0 is always in range here — every caller
+ * has opened a snapshot of several entries — so the checks below
+ * still judge something.
+ */
+static ulong
+mustpos(Objsnap *sn, char *name, char *what)
+{
+	long p;
+
+	checks++;
+	if((p = posof(sn, name)) < 0){
+		fail("%s does not answer %s", what, name);
+		return 0;
+	}
+	return p;
+}
+
+/*
  * One full position walk.  seen[] is indexed by the digits at the end
  * of each oid, which is how every name below is built; nother counts
  * entries whose name is not of that shape, and ngone the positions
@@ -352,10 +374,7 @@ tobj(void)
 	 * what makes this entry gone — and layer-a §2.2 says /obj MUST
 	 * NOT list a tombstone.
 	 */
-	if((p2 = posof(sn, "o2")) < 0){
-		fail("/obj does not answer o2");
-		goto closed;
-	}
+	p2 = mustpos(sn, "o2", "/obj");
 	if(ostat(s, "o2", &oi) < 0)
 		fail("objstat o2: %r");
 	rmv(s, "o2", 2);
@@ -372,10 +391,7 @@ tobj(void)
 	 * object.  The entry is live again and in the snapshot's kinds,
 	 * so only the qid.path half can make it gone.
 	 */
-	if((p5 = posof(sn, "o5")) < 0){
-		fail("/obj does not answer o5");
-		goto closed;
-	}
+	p5 = mustpos(sn, "o5", "/obj");
 	if(ostat(s, "o5", &oi5) < 0)
 		fail("objstat o5: %r");
 	rmv(s, "o5", 2);
@@ -407,7 +423,6 @@ tobj(void)
 	eqv("and nothing new has crept into the walk", w->nother, 0);
 	eqv("and still nothing is answered twice", w->ndup, 0);
 	walkfree(w);
-closed:
 	objsnapclose(sn);
 out:
 	storeclose(s);
@@ -464,10 +479,7 @@ ttombs(void)
 	eqv("a tombstone made after the open is absent", w->nlive, 6);
 
 	/* created over after the open: same qid.path, no longer a tomb */
-	if((p1 = posof(sn, "t1")) < 0){
-		fail("/tombs does not answer t1");
-		goto closed;
-	}
+	p1 = mustpos(sn, "t1", "/tombs");
 	if(ostat(s, "t1", &before) < 0)
 		fail("objstat t1: %r");
 	remk(s, "t1", 3);
@@ -479,10 +491,7 @@ ttombs(void)
 		objsnapent(sn, p1, got, &oidlen, &oi), 0);
 
 	/* discarded after the open: the qid.path half */
-	if((p4 = posof(sn, "t4")) < 0){
-		fail("/tombs does not answer t4");
-		goto closed;
-	}
+	p4 = mustpos(sn, "t4", "/tombs");
 	disc(s, "t4", 2, 2);
 	eqv("a discard after the open answers gone",
 		objsnapent(sn, p4, got, &oidlen, &oi), 0);
@@ -490,7 +499,6 @@ ttombs(void)
 	eqv("and those two are the only ones gone", w->ngone, 2);
 	eqv("the count never moved", objsnapcount(sn), 6);
 	walkfree(w);
-closed:
 	objsnapclose(sn);
 out:
 	storeclose(s);
@@ -522,11 +530,13 @@ tadvert(void)
 	/*
 	 * /advert asks for both kinds, so every occupied slot is in it:
 	 * a freed slot below them is what makes a position differ from a
-	 * slot here.
+	 * slot here.  The gap is discarded LAST, after the entries above
+	 * it exist — a slot freed before them is simply handed back to
+	 * the next create (alloc.c's cursor follows the free), which
+	 * would leave every position equal to its slot and this test
+	 * blind to a snapshot rendered by position.
 	 */
 	mk(s, "gap");
-	rmv(s, "gap", 2);
-	disc(s, "gap", 2, 2);
 	for(i = 0; i < 5; i++){
 		snprint(nm, sizeof nm, "a%lud", i);
 		mk(s, nm);
@@ -536,14 +546,24 @@ tadvert(void)
 		mk(s, nm);
 		rmv(s, nm, 2);
 	}
+	rmv(s, "gap", 2);
+	disc(s, "gap", 2, 2);
 	if((sn = mustsnap(s, Snapboth, "/advert")) == nil)
 		goto out;
 	eqv("/advert lists live objects and tombstones alike",
 		objsnapcount(sn), 8);
-	if((pa = posof(sn, "a0")) < 0 || (pb = posof(sn, "b0")) < 0){
-		fail("/advert does not answer a0 and b0");
-		goto closed;
-	}
+	pa = mustpos(sn, "a0", "/advert");
+	pb = mustpos(sn, "b0", "/advert");
+	/*
+	 * Every entry the snapshot names sits a slot above its position,
+	 * because the discarded gap is below them all: a snapshot
+	 * rendered from the live index by position answers the wrong
+	 * object for every one of them.
+	 */
+	if(objsnapent(sn, 0, got, &oidlen, &oi) != 1)
+		fail("/advert does not answer its first entry: %r");
+	else
+		eqv("no position in this snapshot is its own slot", oi.slot, 1);
 	rmv(s, "a0", 2);
 	eqv("a delete after the open is still in kinds, so not gone",
 		objsnapent(sn, pa, got, &oidlen, &oi), 1);
@@ -552,7 +572,6 @@ tadvert(void)
 	eqv("a discard after the open is gone",
 		objsnapent(sn, pb, got, &oidlen, &oi), 0);
 	eqv("the count is the open-time count", objsnapcount(sn), 8);
-closed:
 	objsnapclose(sn);
 out:
 	storeclose(s);
@@ -571,7 +590,7 @@ tbound(void)
 	Dev *d;
 	Store *s;
 	Storestat st;
-	Objsnap *sn[Objsnapmaxdflt+1];
+	Objsnap *sn[Objsnapmaxdflt+1], *over;
 	int i;
 
 	d = newdisk();
@@ -588,8 +607,9 @@ tbound(void)
 	storestat(s, &st);
 	eqv("the store reports every open snapshot", st.nobjsnap,
 		Objsnapmaxdflt);
-	refused("an open past the bound", objsnapopen(s, Snaplive) != nil ?
-		0 : -1, "disk full");
+	over = objsnapopen(s, Snaplive);
+	refused("an open past the bound", over != nil ? 0 : -1, "disk full");
+	objsnapclose(over);		/* nil unless the bound failed */
 	objsnapclose(sn[0]);
 	storestat(s, &st);
 	eqv("a close releases the count", st.nobjsnap, Objsnapmaxdflt-1);
@@ -597,13 +617,220 @@ tbound(void)
 		fail("objsnapopen after a close: %r");
 	storestat(s, &st);
 	eqv("and the next open is admitted", st.nobjsnap, Objsnapmaxdflt);
-	refused("a snapshot of no kinds at all", objsnapopen(s, 0) != nil ?
-		0 : -1, "object snapshot");
+	over = objsnapopen(s, 0);
+	refused("a snapshot of no kinds at all", over != nil ? 0 : -1,
+		"object snapshot");
+	objsnapclose(over);
+	/*
+	 * kinds is a set of states and not a bag of bits: a caller that
+	 * asks for a state the engine does not have is asking for
+	 * something it will not get, and a snapshot that quietly dropped
+	 * the bit would answer a different question from the one asked.
+	 */
+	over = objsnapopen(s, 1<<4);
+	refused("a snapshot of a state that does not exist",
+		over != nil ? 0 : -1, "object snapshot: kinds");
+	objsnapclose(over);
+	over = objsnapopen(s, Snapboth|1<<4);
+	refused("both kinds and one that does not exist",
+		over != nil ? 0 : -1, "object snapshot: kinds");
+	objsnapclose(over);
 	for(i = 0; i < Objsnapmaxdflt; i++)
 		objsnapclose(sn[i]);
 	storestat(s, &st);
 	eqv("closing them all releases every count", st.nobjsnap, 0);
 	storeclose(s);
+	devclose(d);
+}
+
+/*
+ * §3.2's condemned store, which answers nothing until it has been
+ * opened again and replayed: every one of the five enumerations
+ * refuses through storeserving, the open included, and a snapshot
+ * taken before the condemnation stops answering entries.  Serving a
+ * listing out of memory the store has itself declared untrustworthy
+ * is exactly what the flag exists to stop.
+ */
+static void
+tsnapcondemned(void)
+{
+	Dev *d;
+	Store *s;
+	Objsnap *sn, *over;
+	Objinfo oi;
+	Dirtyrec *dr;
+	Lostent *l;
+	uchar got[Oidmax];
+	char **pe, *w;
+	ulong n;
+	int oidlen;
+
+	d = newdisk();
+	if((s = mustopen(d, "the enumerations on a condemned store")) == nil)
+		return;
+	mk(s, "y0");
+	mk(s, "y1");
+	if((sn = mustsnap(s, Snaplive, "a condemned store")) == nil)
+		goto out;
+	eqv("the snapshot answers while the store serves",
+		objsnapent(sn, 0, got, &oidlen, &oi), 1);
+	storehook(s, "fatal", 1);
+	w = "store condemned";
+	over = objsnapopen(s, Snaplive);
+	refused("objsnapopen on a condemned store", over != nil ? 0 : -1, w);
+	objsnapclose(over);
+	refused("objsnapent on a condemned store",
+		objsnapent(sn, 0, got, &oidlen, &oi), w);
+	refused("dirtysnap on a condemned store", dirtysnap(s, &dr, &n), w);
+	refused("lostsnap on a condemned store", lostsnap(s, &l, &n), w);
+	refused("fullsyncsnap on a condemned store",
+		fullsyncsnap(s, &pe, &n), w);
+	objsnapclose(sn);
+out:
+	storeclose(s);
+	devclose(d);
+}
+
+/*
+ * §9's open counts the index under qlstate, releases it to allocate
+ * the vector — 12 MB at nslots = 2^20, which §7 rule 2 will not have
+ * under a state lock — and re-takes it to fill.  The count can be
+ * stale by then, and a vector short of the index is objsnap=partial,
+ * which the engine does not have: it counts again.  §13's snapstale
+ * point takes the count one short, which is what a create in that
+ * window leaves, so this does not have to race for it.
+ */
+static void
+tsnapstale(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Objsnap *sn;
+	Walk *w;
+	char nm[32];
+	ulong i;
+
+	d = newdisk();
+	if((s = mustopen(d, "a stale count under an open")) == nil)
+		return;
+	for(i = 0; i < 10; i++){
+		snprint(nm, sizeof nm, "s%lud", i);
+		mk(s, nm);
+	}
+	storehook(s, "snapstale", 1);
+	if((sn = mustsnap(s, Snaplive, "a stale count")) == nil)
+		goto out;
+	eqv("an open whose count went stale names every entry",
+		objsnapcount(sn), 10);
+	w = newwalk(16);
+	walkall(sn, w, 's');
+	eqv("and the walk answers them all", w->nlive, 10);
+	eqv("none of them twice", w->ndup, 0);
+	eqv("and nothing else", w->nother, 0);
+	for(i = 0; i < 10; i++)
+		eqv("each object exactly once", w->seen[i], 1);
+	walkfree(w);
+	objsnapclose(sn);
+
+	/*
+	 * The re-count is bounded: an index that moves under every
+	 * attempt is refused rather than spun on under a lock every
+	 * apply wants, and the refusal is local — nothing is full.
+	 */
+	storehook(s, "snapstale", 1000);
+	sn = objsnapopen(s, Snaplive);
+	refused("an open whose count never settles", sn != nil ? 0 : -1,
+		"object snapshot: the index moved");
+	objsnapclose(sn);		/* nil unless the refusal failed */
+	storestat(s, &st);
+	eqv("and the refusal took no count with it", st.nobjsnap, 0);
+	storehook(s, "snapstale", 0);
+	if((sn = objsnapopen(s, Snaplive)) == nil)
+		fail("objsnapopen once the index settles: %r");
+	else{
+		eqv("an open after it is whole again", objsnapcount(sn), 10);
+		objsnapclose(sn);
+	}
+out:
+	storeclose(s);
+	devclose(d);
+}
+
+/*
+ * §9: every snapshot MUST be closed before the store is, and a
+ * storeclose that finds one open says so out loud.  Without that the
+ * entries are rendered from a freed Store, which does not fault: the
+ * walk finds no qid.path match and answers `gone' for every one of
+ * them, so a fid-lifetime bug in a server serves a silently short
+ * /obj listing.  The child is the proc that dies, so this one can
+ * watch it: RFMEM so it shares the store, RFFDG so the standard
+ * error it redirects is its own.
+ */
+static void
+tclosesnap(void)
+{
+	Dev *d;
+	Store *s;
+	Objsnap *sn;
+	Waitmsg *w;
+	int pid, fd, ok;
+
+	d = newdisk();
+	if((s = mustopen(d, "storeclose under an open snapshot")) == nil)
+		return;
+	mk(s, "e0");
+	mk(s, "e1");
+	if((sn = mustsnap(s, Snaplive, "storeclose")) == nil){
+		storeclose(s);
+		devclose(d);
+		return;
+	}
+	switch(pid = rfork(RFPROC|RFMEM|RFFDG)){
+	case -1:
+		fail("rfork: %r");
+		objsnapclose(sn);
+		storeclose(s);
+		devclose(d);
+		return;
+	case 0:
+		close(2);
+		if((fd = open("/dev/null", OWRITE)) >= 0 && fd != 2)
+			dup(fd, 2);
+		storeclose(s);
+		exits("storeclose returned");
+	}
+	ok = 0;
+	checks++;
+	if((w = wait()) == nil)
+		fail("wait for the closing child: %r");
+	else{
+		if(w->pid != pid)
+			fail("waited on pid %d, want the closing child %d",
+				w->pid, pid);
+		else if(w->msg[0] == '\0')
+			fail("storeclose under an open snapshot returned");
+		else if(strstr(w->msg, "object snapshot") == nil)
+			fail("storeclose under an open snapshot died with "
+				"`%s', want the snapshot count", w->msg);
+		else
+			ok = 1;
+		free(w);
+	}
+	/*
+	 * Only if the child really did die before storefree: under the
+	 * unguarded close it freed this proc's store, and touching it
+	 * again would fault over the FAIL line above.
+	 */
+	if(ok){
+		Storestat st;
+
+		objsnapclose(sn);
+		storestat(s, &st);
+		eqv("and the store closes once the count is back to nothing",
+			st.nobjsnap, 0);
+		storeclose(s);
+	}
 	devclose(d);
 }
 
@@ -735,6 +962,13 @@ tdirty(void)
 			"n1.0"), i == 3 ? 0 : 1);
 	}
 	eqv("and the epoch comes with it", c1[0].epoch, 5);
+	/*
+	 * A record that is IN the set is one that was added: layer-a
+	 * §7.1's op is what a renderer would emit, and a copy that said
+	 * remove would describe the set it is not.
+	 */
+	for(i = 0; i < n1; i++)
+		eqv("every record in the copy is an add", c1[i].op, 1);
 
 	/* the copy is the caller's; later mutation cannot reach it */
 	dadd(s, "d3", "n1.0", 9);
@@ -811,6 +1045,89 @@ tdirty(void)
 	}
 	free(c1);
 	killspawned();
+	storeclose(s);
+	devclose(d);
+}
+
+static int
+haspeer(char **p, ulong n, char *name)
+{
+	ulong i, seen;
+
+	seen = 0;
+	for(i = 0; i < n; i++)
+		if(strcmp(p[i], name) == 0)
+			seen++;
+	return seen;
+}
+
+/*
+ * The coarse half of /dirty (layer-a §2.2): one `fullsync peer=' line
+ * per peer carrying §7.1's flag.  §2.6's exhaustion drop is what
+ * makes this a separate enumeration rather than a field of a record
+ * — it throws away every fine-grained record for the peer it marks,
+ * so the peer that most needs the line is the one the record copy
+ * cannot name.
+ */
+static void
+tfullsync(void)
+{
+	Dev *d;
+	Store *s;
+	Dirtyrec *c;
+	char **pe, nm[32];
+	ulong n, np, i;
+
+	d = makedisk(Tnsec, 128, 64, 512*1024);
+	if((s = openstoreck(d)) == nil){
+		fail("the fullsync copy: storeopen: %r");
+		devclose(d);
+		return;
+	}
+	if(fullsyncsnap(s, &pe, &np) < 0)
+		fail("fullsyncsnap of a store with no peers: %r");
+	eqv("a store that has heard of no peer names none", np, 0);
+	istrue("and hands back no array", pe == nil);
+
+	/* fill the region: 40 records for one peer, 24 for the other */
+	for(i = 0; i < 64; i++){
+		snprint(nm, sizeof nm, "f%lud", i);
+		mk(s, nm);
+		dadd(s, nm, i < 40 ? "n1.0" : "n2.0", 5);
+	}
+	eqv("the dirty region is full", dirtycount(s), 64);
+	if(fullsyncsnap(s, &pe, &np) < 0)
+		fail("fullsyncsnap: %r");
+	eqv("both peers are named", np, 2);
+	free(pe);
+
+	/*
+	 * One record past the region.  §2.6 drops every record of the
+	 * peer holding the most of them and marks that peer fullsync,
+	 * which is layer-a §7.1's explicit licence.
+	 */
+	mk(s, "f64");
+	dadd(s, "f64", "n2.0", 5);
+	if(dirtysnap(s, &c, &n) < 0)
+		fail("dirtysnap after the drop: %r");
+	eqv("the drop took every record of its victim", hasrec(c, n,
+		"f0", "n1.0"), 0);
+	eqv("and left the other peer's alone", hasrec(c, n, "f40", "n2.0"),
+		1);
+	eqv("so the record copy names one peer and not two", n, 25);
+	free(c);
+	if(fullsyncsnap(s, &pe, &np) < 0)
+		fail("fullsyncsnap after the drop: %r");
+	else{
+		istrue("the copy names the peer the drop marked, which no "
+			"record left names", haspeer(pe, np, "n1.0") == 1);
+		istrue("and the peer whose records survived, which carries "
+			"the flag too", haspeer(pe, np, "n2.0") == 1);
+		eqv("and nothing the store has never heard of", np, 2);
+		free(pe);
+	}
+	eqv("storefullsync agrees about the victim",
+		storefullsync(s, "n1.0"), 1);
 	storeclose(s);
 	devclose(d);
 }
@@ -909,6 +1226,142 @@ tlost(void)
 	free(buf);
 	storeclose(s);
 	devclose(d);
+}
+
+/*
+ * The other condemnation, §5 step 10's: an index entry that does not
+ * unpack.  The slot is left bad with its state still free, and it is
+ * the one slot on the /lost list whose own entry is the damage — so
+ * it has no oid, and a copy that skipped it would disagree with
+ * /status's own lost count on exactly the case /lost exists for.
+ * The geometry is storetest's: damage an entry the log no longer
+ * describes, so replay does not repair it.
+ */
+static void
+tlostbadent(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Lostent *l;
+	Super sup;
+	uchar *buf, o[Oidmax], junk[8];
+	ulong n;
+
+	d = newdisk();
+	if((s = mustopen(d, "the /lost copy of a damaged entry")) == nil)
+		return;
+	buf = mkbuf(64, 9);
+	mk(s, "g0");
+	oidof(o, "g0");
+	if(objwrite(s, o, 2, buf, 64, 0, 2, 1, nil, 0) < 0)
+		fail("objwrite g0: %r");
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	storeclose(s);
+	geom(d, &sup);
+	memset(junk, 0xff, sizeof junk);
+	simpoke(d, idxentoff(&sup, 0), junk, sizeof junk);
+	if((s = mustopen(d, "a store with a damaged index entry")) == nil){
+		devclose(d);
+		free(buf);
+		return;
+	}
+	storestat(s, &st);
+	eqv("the damaged entry is condemned", st.nlost, 1);
+	eqv("and storelost names its slot", storelost(s, 0), 0);
+	if(lostsnap(s, &l, &n) < 0)
+		fail("lostsnap: %r");
+	else{
+		eqv("the copy names it too", n, st.nlost);
+		if(n == 1){
+			eqv("by the slot storelost named", l[0].oi.slot, 0);
+			eqv("with no oid, because the entry is the damage",
+				l[0].oidlen, 0);
+			eqv("and a state of free", l[0].oi.state, Sfree);
+			eqv("with nothing else invented", l[0].oi.qidpath, 0);
+			eqv("not even a corrupt flag it cannot read",
+				l[0].oi.corrupt, 0);
+		}
+		free(l);
+	}
+	storeclose(s);
+	devclose(d);
+	free(buf);
+}
+
+/*
+ * The transition the gone rule does NOT make: live -> condemned.
+ * §5 step 10 at run time leaves the entry's state alone and sets bad
+ * and Icorrupt, so the copy is still live, still in /obj's kinds and
+ * still at its qid.path — and D14 makes answering it a MUST: a copy
+ * that fails local verification answers corrupt=1 and never absent,
+ * because absence is a §1.5 positive confirmation this holder cannot
+ * give.  A snapshot that dropped it would be spelling exactly that
+ * absence.
+ */
+static void
+tobjcondemned(void)
+{
+	Dev *d;
+	Store *s;
+	Objsnap *sn;
+	Objinfo oi, before;
+	Super sup;
+	uchar *buf, o[Oidmax], got[Oidmax], junk[8];
+	long p;
+	int oidlen;
+
+	d = newdisk();
+	if((s = mustopen(d, "a condemned copy in /obj")) == nil)
+		return;
+	buf = mkbuf(3*Blk, 43);
+	mk(s, "u0");
+	mk(s, "u1");
+	oidof(o, "u1");
+	if(objwrite(s, o, 2, buf, 3*Blk, 0, 2, 1, nil, 0) < 0)
+		fail("objwrite u1: %r");
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	if(ostat(s, "u1", &before) < 0)
+		fail("objstat u1: %r");
+	geom(d, &sup);
+	memset(junk, 0xa5, sizeof junk);
+	simpoke(d, emapentoff(&sup, before.emapslot) + sup.emapsz - sizeof junk,
+		junk, sizeof junk);
+	storeclose(s);
+	if((s = mustopen(d, "a condemned copy in /obj, reopened")) == nil){
+		devclose(d);
+		free(buf);
+		return;
+	}
+	if((sn = mustsnap(s, Snaplive, "/obj over a condemnable copy")) == nil)
+		goto out;
+	p = mustpos(sn, "u1", "/obj");
+	eqv("the copy is sound as far as anything knows", objsnapent(sn, p,
+		got, &oidlen, &oi), 1);
+	eqv("and answers corrupt=0", oi.corrupt, 0);
+	/* the first read of the damaged map is what condemns the slot */
+	if(objread(s, o, 2, buf, Blk, 0) >= 0)
+		fail("a damaged extent map was served");
+	eqv("a condemned copy is still named by the snapshot",
+		objsnapent(sn, p, got, &oidlen, &oi), 1);
+	eqv("with its state unchanged", oi.state, Slive);
+	eqv("and corrupt=1 rather than absent (D14)", oi.corrupt, 1);
+	eqv("at the qid.path it always had", oi.qidpath, before.qidpath);
+	objsnapclose(sn);
+	/* and an open taken after the condemnation names it too */
+	if((sn = mustsnap(s, Snaplive, "/obj over a condemned copy")) == nil)
+		goto out;
+	eqv("a later open names it as well", objsnapcount(sn), 2);
+	p = mustpos(sn, "u1", "/obj");
+	eqv("and answers it", objsnapent(sn, p, got, &oidlen, &oi), 1);
+	eqv("still corrupt=1", oi.corrupt, 1);
+	objsnapclose(sn);
+out:
+	storeclose(s);
+	devclose(d);
+	free(buf);
 }
 
 /* ---- T1.15: a full walk under concurrent creates and deletes ---- */
@@ -1232,8 +1685,14 @@ treclaim(void)
 		if(objremove(s, o, 2, 2, i == 3 ? 9 : 1, nil, 0) < 0)
 			fail("objremove r%lud: %r", i);
 	}
-	if(ostat(s, "r0", &oi) < 0)
-		fail("objstat r0: %r");
+	/*
+	 * The cutoff is the LAST of the group, not the first: mtime is a
+	 * whole second (obj.c takes time(nil)), so a run that crosses a
+	 * second boundary while a group is made would leave the rest of
+	 * that group above a cutoff taken from its first member.
+	 */
+	if(ostat(s, "r4", &oi) < 0)
+		fail("objstat r4: %r");
 	t0 = oi.mtime;
 	/* group B: r5..r8, at least a second later */
 	sleep(1100);
@@ -1316,8 +1775,8 @@ treclaimrace(void)
 		mk(s, nm);
 		rmv(s, nm, 2);
 	}
-	if(ostat(s, "w0", &oi) < 0)
-		fail("objstat w0: %r");
+	if(ostat(s, "w5", &oi) < 0)		/* the last, per treclaim */
+		fail("objstat w5: %r");
 	cutoff = oi.mtime;
 	if((sn = mustsnap(s, Snaptomb, "the reclaim walk")) == nil)
 		goto out;
@@ -1347,6 +1806,30 @@ treclaimrace(void)
 			remk(s, "w2", 3);
 		if(oidlen == 2 && memcmp(oid, "w3", 2) == 0)
 			disc(s, "w3", 2, 2);
+		/*
+		 * And the shape neither of those reaches: tomb -> live ->
+		 * tomb again, at a HIGHER key, between the render and the
+		 * discard.  The entry is a tombstone again and §2.3 kept
+		 * its qid.path, so neither half of the gone rule fires and
+		 * the snapshot must still name it — and the discard must
+		 * still be refused, because the record it names is not the
+		 * one this walk inspected.  Only the key says so.
+		 */
+		if(oidlen == 2 && memcmp(oid, "w5", 2) == 0){
+			Objinfo now;
+			uchar again[Oidmax];
+			int alen;
+
+			remk(s, "w5", 3);
+			rmv(s, "w5", 4);
+			eqv("a tombstone re-made at a higher key is still "
+				"named", objsnapent(sn, i, again, &alen, &now),
+				1);
+			eqv("as the tombstone it is again", now.state, Stomb);
+			eqv("at the key it now carries", now.ver, 4);
+			eqv("and the qid.path it has always had (§2.3)",
+				now.qidpath, oi.qidpath);
+		}
 		if(objdiscard(s, oid, oidlen, oi.ver, oi.wepoch, 5) < 0){
 			nrefused++;
 			if(oidlen == 2 && memcmp(oid, "w2", 2) == 0)
@@ -1357,6 +1840,11 @@ treclaimrace(void)
 				refused("a discard of a record another proc "
 					"already discarded", -1,
 					"no such object");
+			else if(oidlen == 2 && memcmp(oid, "w5", 2) == 0)
+				refused("a discard naming the stale key of a "
+					"tombstone re-made under the walk", -1,
+					"not discardable: tombstone at (1, 4), "
+					"discard names (1, 2)");
 			else
 				fail("objdiscard: %r");
 			continue;
@@ -1365,8 +1853,8 @@ treclaimrace(void)
 	}
 	eqv("a tombstone created over before the walk reached it is gone",
 		ngone, 1);
-	eqv("the two interfered-with entries are refused", nrefused, 2);
-	eqv("and the other three are discarded", ndisc, 3);
+	eqv("the three interfered-with entries are refused", nrefused, 3);
+	eqv("and the other two are discarded", ndisc, 2);
 	/* the refusals removed nothing that was not the record inspected */
 	if(ostat(s, "w1", &oi) < 0)
 		fail("objstat w1: %r");
@@ -1379,6 +1867,7 @@ treclaimrace(void)
 			oi.state, Slive);
 	gone(s, "w0");
 	gone(s, "w3");
+	stilltomb(s, "w5");		/* the refusal left the new record */
 	objsnapclose(sn);
 out:
 	storeclose(s);
@@ -1427,8 +1916,15 @@ treclaimconc(void)
 		snprint(nm, sizeof nm, "m%04lud", i);
 		mk(s, nm);
 	}
-	if(ostat(s, "z0000", &oi) < 0)
-		fail("objstat z0000: %r");
+	/*
+	 * The cutoff is the LAST tombstone's mtime, not the first's:
+	 * mtime is a whole second (obj.c takes time(nil)), so a run that
+	 * straddles a second boundary while these 200 are made would
+	 * leave the later ones above a cutoff taken from the first and
+	 * silently halve what the walk is given.
+	 */
+	if(ostat(s, "z0199", &oi) < 0)
+		fail("objstat z0199: %r");
 	cutoff = oi.mtime;
 	for(k = 0; k < Nproc; k++){
 		if((c[k] = mallocz(sizeof *c[k], 1)) == nil)
@@ -1437,13 +1933,14 @@ treclaimconc(void)
 		c[k]->lo = k*50;
 		c[k]->hi = (k+1)*50;
 		/*
-		 * Above the epoch the reclaim walk below runs at, so that
-		 * walk's /tombs snapshot skips whatever tombstone the churn
-		 * is holding when it is taken: layer-a §1.5's condition 3
-		 * is the caller's, and this caller is not the churn's
-		 * primary.
+		 * Not below the epoch the reclaim walk below runs at, so
+		 * that walk skips whatever tombstone the churn is holding
+		 * when its snapshot is taken: layer-a §1.5's condition 3 is
+		 * the caller's, and this caller is not the churn's primary.
+		 * The epoch is what separates the two sets and not the
+		 * cutoff, because the churn's mtimes are this same second.
 		 */
-		c[k]->we = 4;
+		c[k]->we = 5;
 		if(spawnproc(churnproc, c[k]) < 0){
 			fail("spawn: %r");
 			c[k]->done = 1;
@@ -1462,6 +1959,8 @@ treclaimconc(void)
 	for(k = 0; k < Nproc; k++)
 		c[k]->stop = 1;
 	eqv("the walk discarded every tombstone it was given", r.ndisc, 200);
+	eqv("and skipped every one the churn's epoch reserves", r.nskip,
+		r.nseen - 200);
 	eqv("and was refused none of them", r.nrefused, 0);
 	for(i = 0; i < 200; i += 37){
 		snprint(nm, sizeof nm, "z%04lud", i);
@@ -1497,8 +1996,14 @@ main(int argc, char **argv)
 	ttombs();
 	tadvert();
 	tbound();
+	tsnapcondemned();
+	tsnapstale();
+	tclosesnap();
 	tdirty();
+	tfullsync();
 	tlost();
+	tlostbadent();
+	tobjcondemned();
 	tckpt();
 	treclaim();
 	treclaimrace();

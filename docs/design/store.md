@@ -2600,11 +2600,32 @@ Entries are addressed **by position**, not by slot. That is what lets
 a server map a `Tread` offset onto an entry and restart from 0 on a
 re-read, which is how a Plan 9 directory read works. Entry *i* is
 rendered from the *live* index under the same short hold of `qlstate`
-§8's cursor takes, so no lock spans a caller's use of an entry and a
-full walk never blocks `/status`, `/ctl` or `Tflush` (§7 rule 2).
-Nothing shifts under the reader, so no entry is skipped or duplicated
-because of an index shift, and an entry created after the open is not
-in the vector at all.
+§8's cursor takes, so no lock spans a caller's use of an entry: a
+full walk of 2.6·10^5 entries is 2.6·10^5 short holds and blocks
+`/status`, `/ctl` or `Tflush` for no longer than one of them (§7
+rule 2). Nothing shifts under the reader, so no entry is skipped or
+duplicated because of an index shift, and an entry created after the
+open is not in the vector at all.
+
+**What the open costs.** The walk stops at the count, so the cost is
+the highest occupied slot and not `nslots`: a lightly-used 2^20 index
+opens in microseconds, and an index whose last entry sits near slot
+2^20 costs a scan of them all — measured at **~22 ns a slot on the
+reference machine, ≈23 ms at `nslots = 2^20`** — under one hold of
+`qlstate`. §2.3's 4× over-provision puts the envelope's 2.6·10^5
+objects on an `nslots` near 10^6, so that is the envelope case rather
+than a corner, and it is the one place in the store where a state
+lock is held for milliseconds. §7 rule 2's letter holds — no device
+call, flush wait or `Rendez` sleep is reachable under the hold, and
+the vector's 12 MB is allocated *outside* it — but its number, an
+8.4 ms write, is the thing this is comparable to rather than the
+thing it avoids. The open takes the counts under the lock, releases
+it, allocates, and re-takes it to fill; if the counts moved in
+between it counts again rather than serve a short vector, because a
+vector short of the index is `objsnap=partial` and the engine does
+not have that escape. §16(a) carries the chunked scan under a
+generation counter that would bound the hold if T2 shows the 23 ms
+matters; it is not built.
 
 **An entry is gone under either of two conditions, and the second is
 not a refinement of the first.** Either its slot's `qidpath` no
@@ -2628,18 +2649,52 @@ are 96 MB, which is the number §14(9) says is answered for the Layer
 B envelope and not for this design's own maximum. A close releases
 the count and `/status` reports how many are open. A snapshot is the
 caller's, and `storeclose` frees nothing of the caller's, so every
-snapshot MUST be closed before the store it was taken from is.
+snapshot MUST be closed before the store it was taken from is —
+and a `storeclose` that finds one still open **`sysfatal`s, naming
+the count**. It is a programming error in the server's fid handling,
+and the alternative is worse than a crash: the snapshot's entries are
+then rendered from a freed `Store`, where the walk finds no `qidpath`
+match and answers *gone* for every one of them, so the bug surfaces
+as a silently short `/obj` listing rather than as a fault. Closing a
+snapshot twice is the same class of bug and is **not** detectable —
+the second call reads a handle the first freed — so the count guard
+in the close is a guard against wedging the bound, not a check.
 
-**`/dirty` and `/lost` are copies rather than cursors.** Both sets
-are bounded — by the dirty region (§2.6) and by what fails local
+**`/dirty` and `/lost` are copies rather than cursors.** Both sets are
+bounded — by the dirty region (§2.6) and by what fails local
 verification (§8) — so a copy taken under one hold of the lock that
 guards each is the whole of what a renderer needs, and layer-a §2.2's
-MUST for these two costs nothing. The `/dirty` copy carries every
-record's `(oid, peer, epoch)`; the `/lost` copy carries every slot
+MUST for these two costs nothing. **`/dirty` is two copies**, because
+layer-a §2.2's file is two kinds of line: the record lines, and one
+`fullsync peer=<iid>` line per peer carrying §7.1's coarse flag. No
+record names those peers — §2.6's exhaustion drop sets the flag on
+exactly the peer whose fine-grained records it has just thrown away, so
+the peers that most need the line are the ones with no record left to
+name them — so the peer list is enumerated by a second call under the
+same lock, and a renderer takes both. Today nothing clears the flag
+until the reconcile pass exists and a peer is registered with it already
+set, so that enumeration names every peer the store knows of; a peer it
+has never seen has no line, which is what `storefullsync`'s answer of 1
+for an unknown name already means. The `/dirty` record copy carries
+every record's `(oid, peer, epoch)`; the `/lost` copy carries every slot
 the membership list names, with that slot's oid and published record
-beside it, so a renderer never goes back to an index the scrub has
-moved under it. The slot-at-a-time accessor stays beside the copy: it
-is what a walker that wants the live list uses.
+beside it, so a renderer never goes back to an index the scrub has moved
+under it. The slot-at-a-time accessor stays beside the copy: it is what
+a walker that wants the live list uses.
+
+The `/lost` copy names **every** slot the membership list names,
+including §5 step 10's: an index entry that would not unpack leaves
+its slot marked bad with its state still free, and that slot is on
+the list and in `/status`'s `lost=` count. It has no oid to give —
+the entry that would have carried one is the damage — so its copy
+carries an oid length of 0 and an `Objinfo` that is the slot number,
+state free and zeroes, and a renderer emits `slot=<n> kind=lost`
+with no `oid=`. Layer-a §2.2 fixes only `oid=` and `kind=` for that
+file, and does so for the fields a line *has*: a slot with no
+readable oid has none to give, and the rest of the line is
+implementation policy. Dropping it instead would make the copy and
+`/status`'s own count disagree on precisely the damage `/lost`
+exists for.
 
 §6's tombstone reclaim is the enumeration's first caller, and it is
 the caller's walk rather than the engine's: the engine holds no
@@ -3124,45 +3179,42 @@ problem: the flag is durable and it is §8's online scrub that clears
 it, with a key-preserving `Eobj` this tool does not write. `-q`
 prints the problems and nothing else.
 
-**`-R`** rebuilds the free-grain bitmap from the live maps and
-rewrites the checkpoint — the offline form of §5 step 11's automatic
-rebuild. A page that fails its checksum is already rebuilt at every
-start (§2.5); `-R` is for the page that is **valid and wrong**, which
-no start repairs, and for the operator who wants the scan done now
-rather than at the next one. It prints how many grains the on-disk
-bitmap left free and how many the rebuild leaves, so what changed is
-visible — the first of those numbers comes from the checker's own
-bitmap pass, so it is printed only when every bitmap page was read
-and passed its checksum, and otherwise the line says how many pages
-did not read **or** did not pass their checksum — both are counted,
-and a page that reads cleanly and fails its checksum is the commoner
-— and gives no number. It reports `bmaprebuild` and any
-refusal from the store in the store's own words. An extent-map entry
-that fails its own `csum128` is not rebuilt from: every grain number
-in it is the damaged bytes', so §5 step 10 condemns the slot and the
-rebuild skips its map. The **slot** stays out of the allocator —
-`completemaps` counts a condemned slot as used — but the **grains**
-the damaged map named are not marked and so return to the free set,
-because nothing knows which they were. That is safe and it is the
-only answer available: the copy is unrecoverable (§3.6, D14), the
+**`-R`** rebuilds the free-grain bitmap from the live maps and rewrites
+the checkpoint — the offline form of §5 step 11's automatic rebuild. A
+page that fails its checksum is already rebuilt at every start (§2.5);
+`-R` is for the page that is **valid and wrong**, which no start
+repairs, and for the operator who wants the scan done now rather than at
+the next one. It prints how many grains the on-disk bitmap left free and
+how many the rebuild leaves, so what changed is visible — the first of
+those numbers comes from the checker's own bitmap pass, so it is printed
+only when every bitmap page was read and passed its checksum, and
+otherwise the line says how many pages did not read **or** did not pass
+their checksum — both are counted, and a page that reads cleanly and
+fails its checksum is the commoner — and gives no number. It reports
+`bmaprebuild` and any refusal from the store in the store's own words.
+An extent-map entry that fails its own `csum128` is not rebuilt from:
+every grain number in it is the damaged bytes', so §5 step 10 condemns
+the slot and the rebuild skips its map. The **slot** stays out of the
+allocator — `completemaps` counts a condemned slot as used — but the
+**grains** the damaged map named are not marked and so return to the
+free set, because nothing knows which they were. That is safe and it is
+the only answer available: the copy is unrecoverable (§3.6, D14), the
 grains it held are named by no readable structure, and holding an
-unknown set of grains out of the allocator for ever would leak the
-disk instead. Until such a rebuild runs they stay marked from the
-bitmap as it was found, which is what §3.6 means by a condemned
-copy's grains staying marked used until a rebuild. It opens the
-device read-write — the open `shoalfmt` takes, with the flush
-channel, and `-w` as §3.2's operator assertion for a unit whose raw
-channel will not open — so `-w`
+unknown set of grains out of the allocator for ever would leak the disk
+instead. Until such a rebuild runs they stay marked from the bitmap as
+it was found, which is what §3.6 means by a condemned copy's grains
+staying marked used until a rebuild. It opens the device read-write —
+the open `shoalfmt` takes, with the flush channel, and `-w` as §3.2's
+operator assertion for a unit whose raw channel will not open — so `-w`
 without `-R` is refused rather than ignored. `-R` with `-v` rebuilds
 first and then verifies. `-R` with `-o` is refused: `-o` dumps one
 object, and a rebuild driven from one object's map would clear every
-grain the rest of the store holds. The passes above run first and
-report the bitmap they found, so a `-R` run that repairs a wrong
-bitmap still exits non-zero on what it repaired; the run after it is
-the clean one. `-R -v` can exit non-zero for either reason at once —
-the bitmap it repaired, an object that failed its verify, or both —
-so the exit code alone does not say which, and the report is what
-does.
+grain the rest of the store holds. The passes above run first and report
+the bitmap they found, so a `-R` run that repairs a wrong bitmap still
+exits non-zero on what it repaired; the run after it is the clean one.
+`-R -v` can exit non-zero for either reason at once — the bitmap it
+repaired, an object that failed its verify, or both — so the exit code
+alone does not say which, and the report is what does.
 
 **`shoalmonfmt`** — format a monitor map partition. §10 is the format
 it writes.
@@ -3327,9 +3379,9 @@ record is written and then a byte-wise mixture of its old and its new
 header bytes is placed on the platter, which is what a torn write
 leaves and what the sweep must be exhaustive over.
 
-Six of §13's points are *mutations* or schedules rather than crashes,
-and are built into the store as hooks that are inert unless a test
-asks for them: `reclaim` (reclaim log space before the checkpoint's
+Seven of §13's points are *mutations* or schedules rather than
+crashes, and are built into the store as hooks that are inert unless
+a test asks for them: `reclaim` (reclaim log space before the checkpoint's
 superblock write returns), `publish` (force an `epochhigh` publish
 after the *n*'th checkpoint page write, so it can be combined with
 `ckpt:n`), `batch:n` (hold batch *n*'s record write and let *n+1*
@@ -3346,7 +3398,10 @@ while the committer is still inside the flush), and `fatal` (put the
 store into §3.2's condemned state, which the commit path itself
 reaches only from an apply that failed after its record was durable —
 a case §3.2 makes unreachable, so a test cannot arrive at it any
-other way). Each T1 test names the requirement it discriminates
+other way), and `snapstale:n` (take the next *n* enumeration opens'
+index counts one entry short, which is what a create between the
+count and the fill leaves, so a test can drive §9's re-count without
+racing for it). Each T1 test names the requirement it discriminates
 and the mutation that must break it; **each mutation is run**, per
 `AGENTS.md`.
 
@@ -3507,10 +3562,19 @@ batch's members, and `qid.path` across restarts) and `enumtest` (§9's
 snapshot-at-open enumeration: a `/obj`, a `/tombs` and an `/advert`
 snapshot each walked by position with an entry created, deleted,
 created over and discarded under it, both halves of the gone rule
-discriminated one at a time, the bound on open snapshots and the
-`disk full` past it, a checkpoint taken mid-walk, the `/dirty` and
-`/lost` copies against a moving set, and §6's tombstone reclaim walk
-— single-proc and with the record replaced under it).
+discriminated one at a time, a live copy condemned under an open
+`/obj` and still answered with `corrupt=1` rather than dropped (D14),
+the bound on open snapshots, the `disk full` past it and the refusal
+of a `kinds` the engine has no state for, a `storeclose` under an
+open snapshot, an open whose index count goes stale between the count
+and the fill, every one of the five enumerations refusing on a
+condemned store, a checkpoint taken mid-walk, the `/dirty` copy
+against a moving set and the `fullsync` peer enumeration beside it
+after §2.6's exhaustion drop, the `/lost` copy against a moving list
+and over the one slot whose own index entry is the damage, and §6's
+tombstone reclaim walk — single-proc, with the record replaced under
+it, with the record put back at a higher key under it, and under
+concurrent churn).
 
 Against the list below that is T1.1–T1.26. One case is not covered
 and waits on something this store does not have yet: **T1.27** waits
@@ -3680,11 +3744,10 @@ within `AGENTS.md`'s seconds.
   the case a rule that exempts holes from `nmap` gets wrong once
   clause 4 is wrong as well. Crash at `commit:0`; restart. Block 0
   must read what it held — its own bytes in the first variant, zeros
-  in the second —
-  every unwritten block must read zeros, and `verify` must pass,
-  which is what catches a hole left with sixteen zero bytes for a
-  digest. Then the re-replay
-  schedule: with the hole variant, crash at `ckpt:n` with the
+  in the second — every unwritten block must read zeros, and
+  `verify` must pass, which is what catches a hole left with sixteen
+  zero bytes for a digest. Then the re-replay schedule: with the hole
+  variant, crash at `ckpt:n` with the
   object's index page written and its extent-map entry not, restart,
   and assert the same — replay must zero the map it inherits even
   though the entry it is applying to already carries the record's
@@ -4147,6 +4210,19 @@ rather than an amendment, because it touches the wire.
 10. **BLAKE2s throughput on the fleet**, to confirm the 50–59 MB/s
     measured here — every hashing term in §5, §8 and §11 scales with
     it.
+11. **Whether the enumeration open's `qlstate` hold has to be
+    chunked.** §9 measures it at ~22 ns a slot up to the highest
+    occupied one, so ≈23 ms at `nslots = 2^20` — the one state-lock
+    hold in the store of the same order as a commit's write. If T2
+    shows it delaying `/status`, `/ctl` or a `Tflush` behind a
+    `/obj` open, the shape that fixes it is a **chunked scan under a
+    generation counter**: take the index in bounded runs, dropping
+    and re-taking `qlstate` between them, and restart the scan when
+    a counter bumped by every apply that creates, frees or re-states
+    a slot shows the index moved under it. That keeps `objsnap=full`
+    — a restart is not a partial vector — at the price of a scan
+    that can be made to starve by a continuous create rate, which is
+    why it is not built on speculation. T2.
 
 ### (b) Product calls
 

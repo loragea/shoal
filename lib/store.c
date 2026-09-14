@@ -130,6 +130,18 @@ storehook(Store *s, char *name, uvlong n)
 		s->fatal = n != 0;
 		s->broken = n != 0;
 		qunlock(&s->qllog);
+	}else if(strcmp(name, "snapstale") == 0){
+		/*
+		 * §9's snapshot open counts the index, allocates the vector
+		 * outside the lock and fills it under a second hold, so the
+		 * count can be stale by the time the fill runs.  This makes
+		 * the next n counts short by one, which is what a create in
+		 * that window leaves, so a test can drive the re-count
+		 * without racing for it.
+		 */
+		qlock(&s->qlstate);
+		s->snapstale = n;
+		qunlock(&s->qlstate);
 	}else if(strcmp(name, "reclaim") == 0)
 		s->reclaimearly = n != 0;
 	else if(strcmp(name, "publish") == 0)
@@ -1111,8 +1123,25 @@ storeopen(Dev *d, Storecfg *cfg)
 void
 storeclose(Store *s)
 {
+	ulong n;
+
 	if(s == nil)
 		return;
+	/*
+	 * §9: a snapshot is the caller's, so this frees none of them —
+	 * and a store freed under one leaves every later objsnapent
+	 * reading the freed Store, where it finds no qid.path match and
+	 * answers 0, "this entry is gone", rather than faulting.  That
+	 * is a plausible lie: a fid-lifetime bug in a server becomes a
+	 * silently short /obj listing.  There is no answer this can give
+	 * that is not one, so it says so out loud instead.
+	 */
+	qlock(&s->qlstate);
+	n = s->nobjsnap;
+	qunlock(&s->qlstate);
+	if(n > 0)
+		sysfatal("storeclose: %lud object snapshot%s still open",
+			n, n == 1 ? "" : "s");
 	qlock(&s->cklk);
 	s->stop = 1;
 	rwakeupall(&s->ckrz);
