@@ -97,6 +97,31 @@ ientunhash(Store *s, ulong slot)
 		}
 }
 
+/*
+ * The published view of one index entry, as objstat, §8's cursor and
+ * §9's snapshots all render it.  One home for it, so the four callers
+ * cannot drift: what an Objinfo says about a slot is decided here.
+ * The caller holds qlstate, which is what makes the entry readable.
+ */
+void
+ientinfo(Store *s, ulong slot, Objinfo *oi)
+{
+	Ient *e;
+
+	e = &s->idx[slot];
+	memset(oi, 0, sizeof *oi);
+	oi->slot = slot;
+	oi->emapslot = e->emapslot;
+	oi->qidpath = e->qidpath;
+	oi->len = e->len;
+	oi->ver = e->ver;
+	oi->wepoch = e->wepoch;
+	oi->mtime = e->mtime;
+	memmove(oi->csum, e->csum, Csumlen);
+	oi->state = e->state;
+	oi->corrupt = (e->flags & Icorrupt) != 0;
+}
+
 long
 ientfind(Store *s, uchar *oid, int oidlen)
 {

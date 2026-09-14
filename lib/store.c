@@ -43,6 +43,32 @@ bitset(uchar *p, uvlong i)
 	p[i/8] |= 1 << (i%8);
 }
 
+/*
+ * §3.2: a store whose apply failed after its record was durable is
+ * serving in-memory state that its own log no longer describes, so it
+ * answers nothing until it has been opened again and replayed.  The
+ * commit path refuses through the same flag (broken).  Both are
+ * qllog's, which is where the batch that condemns the store sets them
+ * and where §3.2's failseq is read beside them.  It is taken alone and
+ * released before this call takes any other, so §7 rule 1 — no proc
+ * holds two state locks at once — still holds as stated.
+ */
+int
+storeserving(Store *s)
+{
+	int f;
+
+	qlock(&s->qllog);
+	f = s->fatal;
+	qunlock(&s->qllog);
+	if(f){
+		werrstr("store condemned: in-memory state no longer matches "
+			"the log; open it again");
+		return 0;
+	}
+	return 1;
+}
+
 int
 storeproc(Store *s, void (*fn)(void*), void *a)
 {

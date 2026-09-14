@@ -339,6 +339,7 @@ void	zerodigest(Store*, uvlong len, ulong i, uchar *dig);
 void	ienthash(Store*, ulong slot);
 void	ientunhash(Store*, ulong slot);
 long	ientfind(Store*, uchar *oid, int oidlen);
+void	ientinfo(Store*, ulong slot, Objinfo*);	/* caller holds qlstate */
 
 /* commit.c — the log, group commit and the flusher */
 int	logcommit(Store*, Item*);
@@ -352,6 +353,7 @@ void	ckptproc(void*);
 int	publishlocked(Store*);
 
 /* store.c */
+int	storeserving(Store*);	/* 0 and an error set on a condemned store */
 int	storeproc(Store*, void (*)(void*), void*);
 void	storeprocdone(Store*);
 void	storecondemn(Store*, ulong slot);	/* §5 step 10, at run time */
