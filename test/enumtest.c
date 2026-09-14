@@ -1389,6 +1389,15 @@ struct Churn
 	int	done;
 	int	err;
 	int	ops;
+	/*
+	 * Park between the first delete and its discard and stay there
+	 * until unpark, so that a walk overlapping this proc is given a
+	 * tombstone of ITS making — at its wepoch — and not merely the
+	 * tombstones the test made before spawning it.
+	 */
+	int	park;
+	int	parked;
+	int	unpark;
 };
 
 /*
@@ -1413,10 +1422,19 @@ churnproc(void *a)
 			oidof(o, nm);
 			if(objremove(c->s, o, 5, 2, c->we, nil, 0) < 0)
 				c->err++;
-			else if(objdiscard(c->s, o, 5, 2, c->we, c->we+1) < 0)
-				c->err++;
-			else if(objcreate(c->s, o, 5, 1, c->we, nil, 0, nil) < 0)
-				c->err++;
+			else{
+				if(c->park && !c->parked){
+					c->parked = 1;
+					while(!c->unpark)
+						sleep(1);
+				}
+				if(objdiscard(c->s, o, 5, 2, c->we,
+					c->we+1) < 0)
+					c->err++;
+				else if(objcreate(c->s, o, 5, 1, c->we, nil,
+					0, nil) < 0)
+					c->err++;
+			}
 			c->ops++;
 		}
 	c->done = 1;
@@ -2072,6 +2090,7 @@ treclaimconc(void)
 	vlong cutoff;
 	int k, live;
 
+	live = 0;
 	d = bigdisk();
 	if((s = openstoreck(d)) == nil){
 		fail("the concurrent reclaim: storeopen: %r");
@@ -2093,16 +2112,6 @@ treclaimconc(void)
 		snprint(nm, sizeof nm, "m%04lud", i);
 		mk(s, nm);
 	}
-	/*
-	 * The cutoff is the LAST tombstone's mtime, not the first's:
-	 * mtime is a whole second (obj.c takes time(nil)), so a run that
-	 * straddles a second boundary while these 200 are made would
-	 * leave the later ones above a cutoff taken from the first and
-	 * silently halve what the walk is given.
-	 */
-	if(ostat(s, "z0199", &oi) < 0)
-		fail("objstat z0199: %r");
-	cutoff = oi.mtime;
 	for(k = 0; k < Nproc; k++){
 		if((c[k] = mallocz(sizeof *c[k], 1)) == nil)
 			sysfatal("mallocz: %r");
@@ -2118,6 +2127,15 @@ treclaimconc(void)
 		 * cutoff, because the churn's mtimes are this same second.
 		 */
 		c[k]->we = 5;
+		/*
+		 * One proc parks between its delete and its discard, so the
+		 * walk is GIVEN a churn tombstone rather than merely racing
+		 * for one.  Without it the walk's 200 commits outrun the
+		 * churn's window every time, condition 3 is never reached,
+		 * and the nskip assertion below reads 0 == 0.
+		 */
+		if(k == 0)
+			c[k]->park = 1;
 		if(spawnproc(churnproc, c[k]) < 0){
 			fail("spawn: %r");
 			c[k]->done = 1;
@@ -2126,18 +2144,46 @@ treclaimconc(void)
 	for(i = 0; i < 5000; i++){
 		live = 0;
 		for(k = 0; k < Nproc; k++)
-			if(c[k]->ops > 0)
+			if(c[k]->ops > 0 || c[k]->parked)
 				live++;
-		if(live == Nproc)
+		if(live == Nproc && c[0]->parked)
 			break;
 		sleep(1);
 	}
+	eqv("every churn proc is running", live, Nproc);
+	istrue("and one of them is holding a tombstone of its own",
+		c[0]->parked);
+	/*
+	 * The cutoff is the LAST tombstone's mtime, not the first's:
+	 * mtime is a whole second (obj.c takes time(nil)), so a run that
+	 * straddles a second boundary while these 200 are made would
+	 * leave the later ones above a cutoff taken from the first and
+	 * silently halve what the walk is given.  The parked proc's own
+	 * tombstone is younger still, and the cutoff has to reach it too
+	 * — otherwise the cutoff, not the epoch, is what reserves it,
+	 * and condition 3 goes untested again.
+	 */
+	if(ostat(s, "z0199", &oi) < 0)
+		fail("objstat z0199: %r");
+	cutoff = oi.mtime;
+	if(ostat(s, "m0000", &oi) < 0)
+		fail("objstat m0000: %r");
+	else if(oi.mtime > cutoff)
+		cutoff = oi.mtime;
 	reclaimwalk(s, cutoff, 5, &r);
+	c[0]->unpark = 1;
 	for(k = 0; k < Nproc; k++)
 		c[k]->stop = 1;
 	eqv("the walk discarded every tombstone it was given", r.ndisc, 200);
 	eqv("and skipped every one the churn's epoch reserves", r.nskip,
 		r.nseen - 200);
+	/*
+	 * And that set is not empty: the parked proc's tombstone is in
+	 * the snapshot, at the walk's own epoch and under its cutoff, so
+	 * layer-a §1.5's condition 3 is the only thing that can hold the
+	 * walk off it.
+	 */
+	istrue("and there was one for it to reserve", r.nskip > 0);
 	eqv("and was refused none of them", r.nrefused, 0);
 	for(i = 0; i < 200; i += 37){
 		snprint(nm, sizeof nm, "z%04lud", i);
