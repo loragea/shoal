@@ -2870,8 +2870,8 @@ for the current-map slot, and the same again for the history slot
 that precedes it, so a publish is ~17 ms whether it carries a
 placement change or a single `stale` mark. The read-back of each slot
 is one read of at most `slotsz` — the sector the checksum needs plus
-`len` bytes — which is noise beside the flush it follows. That is what makes
-layer-a §5.4 step 5a affordable — the alternative
+`len` bytes — which is noise beside the flush it follows. That is what
+makes layer-a §5.4 step 5a affordable — the alternative
 `docs/platform/9front-storage.md` measured, a file plus a gefs sync,
 costs 530–620 ms and would blow `replms` regularly.
 
@@ -3311,9 +3311,10 @@ superblock write returns, before its flush — the two copies are
 written in sequence only by `shoalfmt`), and the monitor store's four
 (§10): `monfmthdr`, inside `monfmt` after the flush that zeroes both
 header sectors and before any other write, and `monhist`,
-`monhistflush` and `moncur` inside a commit. A crash at a point is the end
-of a run, so the simulated disk can be told to **stop the device** at
-the crash: every subsequent read, write and flush fails until the
+`monhistflush` and `moncur` inside a commit. A crash at a point is the
+end of a run, so the simulated disk can be told to **stop the
+device** at the crash: every subsequent read, write and flush fails
+until the
 test brings the machine back. Without that the writes a schedule
 places *after* its crash point would still land, and a crash at
 `commit` would still leave a committed record. The schedules that
@@ -3388,8 +3389,9 @@ commit — §10's read-back under a write that reports success and lands
 nothing (`Sfdrop`) or lands a mix of old and new bytes
 (`Sftearbyte`), on the ring slot and on the current slot in turn,
 each failing the commit and leaving the restart on the previous map
-with position 0 still equal to it; **T1.9's second half**, a crash at `moncur` leaving the previous map
-current and the failed publish's ring entry a phantom, and a slot torn
+with position 0 still equal to it; **T1.9's second half**, a crash at
+`moncur` leaving the previous map current and the failed publish's
+ring entry a phantom, and a slot torn
 at a high `seq` not steering the next write onto the only good one;
 **T2.7's phantom case at T1 scale**, a crash at `monhistflush` after
 which the unpublished epoch answers nothing and the next commit
@@ -3413,8 +3415,9 @@ through them — a current slot whose `len` does not
 fit its slot, an open that writes nothing, a store reopened over a
 read-only file image, §10's equal-`seq` tie — a fresh store opens on
 slot 0 and its first commit writes slot 1 — an epoch published twice
-with a regression between, and §12's refusals and its object-store superblock warning,
-driven through `monfmt` as `fmtcktest` drives `fmtstore`),
+with a regression between, and §12's refusals and its object-store
+superblock warning, driven through `monfmt` as `fmtcktest` drives
+`fmtstore`),
 `fmtcktest` (`shoalfmt` to `shoalck` over both a
 simulated disk and a file image; a store with a live one-block object
 and a live three-block one, built through the codecs, with each fault
