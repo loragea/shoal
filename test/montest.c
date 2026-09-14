@@ -1106,6 +1106,85 @@ tringfailphantom(void)
 }
 
 /*
+ * A ring write that fails over a VALID victim.  With the ring full
+ * the victim is an ordinary committed entry, and a write that landed
+ * nothing left it on the platter: the live store must keep answering
+ * that epoch and must not count a phantom the disk does not hold.
+ * The failure path re-reads the slot to find that out.
+ */
+static void
+tringfailvalid(void)
+{
+	Dev *d;
+	Mon *m;
+	Monstat st;
+	Monmap mm;
+	uchar hdr[Secsz];
+	char text[32];
+	vlong voff;
+	int i;
+
+	d = fresh();
+	if((m = mustopen(d, "ringfull")) == nil){
+		devclose(d);
+		return;
+	}
+	/* retain commits: every ring slot valid, none a phantom */
+	for(i = 1; i <= Retain; i++){
+		snprint(text, sizeof text, "map=%d", i);
+		commit(m, "ringfull", text, i);
+	}
+	monstat(m, &st);
+	eqv("ringfull: the ring is full", st.nhist, Retain);
+	eqv("ringfull: with no phantom", st.nphantom, 0);
+
+	/* the victim is the oldest entry: seq 1, epoch 1 */
+	voff = -1;
+	for(i = 0; i < Retain; i++){
+		simpeek(d, histoffs(&st, i), hdr, Secsz);
+		if(memcmp(hdr, "shoalmap", 8) == 0 && GBIT64(hdr + 32) == 1)
+			voff = histoffs(&st, i);
+	}
+	checks++;
+	if(voff < 0){
+		fail("ringfull: the oldest entry is not on the disk");
+		monclose(m);
+		devclose(d);
+		return;
+	}
+
+	simfaultat(d, Sfeio, 1, voff, st.slotsz);
+	checks++;
+	if(moncommit(m, "map=E", 5, 5) == 0)
+		fail("ringfull: a commit whose ring write failed reported "
+			"success");
+	monstat(m, &st);
+	eqv("ringfull: the current map is untouched", st.epoch, Retain);
+	eqv("ringfull: the victim is still committed history", st.nhist,
+		Retain);
+	eqv("ringfull: and is no phantom", st.nphantom, 0);
+	eqi("ringfull: the oldest epoch still answers", monlookup(m, 1, &mm),
+		1);
+	eqtext("ringfull: with its own text", &mm, "map=1");
+
+	/* and a restart agrees with the live store */
+	monclose(m);
+	if((m = mustopen(d, "ringfull restart")) == nil){
+		devclose(d);
+		return;
+	}
+	monstat(m, &st);
+	eqv("ringfull: the restart finds the same current map", st.epoch,
+		Retain);
+	eqv("ringfull: the same history", st.nhist, Retain);
+	eqv("ringfull: and no phantom", st.nphantom, 0);
+	eqi("ringfull: the oldest epoch answers after it",
+		monlookup(m, 1, &mm), 1);
+	monclose(m);
+	devclose(d);
+}
+
+/*
  * The monitor retries in the SAME session after a current-slot write
  * fails.  Nothing restarts here, so the phantom mark that failure
  * leaves has to hold in memory: the ring entry for the map that was
@@ -1928,6 +2007,7 @@ main(int, char**)
 	tcrashmatrix();
 	thistfail();
 	tringfailphantom();
+	tringfailvalid();
 	tcurfailretry();
 	treadretry(1);
 	treadretry(0);

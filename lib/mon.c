@@ -696,13 +696,38 @@ histvictim(Mon *m)
  * would read back at the following open as ordinary history for a map
  * that was never published.  So the slot stays first in line for
  * reuse — invalid and phantom both — and nphantom counts it once.
+ *
+ * Unless the platter says otherwise.  When the ring is full the
+ * victim is an ordinary committed entry, and a write that landed
+ * nothing left it exactly where it was: one read says so, and an
+ * entry whose seq is not above the current map's is history this
+ * store can still answer, so it goes back into memory as it is found
+ * rather than vanishing from monhistory and monlookup — and counting
+ * as a phantom the disk does not hold — until the next open.  The
+ * read is not made after an INDETERMINATE write (§10): the read-back
+ * has already failed twice on this slot, so whatever is there is not
+ * to be trusted as the victim's own bytes, and the slot must be the
+ * next one reused.
  */
 static void
-histfail(Mon *m, int v, char *err)
+histfail(Mon *m, int v, char *err, int indet)
 {
+	Monslot sl;
 	int wasphantom;
 
 	wasphantom = m->hist[v].phantom;
+	if(!indet){
+		memset(&sl, 0, sizeof sl);
+		slotread(m, slotoff(m, m->h.histoff, v), &sl);
+		if(sl.valid && sl.seq <= m->cur[m->curi].seq){
+			slotclear(&m->hist[v]);
+			m->hist[v] = sl;
+			if(wasphantom && m->nphantom > 0)
+				m->nphantom--;
+			return;
+		}
+		slotclear(&sl);
+	}
 	slotclear(&m->hist[v]);
 	snprint(m->hist[v].why, sizeof m->hist[v].why,
 		"the write that failed the commit: %s", err);
@@ -765,7 +790,7 @@ moncommit(Mon *m, void *text, ulong len, uvlong epoch)
 		 */
 		if(r == -2)
 			m->seqnext = seq + 1;
-		histfail(m, v, err);
+		histfail(m, v, err, r == -2);
 		errstr(err, sizeof err);
 		return -1;
 	}

@@ -2905,6 +2905,18 @@ map would raise `seq` above it, and the following start would read the
 never-published map back as ordinary history: precisely the outcome
 the rule above exists to prevent.
 
+There is a third thing the victim can hold, and the failure path
+**reads the slot once to find out**. When the ring is full the victim
+is not an invalid slot or a phantom but an ordinary committed entry,
+and a write that landed nothing left it there intact. An entry read
+back valid whose `seq` is not above the current map's is history this
+store can still answer, so it goes back into memory as it is found:
+the live store keeps answering that epoch and counts no phantom it
+does not hold, instead of both until the next open. A slot that reads
+back unreadable or invalid, and a slot whose write was indeterminate —
+where the read-back has already failed twice and this read is not
+attempted — take the invalid-and-phantom mark above.
+
 **The store never compares epochs.** It records the epoch it is given
 beside the map and orders nothing by it: layer-a §8.3's `forceepoch`
 and §8.6's rebuild path can each legitimately publish an epoch that is
@@ -3483,7 +3495,10 @@ current map, and that no ring entry sits above the current map's
 `monhist`, each leaving the current map untouched; a ring write that
 fails *over a phantom victim*, after which the retry reuses that same
 slot and the never-published epoch is still unanswerable at the next
-start; a current-slot write that fails and is retried *in the same
+start; a ring write that fails *over a valid victim*, with the ring
+full, after which the live store still answers the oldest epoch,
+counts no phantom, and agrees with the restart; a current-slot write
+that fails and is retried *in the same
 session*, where the phantom mark has to hold in memory with no restart
 to rebuild it; `disk full` on an
 oversize map with the store unchanged, and the largest map that fits
