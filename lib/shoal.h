@@ -1250,7 +1250,7 @@ struct Cinst
 	ulong	weight;			/* §4.4: parsed, must be 100 */
 	int	status;			/* Snew … Sdead */
 	int	up;			/* Uyes … Uno */
-	int	fenced;
+	int	fenced;			/* §3.3: parsed; §5.2's grace reads it */
 	uvlong	since;
 };
 
@@ -1295,6 +1295,13 @@ struct Cmap
  * mapparse validates text[0:n] in full and answers nil with
  * `bad map: <why>' in the error string if it does not conform.  The
  * text need not be NUL-terminated and is not retained.
+ *
+ * nil is not always `bad map': an allocation failure answers nil
+ * with whatever mallocz left in the error string, or with
+ * `out of memory' for a size a ulong cannot hold.  A caller that
+ * puts the errstr of a nil on the wire must therefore decide what a
+ * non-`bad map' one means to it; store.md §3.7 forbids inventing a
+ * §2.6 prefix for it.
  *
  * mapnextok is §8.1's commit-time half of the same validation, which
  * needs two maps: next's epoch MUST be exactly cur's plus one and
@@ -1343,8 +1350,13 @@ char*	upname(int up);
  * with up=yes, or nil when there is none, which is the object's
  * `object unavailable' at this epoch — or nil with an error string,
  * which is not.  mapunderrep answers 1, 0, or −1 for the same
- * failure.  Being it is necessary and not
- * sufficient to serve: §5.2's grace and currency check are the rest.
+ * failure.  Being the serving primary is necessary and not
+ * sufficient to serve: §5.2's grace and currency check are the rest,
+ * and neither is computed here.  The grace is the caller's:
+ * mapprimary(prev, oid) says whether it was already serving primary
+ * for the object at E−1, and §5.2's exemption is that instance being
+ * up=no with fenced set in the map at E — `fenced=' is parsed here
+ * (Cinst.fenced) and consumed there.
  */
 uvlong	maphash(char *oid, int dom, char *id);
 int	placecmp(uvlong sa, char *a, uvlong sb, char *b);
@@ -1352,7 +1364,21 @@ int	mapplace(Cmap*, char *oid, Cinst **out, int nout);
 Cinst*	mapprimary(Cmap*, char *oid);
 int	mapunderrep(Cmap*, char *oid);
 
-/* §6.4 F3, and the membership rule its carve-out does not cover */
+/*
+ * §6.4 F3, and the membership rule its carve-out does not cover.
+ *
+ * mapdown answers whether the map bars this instance from serving
+ * role=client I/O — up=no, status=out, status=dead, or no record at
+ * all — which a caller refuses with `down'.  Keeping F3 to that is
+ * the caller's job, not this answer's: F3 MUST NOT stop the instance
+ * answering op=meta, op=get, op=list or op=verify, accepting an
+ * incoming op=full or op=delete push, or completing a pull or push
+ * it is the source of, and mis-wording exactly that is what made
+ * `disable' self-defeating in the previous revision.  mapmember is
+ * the zombie rule the carve-out does not cover: an instance with no
+ * record, or status=dead, must not advertise, push, answer /rpc or
+ * attach role=repl anywhere.
+ */
 int	mapdown(Cmap*, char *iid);
 int	mapmember(Cmap*, char *iid);
 
