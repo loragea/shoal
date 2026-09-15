@@ -2592,10 +2592,14 @@ lock once it returns. That is 12 bytes an entry, **3.1 MB at 2.6·10^5
 objects and 12 MB at `nslots = 2^20`**, held as two parallel arrays
 rather than one array of a struct, because a `{u32, u64}` struct is
 16 bytes on amd64 and the 4 in every 16 buys nothing. It takes
-**two** holds of `qlstate` (§7) to do that on the happy path and up
-to `Snaptries` pairs of holds when the index keeps growing under it —
-the count under one, the 12 MB allocated outside any, the fill under
-the next — and it can fail: see "What the open costs" below. The
+**two** holds of `qlstate` (§7) to do that on the quiet path, one per
+step — the count under one, the 12 MB allocated outside any, the fill
+under the next — and two more for every re-count the index forces.
+The bound below costs no hold of its own: it is tested and taken
+inside the first count's. So the holds an open takes are
+`2·(fill attempts)` on any path that yields a snapshot, and
+`2·Snaptries + 1` = **17** on the refusal, whose last hold gives the
+bound's slot back. It can fail: see "What the open costs" below. The
 vector is a list of names and not a reference the engine must honour:
 a discard of an entry it names is neither refused nor delayed by it.
 
@@ -2627,8 +2631,9 @@ counter that would bound the hold if T2 shows the 23 ms matters; it
 is not built.
 
 **The second hold, and the one way the open can fail.** The open
-counts the index under `qlstate`, releases it, allocates, and re-takes
-it to fill. The index moves in between as a matter of course, because
+counts the index under `qlstate` — testing and taking the bound in
+that same hold, the first time round — releases it, allocates, and
+re-takes it to fill. The index moves in between as a matter of course, because
 releasing `qlstate` puts the open *behind* every apply already queued
 for it; this is the common case, not a corner. Three of the four
 things that can have happened cost nothing:
@@ -2678,9 +2683,10 @@ policy, default 8) and answers a further open `disk full` (layer-a
 §2.6) rather than growing without limit; at 2^20 slots eight of them
 are 96 MB, which is the number §14(9) says is answered for the Layer
 B envelope and not for this design's own maximum. The test and the
-count are **one step under one hold** of `qlstate` — the open takes
-its slot the moment it passes the bound, so two opens racing cannot
-both find room — and an open that then fails gives the slot back, so
+count are **one step under one hold** of `qlstate` — the open's first
+count takes that hold anyway, and the open takes its slot the moment
+it passes the bound, so two opens racing cannot both find room — and
+an open that then fails gives the slot back in a hold of its own, so
 `/status` counts an open in flight along with the opens that
 completed. A close releases the count. A snapshot is the
 caller's, and `storeclose` frees nothing of the caller's, so every

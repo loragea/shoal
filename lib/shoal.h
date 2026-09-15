@@ -804,14 +804,17 @@ int	objslot(Store*, ulong slot, uchar *oid, int *oidlen, Objinfo*);
  * engine must honour: it is a list of names, and an entry a later
  * discard removes simply becomes gone.
  *
- * It takes TWO holds of the state lock to do that — the count under
- * one, the vector allocated outside any, the fill under the next —
- * and up to Snaptries pairs of them when the index grows past the
+ * It takes TWO holds of the state lock to do that, one per step —
+ * the count, the vector allocated outside any hold, the fill — and
+ * two more for every re-count the index forces by growing past the
  * vector's slack in between, which is why it can fail with `object
- * snapshot: the index moved under 8 counts'.  That failure is
- * pathological and not ordinary: the vector is allocated with slack
- * over the count, so a create rate would have to outrun a malloc
- * eight times running to provoke it.  It is not a layer-a §2.6
+ * snapshot: the index moved under 8 counts'.  The bound below costs
+ * no hold of its own: it is tested and taken inside the first count's.
+ * A refused open is 2·Snaptries + 1 holds, the last of them giving
+ * the bound's slot back.  That failure is pathological and not
+ * ordinary: the vector is allocated with slack over the count, so a
+ * create rate would have to outrun a malloc eight times running to
+ * provoke it.  It is not a layer-a §2.6
  * condition — nothing is full and nothing is broken — so it carries
  * no §2.6 prefix (§3.7), and a server SHOULD retry the open once
  * before answering a client at all.
@@ -839,11 +842,11 @@ int	objslot(Store*, ulong slot, uchar *oid, int *oidlen, Objinfo*);
  * objsnapmax (§9: policy, default Objsnapmaxdflt), because the cost
  * is per open fid; an open past it answers `disk full' (layer-a
  * §2.6).  The bound is tested and the count taken in one step under
- * one hold of the state lock, so two opens racing cannot both find
- * room; an open that fails after that gives the count back, and
- * Storestat counts an open in flight.  objsnapclose releases the
- * count.  A snapshot is the
- * caller's, and storeclose frees nothing of the caller's, so every
+ * one hold of the state lock — the hold the open's first count takes
+ * anyway — so two opens racing cannot both find room; an open that
+ * fails after that gives the count back, and Storestat counts an open
+ * in flight.  objsnapclose releases the count.  A snapshot is the
+ * caller's and storeclose frees nothing of the caller's, so every
  * snapshot MUST be closed before the store it was taken from is:
  * storeclose `sysfatal's on a store that still has one open, because
  * the alternative is a snapshot answering "gone" for every entry out
