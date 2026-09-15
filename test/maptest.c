@@ -1747,7 +1747,13 @@ tnext(void)
 	checks += 4;
 	mapfree(cur);
 
-	/* §8.5's other immutables, which forceepoch does not lift */
+	/*
+	 * §8.5's other immutables, which forceepoch does not lift:
+	 * §8.1 exempts the `exactly current+1' and `monid immutable'
+	 * checks from the commit it governs and then says
+	 * "Everything else in the validation still applies to it", so
+	 * each of these is refused at force = 1 as well as at 0.
+	 */
 	cur = mapparse(good, strlen(good));
 	next = mapparse(good, strlen(good));
 	if(cur == nil || next == nil)
@@ -1758,18 +1764,18 @@ tnext(void)
 		fail("commit: a changed objmax was accepted");
 	next->objmax = cur->objmax;
 	next->blksz = cur->blksz * 2;
-	if(mapnextok(cur, next, 0))
+	if(mapnextok(cur, next, 0) || mapnextok(cur, next, 1))
 		fail("commit: a changed blksz was accepted");
 	next->blksz = cur->blksz;
 	strcpy(next->csumalg, "other");
-	if(mapnextok(cur, next, 0))
+	if(mapnextok(cur, next, 0) || mapnextok(cur, next, 1))
 		fail("commit: a changed csumalg was accepted");
 	strcpy(next->csumalg, cur->csumalg);
 	strcpy(next->placehash, "other");
-	if(mapnextok(cur, next, 0))
+	if(mapnextok(cur, next, 0) || mapnextok(cur, next, 1))
 		fail("commit: a changed placehash was accepted");
 	strcpy(next->placehash, cur->placehash);
-	if(!mapnextok(cur, next, 0))
+	if(!mapnextok(cur, next, 0) || !mapnextok(cur, next, 1))
 		fail("commit: an otherwise equal map at epoch+1 was refused");
 	checks += 5;
 	mapfree(next);
