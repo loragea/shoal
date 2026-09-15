@@ -151,6 +151,20 @@ storehook(Store *s, char *name, uvlong n)
 		qlock(&s->qlstate);
 		s->snapshort = n;
 		qunlock(&s->qlstate);
+	}else if(strcmp(name, "snaphold") == 0){
+		/*
+		 * §9's open takes the bound's slot under its first count
+		 * and gives it back at its bail-out, so an open in flight
+		 * when storeclose runs can be holding the store's last
+		 * claim — and then the bail-out is what frees the Store.
+		 * This parks the next open with the slot taken until
+		 * storeclose has set `closed', so a test drives that
+		 * interleaving instead of racing for it.  One arming
+		 * parks one open; inert while 0.
+		 */
+		qlock(&s->qlstate);
+		s->snaphold = n != 0;
+		qunlock(&s->qlstate);
 	}else if(strcmp(name, "reclaim") == 0)
 		s->reclaimearly = n != 0;
 	else if(strcmp(name, "publish") == 0)
@@ -861,7 +875,15 @@ condemn(Store *s)
 	return 0;
 }
 
-static void
+/*
+ * The Store's own memory, released by whichever path gave up the last
+ * claim on it: a storeopen that failed part-way, storeclose, or — for
+ * a store closed under an open snapshot (§9) — the last objsnapclose.
+ * It touches s->d nowhere, so the caller's device may already be
+ * closed; and it destroys exactly what objsnapent renders, which is
+ * why §9 defers it rather than letting a snapshot read through it.
+ */
+void
 storefree(Store *s)
 {
 	Peer *p, *pn;
@@ -897,6 +919,13 @@ storefree(Store *s)
 	free(s->stagebuck);
 	free(s->zeroblk);
 	free(s->lost);
+	/*
+	 * §13's freed hook, last: the Store's fields are still readable
+	 * here, and this is the one place any of them stops being so, so
+	 * a test can say "the memory is gone" and mean exactly that.
+	 */
+	if(s->cfg.freed != nil)
+		(*s->cfg.freed)(s->cfg.freedarg);
 	free(s);
 }
 
@@ -950,6 +979,7 @@ storeopen(Dev *d, Storecfg *cfg)
 	s->relrz.l = &s->qllog;
 	s->donerz.l = &s->qllog;
 	s->holdrz.l = &s->qllog;
+	s->snaprz.l = &s->qlstate;
 	s->flrz.l = &s->fllk;
 	s->ckrz.l = &s->cklk;
 	s->procrz.l = &s->proclk;
@@ -979,7 +1009,7 @@ storeopen(Dev *d, Storecfg *cfg)
 	else{
 		werrstr("%s: no flush channel: refusing to start without -w",
 			d->name);
-		free(s);
+		storefree(s);
 		return nil;
 	}
 
@@ -987,14 +1017,14 @@ storeopen(Dev *d, Storecfg *cfg)
 	if(superselect(d, &sel) < 0){
 		werrstr("%s: no valid superblock: shoalck, then shoalfmt -r "
 			"and refill from peers", d->name);
-		free(s);
+		storefree(s);
 		return nil;
 	}
 	s->sb = sel.sb[sel.start];
 	s->pub = s->sb;
 	if(geomok(s, d) < 0){
 		werrstr("%s: geometry: %r", d->name);
-		free(s);
+		storefree(s);
 		return nil;
 	}
 
@@ -1129,47 +1159,25 @@ storeopen(Dev *d, Storecfg *cfg)
 	return s;
 }
 
+/*
+ * Stop the procs and give up the store's own claim on its memory; it
+ * writes nothing, and the device is the caller's.  §9: an object
+ * snapshot MAY still be open, and then this frees nothing — the
+ * snapshot's reads answer `store closed' from a Store that is still
+ * there, and the last objsnapclose releases it.  Neither the fatal
+ * this used to take nor the lie the fatal was chosen over: a store
+ * freed under a snapshot leaves objsnapent rendering from freed
+ * memory, where it finds no qid.path match and answers 0, "that
+ * entry is gone", so a fid-lifetime bug in a server would surface as
+ * a silently short /obj listing.
+ */
 void
 storeclose(Store *s)
 {
-	ulong n;
-	int die;
+	int last;
 
 	if(s == nil)
 		return;
-	/*
-	 * §9: a snapshot is the caller's, so this frees none of them —
-	 * and a store freed under one leaves every later objsnapent
-	 * reading the freed Store, where it finds no qid.path match and
-	 * answers 0, "this entry is gone", rather than faulting.  That
-	 * is a plausible lie: a fid-lifetime bug in a server becomes a
-	 * silently short /obj listing.  There is no answer this can give
-	 * that is not one, so it says so out loud instead.
-	 *
-	 * The count is read and the decision taken under one hold of
-	 * qlstate, but the death is outside it, and that is not an
-	 * oversight.  sysfatal ends with exits(), which on Plan 9 ends
-	 * the calling PROC and not its rfork(RFMEM) group: a qlstate
-	 * carried into it is a QLock no one will ever unlock, and every
-	 * sibling that touches the store afterwards sleeps in Rendez for
-	 * ever.  Measured, with the sysfatal moved inside the hold: the
-	 * T1 case for this call wedges two procs and never returns.
-	 *
-	 * What the window between the unlock and the death costs is
-	 * nothing a conforming caller can see.  It is reachable only by
-	 * opening or closing a snapshot concurrently with storeclose,
-	 * and a caller doing that has already broken the contract this
-	 * call exists to enforce — every snapshot MUST be closed before
-	 * the store is, which orders them, so there is no legitimate
-	 * concurrent open or close for the window to mis-judge.
-	 */
-	qlock(&s->qlstate);
-	n = s->nobjsnap;
-	die = n > 0;
-	qunlock(&s->qlstate);
-	if(die)
-		sysfatal("storeclose: %lud object snapshot%s still open",
-			n, n == 1 ? "" : "s");
 	qlock(&s->cklk);
 	s->stop = 1;
 	rwakeupall(&s->ckrz);
@@ -1187,7 +1195,33 @@ storeclose(Store *s)
 	while(s->nproc > 0)
 		rsleep(&s->procrz);
 	qunlock(&s->proclk);
-	storefree(s);
+	/*
+	 * The store's own reference, given up only now — AFTER the proc
+	 * wait, not at the top of the call.  `closed' is what makes the
+	 * free reachable by anyone else, so setting it early would let a
+	 * last objsnapclose free the Store while this call is still
+	 * asleep inside it on s->procrz, and both would then free: a
+	 * double free and a fault, measured.
+	 *
+	 * Free after unlocking, and no party this call is answerable for
+	 * is waiting on the qlstate inside the memory about to go: the
+	 * ones that block on it holding a claim are an objsnapent or
+	 * objsnapclose of a snapshot whose count is not yet given back,
+	 * an objsnapopen that has taken §9's slot, and this call — and
+	 * the procs are gone — so a true predicate says there is none.
+	 * The calls that block on it holding no claim at all (dirtysnap,
+	 * lostsnap, fullsyncsnap, storestat, the object API, an
+	 * objsnapopen before the slot) would wake in freed memory, and
+	 * §9 makes it the caller's obligation that none of them is still
+	 * in flight here: quiesce, then close.
+	 */
+	qlock(&s->qlstate);
+	s->closed = 1;
+	rwakeupall(&s->snaprz);		/* §13's snaphold point, if one parked */
+	last = s->nobjsnap == 0;
+	qunlock(&s->qlstate);
+	if(last)
+		storefree(s);
 }
 
 void

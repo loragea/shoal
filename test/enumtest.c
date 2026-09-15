@@ -196,6 +196,47 @@ mustsnap(Store *s, int kinds, char *what)
 }
 
 /*
+ * §9's deferred free, watched.  A store closed under an open snapshot
+ * is freed by the LAST objsnapclose and not by storeclose, and there
+ * is no answer that discriminates the two: a read through a snapshot
+ * whose Store was freed early answers `store closed' correctly, out
+ * of the freed memory.  So these tests watch §13's freed hook, which
+ * the engine calls as its last act before the Store's memory goes.
+ *
+ * nfreed is a plain counter in bss, which RFMEM shares, so the
+ * concurrent shapes below see the same one their workers do.  Only
+ * the main proc reads it, and only after its workers have finished.
+ */
+static int nfreed;
+
+static void
+sawfree(void *a)
+{
+	USED(a);
+	nfreed++;
+}
+
+static Store*
+mustwatched(Dev *d, int ckproc, char *what)
+{
+	Store *s;
+	Storecfg c;
+
+	nfreed = 0;
+	tcfg(&c);
+	c.freed = sawfree;
+	if(ckproc){
+		/* §2.8's checkpointer, so storeclose has a proc to wait for */
+		c.nockptproc = 0;
+		c.ckhigh = 8;
+		c.ckms = 50;
+	}
+	if((s = storeopen(d, &c)) == nil)
+		fail("%s: storeopen: %r", what);
+	return s;
+}
+
+/*
  * The position of the entry naming name, and -1 if the snapshot does
  * not answer it.  A server maps a Tread offset onto a position; a
  * test that wants to mutate one entry has to find it the same way.
@@ -860,80 +901,533 @@ tsnapslack(void)
 }
 
 /*
- * §9: every snapshot MUST be closed before the store is, and a
- * storeclose that finds one open says so out loud.  Without that the
- * entries are rendered from a freed Store, which does not fault: the
- * walk finds no qid.path match and answers `gone' for every one of
- * them, so a fid-lifetime bug in a server serves a silently short
- * /obj listing.  The child is the proc that dies, so this one can
- * watch it: RFMEM so it shares the store, RFFDG so the standard
- * error it redirects is its own.
+ * §9: a snapshot MAY outlive the storeclose of the store it came
+ * from, and it is the only thing that may.  The Store's memory is
+ * held by the snapshot, so nothing reads freed memory; reads through
+ * it fail `store closed' rather than finding no qid.path match and
+ * answering `gone' for every entry, which is the lie a server would
+ * serve as a silently short /obj listing; and the memory goes at the
+ * LAST objsnapclose, which is what the freed hook watches.
+ *
+ * The hook is the whole of the discrimination: a storeclose that
+ * freed the store regardless would answer these same reads `store
+ * closed', correctly, out of the freed memory.  The one thing NOT
+ * tested here is storestat after the close — it answers too, and out
+ * of the same freed memory, but §9 makes it undefined on a closed
+ * store, so a test of it would fix behaviour the contract refuses.
  */
 static void
 tclosesnap(void)
 {
 	Dev *d;
 	Store *s;
-	Objsnap *sn;
-	Waitmsg *w;
-	int pid, fd, ok;
+	Objsnap *sn[3], *over;
+	Objinfo oi;
+	uchar got[Oidmax];
+	long gone;
+	int i, oidlen;
 
 	d = newdisk();
-	if((s = mustopen(d, "storeclose under an open snapshot")) == nil)
+	if((s = mustwatched(d, 0, "storeclose under open snapshots")) == nil)
 		return;
 	mk(s, "e0");
 	mk(s, "e1");
-	if((sn = mustsnap(s, Snaplive, "storeclose")) == nil){
-		storeclose(s);
-		devclose(d);
+	for(i = 0; i < nelem(sn); i++)
+		if((sn[i] = mustsnap(s, Snaplive, "storeclose")) == nil){
+			while(--i >= 0)
+				objsnapclose(sn[i]);
+			storeclose(s);
+			devclose(d);
+			return;
+		}
+	/*
+	 * One entry made gone before the close, so that the refusal is
+	 * tested where the other answer is available.  The `closed'
+	 * test is the first statement inside objsnapent's hold, ahead
+	 * of the qid.path and state tests: put it after them and this
+	 * position answers 0 — `that entry is gone' — which is the lie
+	 * §9 refuses to serve, entry by entry, to a server that closed
+	 * its store under a live fid.  Nothing here is about memory:
+	 * s->idx is whole, since storefree is the only thing that frees
+	 * it and these three snapshots are holding the store.
+	 */
+	gone = mustpos(sn[0], "e1", "storeclose");
+	rmv(s, "e1", 2);
+	eqv("a delete before the close answers gone",
+		objsnapent(sn[0], gone, got, &oidlen, &oi), 0);
+	storeclose(s);
+	eqv("a store closed under three snapshots is not freed", nfreed, 0);
+	eqv("and the snapshot still counts its entries",
+		objsnapcount(sn[0]), 2);
+	refused("objsnapent after the store was closed",
+		objsnapent(sn[0], 0, got, &oidlen, &oi), "store closed");
+	refused("a gone entry after the store was closed",
+		objsnapent(sn[0], gone, got, &oidlen, &oi), "store closed");
+	refused("the last entry after the store was closed",
+		objsnapent(sn[2], 1, got, &oidlen, &oi), "store closed");
+	/*
+	 * Past the end is still the handle's own answer: objsnapent
+	 * tests i against the vector before it looks at the store at
+	 * all, so a closed store does not change what an out-of-range
+	 * position means.
+	 */
+	refused("an entry past the end of a closed store's snapshot",
+		objsnapent(sn[0], 2, got, &oidlen, &oi), "entry 2");
+	over = objsnapopen(s, Snaplive);
+	refused("objsnapopen on a closed store", over != nil ? 0 : -1,
+		"store closed");
+	objsnapclose(over);		/* nil unless the refusal failed */
+	objsnapclose(sn[0]);
+	eqv("one of three closed: still not freed", nfreed, 0);
+	objsnapclose(sn[1]);
+	eqv("two of three closed: still not freed", nfreed, 0);
+	objsnapclose(sn[2]);
+	eqv("the last close frees the store", nfreed, 1);
+	devclose(d);
+}
+
+/*
+ * The other half of §9's rule: nothing is deferred when nothing is
+ * open.  A store closed with no snapshot — including one whose
+ * snapshots were all closed first, which is what a correct server
+ * does — is freed inside storeclose itself.
+ */
+static void
+tclosesnapplain(void)
+{
+	Dev *d;
+	Store *s;
+	Objsnap *sn;
+
+	d = newdisk();
+	if((s = mustwatched(d, 0, "storeclose with nothing open")) == nil)
 		return;
-	}
-	switch(pid = rfork(RFPROC|RFMEM|RFFDG)){
-	case -1:
-		fail("rfork: %r");
+	mk(s, "e0");
+	if((sn = mustsnap(s, Snaplive, "the snapshot closed first")) != nil)
 		objsnapclose(sn);
+	eqv("closing the snapshot does not free the open store", nfreed, 0);
+	storeclose(s);
+	eqv("a store closed with no snapshot open frees at once", nfreed, 1);
+	devclose(d);
+}
+
+/*
+ * §3.2's condemnation and §9's close are both true at once, and the
+ * condemnation is what the snapshot is told: objsnapent runs
+ * storeserving — which reads the condemned flag under qllog — before
+ * it takes qlstate, so `store condemned' wins over `store closed'.
+ * Neither is the `gone' lie, and §9 says which comes out.  This is
+ * §0's Echange shape: the store is condemned first and closed after.
+ */
+static void
+tclosesnapcond(void)
+{
+	Dev *d;
+	Store *s;
+	Objsnap *sn;
+	Objinfo oi;
+	uchar got[Oidmax];
+	int oidlen;
+
+	d = newdisk();
+	if((s = mustwatched(d, 0, "a condemned store, then closed")) == nil)
+		return;
+	mk(s, "e0");
+	if((sn = mustsnap(s, Snaplive, "a condemned store, then closed"))
+	== nil){
 		storeclose(s);
 		devclose(d);
 		return;
-	case 0:
-		close(2);
-		if((fd = open("/dev/null", OWRITE)) >= 0 && fd != 2)
-			dup(fd, 2);
-		storeclose(s);
-		exits("storeclose returned");
 	}
-	ok = 0;
+	storehook(s, "fatal", 1);
+	refused("objsnapent on a condemned store, before the close",
+		objsnapent(sn, 0, got, &oidlen, &oi), "store condemned");
+	storeclose(s);
+	eqv("a condemned store closed under a snapshot is not freed",
+		nfreed, 0);
+	refused("objsnapent on a store condemned and then closed",
+		objsnapent(sn, 0, got, &oidlen, &oi), "store condemned");
+	objsnapclose(sn);
+	eqv("and its last close frees it all the same", nfreed, 1);
+	devclose(d);
+}
+
+/*
+ * §9's bail-out, which is a release like any other.  An open takes
+ * the bound's slot under its first count and gives it back at `bad'
+ * if anything after that fails, so an open in flight when
+ * storeclose runs is holding the store's LAST claim: storeclose
+ * finds the count non-zero, defers, and the open's own failure path
+ * is what must free the Store.  Nothing here is raced for — §13's
+ * snaphold point parks the open with the slot taken until `closed'
+ * is set, and snapstale sends the pass it wakes into round again,
+ * where the close is what refuses it — so this is one driven
+ * interleaving and not a probability.
+ *
+ * That second pass is the other half of what this watches.  The
+ * `closed' test is made on EVERY count pass and not only the first,
+ * so a storeclose that lands while an open is re-counting is seen
+ * and the open is refused; an open that tested it once would hand
+ * back a snapshot of a store it had been told was closed.
+ *
+ * The opener is a proc of its own because storeclose has to run
+ * while the open is inside the engine, and it keeps what it was
+ * answered in shared memory: errstr is per-proc, so the refusal has
+ * to be copied out where the main proc can read it.
+ */
+static Store *bailstore;
+static Objsnap *bailsn;
+static char bailerr[ERRMAX];
+static int baildone;
+
+static void
+bailopen(void *a)
+{
+	USED(a);
+	bailerr[0] = '\0';
+	if((bailsn = objsnapopen(bailstore, Snaplive)) == nil)
+		rerrstr(bailerr, sizeof bailerr);
+	baildone = 1;
+}
+
+/* an open that was neither an entry nor a refusal is neither */
+static void
+refusedas(char *what, Objsnap *sn, char *err, char *want)
+{
 	checks++;
-	if((w = wait()) == nil)
-		fail("wait for the closing child: %r");
-	else{
-		if(w->pid != pid)
-			fail("waited on pid %d, want the closing child %d",
-				w->pid, pid);
-		else if(w->msg[0] == '\0')
-			fail("storeclose under an open snapshot returned");
-		else if(strstr(w->msg, "object snapshot") == nil)
-			fail("storeclose under an open snapshot died with "
-				"`%s', want the snapshot count", w->msg);
-		else
-			ok = 1;
-		free(w);
+	if(sn != nil){
+		fail("%s was accepted", what);
+		return;
+	}
+	if(strncmp(err, want, strlen(want)) != 0)
+		fail("%s: %s, want %s", what, err, want);
+}
+
+/*
+ * The shape both of the tests below drive: an open parked at the
+ * snaphold point with the bound's slot taken, a storeclose under it,
+ * and the open then let go against a store that is closed.  stale is
+ * how many fill attempts are armed to find the index grown, which is
+ * what decides where the woken open goes — one sends it round the
+ * loop once more, past Snaptries leaves it no way out but `bad'.
+ * The store is gone by the time this returns; 1 if the shape came
+ * off, and what the open answered is in bailsn and bailerr.
+ */
+static int
+closebail(ulong stale, char *what)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	int k, ok;
+
+	ok = 0;
+	spawnforget();
+	d = newdisk();
+	if((s = mustwatched(d, 0, what)) == nil){
+		devclose(d);
+		return 0;
+	}
+	mk(s, "e0");
+	storehook(s, "snapshort", Nslackshort);
+	storehook(s, "snapstale", stale);
+	storehook(s, "snaphold", 1);
+	bailstore = s;
+	bailsn = nil;
+	baildone = 0;
+	if(spawnproc(bailopen, nil) < 0){
+		fail("%s: spawn: %r", what);
+		goto out;
 	}
 	/*
-	 * Only if the child really did die before storefree: under the
-	 * unguarded close it freed this proc's store, and touching it
-	 * again would fault over the FAIL line above.
+	 * The slot is taken under qlstate and the open parks inside
+	 * that same hold, so a storestat that comes back with the
+	 * count at 1 is a store whose opener is parked: there is no
+	 * other way for it to have released the lock.
 	 */
-	if(ok){
-		Storestat st;
-
-		objsnapclose(sn);
+	st.nobjsnap = 0;
+	for(k = 0; k < 2000; k++){
 		storestat(s, &st);
-		eqv("and the store closes once the count is back to nothing",
-			st.nobjsnap, 0);
-		storeclose(s);
+		if(st.nobjsnap == 1)
+			break;
+		sleep(5);
 	}
+	istrue("the open in flight takes the bound's slot", st.nobjsnap == 1);
+	if(st.nobjsnap != 1)
+		goto out;
+	storeclose(s);
+	s = nil;
+	eqv("a store closed under an open in flight is not freed", nfreed, 0);
+	for(k = 0; k < 2000 && !baildone; k++)
+		sleep(5);
+	istrue("the parked open finishes once the store is closed", baildone);
+	ok = baildone;
+out:
+	/*
+	 * A bail-out here still owns the store, and closing it comes
+	 * before the reaping: killspawned takes the store's own procs
+	 * with it, and storeclose waits for them.
+	 */
+	if(s != nil)
+		storeclose(s);
+	killspawned();
 	devclose(d);
+	return ok;
+}
+
+static void
+tclosesnapbail(void)
+{
+	if(!closebail(1, "an open re-counting across a storeclose"))
+		return;
+	refusedas("an open re-counting across a storeclose", bailsn,
+		bailerr, "store closed");
+	objsnapclose(bailsn);		/* nil unless the refusal failed */
+	eqv("and the bail-out frees the store it last held", nfreed, 1);
+}
+
+/*
+ * §13's freed hook means one thing on every path that releases a
+ * Store, and a storeopen that fails part-way is one of them: it
+ * frees the store it had half-built, so a bail-out that went back to
+ * a bare free(s) would be a release the hook does not see — and the
+ * hook is what every test of the deferred free reads.  A device that
+ * was never formatted takes §5 step 2's bail-out, no valid
+ * superblock on either copy, with no fault to inject and nothing to
+ * race.
+ */
+static void
+tfreeonopenfail(void)
+{
+	Dev *d;
+	Store *s;
+	Storecfg c;
+
+	if((d = simopen(Tsecsz, Tnsec, Tseed)) == nil)
+		sysfatal("simopen: %r");
+	nfreed = 0;
+	tcfg(&c);
+	c.freed = sawfree;
+	s = storeopen(d, &c);
+	istrue("storeopen on a device with no superblock fails", s == nil);
+	if(s != nil)
+		storeclose(s);
+	else
+		eqv("and the store it half-built is freed exactly once",
+			nfreed, 1);
+	devclose(d);
+}
+
+/*
+ * §9's close race, in the three shapes the deferred free has to
+ * survive.  All three put four procs on four snapshots of one store
+ * and close the store under them; what differs is who closes the
+ * snapshots and when.
+ *
+ * - Srender: the workers only render, and the main proc closes every
+ *   snapshot after they have finished.  This is the shape that says
+ *   a render in flight when storeclose runs is answered and not
+ *   faulted, and the device — which is the caller's — is closed the
+ *   instant storeclose returns, so it also says storefree needs
+ *   nothing of it.
+ * - Sclose: each worker closes its own snapshot when it is done, so
+ *   the last close races storeclose's own decision.  Whichever sees
+ *   `closed && nobjsnap == 0' frees, and exactly one must.
+ * - Stight: each worker polls until it is told `store closed' and
+ *   closes at once, which is the earliest after the flag a caller
+ *   can manage.  That is the one shape that catches a storeclose
+ *   which sets `closed' before waiting for its procs: the last close
+ *   then frees the Store while storeclose is still asleep inside it
+ *   on procrz, and both free it.  Sclose and Stight run a real
+ *   checkpointer for storeclose to have a proc to wait for.
+ */
+enum
+{
+	Nclosew		= 4,		/* workers, one snapshot each */
+	Nclosent	= 6,		/* entries in the index */
+	Ncloseloop	= 400,		/* renders a worker attempts */
+	Ncloserun	= 30,		/* runs of each shape */
+	Ntightloop	= 200000,	/* renders Stight gives up after */
+
+	Srender		= 0,
+	Sclose,
+	Stight,
+};
+
+typedef struct Closew Closew;
+struct Closew
+{
+	Objsnap	*sn;
+	int	done;
+	int	bad;		/* an answer that was neither an entry
+				 * nor `store closed' */
+};
+static Closew closew[Nclosew];
+
+/* 1, 0 or a refusal that says `store closed'; anything else is bad */
+static int
+closeread(Closew *w, ulong i)
+{
+	Objinfo oi;
+	uchar got[Oidmax];
+	char e[ERRMAX];
+	int r, oidlen;
+
+	r = objsnapent(w->sn, i, got, &oidlen, &oi);
+	if(r < 0){
+		rerrstr(e, sizeof e);
+		if(strcmp(e, "store closed") != 0)
+			w->bad = 1;
+	}else if(r != 0 && r != 1)
+		w->bad = 1;
+	return r;
+}
+
+static void
+closerender(void *a)
+{
+	Closew *w;
+	int k;
+
+	w = a;
+	for(k = 0; k < Ncloseloop; k++)
+		closeread(w, k % Nclosent);
+	w->done = 1;
+}
+
+static void
+closeworker(void *a)
+{
+	Closew *w;
+	int k;
+
+	w = a;
+	for(k = 0; k < Ncloseloop; k++)
+		closeread(w, k % Nclosent);
+	objsnapclose(w->sn);
+	w->done = 1;
+}
+
+static void
+closetight(void *a)
+{
+	Closew *w;
+	int k;
+
+	w = a;
+	for(k = 0; k < Ntightloop; k++)
+		if(closeread(w, k % Nclosent) < 0)
+			break;
+	objsnapclose(w->sn);
+	w->done = 1;
+}
+
+static void
+closerace(int shape, int run)
+{
+	Dev *d;
+	Store *s;
+	void (*fn)(void*);
+	char nm[16];
+	int i, k, alldone, nhanded;
+
+	spawnforget();
+	d = newdisk();
+	nhanded = 0;
+	for(i = 0; i < Nclosew; i++)
+		closew[i].sn = nil;
+	if((s = mustwatched(d, shape != Srender, "the storeclose race"))
+	== nil){
+		devclose(d);
+		return;
+	}
+	for(i = 0; i < Nclosent; i++){
+		snprint(nm, sizeof nm, "r%d", i);
+		mk(s, nm);
+	}
+	fn = closerender;
+	if(shape == Sclose)
+		fn = closeworker;
+	else if(shape == Stight)
+		fn = closetight;
+	for(i = 0; i < Nclosew; i++){
+		closew[i].done = 0;
+		closew[i].bad = 0;
+		if((closew[i].sn = mustsnap(s, Snaplive,
+		"the storeclose race")) == nil)
+			goto out;
+		if(spawnproc(fn, &closew[i]) < 0){
+			fail("the storeclose race: spawn: %r");
+			goto out;
+		}
+		nhanded++;
+	}
+	storeclose(s);
+	s = nil;
+	devclose(d);		/* the device is the caller's, and goes now */
+	d = nil;
+	for(k = 0; k < 4000; k++){
+		alldone = 1;
+		for(i = 0; i < Nclosew; i++)
+			if(!closew[i].done)
+				alldone = 0;
+		if(alldone)
+			break;
+		sleep(5);
+	}
+	alldone = 1;
+	for(i = 0; i < Nclosew; i++)
+		if(!closew[i].done)
+			alldone = 0;
+	istrue("every worker in the storeclose race finished", alldone);
+	if(!alldone){
+		print("FAIL: shape %d run %d\n", shape, run);
+		goto out;
+	}
+	for(i = 0; i < Nclosew; i++)
+		if(closew[i].bad){
+			fail("a worker racing storeclose (shape %d run %d) "
+				"was answered something that was neither an "
+				"entry nor `store closed'", shape, run);
+			break;
+		}
+	checks++;
+	if(shape == Srender){
+		eqv("the store is not freed while four snapshots hold it",
+			nfreed, 0);
+		for(i = 0; i < Nclosew; i++)
+			objsnapclose(closew[i].sn);
+	}
+	eqv("the store is freed exactly once out of the close race",
+		nfreed, 1);
+	nhanded = Nclosew;		/* every snapshot is closed by here */
+out:
+	/*
+	 * A shape that bailed out still owns the store and whatever it
+	 * opened before the bail, and closing them has to come before
+	 * the reaping: killspawned takes the store's checkpointer with
+	 * it, and storeclose waits for the procs the store started.
+	 * The snapshots already handed to a worker go with that worker;
+	 * what is left here is closed here, and the store is freed by
+	 * whichever release is last.
+	 */
+	for(i = nhanded; i < Nclosew; i++)
+		objsnapclose(closew[i].sn);
+	if(s != nil)
+		storeclose(s);
+	killspawned();
+	if(d != nil)
+		devclose(d);
+}
+
+static void
+tclosesnaprace(void)
+{
+	int shape, run;
+
+	for(shape = Srender; shape <= Stight; shape++)
+		for(run = 0; run < Ncloserun; run++)
+			closerace(shape, run);
 }
 
 /* ---- /dirty ---- */
@@ -2312,6 +2806,11 @@ main(int argc, char **argv)
 	tsnapstale();
 	tsnapslack();
 	tclosesnap();
+	tclosesnapplain();
+	tclosesnapcond();
+	tclosesnapbail();
+	tfreeonopenfail();
+	tclosesnaprace();
 	tdirty();
 	tfullsync();
 	tlost();

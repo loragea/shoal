@@ -2148,7 +2148,7 @@ touch:
 
 | Lock | Covers | Taken by |
 |---|---|---|
-| `qlstate` | the index array, the oid arena and hash table (§9), the index-slot and extent-map-slot free lists, the free-grain bitmap and its cursor, the staged set (§6), and the dirty set | every queue proc (stage, apply), the committer applying a batch, the checkpointer, the scrubber's commits, and the service loop taking an enumeration snapshot |
+| `qlstate` | the index array, the oid arena and hash table (§9), the index-slot and extent-map-slot free lists, the free-grain bitmap and its cursor, the staged set (§6), the dirty set, and §9's open-snapshot count and `closed` flag | every queue proc (stage, apply), the committer applying a batch, the checkpointer, the scrubber's commits, the service loop taking an enumeration snapshot or rendering one of its entries, `storeclose` giving up the store's own reference after its proc wait, and `objsnapclose` giving back a snapshot's |
 | `qlemap` | the extent-map cache: which entries are present, their loading state and pin counts, and the LRU (§9) — not a pinned entry's contents, which its pin covers | every queue proc, on a map read, a pin and an unpin |
 | `qllog` | the log tail and free space, the pending-commit queue, batch numbering, the durable watermark, and the two flags that condemn the store — `broken` and the failed-apply flag beside it (§3.2) | every committer, and every entry point that refuses on a condemned store |
 | `qlsuper` | the five publishable superblock fields and the publish itself (§2.2) | the checkpointer, a `qidnext` batch advance, the first `monid` pin, an `epochhigh` advance |
@@ -2162,6 +2162,29 @@ nothing is ever taken under them.
 | the flush lock | the coalescing flusher's ticket counters (§3.2): who is issuing the one device flush and who is waiting for it |
 | the checkpoint lock | the checkpointer's request and completion counters, its wake-up, and the failure state a checkpoint leaves behind (§2.8): the stuck flag, the count of failed attempts and the last failure's text, which §6's refusal reads under it. The checkpoint itself runs with it released |
 | the proc lock | the count of procs the store has started, so `storeclose` can wait for them |
+
+**Releasing the store itself is under no lock at all**, and is
+ordered rather than locked. §9 lets an object snapshot outlive
+`storeclose`, so the free runs from `storeclose` or from the last
+`objsnapclose`, whichever observes `closed && nobjsnap == 0` under
+`qlstate` — and it runs *after* that hold is dropped, because the
+`QLock` is a field of the memory being freed. That is safe on the
+ordering **given §9's contract on the caller**, and not on the
+ordering alone. The parties that block on the lock holding a claim
+are `objsnapent` and `objsnapclose` of a snapshot whose count is not
+yet given back, an `objsnapopen` that has taken §9's slot, and
+`storeclose` itself — and the predicate being true says there is
+none of those. Every other caller of the lock holds nothing:
+`objsnapopen` before the slot, `dirtysnap`, `lostsnap`,
+`fullsyncsnap`, `storestat` and the object API, each of which would
+wake in released memory if it were queued here when the free is
+decided. §9 makes that the caller's obligation — quiesce, then
+close — rather than an ordering the engine can enforce, because a
+waiter would have to be counted under the lock it is waiting for.
+The engine's own procs are excluded by the wait above, which is also
+why `storeclose` sets `closed` only after that wait has returned — it is the store's own claim, and giving it up while
+the call is still asleep on `procrz` inside the `Store` would let the
+last `objsnapclose` free it underneath.
 
 Three rules make that discipline checkable rather than aspirational:
 
@@ -2700,21 +2723,92 @@ count takes that hold anyway, and the open takes its slot the moment
 it passes the bound, so two opens racing cannot both find room — and
 an open that then fails gives the slot back in a hold of its own, so
 `/status` counts an open in flight along with the opens that
-completed. A close releases the count. A snapshot is the
-caller's, and `storeclose` frees nothing of the caller's, so every
-snapshot MUST be closed before the store it was taken from is —
-and a `storeclose` that finds one still open **`sysfatal`s, naming
-the count**. It is a programming error in the server's fid handling,
-and the alternative is worse than a crash: the snapshot's entries are
-then rendered from a freed `Store`, where the walk finds no `qidpath`
-match and answers *gone* for every one of them, so the bug surfaces
-as a silently short `/obj` listing rather than as a fault. Closing a
-snapshot twice is **undefined**, exactly as freeing the same pointer
-twice is, and for the same reason: the second call reads a handle the
-first freed, whose first word — the store pointer everything in the
-close goes through — the allocator has already overwritten with its
-own free-list links. There is nothing a guard in the close could
-test, so there is none.
+completed. A close releases the count. **Giving the slot back is
+releasing a claim**, so a failing open's bail-out carries the same
+free predicate an `objsnapclose` does: the slot is the open's claim
+from the moment the bound is passed, and an open in flight when
+`storeclose` runs is therefore the store's last claim — `storeclose`
+finds the count non-zero, defers, and the bail-out is what releases
+the memory.
+
+**A snapshot MAY outlive `storeclose`.** The store's memory is not
+released while one names it: `storeclose` stops the procs, then takes
+`qlstate` and sets `closed`, and the `Store` is freed by whoever then
+observes `closed && nobjsnap == 0` — `storeclose` itself when no
+snapshot is open, and otherwise the **last** `objsnapclose`, which
+tests the same predicate after giving its count back. `closed` *is*
+the store's own reference; there is no second counter beside
+`nobjsnap` to drift out of step with it. Reads through a snapshot
+taken before the close then **fail** `store closed` (a local error,
+no layer-a §2.6 prefix — nothing is full and nothing is broken, §3.7)
+rather than answering *gone*: `objsnapent` tests `closed` as the
+first statement inside the hold it already takes, ahead of the
+`qidpath` and state tests that would otherwise answer *gone* for an
+entry deleted or discarded since the open. That position is what
+makes the refusal win over the lie, and it is a **contract refusal
+and not a memory guard**: `storefree` is the only thing that frees
+`s->idx`, and it cannot have run while this snapshot holds the
+store, so the index underneath is whole and still matching. What the
+test guards is that a store which has stopped serving — its procs
+gone, its device the caller's to have closed already — answers
+nothing out of what it happens to still hold in memory. `objsnapcount` still
+answers, because it reads the handle and not the store. A store that
+is condemned (§3.2) *and* closed answers `store condemned`, because
+`storeserving` runs ahead of the hold; both are true, and neither is
+the lie.
+
+That is the whole of what may outlive the call. `storeclose` must
+give up the store's reference only **after** its proc wait has
+returned — setting `closed` earlier is what lets a concurrent last
+`objsnapclose` free the `Store` while `storeclose` is still asleep
+inside it, so that both free it. And a `Store*` is invalid the moment
+`storeclose` returns: **only an `Objsnap` handle may outlive one**,
+and `objsnapopen`, `dirtysnap`, `lostsnap`, `fullsyncsnap` and
+`storestat` on a closed store are undefined exactly as they were.
+`objsnapopen` does refuse `store closed` when it is reached on a
+store some other snapshot is holding alive — it is inside the hold it
+takes anyway, on each of the open's count passes, so a close landing
+while the open re-counts is seen rather than skipped — but that is a courtesy inside an undefined call, not a
+guarantee the pointer can keep; the other four are given no such
+check, because advertising one there would promise what a dangling
+pointer cannot deliver.
+
+**The caller quiesces, then closes.** The obligation is not only
+that a `Store*` is dead once `storeclose` returns; it is that no call
+taking one may still be **in flight** when the close runs. A call
+that holds no claim — `objsnapopen` before it reaches the bound, and
+`dirtysnap`, `lostsnap`, `fullsyncsnap`, `storestat` and the object
+API throughout — blocks on `qlstate` with nothing keeping the
+`Store` alive, so if the last `objsnapclose` evaluates the free
+predicate while one of them is queued on that very `QLock`, the
+waiter wakes inside memory the free has released. The engine cannot
+close that window: a waiter would have to be counted under the lock
+it is waiting for. So the caller MUST have stopped issuing such
+calls **before** it calls `storeclose`, and MUST make none after it.
+What is allowed after the close is exactly `objsnapent`,
+`objsnapcount` and `objsnapclose` on handles taken before it — the
+three that carry a claim of their own. The shutdown order of the
+server that will export this store (wave 1d, §8) follows from that
+rule and not from taste: it stops accepting requests and lets the
+ones in flight drain, and only then closes the store, its surviving
+`/obj` fids holding the snapshots that are the one thing the close
+leaves valid.
+
+What this buys over simply deleting the fatal is more than the
+refusal. A freed `Store` address can be handed straight back to the
+next `storeopen` — §0's `Echange` close-and-reopen is precisely that
+shape — and an old `/obj` fid would then render entries out of the
+**new** store, which is worse than *gone*. `Objsnap.s` is a bare
+pointer with no generation, so the refcount is what makes the
+address-reuse confusion unreachable: the old `Store` cannot be freed
+while a snapshot names it.
+
+Closing a snapshot twice is **undefined**, exactly as freeing the
+same pointer twice is, and for the same reason: the second call reads
+a handle the first freed, whose first word — the store pointer
+everything in the close goes through — the allocator has already
+overwritten with its own free-list links. There is nothing a guard in
+the close could test, so there is none.
 
 **`/dirty` and `/lost` are copies rather than cursors.** Both sets are
 bounded — by the dirty region (§2.6) and by what fails local
@@ -3530,7 +3624,7 @@ record is written and then a byte-wise mixture of its old and its new
 header bytes is placed on the platter, which is what a torn write
 leaves and what the sweep must be exhaustive over.
 
-Seven of §13's points are *mutations* or schedules rather than
+Eight of §13's points are *mutations* or schedules rather than
 crashes, and are built into the store as hooks that are inert unless
 a test asks for them: `reclaim` (reclaim log space before the checkpoint's
 superblock write returns), `publish` (force an `epochhigh` publish
@@ -3555,7 +3649,29 @@ the count did, so a test can drive §9's re-count — and the vector's
 slack, which is what decides whether a given growth needs one —
 without racing for either; one arming is spent per fill attempt
 rather than per open, an open makes up to `Snaptries` of them, and
-the point is inert while `snapshort` is 0).
+the point is inert while `snapshort` is 0), and `snaphold` (park the
+next enumeration open with the bound's slot taken until `storeclose`
+has set `closed`, and let it go on again there — one arming parks one
+open, and the sleep drops `qlstate` so the close can take it). The
+last is what makes §9's *bail-out* free deterministic: an open that
+holds the slot when the store is closed is the store's last claim, so
+its failure path is the one that frees the `Store`, and without the
+point a test could only race for that window.
+
+**The freed hook is not one of those points.** `Storecfg.freed` and
+`freedarg` are a callback rather than an `-X` name, because what they
+observe is not an injected fault but the engine releasing the
+`Store`'s own memory: the engine calls it as its last act before that
+memory goes, on every path that releases a store — a `storeopen` that
+failed part-way, `storeclose`, and the last `objsnapclose` of a
+snapshot that outlived one (§9) — and it is inert while nil, which is
+what everything but a test leaves it. It exists because §9's deferred
+free has **no other observable**: a read through a snapshot whose
+`Store` was freed early answers *correctly* out of freed memory, and
+so does `storestat`, so a test that watched the answers alone would
+pass a use-after-free and only the allocator would notice, later and
+somewhere else.
+
 Each T1 test names the requirement it discriminates and the mutation
 that must break it; **each mutation is run**, per
 `AGENTS.md`.
@@ -3736,9 +3852,28 @@ created over and discarded under it, both halves of the gone rule
 discriminated one at a time, a live copy condemned under an open
 `/obj` and still answered with `corrupt=1` rather than dropped (D14),
 the bound on open snapshots, the `disk full` past it and the refusal
-of a `kinds` the engine has no state for, a `storeclose` under an
-open snapshot, an open whose vector the index outgrows between the
-count and the fill, and the two terms of that vector's slack told
+of a `kinds` the engine has no state for, three snapshots outliving
+a `storeclose` — every read through them refused `store closed`,
+an entry deleted before the close included, so that the refusal is
+watched where the *gone* answer was available; `objsnapcount` still
+answering; a further `objsnapopen` refused; and §13's freed hook
+fired exactly once and only at the third `objsnapclose` — beside a
+store closed with nothing open, which the same hook shows freed
+inside `storeclose`, and a store condemned and then closed, which
+answers `store condemned`; an open parked at §13's `snaphold` point
+with the bound's slot taken while the store is closed under it,
+refused `store closed` on the count pass it wakes into and its
+bail-out shown to be what frees the `Store`; the same hook fired
+once by a `storeopen` that failed on a device with no superblock;
+that close raced by four procs on four snapshots in each of its
+three shapes, thirty runs apiece — the procs only rendering, with
+the caller's device closed the instant `storeclose` returns; each
+proc closing its own snapshot against `storeclose`'s own decision;
+and each proc closing the instant it is told `store closed`, which
+is what catches a `closed` set before the proc wait — with the store
+freed exactly once every time, an open whose vector the index
+outgrows between the count and the fill, and the two terms of that
+vector's slack told
 apart — one growth refused by a ten-entry index, whose slack is the
 flat sixteen, and absorbed by an 800-entry one, whose sixteenth is
 fifty besides — two thousand opens under four churning procs with

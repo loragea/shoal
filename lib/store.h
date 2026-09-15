@@ -183,8 +183,25 @@ struct Store
 	ulong	nhash;
 	ulong	nlive, ntomb;
 	ulong	nobjsnap;		/* §9's open snapshots; qlstate's */
+	/*
+	 * §9: storeclose has run.  It is the store's OWN reference, not
+	 * a flag beside one — the memory goes when `closed && nobjsnap
+	 * == 0', tested under qlstate by storeclose and by every
+	 * objsnapclose, so there is no second counter to drift out of
+	 * step with the bound's.
+	 */
+	int	closed;			/* qlstate's */
 	ulong	snapstale;		/* §13's snapstale point; qlstate's */
 	ulong	snapshort;		/* ... by how many entries; qlstate's */
+	/*
+	 * §13's snaphold point: park one objsnapopen with the bound's
+	 * slot taken until storeclose has set `closed', so a test can
+	 * drive the window in which that open holds the store's last
+	 * claim instead of racing for it.  Cleared by the open that
+	 * takes it, so one arming parks one open.
+	 */
+	int	snaphold;		/* qlstate's */
+	Rendez	snaprz;			/* on qlstate: the open parked there */
 
 	/* the two slot spaces, §6.  resv is a stage's reservation. */
 	uchar	*slotused;
@@ -376,6 +393,7 @@ int	publishlocked(Store*);
 /* store.c */
 int	storeserving(Store*);	/* 0 and an error set on a condemned store */
 int	storeproc(Store*, void (*)(void*), void*);
+void	storefree(Store*);	/* the Store's memory; §13's freed hook */
 void	storeprocdone(Store*);
 void	storecondemn(Store*, ulong slot);	/* §5 step 10, at run time */
 void	lostupdate(Store*, ulong slot);		/* /lost membership, §8 */

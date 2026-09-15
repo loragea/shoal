@@ -121,6 +121,7 @@ objsnapopen(Store *s, int kinds)
 	Objsnap *sn;
 	Ient *e;
 	ulong i, n, want, cap, have, grew, try;
+	int last;
 
 	if(!storeserving(s))
 		return nil;
@@ -145,12 +146,35 @@ objsnapopen(Store *s, int kinds)
 		 * one anyway.  Every way out of here that is not a
 		 * snapshot gives the slot back at `bad'.  A re-count is a
 		 * fresh pass of this loop, where the slot is already this
-		 * open's and the test is not made again.  One bound check
+		 * open's and the bound is not tested again.  One bound check
 		 * and not two — a second one anywhere else would be a
 		 * check no test could discriminate, and so a check that
 		 * could be deleted in silence.
 		 */
 		qlock(&s->qlstate);
+		/*
+		 * §9: only an Objsnap handle may outlive storeclose, so a
+		 * closed store takes no new one.  Tested on EVERY pass and
+		 * not just the first: a re-count puts this open back here
+		 * with the store's lock dropped in between, which is time
+		 * enough for a storeclose to land, and an open that only
+		 * looked once would hand back a snapshot of a store it has
+		 * been told is closed.  Past the first pass the slot is
+		 * already this open's, so the refusal gives it back at
+		 * `bad' like every other way out.  The check is sound only
+		 * because some other snapshot is holding this Store alive
+		 * for us to read the flag out of — a Store* is invalid the
+		 * moment storeclose returns, and this refusal promises
+		 * nothing beyond that.
+		 */
+		if(s->closed){
+			qunlock(&s->qlstate);
+			werrstr("store closed");
+			if(try > 0)
+				goto bad;
+			free(sn);
+			return nil;
+		}
 		if(try == 0){
 			if(s->nobjsnap >= s->cfg.objsnapmax){
 				qunlock(&s->qlstate);
@@ -160,6 +184,21 @@ objsnapopen(Store *s, int kinds)
 				return nil;
 			}
 			s->nobjsnap++;
+			/*
+			 * §13's snaphold point: park here, with the slot
+			 * taken and every way out of the loop still ahead,
+			 * until storeclose has set `closed'.  That is the
+			 * window in which this open holds the store's last
+			 * claim and the bail-out below is what releases
+			 * it.  rsleep drops qlstate, so storeclose can
+			 * take it to set the flag and wake this open
+			 * again.  Inert unless a test asks for it.
+			 */
+			if(s->snaphold){
+				s->snaphold = 0;
+				while(!s->closed)
+					rsleep(&s->snaprz);
+			}
 		}
 		want = snapwant(s, kinds);
 		qunlock(&s->qlstate);
@@ -237,12 +276,25 @@ objsnapopen(Store *s, int kinds)
 	 */
 	werrstr("object snapshot: the index moved under %d counts", Snaptries);
 bad:
+	/*
+	 * Giving the slot back is giving up a claim, so this path frees
+	 * the Store on exactly the terms objsnapclose does: the slot IS
+	 * this open's claim from the increment above on — nothing can
+	 * have freed the store under an open that holds one — and an
+	 * open in flight when storeclose runs is the last claim, which
+	 * storeclose then leaves to whoever gives it up.  Predicate
+	 * under the hold, free after the unlock, because the QLock is a
+	 * field of the memory going away.
+	 */
 	qlock(&s->qlstate);
 	s->nobjsnap--;
+	last = s->closed && s->nobjsnap == 0;
 	qunlock(&s->qlstate);
 	free(sn->slot);
 	free(sn->qidpath);
 	free(sn);
+	if(last)
+		storefree(s);
 	return nil;
 }
 
@@ -279,6 +331,29 @@ objsnapent(Objsnap *sn, ulong i, uchar *oid, int *oidlen, Objinfo *oi)
 		return -1;
 	slot = sn->slot[i];
 	qlock(&s->qlstate);
+	/*
+	 * §9: the store may have been closed under this snapshot, and a
+	 * closed store answers nothing.  This is a CONTRACT refusal and
+	 * not a memory guard: storefree is the only thing that frees
+	 * s->idx and it cannot have run while this snapshot holds the
+	 * store, so the entry below is whole and still matching — what
+	 * the test refuses is a store that has stopped serving, whose
+	 * procs are gone and whose device the caller may already have
+	 * closed, answering out of what it happens to still hold.  It is
+	 * the FIRST thing inside the hold — not a hold of its own, which
+	 * would double the 2.6·10^5 short holds a full walk costs for
+	 * nothing — and being first is what makes the refusal win over
+	 * the two tests below, which would answer 0, "that entry is
+	 * gone", for an entry deleted or discarded since the open: the
+	 * lie §9 exists to refuse.  A store that is condemned as well as
+	 * closed answers `store condemned', because storeserving above
+	 * runs first; both are true and neither is the lie.
+	 */
+	if(s->closed){
+		qunlock(&s->qlstate);
+		werrstr("store closed");
+		return -1;
+	}
 	e = &s->idx[slot];
 	if(e->qidpath != sn->qidpath[i] || !inkinds(e->state, sn->kinds)){
 		qunlock(&s->qlstate);
@@ -293,8 +368,23 @@ objsnapent(Objsnap *sn, ulong i, uchar *oid, int *oidlen, Objinfo *oi)
 }
 
 /*
- * Releases the bound's slot and frees the handle.  nil is a no-op, so
- * a caller can close whatever an open handed it.  Closing the same
+ * Releases the bound's slot and frees the handle — and, if this was
+ * the last snapshot of a store that storeclose has already run on,
+ * the Store's memory with it (§9): `closed' is the store's own
+ * reference, so `closed && nobjsnap == 0' is the whole free
+ * predicate, evaluated here under qlstate and acted on after the
+ * unlock.  The parties that block on that qlstate holding a claim
+ * are the entry reads and closes of snapshots still open, an open
+ * that has taken §9's slot, and storeclose — which set `closed' only
+ * after its procs had stopped — so the predicate being true says
+ * there is none of them.  The calls that block on it holding NO
+ * claim (objsnapopen before the slot, dirtysnap, lostsnap,
+ * fullsyncsnap, storestat, the object API) would wake in freed
+ * memory instead, which is why §9 puts it on the caller to have
+ * quiesced them before the close rather than on this predicate.
+ *
+ * nil is a no-op, so a caller can close whatever an open handed it.
+ * Closing the same
  * snapshot twice is undefined exactly as freeing the same pointer
  * twice is, and for the same reason: Objsnap.s is the handle's first
  * word, which the pool overwrites with its free-list links the moment
@@ -305,13 +395,17 @@ void
 objsnapclose(Objsnap *sn)
 {
 	Store *s;
+	int last;
 
 	if(sn == nil)
 		return;
 	s = sn->s;
 	qlock(&s->qlstate);
 	s->nobjsnap--;
+	last = s->closed && s->nobjsnap == 0;
 	qunlock(&s->qlstate);
+	if(last)
+		storefree(s);
 	free(sn->slot);
 	free(sn->qidpath);
 	free(sn);
