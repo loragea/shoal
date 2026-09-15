@@ -784,16 +784,19 @@ line(Parse *p, char *s, int start)
  * and continues through following indented lines (§3.1).  A blank
  * line and a comment line are ignored outright (§0) and so are
  * transparent: they neither begin nor end a record.  §0 puts a
- * comment's `#' at the start of a line; an indented `#' line is taken
- * as one too, because no attribute name may begin with `#' so the
- * widening cannot mis-read a conforming map.
+ * comment's `#' AT THE START OF A LINE, and §3's grammar is
+ * normative, so an indented line is a continuation whose tokens must
+ * be attr=value and an indented `#' is bad grammar, not a comment.
+ * A line of nothing but white space is blank either way.
  */
 static int
 blankline(char *s)
 {
+	if(*s == '#')
+		return 1;
 	while(*s == ' ' || *s == '\t')
 		s++;
-	return *s == '\0' || *s == '#';
+	return *s == '\0';
 }
 
 /* the node set V of §4.3 step 1: the onnode= of the status=in instances */

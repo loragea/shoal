@@ -187,6 +187,7 @@ static Case cases[] =
 	{ "staledangling",	nil,			"names no instance" },
 	{ "stalebadreporter",	nil,			"names no instance" },
 	{ "dupstale",		nil,			"two stale records" },
+	{ "indentedcomment",	nil,			"is not attr=value" },
 };
 
 /* one instance record, spelled from parts, for the rejection cases */
@@ -368,6 +369,9 @@ casetext(Case *c)
 				"status=in up=yes\n"
 				"stale=n2.1 reporter=n2.1 since=3\n"
 				"stale=n2.1 reporter=n2.1 since=4\n");
+	if(strcmp(c->name, "indentedcomment") == 0)
+		return withhdr("\t# an indented # is a continuation, not a "
+				"comment\n");
 	if(strcmp(c->name, "twomaps") == 0){
 		snprint(twomaps, sizeof twomaps, "%smap=other epoch=8\n", hdr);
 		return twomaps;
@@ -506,7 +510,13 @@ tunknown(void)
 	mapfree(m);
 }
 
-/* §0: comments and blank lines are ignored and do not end a record */
+/*
+ * §0: a comment begins with a `#' AT THE START OF A LINE, and
+ * comments and blank lines are ignored and do not end a record.  A
+ * line of nothing but white space is blank; an indented `#' is a
+ * continuation line whose first token is not attr=value, which §3's
+ * normative grammar makes bad grammar and §8.1 makes `bad map'.
+ */
 static void
 tcomments(void)
 {
@@ -516,7 +526,7 @@ tcomments(void)
 		"map=vec epoch=7\n"
 		"# a comment inside the record\n"
 		"\tmonid=00112233445566778899aabbccddeeff\n"
-		"\t# an indented one too\n"
+		"\t\t\n"
 		"\tobjmax=16777216 blksz=16384 replicas=2\n"
 		"\tcsumalg=blake2s256 placehash=blake2s256-64\n"
 		"\tpollms=1000 leasems=3000 replms=1000 deadms=10000\n"
@@ -528,7 +538,7 @@ tcomments(void)
 		return;
 	}
 	if(m->blksz != 16384 || m->retain != 8)
-		fail("comments: a comment ended the record");
+		fail("comments: a comment or a blank line ended the record");
 	checks++;
 	mapfree(m);
 }
