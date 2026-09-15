@@ -112,26 +112,37 @@ struct Case
 	char	*want;	/* nil: must parse; else a detail it must contain */
 };
 
+/*
+ * layer-a §3.1's example map, VERBATIM: this text must equal the one
+ * printed there byte for byte with the code block's four-space indent
+ * stripped, comment line and all.  The spec's one complete example is
+ * an input a conforming parser must accept, so the test reads it from
+ * the doc rather than paraphrasing it; change one and change both.
+ */
 static char good[] =
+	"# shoal cluster map\n"
 	"map=cluster0 epoch=41\n"
-	"\tmonid=8c1d0f5a9b2e47c3a6d180fe37b45219\n"
-	"\tobjmax=16777216 blksz=16384 replicas=2\n"
-	"\tcsumalg=blake2s256 placehash=blake2s256-64\n"
-	"\tpollms=1000 leasems=3000 replms=1000 deadms=10000\n"
-	"\toutmins=60 tombdays=7 mincopies=1 retain=8\n"
+	"    monid=8c1d0f5a9b2e47c3a6d180fe37b45219\n"
+	"    objmax=16777216 blksz=16384 replicas=2\n"
+	"    csumalg=blake2s256 placehash=blake2s256-64\n"
+	"    pollms=1000 leasems=3000 replms=1000 deadms=10000\n"
+	"    outmins=60 tombdays=7 mincopies=1 retain=8\n"
 	"\n"
 	"node=n2\n"
 	"\n"
 	"instance=n2.1 onnode=n2\n"
-	"\taddr=tcp!10.0.0.2!17011\n"
-	"\tuuid=3f1c9a20b47e4d18a0c6e5721b93df04\n"
-	"\tclass=ssd weight=100\n"
-	"\tstatus=in up=yes since=41 fenced=no\n"
+	"    addr=tcp!10.0.0.2!17011\n"
+	"    uuid=3f1c9a20b47e4d18a0c6e5721b93df04\n"
+	"    class=ssd weight=100\n"
+	"    status=in up=yes since=41 fenced=no\n"
 	"\n"
-	"instance=n5.0 onnode=n5 addr=tcp!10.0.0.5!17011\n"
-	"\tuuid=3f1c9a20b47e4d18a0c6e5721b93df05\n"
-	"\tclass=hdd weight=100\n"
-	"\tstatus=out up=no since=40 fenced=no\n"
+	"node=n5\n"
+	"\n"
+	"instance=n5.0 onnode=n5\n"
+	"    addr=tcp!10.0.0.5!17011\n"
+	"    uuid=5b9e13c74a0d482fb6318ce2d05a7f16\n"
+	"    class=hdd weight=100\n"
+	"    status=out up=no since=39 fenced=no\n"
 	"\n"
 	"stale=n5.0 reporter=n2.1 since=39\n";
 
@@ -477,7 +488,7 @@ theader(void)
 		fail("outmins/tombdays/mincopies/retain");
 	if(strcmp(m->placerule, "nodes") != 0)
 		fail("placerule defaults to %s, not nodes", m->placerule);
-	if(m->nnode != 1 || m->ninst != 2 || m->nstale != 1)
+	if(m->nnode != 2 || m->ninst != 2 || m->nstale != 1)
 		fail("records: %d node %d instance %d stale", m->nnode,
 			m->ninst, m->nstale);
 	checks += 8;
@@ -503,6 +514,29 @@ theader(void)
 	   m->stale[0].since != 39)
 		fail("stale record");
 	checks += 6;
+
+	/*
+	 * §7.1's mark names an instance the map carries, which is what
+	 * makes the example a map this parser accepts: the subject is
+	 * the second instance record, out and down since epoch 39.
+	 */
+	if((i = mapinst(m, "n5.0")) == nil){
+		fail("no n5.0, the subject of the example's stale mark");
+		mapfree(m);
+		return;
+	}
+	if(strcmp(i->node, "n5") != 0 || i->idx != 0)
+		fail("n5.0 iid split %s %lud", i->node, i->idx);
+	if(strcmp(i->addr, "tcp!10.0.0.5!17011") != 0)
+		fail("n5.0 addr %s", i->addr);
+	if(strcmp(i->uuid, "5b9e13c74a0d482fb6318ce2d05a7f16") != 0)
+		fail("n5.0 uuid %s", i->uuid);
+	if(i->status != Sout || i->up != Uno || i->fenced != 0 ||
+	   i->since != 39)
+		fail("n5.0 status/up/fenced/since");
+	if(mapinst(m, m->stale[0].subject) != i)
+		fail("the mark's subject is not the instance record");
+	checks += 5;
 	mapfree(m);
 }
 
@@ -645,7 +679,7 @@ tblank(void)
 	if((m = mapparse(t, strlen(t))) == nil)
 		fail("1000 blank lines: %r");
 	else{
-		if(m->epoch != 41 || m->nnode != 1 || m->ninst != 2 ||
+		if(m->epoch != 41 || m->nnode != 2 || m->ninst != 2 ||
 		   m->nstale != 1)
 			fail("1000 blank lines: %d node %d instance %d "
 				"stale", m->nnode, m->ninst, m->nstale);

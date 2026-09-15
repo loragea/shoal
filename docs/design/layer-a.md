@@ -753,6 +753,14 @@ this is what keeps a later replicated monitor (§8.7) additive.
         class=ssd weight=100
         status=in up=yes since=41 fenced=no
 
+    node=n5
+
+    instance=n5.0 onnode=n5
+        addr=tcp!10.0.0.5!17011
+        uuid=5b9e13c74a0d482fb6318ce2d05a7f16
+        class=hdd weight=100
+        status=out up=no since=39 fenced=no
+
     stale=n5.0 reporter=n2.1 since=39
 
 Exactly one `map` record MUST be present.
