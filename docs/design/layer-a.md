@@ -753,6 +753,14 @@ this is what keeps a later replicated monitor (§8.7) additive.
         class=ssd weight=100
         status=in up=yes since=41 fenced=no
 
+    node=n5
+
+    instance=n5.0 onnode=n5
+        addr=tcp!10.0.0.5!17011
+        uuid=5b9e13c74a0d482fb6318ce2d05a7f16
+        class=hdd weight=100
+        status=out up=no since=39 fenced=no
+
     stale=n5.0 reporter=n2.1 since=39
 
 Exactly one `map` record MUST be present.
@@ -1032,7 +1040,9 @@ across libm implementations — the reason weighted HRW's usual
 `-w/ln(u)` form is rejected outright. The first draft reserved this
 rule without saying what was hashed, which made it unimplementable;
 the strings above are the reservation. Until it is ratified, a v1
-monitor MUST reject `weight` ≠ 100 with `bad ctl`.
+monitor MUST reject `weight` ≠ 100 with `bad map` (§8.1): `weight`
+is set by a map text and by no ctl verb, so the refusal is a map
+validation and carries the prefix §8.1 lists for it.
 
 Consequence to state plainly: v1 fills disks in proportion to
 *count*, not capacity. A cluster with a 1 TB and an 8 TB disk on

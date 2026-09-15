@@ -1170,3 +1170,371 @@ int	moncurrent(Mon*, Monmap*);
 int	monhistory(Mon*, ulong i, Monmap*);
 int	monlookup(Mon*, uvlong epoch, Monmap*);
 void	monstat(Mon*, Monstat*);
+
+/*
+ * The cluster map, docs/design/layer-a.md §3; placement, §4; the
+ * currency witness set, §5.2; the epoch/monid adoption decision,
+ * §6.3; and the fence state, §6.4.
+ *
+ * Everything below is pure: no globals, no I/O, no clock of its own.
+ * The map arrives as bytes from wherever the caller got them and
+ * this code parses it and answers questions about it.  mapparse is
+ * the only allocator; the Cmap it returns, and everything reachable
+ * from it, is freed by mapfree and by nothing else.  Every other
+ * function writes only into arrays the caller supplies.
+ *
+ * Error strings: a map text that fails validation answers layer-a
+ * §2.6's `bad map' with a detail after a colon, and that is the only
+ * §2.6 prefix anything here produces (store.md §3.7's mapping rule).
+ * An instance's refusal to adopt a map is not a wire error at all —
+ * §6.3 reports it in /status — so mapadoptable answers flag bits,
+ * not a string.
+ */
+enum
+{
+	Nodelen		= 63,	/* §3.3 node-name bound */
+	Idxdigits	= 10,	/* an instance index is a u32 in decimal */
+	Iidlen		= Nodelen + 1 + Idxdigits,
+	Uuidlen		= 32,	/* §3.3, hex characters */
+	Monidlen	= 32,	/* §3.2, hex characters */
+	Clnamelen	= 63,	/* the cluster name in map=<name> */
+	Addrlen		= 127,	/* a 9P dial string */
+	Classlen	= 31,	/* a device class tag */
+
+	/*
+	 * The largest R this build places for.  layer-a bounds
+	 * `replicas' only below (§3.2, ≥ 1); this bound is
+	 * implementation policy, chosen so every placement array is a
+	 * fixed size, and is two orders above the 3–12 node envelope
+	 * §4.1 designs for.  mapparse refuses a larger `replicas'.
+	 */
+	Maxplace	= 64,
+};
+
+/* §3.3 status=, in the order the enum is compared nowhere */
+enum
+{
+	Snew	= 0,
+	Sin,
+	Sout,
+	Sdead,
+};
+
+/* §3.3 up= */
+enum
+{
+	Uyes	= 0,
+	Uheal,
+	Uno,
+};
+
+typedef struct Cinst Cinst;
+typedef struct Cstale Cstale;
+typedef struct Cmap Cmap;
+
+/*
+ * One `instance' record.  class is the empty string when the record
+ * carried none; zone is `default' then (§3.3), weight 100, fenced 0
+ * and since 0.  node points at iid's node part, so it is iid's
+ * prefix by construction, which is what §3.3 requires onnode= to be.
+ */
+struct Cinst
+{
+	char	iid[Iidlen+1];
+	char	node[Nodelen+1];
+	ulong	idx;			/* the iid's index part */
+	char	addr[Addrlen+1];
+	char	uuid[Uuidlen+1];
+	char	class[Classlen+1];
+	char	zone[Nodelen+1];	/* §4.5: parsed, never placed on */
+	ulong	weight;			/* §4.4: parsed, must be 100 */
+	int	status;			/* Snew … Sdead */
+	int	up;			/* Uyes … Uno */
+	int	fenced;			/* §3.3: parsed; §5.2's grace reads it */
+	uvlong	since;
+};
+
+/* one `stale' record: the ledger of §7.1, travelling in the map */
+struct Cstale
+{
+	char	subject[Iidlen+1];
+	char	reporter[Iidlen+1];
+	uvlong	since;
+};
+
+/*
+ * A parsed map.  node[] is the `node' records, which §3.1 makes
+ * optional and informational; placement uses pnode[], the node set
+ * derived from the onnode= of status=in instances, which is what
+ * §4.3 step 1 defines V to be.
+ */
+struct Cmap
+{
+	char	name[Clnamelen+1];
+	uvlong	epoch;
+	char	monid[Monidlen+1];
+	uvlong	objmax;
+	ulong	blksz;
+	ulong	replicas;
+	char	csumalg[32], placehash[32];
+	ulong	pollms, leasems, replms, deadms;
+	ulong	outmins, tombdays, mincopies, retain;
+	char	placerule[32];
+
+	Cinst	*inst;
+	int	ninst;
+	Cstale	*stale;
+	int	nstale;
+	char	(*node)[Nodelen+1];
+	int	nnode;
+	char	(*pnode)[Nodelen+1];	/* V, §4.3 step 1 */
+	int	npnode;
+};
+
+/*
+ * mapparse validates text[0:n] in full and answers nil with
+ * `bad map: <why>' in the error string if it does not conform.  The
+ * text need not be NUL-terminated and is not retained.
+ *
+ * nil is not always `bad map': an allocation failure answers nil
+ * with whatever mallocz left in the error string, or with
+ * `out of memory' for a size a ulong cannot hold.  A caller that
+ * puts the errstr of a nil on the wire must therefore decide what a
+ * non-`bad map' one means to it; store.md §3.7 forbids inventing a
+ * §2.6 prefix for it.
+ *
+ * mapnextok is §8.1's commit-time half of the same validation, which
+ * needs two maps: next's epoch MUST be exactly cur's plus one and
+ * §8.5's immutable attributes MUST be unchanged.  force is the
+ * `forceepoch' exemption (§8.6): it lifts the monid check and
+ * replaces the epoch relation with cur's epoch < next's, which is
+ * §8.1's "arbitrary higher value", §6.1's strictly increasing epoch
+ * and §8.6.2's "MUST NOT publish an epoch it cannot prove is the
+ * highest".  A regression under force is refused here and nowhere
+ * else.  mapnextok answers 0 with `bad map: …' when next may not be
+ * committed over cur.
+ */
+Cmap*	mapparse(char *text, long n);
+void	mapfree(Cmap*);
+int	mapnextok(Cmap *cur, Cmap *next, int force);
+
+Cinst*	mapinst(Cmap*, char *iid);
+char*	statusname(int status);
+char*	upname(int up);
+
+/*
+ * Placement, §4.  maphash is §4.2's H over the score input for one
+ * round: dom is 'N' for the node round and 'D' for the instance
+ * round, and the bytes hashed are oid || 0x00 || dom || id.
+ *
+ * mapplace fills out[] with P(oid) in placement order and answers
+ * |P|, which is min(replicas, |V|) and MAY be less than replicas —
+ * §4.3 step 4's structural under-replication, which a caller reports
+ * and still serves.  It answers the whole |P| even when out[] is
+ * shorter, filling the first nout entries, so a caller may size
+ * out[] by what it can use.  Above 32 nodes it allocates the score
+ * array; that failing, it answers −1 with `out of memory' in the
+ * error string rather than 0, which would be a statement about the
+ * map.  mapprimary then answers nil with that errstr still set, and
+ * mapunderrep and mapwitness answer −1: an allocation failure is
+ * never a placement answer.
+ *
+ * placecmp is the order both HRW rounds sort by — descending score,
+ * ties to the byte-wise greater id, the longer id winning when one is
+ * the other's prefix — answering <0, 0 or >0 as the left candidate
+ * ranks below, with or above the right.  It is the tie-break no
+ * known-answer vector can exercise, since a tie needs a 64-bit
+ * collision.
+ *
+ * mapprimary is §4.3's serving primary: the first member of P(oid)
+ * with up=yes, or nil when there is none, which is the object's
+ * `object unavailable' at this epoch — or nil with an error string,
+ * which is not.  mapunderrep answers 1, 0, or −1 for the same
+ * failure.  Being the serving primary is necessary and not
+ * sufficient to serve: §5.2's grace and currency check are the rest,
+ * and neither is computed here.  The grace is the caller's:
+ * mapprimary(prev, oid) says whether it was already serving primary
+ * for the object at E−1, and §5.2's exemption is that instance being
+ * up=no with fenced set in the map at E — `fenced=' is parsed here
+ * (Cinst.fenced) and consumed there.
+ */
+uvlong	maphash(char *oid, int dom, char *id);
+int	placecmp(uvlong sa, char *a, uvlong sb, char *b);
+int	mapplace(Cmap*, char *oid, Cinst **out, int nout);
+Cinst*	mapprimary(Cmap*, char *oid);
+int	mapunderrep(Cmap*, char *oid);
+
+/*
+ * §6.4 F3, and the membership rule its carve-out does not cover.
+ *
+ * mapdown answers whether the map bars this instance from serving
+ * role=client I/O — up=no, status=out, status=dead, or no record at
+ * all — which a caller refuses with `down'.  Keeping F3 to that is
+ * the caller's job, not this answer's: F3 MUST NOT stop the instance
+ * answering op=meta, op=get, op=list or op=verify, accepting an
+ * incoming op=full or op=delete push, or completing a pull or push
+ * it is the source of, and mis-wording exactly that is what made
+ * `disable' self-defeating in the previous revision.  mapmember is
+ * the zombie rule the carve-out does not cover: an instance with no
+ * record, or status=dead, must not advertise, push, answer /rpc or
+ * attach role=repl anywhere.
+ */
+int	mapdown(Cmap*, char *iid);
+int	mapmember(Cmap*, char *iid);
+
+/*
+ * The currency witness set, §5.2.  A witness is an instance that is
+ * not status=dead and satisfies one of the four clauses, recorded in
+ * `why'; `how' is what the check must do with it:
+ *
+ *	Wquery	up is yes or heal: an op=meta response is required
+ *	Wskip	up=no, and the reporter of no in-scope mark: skipped
+ *	Wblock	up=no and an in-scope reporter: the check cannot
+ *		complete, and the instance answers `not ready'
+ */
+enum
+{
+	Wquery	= 0,
+	Wskip,
+	Wblock,
+};
+
+enum
+{
+	Wplace		= 1<<0,	/* clause 1: in P(o) at E */
+	Wprev		= 1<<1,	/* clause 2: in P(o) at E−1 */
+	Wstray		= 1<<2,	/* clause 3: a known stray holder */
+	Wreporter	= 1<<3,	/* clause 4: an in-scope mark's reporter */
+};
+
+typedef struct Cwit Cwit;
+struct Cwit
+{
+	Cinst	*inst;
+	int	how;
+	int	why;	/* the clauses that put it here */
+};
+
+/*
+ * m is the map at E and prev the map the instance last adopted, or
+ * nil.  Clause 2 reads prev only when it is the map at E−1
+ * specifically; when it is not, or when subst is set because this
+ * instance's reconcile pass for the last placement change has not
+ * completed, §5.2 substitutes every instance with status in
+ * {new,in,out} — for that clause and for no other.
+ *
+ * Clause 4 and the skip rule are scoped on the mark's subject being
+ * in P(o) at E or at E−1, and take no substitute: with no E−1 map
+ * here (prev nil, or prev at some other epoch) the E−1 half of that
+ * scope is NOT evaluated, whatever subst says.  §5.2 offers the
+ * caller the other way out — fetch /maps/<E−1> from the monitor,
+ * which §8.2 requires it to keep, and pass it as prev — and that
+ * fetch is the caller's obligation, not this code's.  Substituting
+ * for clause 4 instead would scope it on "every instance that is not
+ * dead", which is the unscoped reading §5.2 rules out: one down
+ * reporter of one unresolved mark would then block every currency
+ * check in the cluster.
+ *
+ * stray[] is the locally known stray holders of clause 3, as iids;
+ * one that names no instance of m is ignored.  mapwitness answers
+ * |W|, or −1 with an error string when placement could not be
+ * computed, and fills the first nout entries, so an out[] of
+ * m->ninst entries always holds the whole set.
+ *
+ * witblocker answers the first Wblock witness, which is the one
+ * whose name belongs in the `not ready' this check produces, or nil
+ * when the check may complete once its Wquery responses are in.  The
+ * n it is passed MUST be min(|W|, nout) — mapwitness answers the
+ * whole |W| but fills and classifies only the first nout entries, so
+ * handing it mapwitness's answer unclamped walks off a shorter
+ * out[].  An out[] of m->ninst entries needs no clamp, since |W| can
+ * never exceed it.
+ */
+typedef struct Witreq Witreq;
+struct Witreq
+{
+	Cmap	*m;
+	Cmap	*prev;
+	char	*oid;
+	char	**stray;
+	int	nstray;
+	int	subst;
+};
+
+int	mapwitness(Witreq*, Cwit *out, int nout);
+Cinst*	witblocker(Cwit*, int n);
+
+/*
+ * §6.3's adoption decision.  An Adopt is the instance's own durable
+ * pair (highest adopted epoch, pinned monid) — store.md §2.2 says
+ * where it lives — plus whether it has ever adopted a map.
+ * mapadoptable decides and changes nothing; mapadopted records an
+ * adoption that went ahead.
+ *
+ * §6.3 makes two independent MUSTs, one per flag, so the codes below
+ * are BITS and mapadoptable answers the OR of every refusal that
+ * holds: the map that trips both — another authority's, at an epoch
+ * below ours — must report both flags.  adoptwhy names the /status
+ * flag of ONE bit, and answers nil for anything that is not a single
+ * known bit; a caller renders each bit it finds set, rendering
+ * /status itself being the server's job and not this library's.
+ */
+enum
+{
+	Mapok		= 0,
+	Mapregress	= 1<<0,	/* epoch below the one held: epochregress=yes */
+	Mapmonid	= 1<<1,	/* monid differs from the pin: monidmismatch=yes */
+};
+
+typedef struct Adopt Adopt;
+struct Adopt
+{
+	int	pinned;			/* has adopted a map before */
+	char	monid[Monidlen+1];
+	uvlong	epoch;
+};
+
+int	mapadoptable(Adopt*, Cmap*);	/* Mapok, or the OR of the refusals */
+void	mapadopted(Adopt*, Cmap*);
+char*	adoptwhy(int bit);		/* one bit's /status flag, or nil */
+
+/*
+ * §6.4's fence state.  Times are milliseconds on the caller's own
+ * monotonic clock, which is all §6.4 assumes of a clock — elapsed
+ * time, not synchronisation.  `last' is the time of the last
+ * SUCCESSFUL refresh, which §6.3 makes a narrower thing than a read
+ * that returned bytes: a map refused for epoch regression or a monid
+ * mismatch is not one.  maprefresh is that rule in one call — it
+ * adopts and clears the lease fence together, or does neither.
+ *
+ * A `now' below `last' is a clock that has gone backwards, which is
+ * §6.4's assumption broken rather than an interval: it counts as the
+ * lease having elapsed, so the instance is fenced until a refresh
+ * succeeds.
+ *
+ * F4's operator fence is a separate flag with the same effect, and
+ * clearing it MUST NOT clear a lease-derived fence; since fencekind
+ * derives both from state rather than latching a bit, it cannot.
+ */
+enum
+{
+	Fencenone	= 0,
+	Fencelease	= 1<<0,
+	Fenceoper	= 1<<1,
+	Fenceboth	= Fencelease|Fenceoper,
+};
+
+typedef struct Fence Fence;
+struct Fence
+{
+	int	refreshed;	/* a refresh has ever succeeded */
+	vlong	last;		/* ms, the last successful refresh */
+	ulong	leasems;
+	int	oper;		/* F4 */
+};
+
+int	fencekind(Fence*, vlong now);
+void	fencerefresh(Fence*, vlong now);
+void	fenceoperator(Fence*, int on);
+char*	fencename(int kind);
+int	maprefresh(Adopt*, Fence*, Cmap*, vlong now);

@@ -16,6 +16,7 @@ OFILES=\
 	emap.$O\
 	format.$O\
 	log.$O\
+	map.$O\
 	mon.$O\
 	obj.$O\
 	ondisk.$O\

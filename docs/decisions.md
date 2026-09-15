@@ -512,3 +512,189 @@ prefix-free and §3.7's carve-out makes the mapping normative.
 of 8, the detail after the prefix, and reporting the open count in
 `/status`. An implementation that never refuses such an open is
 conforming.
+
+## D21 — Cluster-map validation policy (2026-09-15)
+
+**Decision:** `mapparse` validates a map text against `design/layer-a.md`
+§3 and answers §2.6's `bad map`, with a detail after a colon, for every
+refusal and for no other condition. Beyond the rules §3 states, it
+refuses the following; each is a choice this implementation makes where
+layer-a is silent, and the reasons are one apiece:
+
+- **Every header attribute of §3.2 is required** except `retain`, which
+  is 8 when absent, and `placerule`, which is `nodes`. Only `retain`'s
+  default is layer-a's own: §8.2 keeps "the last `retain` (default 8)
+  published maps". §3.2 prints no default for `placerule` — it defines
+  `nodes`, reserves `zones` and makes a v1 monitor reject it, which
+  leaves `nodes` the only value this build could choose but leaves the
+  choosing to this build. §3.2 gives no other default at all, and a
+  timer this build invented a value for would be a timer the operator
+  did not choose.
+- **An instance record requires `onnode`, `addr`, `uuid`, `status`,
+  `up`**; `class` is empty when absent, `zone` is `default` (§3.3 says
+  so), `weight` 100, `fenced` `no` (§3.3's "`no` otherwise"), `since` 0.
+  Nothing normative here reads `class` or `since`, and the conservative
+  value is the one that costs a grace rather than skips one.
+- **An empty value** (`map=`, `addr=`, `class=`) is refused: §0 forbids
+  white space in a value and an empty one names nothing.
+- **Length caps**: 63 bytes of cluster name, 127 of `addr`, 31 of
+  `class`, 63 of node and zone name (§3.3's own bound), 10 digits of
+  instance index. They make every record a fixed-size struct; only the
+  `addr` cap could refuse a conforming map, and a 127-byte dial string
+  is already past anything 9front dials.
+- **An instance index is a u32 with no leading zero.** Placement hashes
+  the iid's bytes (§4.2), so `n2.01` beside `n2.1` would be one disk
+  with two placement shares.
+- **`replicas` over `Maxplace` (64)** is refused: §3.2 bounds R only
+  below, and a fixed bound is what makes every `Cinst *p[Maxplace]` in
+  this library safe. It is two orders above §4.1's 3–12 node envelope.
+- **`pollms` and `mincopies` of 0** are refused as degenerate: a zero
+  refresh period and a write that must land on no copies are not
+  configurations, and §3.2's `leasems` > `pollms` half-says the first.
+- **A duplicate known attribute inside one record**, and a second
+  `map`, `node`, `instance` or `stale` record for the same subject, are
+  refused; ndb would silently take the first, and §3.1's "exactly one
+  `map` record" and §7.1's one mark per ordered pair say the rest.
+- **A `stale` record whose subject or reporter names no instance** of
+  this map is refused: §5.2 indexes the ledger on both and cannot
+  evaluate a dangling mark.
+- **A self-mark (`stale=X reporter=X`)** is refused: §7.1 gives a mark
+  one meaning — the reporter acked a write the subject did not take —
+  which X cannot say of itself, and X,X is not an ordered pair.
+- **`retain` under 2** is refused, reusing the monitor store's
+  `Monretainmin`: §8.2 must keep `/maps/<E−1>`, which §5.2 clause 2
+  depends on.
+- **A `csumalg` or `placehash` this build cannot compute** is refused:
+  §3.4 requires an instance to refuse to serve a map that disagrees
+  with either, and a build that cannot compute the named function must
+  not place with a different one.
+- **A leading indented line** is refused: §3.1's record begins at an
+  unindented line, so a continuation with nothing to continue is not a
+  record.
+- **An indented `#`** is a continuation line whose first token is not
+  `attr=value`, and is refused. §0 puts a comment's `#` "at the start
+  of a line" and §3's grammar is normative, so the widening the first
+  implementation made would have let two conforming implementations
+  disagree about a hand-edited map. A `#` in column 0 and a line of
+  nothing but white space stay transparent.
+- **A byte outside 0x20–0x7e**, `\n` and `\t` excepted, is refused
+  anywhere in the text (§0: 7-bit ASCII, LF-terminated, no CR), and no
+  error string this library produces carries one either — an `Rerror`
+  body is ERRMAX-bounded and would otherwise fail this very rule.
+
+`zone` sharing one value across a node's instances is layer-a's own
+(§3.3, validated at `commit`), not an invention, and is checked here
+even though v1 placement ignores zones (D11 makes them inert for
+placement, not for validation).
+
+**Rationale:** §8.1 makes `commit` reject a map that does not validate
+and lists some of what that means; the rest is left to the
+implementation, and a monitor that accepts a map no consumer can
+evaluate publishes an unevaluable cluster. Refusing at parse is the
+only place with the whole text in hand, and `bad map` is the only
+§2.6 prefix a map text may produce (`design/store.md` §3.7's mapping
+rule is one-directional).
+
+**Normative:** §3's grammar and attribute names, and that a map text
+that fails validation is refused with `bad map` and no other §2.6
+prefix. That an indented line is a continuation whose tokens are
+`attr=value`, and a comment starts at column 0, is §0 and §3, not a
+choice made here. So are three rules the list above repeats rather
+than invents, each of them wire-visible: node and zone names match
+`1*63(ALPHA / DIGIT / "-" / "_")` (§3.3, "Zone names share the
+node-name grammar"), exactly one `map` record is present (§3.1), and
+every byte of a map text is 7-bit ASCII (§0). A reimplementation that
+took a 64-byte node name, a two-`map` text or a high byte would
+disagree with this one about what a map is.
+
+**Implementation policy:** every refusal in the list above except the
+three the paragraph before names — which attributes are required and
+what an absent one defaults to, the caps on the cluster name, `addr`,
+`class` and the instance index, `Maxplace = 64`, the degenerate-value
+refusals, the refusal of a duplicate attribute inside one record and
+of a second `node`, `instance` or `stale` record for one subject, the
+dangling-mark and self-mark refusals, and the wording of every detail
+after `bad map: `. A conforming implementation may accept any of
+them, or refuse more.
+
+## D22 — Witness scoping without the E−1 map, and the fence and adoption edges (2026-09-15)
+
+**Decision:** Four edges at the map library's boundary, settled in
+`lib/map.c` — two are layer-a's own rules read precisely, two are
+ours:
+
+- **§5.2's substitution belongs to clause 2 alone.** `mapwitness`
+  applies "substitute every instance with `status` ∈ {new,in,out}" to
+  clause 2, which is what §5.2 attaches it to ("for this clause"), and
+  to nothing else. Clause 4 and the skip rule scope on the mark's
+  subject being in `P(o)` at `E`, plus `P(o)` at `E−1` when the caller
+  passed the `E−1` map, and on `P(o)` at `E` alone when it did not.
+  The `subst` flag does not reach them.
+- **With no `E−1` map, clause 4's `E−1` half is not evaluated.** §5.2
+  offers the instance two ways out of not holding that map — fetch
+  `/maps/<E−1>`, which §8.2 requires the monitor to keep, or substitute
+  — and the fetch is the caller's obligation; this library answers over
+  the maps it is given.
+- **A clock that has gone backwards fences.** `now < last` counts as
+  `leasems` having elapsed: kind `lease`, until the next successful
+  refresh.
+- **Both §6.3 refusals are reported when both hold.** `mapadoptable`
+  answers the OR of the refusals: a map from another authority at an
+  epoch below the one held sets `monidmismatch=yes` and
+  `epochregress=yes` both. `adoptwhy` names the flag of one bit and
+  the caller renders each bit it finds set.
+- **`forceepoch` is exempt from "exactly `current+1`", not from
+  increasing.** `mapnextok(cur, next, 1)` requires
+  `next->epoch > cur->epoch` and lifts only the `monid` check.
+
+**Rationale:** Substituting for clause 4 makes its subject test "any
+instance that is not `dead`", which is precisely the unscoped reading
+§5.2 spends a paragraph ruling out: one reporter that dies with a mark
+outstanding then lands in the witness set of every object and, by the
+skip rule, fails every currency check in the cluster — "a second disk
+failure during recovery from the first would take a cluster with every
+byte present completely dark". Scoping on `P(o)` at `E` alone is the
+narrower loss: §5.2's case-(ii) lemma keeps its `E` half, and the
+instance that wants the `E−1` half has a documented way to get it.
+A backwards clock breaks the one assumption §6.4 makes about clocks —
+that elapsed time can be measured — and F1 is the only thing between a
+deposed primary and the D2 violation fencing exists to prevent; one
+poll interval of `not ready` against an acked write lost is not a close
+call. §6.3 states its two refusals as independent MUSTs, each naming its
+own flag: an instance "MUST reject a map whose `epoch` is lower than
+the epoch it currently holds … and MUST report the condition in
+`/status` (`epochregress=yes`)", and it "MUST refuse … any map whose
+`monid` differs, reporting `monidmismatch=yes` in `/status`". Neither
+sentence is conditioned on the other, and the accident §6.3 says the
+tripwire exists for — "a freshly created monitor … being pointed at a
+live cluster" — has both properties, so answering one code left
+`epochregress=yes` unset for exactly the case the rule was written
+for. Nothing in §6.3 orders the two conditions, so the order they are
+tested in is free; dropping one is not. And §8.1's
+exemption is worded "sets the next epoch to an arbitrary **higher**
+value", §6.1 makes the epoch strictly increasing and §8.6.2 forbids
+publishing an epoch a monitor cannot prove is the highest — an
+exemption from the `+1` only.
+
+**Normative:** that the substitution is clause 2's alone, and clause 4's
+scoping, are layer-a's (§5.2) and a reimplementation must match them.
+So is the `force` epoch relation: §6.1's strictly increasing epoch and
+§8.6.2's proof obligation, of which §8.1's exemption lifts only the
+`+1`. So is reporting both §6.3 conditions when both hold: its two
+sentences are separate MUSTs, each naming its own `/status` flag.
+
+**Implementation policy:** what this library does when it holds no
+`E−1` map (evaluate clause 4's `E` half alone, and leave the
+`/maps/<E−1>` fetch to the caller) — an implementation that fetches
+inside the check, or blocks until it has the map, conforms equally,
+while one that never fetches does not: §5.2's case-(ii) lemma needs
+clause 4's `E−1` half, so obtaining that map is an obligation of the
+caller and not an option this library's silence grants it;
+the order in which the two §6.3 conditions are tested, and this
+library's shape for them — one `int` of flag bits, `adoptwhy` naming
+one bit at a time, the rendering of `/status` left to the server;
+and the backwards-clock reading, since §6.4's assumption makes
+the case undefined rather than decided. Also policy, and a known cost:
+`mapprimary` and `mapunderrep` each recompute the whole placement, so a
+`/status` path reporting both runs the HRW twice — measured against
+nothing yet, and cheap at §4.1's envelope.
