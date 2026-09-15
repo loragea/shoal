@@ -2819,14 +2819,16 @@ count beside it, is the server's half and waits on the 9P surface.
 
 The cost is per open fid, so the store bounds how many snapshots may
 be open at once (`objsnapmax`, policy, default 8) rather than growing
-without limit; at 2^20 slots eight of them are 102 MB, which is the
-number §14(9) says is answered for the Layer B envelope and not for
-this design's own maximum. An open past the bound answers
-`disk full: <n> object snapshots open, objsnapmax <max>` — layer-a
-§2.6's `disk full`, whose entry covers any operation that needs space,
-with the detail naming the space and the knob. It is **not** an
-internal-invariant error (§3.7): a ninth open is a legal call and not
-a caller's bug, so it is a refusal a client library may key on; and
+without limit; at 2^20 slots one fid is the 12 MB vector plus the
+slack above — a sixteenth and 16 entries, so 12.75 MiB — and eight of
+them are 102 MB, which is the number §14(9) says is answered for the
+Layer B envelope and not for this design's own maximum. An open past
+the bound answers `disk full: <n> object snapshots open, objsnapmax
+<max>` — layer-a §2.6's `disk full`, whose entry covers any operation
+that needs space, with the detail naming the space and the knob. It
+is **not** an internal-invariant error (§3.7): a ninth open is a legal
+call and not a caller's bug, so it is a refusal a client library may
+key on; and
 it is not a new prefix, because §2.6's set is normative and
 prefix-free and this condition is reachable only by an admin listing
 or the store's own reconcile and reclaim walks, on an enumeration
@@ -4442,7 +4444,9 @@ rather than an amendment, because it touches the wire.
    snapshot is affordable — 3.1 MB at 2.6·10^5 objects but 12 MB per
    open fid at `nslots = 2^20`, so `objsnap=partial` is unnecessary at
    the Layer B envelope and not demonstrated unnecessary at this
-   design's own maximum (§9).
+   design's own maximum (§9). That 12 MB is the vector alone; §9's
+   102 MB for eight fids is the same vector with its allocation
+   slack, 12.75 MiB each.
 
 10. **A `Tflush` after the commit still owes the cleanup half of step
     7.** Once the commit is durable the discard half is vacuous but
