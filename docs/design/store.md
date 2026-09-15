@@ -2045,24 +2045,22 @@ every leak is countable: a slot §5 step 10 condemned for an index
 entry that does not unpack has no readable `len`, so it raises
 `lost=` and nothing else.
 
-What survives is the 256-byte index entry. Layer-a §1.5's discard,
-once its three cluster-wide conditions hold, commits an `Eslot` and
-the slot returns to the free list. The discard names the tombstone's
-key and the caller's current map epoch, and the store re-checks
-§1.5's two receiver conditions inside the call, under one hold of the
-state lock — the
-record is a tombstone at exactly that key, its `wepoch` strictly
-below the epoch — answering `not discardable` otherwise (§3.7).
-Check (i)'s two halves are answered **state first**, so a live record
-is refused as not a tombstone whether or not the key matches; the
-detail after the prefix is implementation policy (§3.7), and pointing
-a caller at a key when the state is the objection would send it to
-re-read the wrong thing. The checks are atomic among themselves, so they judge one record where a
-separate stat-then-discard could race an `op=delete`; the window
+What survives is the 256-byte index entry. Layer-a §1.5's discard, once
+its three cluster-wide conditions hold, commits an `Eslot` and the slot
+returns to the free list. The discard names the tombstone's key and the
+caller's current map epoch, and the store re-checks §1.5's two receiver
+conditions inside the call, under one hold of the state lock — the
+record is a tombstone at exactly that key, its `wepoch` strictly below
+the epoch — answering `not discardable` otherwise (§3.7). Check (i)'s
+two halves are answered **state first**, so a live record is refused as
+not a tombstone whether or not the key matches; the detail after the
+prefix is implementation policy (§3.7), and pointing a caller at a key
+when the state is the objection would send it to re-read the wrong
+thing. The checks are atomic among themselves, so they judge one record
+where a separate stat-then-discard could race an `op=delete`; the window
 between the checks and the `Eslot` commit is closed by the caller's
-per-object queue (§7), as for every mutation.
-`tombdays` is evaluated against
-the entry's `mtime`, which is why the tombstone keeps one.
+per-object queue (§7), as for every mutation. `tombdays` is evaluated
+against the entry's `mtime`, which is why the tombstone keeps one.
 
 **Disk full.** Four distinct exhaustions, mapped deliberately:
 
@@ -2232,28 +2230,27 @@ nothing is ever taken under them.
 | the checkpoint lock | the checkpointer's request and completion counters — the paced pair a trigger or a committer advances and the exempt pair an explicit `storecheckpoint` advances (§2.8) — its wake-up, and the failure state a checkpoint leaves behind (§2.8): the stuck flag, the dead flag, the retry floor in force and the earliest time a paced attempt may run behind it, the count of failed attempts and the last failure's text, which §6's refusal reads under it. The checkpoint itself runs with it released |
 | the proc lock | the count of procs the store has started, so `storeclose` can wait for them |
 
-**Releasing the store itself is under no lock at all**, and is
-ordered rather than locked. §9 lets an object snapshot outlive
-`storeclose`, so the free runs from `storeclose` or from the last
-`objsnapclose`, whichever observes `closed && nobjsnap == 0` under
-`qlstate` — and it runs *after* that hold is dropped, because the
-`QLock` is a field of the memory being freed. That is safe on the
-ordering **given §9's contract on the caller**, and not on the
-ordering alone. The parties that block on the lock holding a claim
-are `objsnapent` and `objsnapclose` of a snapshot whose count is not
-yet given back, an `objsnapopen` that has taken §9's slot, and
-`storeclose` itself — and the predicate being true says there is
-none of those. Every other caller of the lock holds nothing:
-`objsnapopen` before the slot, `dirtysnap`, `lostsnap`,
-`fullsyncsnap`, `storestat` and the object API, each of which would
-wake in released memory if it were queued here when the free is
-decided. §9 makes that the caller's obligation — quiesce, then
-close — rather than an ordering the engine can enforce, because a
-waiter would have to be counted under the lock it is waiting for.
-The engine's own procs are excluded by the wait above, which is also
-why `storeclose` sets `closed` only after that wait has returned — it is the store's own claim, and giving it up while
-the call is still asleep on `procrz` inside the `Store` would let the
-last `objsnapclose` free it underneath.
+**Releasing the store itself is under no lock at all**, and is ordered
+rather than locked. §9 lets an object snapshot outlive `storeclose`, so
+the free runs from `storeclose` or from the last `objsnapclose`,
+whichever observes `closed && nobjsnap == 0` under `qlstate` — and it
+runs *after* that hold is dropped, because the `QLock` is a field of the
+memory being freed. That is safe on the ordering **given §9's contract
+on the caller**, and not on the ordering alone. The parties that block
+on the lock holding a claim are `objsnapent` and `objsnapclose` of a
+snapshot whose count is not yet given back, an `objsnapopen` that has
+taken §9's slot, and `storeclose` itself — and the predicate being true
+says there is none of those. Every other caller of the lock holds
+nothing: `objsnapopen` before the slot, `dirtysnap`, `lostsnap`,
+`fullsyncsnap`, `storestat` and the object API, each of which would wake
+in released memory if it were queued here when the free is decided. §9
+makes that the caller's obligation — quiesce, then close — rather than
+an ordering the engine can enforce, because a waiter would have to be
+counted under the lock it is waiting for. The engine's own procs are
+excluded by the wait above, which is also why `storeclose` sets `closed`
+only after that wait has returned — it is the store's own claim, and
+giving it up while the call is still asleep on `procrz` inside the
+`Store` would let the last `objsnapclose` free it underneath.
 
 Three rules make that discipline checkable rather than aspirational:
 
@@ -2885,19 +2882,19 @@ is condemned (§3.2) *and* closed answers `store condemned`, because
 `storeserving` runs ahead of the hold; both are true, and neither is
 the lie.
 
-That is the whole of what may outlive the call. `storeclose` must
-give up the store's reference only **after** its proc wait has
-returned — setting `closed` earlier is what lets a concurrent last
-`objsnapclose` free the `Store` while `storeclose` is still asleep
-inside it, so that both free it. And a `Store*` is invalid the moment
-`storeclose` returns: **only an `Objsnap` handle may outlive one**,
-and `objsnapopen`, `dirtysnap`, `lostsnap`, `fullsyncsnap` and
-`storestat` on a closed store are undefined exactly as they were.
-`objsnapopen` does refuse `store closed` when it is reached on a
-store some other snapshot is holding alive — it is inside the hold it
-takes anyway, on each of the open's count passes, so a close landing
-while the open re-counts is seen rather than skipped — but that is a courtesy inside an undefined call, not a
-guarantee the pointer can keep; the other four are given no such
+That is the whole of what may outlive the call. `storeclose` must give
+up the store's reference only **after** its proc wait has returned —
+setting `closed` earlier is what lets a concurrent last `objsnapclose`
+free the `Store` while `storeclose` is still asleep inside it, so that
+both free it. And a `Store*` is invalid the moment `storeclose` returns:
+**only an `Objsnap` handle may outlive one**, and `objsnapopen`,
+`dirtysnap`, `lostsnap`, `fullsyncsnap` and `storestat` on a closed
+store are undefined exactly as they were. `objsnapopen` does refuse
+`store closed` when it is reached on a store some other snapshot is
+holding alive — it is inside the hold it takes anyway, on each of the
+open's count passes, so a close landing while the open re-counts is seen
+rather than skipped — but that is a courtesy inside an undefined call,
+not a guarantee the pointer can keep; the other four are given no such
 check, because advertising one there would promise what a dangling
 pointer cannot deliver.
 
@@ -3150,16 +3147,17 @@ crash argument above already covers, because layer-a §8.2 requires
 durable-before-ack and not ack-iff-durable. The operator's retry
 publishes above it either way.
 
-The read-back is **two device reads per slot** — the header sector,
-then the text — and not one, because it goes through the same slot
-reader the start does, which must bounds-check `len` before it reads
-the `len` bytes that field names (a torn length field must not drive
-a read past the slot). It is one read for a `len = 0` map, the empty
-map a fresh format leaves in both current slots (§2.2's tie): there
-are no text bytes to read and the reader does not ask for any. Reading `roundup(secsz+len, secsz)` in one
-request would be possible here, where `len` is known, at the price of
-a second reader; the four extra requests a commit makes are noise
-beside its two flushes, so it keeps the one reader.
+The read-back is **two device reads per slot** — the header sector, then
+the text — and not one, because it goes through the same slot reader the
+start does, which must bounds-check `len` before it reads the `len`
+bytes that field names (a torn length field must not drive a read past
+the slot). It is one read for a `len = 0` map, the empty map a fresh
+format leaves in both current slots (§2.2's tie): there are no text
+bytes to read and the reader does not ask for any. Reading
+`roundup(secsz+len, secsz)` in one request would be possible here, where
+`len` is known, at the price of a second reader; the four extra requests
+a commit makes are noise beside its two flushes, so it keeps the one
+reader.
 
 What the read-back proves is that the device **accepted** the bytes,
 not that they are on the platter: the read is answered by the same
