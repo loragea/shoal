@@ -958,6 +958,14 @@ setdefaults(Storecfg *c)
 		c->ckhigh = Ckhighdflt;
 	if(c->ckms == 0)
 		c->ckms = Ckmsdflt;
+	/*
+	 * §2.8's retry floor.  Zero is the unset value and not `no
+	 * floor': a store that retried a failing checkpoint with no
+	 * wait at all is the condition the floor exists to remove, so
+	 * there is no way to ask for one.
+	 */
+	if(c->ckbackms == 0)
+		c->ckbackms = Ckbackmsdflt;
 }
 
 Store*

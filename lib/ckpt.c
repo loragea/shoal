@@ -478,15 +478,33 @@ checkpoint(Store *s)
  * refusal has to tell a log that will not drain from one that is
  * merely full, and a flag that only ever rises cannot.  ckfailed is
  * the lifetime statistic and is not cleared -- it counts ATTEMPTS,
- * and a store whose checkpoints fail re-attempts every Cktickms, so
- * it is a rate of retrying and not a count of distinct outages.
+ * and a store whose checkpoints fail re-attempts no faster than the
+ * floor below, so it is a rate of retrying and not a count of
+ * distinct outages.
+ *
+ * §2.8's retry floor is set here because this is the one place that
+ * knows an attempt has just failed.  Neither of ckdue's triggers
+ * paces one -- ckhigh is a level and not an interval -- so a store
+ * whose checkpoint cannot reclaim log space would re-attempt with no
+ * wait at all, taking qllog twice per attempt against the very
+ * commits waiting for the space.  The floor starts at cfg.ckbackms
+ * and doubles per consecutive failure up to cfg.ckms, and any
+ * success clears it.  A FORCED run -- storecheckpoint, a tool's or a
+ * test's -- is not paced by it and resets the doubling first, so a
+ * caller driving checkpoints by hand runs at full speed.
  */
 static int
-ckrun(Store *s)
+ckrun(Store *s, int forced)
 {
 	char e[ERRMAX];
 	int r;
 
+	if(forced){
+		qlock(&s->cklk);
+		s->ckbackms = 0;
+		s->ckwake = 0;
+		qunlock(&s->cklk);
+	}
 	if((r = checkpoint(s)) < 0)
 		rerrstr(e, sizeof e);
 	qlock(&s->cklk);
@@ -494,12 +512,29 @@ ckrun(Store *s)
 		s->ckfailed++;
 		s->ckstuck = 1;
 		strecpy(s->ckerrstr, s->ckerrstr + sizeof s->ckerrstr, e);
+		if(s->ckbackms == 0)
+			s->ckbackms = s->cfg.ckbackms;
+		else if(s->ckbackms < s->cfg.ckms){
+			s->ckbackms *= 2;
+			if(s->ckbackms > s->cfg.ckms)
+				s->ckbackms = s->cfg.ckms;
+		}
+		s->ckwake = nsec() + (vlong)s->ckbackms*1000000LL;
 	}else{
 		s->ckstuck = 0;
 		s->ckerrstr[0] = '\0';
+		s->ckbackms = 0;
+		s->ckwake = 0;
 	}
 	qunlock(&s->cklk);
 	return r;
+}
+
+/* caller holds cklk: may a paced attempt run now? */
+static int
+ckpaceok(Store *s)
+{
+	return s->ckwake == 0 || nsec() >= s->ckwake;
 }
 
 /*
@@ -508,13 +543,29 @@ ckrun(Store *s)
  * tunable without a format change.  A quarter rather than a half
  * because the checkpointer's job is to keep the log from ever being
  * full, and starting earlier is what keeps §6's wait rare.
+ *
+ * Neither trigger paces a retry, so both are gated on ckrun's floor:
+ * the log one is a LEVEL and not an interval, and a store whose
+ * checkpoint cannot reclaim log space holds the log above ckhigh for
+ * ever.
  */
 static int
 ckdue(Store *s)
 {
 	uvlong used;
 	vlong now;
+	int ok;
 
+	/*
+	 * §2.8's floor first, and before qllog: the whole point of it is
+	 * that a store which cannot reclaim log space stops contending
+	 * on that lock with the commits waiting for the space.
+	 */
+	qlock(&s->cklk);
+	ok = ckpaceok(s);
+	qunlock(&s->cklk);
+	if(!ok)
+		return 0;
 	qlock(&s->qllog);
 	used = logused(s);
 	qunlock(&s->qllog);
@@ -531,8 +582,8 @@ void
 ckptproc(void *a)
 {
 	Store *s;
-	uvlong req;
-	int r;
+	uvlong req, freq;
+	int r, forced;
 
 	s = a;
 	for(;;){
@@ -542,7 +593,18 @@ ckptproc(void *a)
 				qunlock(&s->cklk);
 				goto out;
 			}
-			if(s->ckreq > s->ckdone)
+			/*
+			 * A request breaks the wait, but only an explicit
+			 * one breaks it now: §6's wait asks for a
+			 * checkpoint and sleeps a millisecond, so a
+			 * committer over a failing checkpointer is the
+			 * second unpaced path and obeys the same floor as
+			 * the triggers.  storecheckpoint's own request is
+			 * counted separately and is exempt.
+			 */
+			if(s->ckforce > s->ckfdone)
+				break;
+			if(s->ckreq > s->ckdone && ckpaceok(s))
 				break;
 			qunlock(&s->cklk);
 			if(ckdue(s)){
@@ -553,14 +615,18 @@ ckptproc(void *a)
 			qlock(&s->cklk);
 		}
 		req = s->ckreq;
+		freq = s->ckforce;
+		forced = freq > s->ckfdone;
 		s->ckbusy = 1;
 		qunlock(&s->cklk);
-		r = ckrun(s);
+		r = ckrun(s, forced);
 		qlock(&s->cklk);
 		s->ckbusy = 0;
 		s->ckret = r;
 		if(req > s->ckdone)
 			s->ckdone = req;
+		if(freq > s->ckfdone)
+			s->ckfdone = freq;
 		s->cklast = nsec();
 		rwakeupall(&s->ckrz);
 		qunlock(&s->cklk);
@@ -581,7 +647,7 @@ storecheckpoint(Store *s)
 			rsleep(&s->ckrz);
 		s->ckbusy = 1;
 		qunlock(&s->cklk);
-		r = ckrun(s);
+		r = ckrun(s, 1);
 		qlock(&s->cklk);
 		s->ckbusy = 0;
 		s->cklast = nsec();
@@ -590,6 +656,7 @@ storecheckpoint(Store *s)
 		return r;
 	}
 	qlock(&s->cklk);
+	s->ckforce++;
 	gen = ++s->ckreq;
 	while(s->ckdone < gen)
 		rsleep(&s->ckrz);

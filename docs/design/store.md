@@ -1101,9 +1101,22 @@ A checkpoint that succeeds clears the flag and the text: a device
 that heals is the expected end of a failure (above), and a store
 whose log then fills for the ordinary reason must be answered §2.6's
 bare `disk full` rather than an error it has recovered from. The
-count is not cleared, and it counts *attempts*: a stuck store
-re-attempts on every checkpoint tick, so it reports a rate of
-retrying rather than a number of distinct outages.
+count is not cleared, and it counts *attempts*.
+
+**A failed checkpoint backs off.** Neither trigger above paces a
+retry: `ckhigh` is a level and not an interval, and a store whose
+checkpoint cannot reclaim log space holds the log above `ckhigh` for
+ever, so the checkpointer would re-attempt with no wait at all — and
+a commit inside §6's wait asks for one every millisecond besides. A
+failing checkpoint therefore sets a retry floor: `ckbackms` (policy,
+default 100 ms), doubling per consecutive failure to `ckms` and
+staying there, cleared by any success. Neither trigger may re-arm
+inside that window, and neither may a commit's request; an explicit
+checkpoint request — a tool's, a test's — is not paced by it and
+resets it. The floor is what makes the attempt count a rate an
+operator can read, and what keeps a store that cannot free log space
+from contending on the log's lock with the very commits waiting for
+it.
 
 Its cost is therefore proportional to the state dirtied since the
 last checkpoint and to nothing else, which is what lets §6 put a
@@ -3805,7 +3818,9 @@ read-only replay too big for its cache is refused naming the cache —
 a checkpointer that cannot write, whose failures are counted, named
 in the commit refused for log space, and dropped from that refusal by
 a device that heals — the same store's next full log, with nothing
-checkpointing, answering the bare `disk full` — §2.8's dirty-page
+checkpointing, answering the bare `disk full` — §2.8's retry floor
+under a live checkpointer proc, read as a rate of failed attempts
+across a second and as the speed of the explicit requests it exempts — §2.8's dirty-page
 trigger surviving a condemnation that lands while a checkpoint runs,
 and a store opened, written and replayed at a `blksz` four times the
 device's `Wunit`), `objtest` (§2.7's extent-map slot

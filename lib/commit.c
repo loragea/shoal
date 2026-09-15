@@ -463,6 +463,11 @@ applybatch(Store *s, Batch *b)
  * ckwaitms and the tick is milliseconds, so the lag is in the noise —
  * but it is a lag, and a Rendez here would only look like it removed
  * one, since the tick is what the checkpointer's own triggers need.
+ *
+ * This is a counter and not ckforce: the wait runs once a
+ * millisecond, so over a checkpointer that is failing it is the
+ * fastest of §2.8's retry paths, and it is paced by the same floor as
+ * the triggers.  Only storecheckpoint is exempt.
  */
 static void
 askcheckpoint(Store *s)

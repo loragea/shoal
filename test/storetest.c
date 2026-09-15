@@ -1380,6 +1380,116 @@ tckfail(void)
 }
 
 /*
+ * §2.8's retry floor, and storecheckpoint's exemption from it.
+ *
+ * tckfail above drives the checkpointer by hand (tcfg), which is what
+ * it needs and also what hid this: neither of §2.8's triggers paces a
+ * retry — ckhigh is a level and not an interval — so with the proc
+ * running, a store whose checkpoint cannot reclaim log space holds the
+ * log above ckhigh for ever and re-attempts with no wait at all.  The
+ * proc is therefore what this test runs, and the floor is read as a
+ * rate: ckfailed sampled across a second.  The window is a second and
+ * the floor is 100 ms, so ten or so attempts are expected and forty is
+ * a generous ceiling; unpaced it was measured in the tens of thousands.
+ *
+ * A committer inside §6's wait is the second unpaced path and is paced
+ * by the same floor, which is what the fill loop leaves behind: its
+ * last commits sat in that wait asking once a millisecond.
+ *
+ * The exemption is the other half and is timed rather than counted: 20
+ * explicit checkpoints over the same refusing region are 20 attempts
+ * that run at once, where the floor would make them two seconds.  This
+ * is what keeps tckfail's 400 hand-driven checkpoints inside AGENTS.md's
+ * seconds budget.
+ *
+ * Mutations: the floor test is dropped from ckdue and from ckptproc's
+ * wait (mut ck-no-backoff); the explicit path obeys the floor too (mut
+ * ck-floor-forces).
+ */
+static void
+tckpace(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Super sb;
+	Sbsel sel;
+	uchar *buf, oid[Oidmax];
+	uvlong n0, n1, nex;
+	vlong t0, ms;
+	int i, nok;
+
+	d = newdisk();
+	spawnforget();
+	if((s = openstoreck(d)) == nil){
+		fail("a store with a live checkpointer: %r");
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(2*Blk, 77);
+	oidof(oid, "pace");
+	if(objcreate(s, oid, 2, 1, 1, nil, 0, nil) < 0)
+		fail("objcreate: %r");
+	if(objwrite(s, oid, 2, buf, 2*Blk, 0, 2, 1, nil, 0) < 0)
+		fail("objwrite: %r");
+	checks++;
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+
+	/* armed after a clean start: every checkpoint from here fails */
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	sb = sel.sb[sel.start];
+	simfaultat(d, Sfeio, 0, (vlong)sb.emapoff*sb.secsz,
+		(vlong)sb.emapsecs*sb.secsz);
+
+	/* the log fills past ckhigh and stays there: nothing reclaims it */
+	for(i = 0; i < 400; i++)
+		if(objwrite(s, oid, 2, buf, 2*Blk, 0, 3 + i, 1, nil, 0) < 0)
+			break;
+	storestat(s, &st);
+	istrue("the live checkpointer is failing", st.ckstuck != 0);
+	istrue("and the log is what ran out", st.logfree < sb.logsecs/2);
+	n0 = st.ckfailed;
+	sleep(1000);
+	storestat(s, &st);
+	n1 = st.ckfailed;
+	istrue("a failing checkpointer keeps retrying", n1 > n0);
+	checks++;
+	if(n1 - n0 >= 40)
+		fail("the retry floor does not hold: %llud attempts in a "
+			"second", n1 - n0);
+
+	/* an explicit checkpoint is not paced by the floor */
+	nex = st.ckfailed;
+	nok = 0;
+	t0 = nsec();
+	for(i = 0; i < 20; i++)
+		if(storecheckpoint(s) >= 0)
+			nok++;
+	ms = (nsec() - t0)/1000000;
+	storestat(s, &st);
+	eqv("no explicit checkpoint succeeds over a refusing region",
+		nok, 0);
+	istrue("every explicit checkpoint ran", st.ckfailed - nex >= 20);
+	checks++;
+	if(ms >= 500)
+		fail("20 explicit checkpoints took %lld ms: the floor paced "
+			"them", ms);
+
+	/* healed, the same store checkpoints again */
+	simfault(d, Sfnone, 0);
+	checks++;
+	if(storecheckpoint(s) < 0)
+		fail("a healed device still refuses the checkpoint: %r");
+	storestat(s, &st);
+	eqv("a checkpoint that succeeds is no longer stuck", st.ckstuck, 0);
+	storeclose(s);
+	free(buf);
+	devclose(d);
+}
+
+/*
  * §2.8's wake-up condition, over a condemnation that lands while a
  * checkpoint is running.  A page is counted dirty on its 0->1 edge
  * only, so a page dirtied after its own pass has packed it keeps its
@@ -2006,6 +2116,7 @@ main(int argc, char **argv)
 	treclaimfault();
 	treplaymaps();
 	tckfail();
+	tckpace();
 	tckdirty();
 	tnodirty();
 	tdirtyfull();
