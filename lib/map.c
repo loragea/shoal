@@ -1020,20 +1020,31 @@ mapnextok(Cmap *cur, Cmap *next, int force)
  * big-endian; the score input is oid || 0x00 || dom || id, hashed in
  * three pieces rather than assembled, so no length bound of this
  * file's choosing sits in front of the placement function.
+ *
+ * The state is a zeroed one of our own on the stack, never nil:
+ * libsec allocates a state for a nil one and answers nil if that
+ * allocation fails, and maphash answers a uvlong with no error
+ * channel, so a failure there would restart the hash over the second
+ * piece and hand placement a plausible wrong score — and §4.2/§4.3
+ * are normative in full, two implementations agreeing bit for bit.
+ * A zeroed state is what libsec seeds (seeded == 0) and does not
+ * free (malloced == 0), so it is also one malloc and free the
+ * cheaper.
  */
 uvlong
 maphash(char *oid, int dom, char *id)
 {
-	DigestState *s;
+	DigestState s;
 	uchar dig[Csumlen], sep[2];
 	uvlong v;
 	int i;
 
+	memset(&s, 0, sizeof s);
 	sep[0] = 0;
 	sep[1] = (uchar)dom;
-	s = blake2s_256((uchar*)oid, strlen(oid), nil, nil);
-	s = blake2s_256(sep, sizeof sep, nil, s);
-	blake2s_256((uchar*)id, strlen(id), dig, s);
+	blake2s_256((uchar*)oid, strlen(oid), nil, &s);
+	blake2s_256(sep, sizeof sep, nil, &s);
+	blake2s_256((uchar*)id, strlen(id), dig, &s);
 	v = 0;
 	for(i = 0; i < 8; i++)
 		v = v<<8 | dig[i];
