@@ -2755,6 +2755,27 @@ guarantee the pointer can keep; the other four are given no such
 check, because advertising one there would promise what a dangling
 pointer cannot deliver.
 
+**The caller quiesces, then closes.** The obligation is not only
+that a `Store*` is dead once `storeclose` returns; it is that no call
+taking one may still be **in flight** when the close runs. A call
+that holds no claim — `objsnapopen` before it reaches the bound, and
+`dirtysnap`, `lostsnap`, `fullsyncsnap`, `storestat` and the object
+API throughout — blocks on `qlstate` with nothing keeping the
+`Store` alive, so if the last `objsnapclose` evaluates the free
+predicate while one of them is queued on that very `QLock`, the
+waiter wakes inside memory the free has released. The engine cannot
+close that window: a waiter would have to be counted under the lock
+it is waiting for. So the caller MUST have stopped issuing such
+calls **before** it calls `storeclose`, and MUST make none after it.
+What is allowed after the close is exactly `objsnapent`,
+`objsnapcount` and `objsnapclose` on handles taken before it — the
+three that carry a claim of their own. The shutdown order of the
+server that will export this store (wave 1d, §8) follows from that
+rule and not from taste: it stops accepting requests and lets the
+ones in flight drain, and only then closes the store, its surviving
+`/obj` fids holding the snapshots that are the one thing the close
+leaves valid.
+
 What this buys over simply deleting the fatal is more than the
 refusal. A freed `Store` address can be handed straight back to the
 next `storeopen` — §0's `Echange` close-and-reopen is precisely that

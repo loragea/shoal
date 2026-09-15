@@ -318,7 +318,14 @@ fails `store closed` (a local error, no layer-a §2.6 prefix, §3.7).
 An `Objsnap` handle is the **only** thing that may outlive a
 `storeclose`: the `Store*` is invalid as before, so `dirtysnap`,
 `lostsnap`, `fullsyncsnap` and `storestat` are given no such check.
-`design/store.md` §9 and §7 now say so.
+The caller **quiesces, then closes**: none of those calls may be in
+flight when `storeclose` runs either, because each waits on the
+state lock holding nothing that keeps the `Store` alive, so one
+queued there when the last release frees it wakes in freed memory —
+a window the engine cannot close, since a waiter would have to be
+counted under the lock it is waiting for. After the close, only
+`objsnapent`, `objsnapcount` and `objsnapclose` on handles taken
+before it. `design/store.md` §9 and §7 now say so.
 **Owner's direction (Victor):** "a fs that just dies" is the wrong
 shape; serving wrong data is worse, but neither is acceptable.
 **Rationale:** Both prior answers were rejected. The *lie* — delete

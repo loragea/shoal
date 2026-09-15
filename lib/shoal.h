@@ -688,6 +688,17 @@ Store*	storeopen(Dev*, Storecfg*);
  * moment this returns — every call below takes one, and none of them
  * may be made afterwards.
  *
+ * QUIESCE FIRST: a call taking a Store* must not be in flight when
+ * this one runs, either.  objsnapopen before it reaches §9's bound,
+ * and dirtysnap, lostsnap, fullsyncsnap, storestat and the object
+ * API throughout, block on the store's state lock holding nothing
+ * that keeps the Store alive, so one queued on that lock when the
+ * last release frees the Store wakes inside freed memory.  The
+ * engine cannot close that window — a waiter would have to be
+ * counted under the lock it is waiting for — so the caller MUST have
+ * stopped issuing such calls BEFORE it calls this, and MUST make
+ * none after.
+ *
  * The single exception is an object snapshot (objsnapopen, below): a
  * snapshot MAY outlive this call.  It still names a Store that is
  * still there, objsnapent through it then fails `store closed', and
@@ -870,7 +881,12 @@ int	objslot(Store*, ulong slot, uchar *oid, int *oidlen, Objinfo*);
  * **A snapshot MAY outlive storeclose**, and it is the ONLY thing
  * that may: the Store* itself is invalid the moment storeclose
  * returns, so objsnapopen, dirtysnap, lostsnap, fullsyncsnap and
- * storestat on a closed store are undefined as before.  A snapshot
+ * storestat on a closed store are undefined as before — and, since
+ * none of them holds a claim while it waits on the state lock, they
+ * must have stopped being issued before the close as well as after
+ * it (storeclose, above).  What may be called on a handle taken
+ * before the close is objsnapent, objsnapcount and objsnapclose,
+ * and nothing else.  A snapshot
  * that outlives one keeps the Store's memory alive, so objsnapcount
  * still answers, objsnapent answers -1 `store closed' — refusing
  * rather than lying "gone" for every entry — and the memory goes at
