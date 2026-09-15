@@ -2838,9 +2838,12 @@ answers `disk full` and reports the sizes rather than answering
 The bound's test and its count are **one step under one hold** of
 `qlstate` — the open's first count takes that hold anyway, and the
 open takes its slot the moment it passes the bound, so two opens
-racing cannot both find room — and an open that then fails gives the
-slot back in a hold of its own, so `/status` counts an open in flight
-along with the opens that completed. A close releases the count.
+racing cannot both find room. The count the refusal names is that
+same count, read under the hold that tested it rather than as the
+text is formatted, so it cannot come out below the maximum it is
+being refused against. An open that then fails gives the slot back in
+a hold of its own, so `/status` counts an open in flight along with
+the opens that completed. A close releases the count.
 **Giving the slot back is releasing a claim**, so a failing open's
 bail-out carries the same free predicate an `objsnapclose` does: the
 slot is the open's claim from the moment the bound is passed, and an
