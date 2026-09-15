@@ -284,6 +284,7 @@ struct Store
 					 * from a committer's ask */
 	int	ckret, ckbusy, ckproc;	/* ckret: the last one's return */
 	int	ckstuck;		/* the LAST checkpoint failed */
+	int	ckdead;			/* the fid is condemned: §2.8 */
 	ulong	ckbackms;		/* the floor in force, doubling */
 	vlong	ckwake;			/* no paced attempt before this nsec */
 	uvlong	ckfailed;		/* checkpoint attempts that failed */

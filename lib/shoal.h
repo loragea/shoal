@@ -667,8 +667,15 @@ struct Storestat
 	 * stuck store re-attempts no faster than §2.8's retry floor, so
 	 * it is a rate of retrying rather than a count of distinct
 	 * outages.
+	 *
+	 * ckdead is the stronger condition: the failing checkpoint's
+	 * device fid is condemned (§0's Echange), so no later checkpoint
+	 * can succeed and nothing short of closing and opening the store
+	 * clears it.  A dead checkpointer stops attempting, so ckfailed
+	 * stands still while ckdead is set.
 	 */
 	int	ckstuck;
+	int	ckdead;
 	uvlong	ckfailed;
 	char	ckerr[ERRMAX];
 };

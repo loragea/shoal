@@ -738,7 +738,7 @@ logcommit(Store *s, Item *ci)
 	Item *it;
 	Batch *b;
 	vlong t0;
-	int ckstuck;
+	int ckstuck, ckdead;
 	char cke[ERRMAX];
 	int full, oom, forced, r;
 
@@ -867,9 +867,13 @@ logcommit(Store *s, Item *ci)
 		 */
 		qlock(&s->cklk);
 		ckstuck = s->ckstuck;
+		ckdead = s->ckdead;
 		strecpy(cke, cke + sizeof cke, s->ckerrstr);
 		qunlock(&s->cklk);
-		if(ckstuck)
+		if(ckdead)
+			werrstr("disk full: log full and the checkpointer "
+				"is dead: %s", cke);
+		else if(ckstuck)
 			werrstr("disk full: log full and the checkpoint "
 				"fails: %s", cke);
 		else

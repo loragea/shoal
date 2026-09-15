@@ -1267,6 +1267,7 @@ storestat(Store *s, Storestat *st)
 	qlock(&s->cklk);
 	st->ckfailed = s->ckfailed;
 	st->ckstuck = s->ckstuck;
+	st->ckdead = s->ckdead;
 	strecpy(st->ckerr, st->ckerr + sizeof st->ckerr, s->ckerrstr);
 	qunlock(&s->cklk);
 	st->ndirtydrop = s->ndirtydrop;

@@ -1118,6 +1118,25 @@ operator can read, and what keeps a store that cannot free log space
 from contending on the log's lock with the very commits waiting for
 it.
 
+**A checkpointer that cannot succeed again is named as such.** §0's
+`Echange` condemns the *fid*: every later read, write and flush on it
+fails without reaching the device, so no later checkpoint can
+materialise anything and no healing device can cure it — the store
+must be closed and opened again. So a **dead** checkpointer is
+distinguished from a stuck one: the flag is set when the failing
+checkpoint's fid is condemned, nothing short of a restart clears it,
+the checkpointer stops attempting, and §6's refusal names that
+condition instead. A stuck checkpointer is a device that may heal; a
+dead one is a store that must be restarted, and answering the first
+when it is the second costs the operator the outage. A dead
+checkpointer still runs an explicit request — it fails, and a caller
+waiting on one has to be answered — so only the paced paths stop.
+
+A commit that carries data is answered §0's refusal directly on a
+condemned fid, because it stages its grains before it commits; §6's
+refusal below is what a commit that writes no data before its
+reservation — a create, a delete — meets.
+
 Its cost is therefore proportional to the state dirtied since the
 last checkpoint and to nothing else, which is what lets §6 put a
 number on how long a commit may wait for log space.
@@ -2037,6 +2056,10 @@ the entry's `mtime`, which is why the tombstone keeps one.
   `disk full: log full and the checkpoint fails: <error>`. A failure
   a later checkpoint has cured does not: the store's log drains
   again, and this refusal is then the ordinary one.
+  If the checkpointer is **dead** rather than stuck (§2.8) — its fid
+  condemned, so no later checkpoint can succeed — the refusal says so
+  instead: `disk full: log full and the checkpointer is dead:
+  <error>`.
   Layer-a §2.6's prefix is what the client matches on and does not
   move; what follows it is for the operator reading the log.
 
@@ -3820,7 +3843,9 @@ in the commit refused for log space, and dropped from that refusal by
 a device that heals — the same store's next full log, with nothing
 checkpointing, answering the bare `disk full` — §2.8's retry floor
 under a live checkpointer proc, read as a rate of failed attempts
-across a second and as the speed of the explicit requests it exempts — §2.8's dirty-page
+across a second and as the speed of the explicit requests it exempts,
+and a fid condemned under the checkpointer, which is dead rather than
+stuck, stops the retries and is what §6's refusal then names — §2.8's dirty-page
 trigger surviving a condemnation that lands while a checkpoint runs,
 and a store opened, written and replayed at a `blksz` four times the
 device's `Wunit`), `objtest` (§2.7's extent-map slot

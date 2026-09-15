@@ -1490,6 +1490,116 @@ tckpace(void)
 }
 
 /*
+ * §2.8's dead checkpointer: §0's Echange condemns the FID, so every
+ * later read, write and flush on it fails without reaching the device
+ * and no later checkpoint can materialise anything.  A device that may
+ * heal and a store that must be restarted are different answers to the
+ * operator, and §6's refusal is where the operator reads them.
+ *
+ * The order matters.  The log is filled first, over an ordinary Sfeio
+ * on the extent-map region, so that §6's refusal is reached on the
+ * reservation and not on a device call: once the fid is condemned there
+ * is no device call left that can succeed.  Only then is the Echange
+ * armed over the same region, and the checkpoint that takes it is
+ * asked for explicitly — the floor would otherwise pace the wait.
+ *
+ * Mutations: a condemned fid sets only ckstuck (mut ck-echange-is-stuck),
+ * and the refusal then carries the stuck wording while the retries
+ * carry on.
+ */
+static void
+tckdead(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Super sb;
+	Sbsel sel;
+	uchar *buf, oid[Oidmax], oid2[Oidmax];
+	char err[ERRMAX];
+	uvlong n0;
+	int i, n;
+
+	d = newdisk();
+	spawnforget();
+	if((s = openstoreck(d)) == nil){
+		fail("a store with a live checkpointer: %r");
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(2*Blk, 78);
+	oidof(oid, "dead");
+	if(objcreate(s, oid, 2, 1, 1, nil, 0, nil) < 0)
+		fail("objcreate: %r");
+	if(objwrite(s, oid, 2, buf, 2*Blk, 0, 2, 1, nil, 0) < 0)
+		fail("objwrite: %r");
+	checks++;
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	sb = sel.sb[sel.start];
+	simfaultat(d, Sfeio, 0, (vlong)sb.emapoff*sb.secsz,
+		(vlong)sb.emapsecs*sb.secsz);
+	n = -1;
+	for(i = 0; i < 400; i++)
+		if(objwrite(s, oid, 2, buf, 2*Blk, 0, 3 + i, 1, nil, 0) < 0){
+			n = i;
+			break;
+		}
+	checks++;
+	if(n < 0)
+		fail("the log drained with every checkpoint failing");
+	storestat(s, &st);
+	eqv("a stuck checkpointer is not yet a dead one", st.ckdead, 0);
+
+	/* the same region now re-declares the unit under the open fid */
+	simfault(d, Sfnone, 0);
+	simfaultat(d, Sfechange, 0, (vlong)sb.emapoff*sb.secsz,
+		(vlong)sb.emapsecs*sb.secsz);
+	checks++;
+	if(storecheckpoint(s) >= 0)
+		fail("a checkpoint succeeded over a condemned fid");
+	storestat(s, &st);
+	istrue("a condemned fid makes the checkpointer dead",
+		st.ckdead != 0);
+	istrue("which is stuck as well", st.ckstuck != 0);
+	istrue("a dead checkpointer does not condemn the store",
+		st.broken == 0);
+	n0 = st.ckfailed;
+	sleep(1000);
+	storestat(s, &st);
+	eqv("a dead checkpointer stops attempting", st.ckfailed, n0);
+
+	/*
+	 * And §6 names the condition rather than a device that may heal.
+	 * The probe is a create and not a write: a write stages its data
+	 * grains before it commits, and on a condemned fid that device
+	 * write fails first, so the caller is answered §0's refusal and
+	 * never reaches the reservation.  A create is metadata only, so
+	 * §6's full log is the first thing it meets.
+	 */
+	oidof(oid2, "dead2");
+	checks++;
+	if(objcreate(s, oid2, 5, 1, 1, nil, 0, nil) >= 0)
+		fail("a commit succeeded with the log full and the "
+			"checkpointer dead");
+	else{
+		rerrstr(err, sizeof err);
+		istrue("the refusal keeps §2.6's prefix",
+			strncmp(err, "disk full", 9) == 0);
+		checks++;
+		if(strstr(err, "log full and the checkpointer is dead: ")
+		== nil)
+			fail("the refusal does not name the dead "
+				"checkpointer: `%s'", err);
+	}
+	storeclose(s);
+	free(buf);
+	devclose(d);
+}
+
+/*
  * §2.8's wake-up condition, over a condemnation that lands while a
  * checkpoint is running.  A page is counted dirty on its 0->1 edge
  * only, so a page dirtied after its own pass has packed it keeps its
@@ -2117,6 +2227,7 @@ main(int argc, char **argv)
 	treplaymaps();
 	tckfail();
 	tckpace();
+	tckdead();
 	tckdirty();
 	tnodirty();
 	tdirtyfull();

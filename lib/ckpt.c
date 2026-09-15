@@ -492,25 +492,37 @@ checkpoint(Store *s)
  * success clears it.  A FORCED run -- storecheckpoint, a tool's or a
  * test's -- is not paced by it and resets the doubling first, so a
  * caller driving checkpoints by hand runs at full speed.
+ *
+ * A fid condemned by §0's Echange is the other half: every later
+ * read, write and flush on it fails without reaching the device, so
+ * no later checkpoint can materialise anything and no healing device
+ * can cure it.  That is dead rather than stuck, it is never cleared
+ * (nothing clears d->changed short of a new fid, which means a new
+ * store), and ckdue stops attempting while it is set.
  */
 static int
 ckrun(Store *s, int forced)
 {
 	char e[ERRMAX];
-	int r;
+	int r, dead;
 
+	dead = 0;
 	if(forced){
 		qlock(&s->cklk);
 		s->ckbackms = 0;
 		s->ckwake = 0;
 		qunlock(&s->cklk);
 	}
-	if((r = checkpoint(s)) < 0)
+	if((r = checkpoint(s)) < 0){
 		rerrstr(e, sizeof e);
+		dead = s->d->changed;
+	}
 	qlock(&s->cklk);
 	if(r < 0){
 		s->ckfailed++;
 		s->ckstuck = 1;
+		if(dead)
+			s->ckdead = 1;
 		strecpy(s->ckerrstr, s->ckerrstr + sizeof s->ckerrstr, e);
 		if(s->ckbackms == 0)
 			s->ckbackms = s->cfg.ckbackms;
@@ -534,6 +546,8 @@ ckrun(Store *s, int forced)
 static int
 ckpaceok(Store *s)
 {
+	if(s->ckdead)
+		return 0;
 	return s->ckwake == 0 || nsec() >= s->ckwake;
 }
 
@@ -600,7 +614,9 @@ ckptproc(void *a)
 			 * committer over a failing checkpointer is the
 			 * second unpaced path and obeys the same floor as
 			 * the triggers.  storecheckpoint's own request is
-			 * counted separately and is exempt.
+			 * counted separately and is exempt -- it must
+			 * also run while the checkpointer is dead, or the
+			 * caller waiting on ckrz would never be woken.
 			 */
 			if(s->ckforce > s->ckfdone)
 				break;
