@@ -1169,6 +1169,38 @@ tclosesnapbail(void)
 }
 
 /*
+ * §13's freed hook means one thing on every path that releases a
+ * Store, and a storeopen that fails part-way is one of them: it
+ * frees the store it had half-built, so a bail-out that went back to
+ * a bare free(s) would be a release the hook does not see — and the
+ * hook is what every test of the deferred free reads.  A device that
+ * was never formatted takes §5 step 2's bail-out, no valid
+ * superblock on either copy, with no fault to inject and nothing to
+ * race.
+ */
+static void
+tfreeonopenfail(void)
+{
+	Dev *d;
+	Store *s;
+	Storecfg c;
+
+	if((d = simopen(Tsecsz, Tnsec, Tseed)) == nil)
+		sysfatal("simopen: %r");
+	nfreed = 0;
+	tcfg(&c);
+	c.freed = sawfree;
+	s = storeopen(d, &c);
+	istrue("storeopen on a device with no superblock fails", s == nil);
+	if(s != nil)
+		storeclose(s);
+	else
+		eqv("and the store it half-built is freed exactly once",
+			nfreed, 1);
+	devclose(d);
+}
+
+/*
  * §9's close race, in the three shapes the deferred free has to
  * survive.  All three put four procs on four snapshots of one store
  * and close the store under them; what differs is who closes the
@@ -2738,6 +2770,7 @@ main(int argc, char **argv)
 	tclosesnapplain();
 	tclosesnapcond();
 	tclosesnapbail();
+	tfreeonopenfail();
 	tclosesnaprace();
 	tdirty();
 	tfullsync();
