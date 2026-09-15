@@ -365,10 +365,15 @@ objsnapent(Objsnap *sn, ulong i, uchar *oid, int *oidlen, Objinfo *oi)
  * the Store's memory with it (§9): `closed' is the store's own
  * reference, so `closed && nobjsnap == 0' is the whole free
  * predicate, evaluated here under qlstate and acted on after the
- * unlock.  Nobody can be waiting on that qlstate when the predicate
- * holds — every party that can block on it holds a count this one
- * has just given back, or is storeclose, which set `closed' only
- * after its procs had stopped.
+ * unlock.  The parties that block on that qlstate holding a claim
+ * are the entry reads and closes of snapshots still open, an open
+ * that has taken §9's slot, and storeclose — which set `closed' only
+ * after its procs had stopped — so the predicate being true says
+ * there is none of them.  The calls that block on it holding NO
+ * claim (objsnapopen before the slot, dirtysnap, lostsnap,
+ * fullsyncsnap, storestat, the object API) would wake in freed
+ * memory instead, which is why §9 puts it on the caller to have
+ * quiesced them before the close rather than on this predicate.
  *
  * nil is a no-op, so a caller can close whatever an open handed it.
  * Closing the same

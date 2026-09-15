@@ -2169,10 +2169,20 @@ ordered rather than locked. §9 lets an object snapshot outlive
 `objsnapclose`, whichever observes `closed && nobjsnap == 0` under
 `qlstate` — and it runs *after* that hold is dropped, because the
 `QLock` is a field of the memory being freed. That is safe on the
-ordering alone: every party that can block on the lock holds a claim
-on the store, so when the predicate is true there is no waiter. Which
-is also why `storeclose` sets `closed` only after the proc wait above
-has returned — it is the store's own claim, and giving it up while
+ordering **given §9's contract on the caller**, and not on the
+ordering alone. The parties that block on the lock holding a claim
+are `objsnapent` and `objsnapclose` of a snapshot whose count is not
+yet given back, an `objsnapopen` that has taken §9's slot, and
+`storeclose` itself — and the predicate being true says there is
+none of those. Every other caller of the lock holds nothing:
+`objsnapopen` before the slot, `dirtysnap`, `lostsnap`,
+`fullsyncsnap`, `storestat` and the object API, each of which would
+wake in released memory if it were queued here when the free is
+decided. §9 makes that the caller's obligation — quiesce, then
+close — rather than an ordering the engine can enforce, because a
+waiter would have to be counted under the lock it is waiting for.
+The engine's own procs are excluded by the wait above, which is also
+why `storeclose` sets `closed` only after that wait has returned — it is the store's own claim, and giving it up while
 the call is still asleep on `procrz` inside the `Store` would let the
 last `objsnapclose` free it underneath.
 

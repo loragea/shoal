@@ -1203,12 +1203,17 @@ storeclose(Store *s)
 	 * asleep inside it on s->procrz, and both would then free: a
 	 * double free and a fault, measured.
 	 *
-	 * Free after unlocking, and nobody is waiting on the qlstate
-	 * inside the memory about to go: every party that can block on
-	 * it holds a claim — an objsnapent or objsnapclose of a snapshot
-	 * whose count is not yet given back, or this call — and the
-	 * procs are gone.  So if the predicate is true here, there is no
-	 * other party.
+	 * Free after unlocking, and no party this call is answerable for
+	 * is waiting on the qlstate inside the memory about to go: the
+	 * ones that block on it holding a claim are an objsnapent or
+	 * objsnapclose of a snapshot whose count is not yet given back,
+	 * an objsnapopen that has taken §9's slot, and this call — and
+	 * the procs are gone — so a true predicate says there is none.
+	 * The calls that block on it holding no claim at all (dirtysnap,
+	 * lostsnap, fullsyncsnap, storestat, the object API, an
+	 * objsnapopen before the slot) would wake in freed memory, and
+	 * §9 makes it the caller's obligation that none of them is still
+	 * in flight here: quiesce, then close.
 	 */
 	qlock(&s->qlstate);
 	s->closed = 1;
