@@ -3160,8 +3160,15 @@ length included**, and the lengths a refusal quotes are the file's
 own rather than the sector-rounded device size. `-z` on a path with
 no file there creates it at that size, where there is nothing to
 destroy — and the hint that `-z` is what sizes a new image belongs to
-that refusal alone, not to a path that is there and will not open.
-`-z` against an `sd` partition is refused by both.
+that refusal alone, not to a path that is there and will not open. A
+run that creates the image at step 2 and is then refused at step 3 or
+4 **removes what it created**, so that path holds no file again: the
+byte-identical rule is kept for a path that had a file, and for a
+path that had none the only length any refusal could leave behind is
+the one the run was refused for. An operator who corrects the flag
+and re-runs without `-z` then gets the same "no image there yet"
+refusal rather than a format at the wrong length. `-z` against an
+`sd` partition is refused by both.
 
 **`shoalfmt`** — format or ream an object-store partition.
 
@@ -3363,11 +3370,15 @@ that is a warning about the unit rather than about these bytes.
 Every one of those decisions is `monfmt`'s or `monfmtcheck`'s rather
 than the command's, so that a T1 program drives them without exec'ing
 anything — the same constraint on the code layout that puts the store
-engine in `libshoal` above. Three are the command's, and all three
-are about a file image the library is never handed: the length to
-open it at, whether `-z` may shorten it, and the refusal over an
-object-store superblock, which `monfmt` reports to its caller as
-§2.1's warning and leaves the caller to decide.
+engine in `libshoal` above. Five are the command's, and all five are
+about a file image the library is never handed: the length to open it
+at, whether `-z` may shorten it, the refusal over an object-store
+superblock — which `monfmt` reports to its caller as §2.1's warning
+and leaves the caller to decide — the refusal over a valid monitor
+header, which `monfmt` makes again for a library caller but which the
+command reaches first and is therefore the one an operator reads, and
+the removal of an image the run's own `-z` created before a later
+step refused it.
 
 **Carving the partitions** is the operator's step and uses stock
 tools. On a whole disk, `disk/fdisk -aw /dev/sdXX/data` creates a

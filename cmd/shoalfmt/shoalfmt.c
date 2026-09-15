@@ -23,7 +23,8 @@
  * is a store and neither is overwritten or shortened without -r;
  * size the geometry against the length -z ASKS FOR; and only then
  * reopen at that length and format.  A refused run leaves the file
- * byte-identical, length included.
+ * byte-identical, length included — and leaves no file at all where
+ * the run's own -z had just created one.
  *
  * A first open that fails is not by itself "no image there yet": a
  * path that exists and will not open read-write would be CREATED by
@@ -137,6 +138,31 @@ ownlen(char *path, Dev *d)
 	return n;
 }
 
+/*
+ * A run that CREATED the image and then refused destroys nothing by
+ * removing it again: there was no file on that path before the run,
+ * so §12's "a refused run leaves the file byte-identical, its length
+ * included" is kept by the path holding no file once more.  Without
+ * this, a geometry refusal after -z's create leaves an image at the
+ * refused length, and an operator who corrects the flag and re-runs
+ * without -z formats that leftover at the wrong one.
+ *
+ * It is an atexit rather than a remove beside each refusal because
+ * every exit between the create and the end of the run is a sysfatal,
+ * which ends in exits(), which runs this — including the ones the
+ * library raises and any added later.  The successful path disarms
+ * it.  Armed before the create, so that a create which fails partway
+ * leaves nothing either.
+ */
+static char *created;
+
+static void
+rmcreated(void)
+{
+	if(created != nil)
+		remove(created);
+}
+
 void
 main(int argc, char **argv)
 {
@@ -228,6 +254,9 @@ main(int argc, char **argv)
 		if(size == 0)
 			sysfatal("%s: %s; -z sizes a new file image", path,
 				err);
+		if(atexit(rmcreated) == 0)
+			sysfatal("atexit: %r");
+		created = path;
 		if((d = fileopen(path, c.secsz, size, 0)) == nil)
 			sysfatal("%s: %r", path);
 		size = 0;
@@ -291,6 +320,7 @@ main(int argc, char **argv)
 
 	if(fmtstore(d, &s) < 0)
 		sysfatal("%s: %r", path);
+	created = nil;		/* the run finished; the image stays */
 	devclose(d);
 	exits(nil);
 }

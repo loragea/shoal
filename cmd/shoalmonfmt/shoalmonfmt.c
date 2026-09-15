@@ -13,10 +13,13 @@
  * it; -z sizes a file image.  The geometry and reformat refusals are
  * monfmt's and monfmtcheck's, so that a T1 program drives them
  * without exec'ing anything; what is left here is argument parsing,
- * a report, and the two decisions about the image itself that the
- * library never sees.
+ * a report, and the decisions about the file image itself, which the
+ * library is never handed: the length to open it at, whether -z may
+ * shorten or create it, the two reformat guards whose refusals this
+ * command is the one to print, and the removal of an image this run
+ * itself created.
  *
- * Those two are the order below.  -z is destructive on its own: it
+ * Those are the order below.  -z is destructive on its own: it
  * truncates whatever the image already holds before a byte of it has
  * been looked at.  So a refused run must refuse BEFORE the resize,
  * whatever the refusal — and the refusals are not all in one place.
@@ -26,7 +29,8 @@
  * overwritten or shortened without -r; ask monfmtcheck about the
  * length -z would give it; and only then resize and format.  A run
  * refused at any of those leaves the file byte-identical, length
- * included.
+ * included — and leaves no file at all where the run's own -z had
+ * just created one.
  *
  * A first open that fails is not by itself "no image there yet": a
  * path that exists and will not open READ-WRITE would be CREATED by
@@ -97,6 +101,31 @@ ownlen(char *path, Dev *d)
 	return n;
 }
 
+/*
+ * A run that CREATED the image and then refused destroys nothing by
+ * removing it again: there was no file on that path before the run,
+ * so §12's "a refused run leaves the file byte-identical, its length
+ * included" is kept by the path holding no file once more.  Without
+ * this, a geometry refusal after -z's create leaves an image at the
+ * refused length, and an operator who corrects the flag and re-runs
+ * without -z formats that leftover at the wrong one.
+ *
+ * It is an atexit rather than a remove beside each refusal because
+ * every exit between the create and the end of the run is a sysfatal,
+ * which ends in exits(), which runs this — including the ones the
+ * library raises and any added later.  The successful path disarms
+ * it.  Armed before the create, so that a create which fails partway
+ * leaves nothing either.
+ */
+static char *created;
+
+static void
+rmcreated(void)
+{
+	if(created != nil)
+		remove(created);
+}
+
 void
 main(int argc, char **argv)
 {
@@ -159,6 +188,9 @@ main(int argc, char **argv)
 		if(size == 0)
 			sysfatal("%s: %s; -z sizes a new file image", path,
 				err);
+		if(atexit(rmcreated) == 0)
+			sysfatal("atexit: %r");
+		created = path;
 		if((d = fileopen(path, Secszdflt, size, 0)) == nil)
 			sysfatal("%s: %r", path);
 		size = 0;
@@ -221,6 +253,7 @@ main(int argc, char **argv)
 		"%lud history slots at sector %llud\n",
 		(uvlong)(d->size/d->secsz - 1), c.curoff, c.retain, c.histoff);
 	print("uses %llud bytes of the partition\n", c.used);
+	created = nil;		/* the run finished; the image stays */
 	devclose(d);
 	exits(nil);
 }
