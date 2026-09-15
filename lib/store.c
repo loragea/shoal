@@ -43,6 +43,32 @@ bitset(uchar *p, uvlong i)
 	p[i/8] |= 1 << (i%8);
 }
 
+/*
+ * §3.2: a store whose apply failed after its record was durable is
+ * serving in-memory state that its own log no longer describes, so it
+ * answers nothing until it has been opened again and replayed.  The
+ * commit path refuses through the same flag (broken).  Both are
+ * qllog's, which is where the batch that condemns the store sets them
+ * and where §3.2's failseq is read beside them.  It is taken alone and
+ * released before this call takes any other, so §7 rule 1 — no proc
+ * holds two state locks at once — still holds as stated.
+ */
+int
+storeserving(Store *s)
+{
+	int f;
+
+	qlock(&s->qllog);
+	f = s->fatal;
+	qunlock(&s->qllog);
+	if(f){
+		werrstr("store condemned: in-memory state no longer matches "
+			"the log; open it again");
+		return 0;
+	}
+	return 1;
+}
+
 int
 storeproc(Store *s, void (*fn)(void*), void *a)
 {
@@ -104,6 +130,27 @@ storehook(Store *s, char *name, uvlong n)
 		s->fatal = n != 0;
 		s->broken = n != 0;
 		qunlock(&s->qllog);
+	}else if(strcmp(name, "snapstale") == 0){
+		/*
+		 * §9's snapshot open counts the index, allocates the vector
+		 * outside the lock and fills it under a second hold, so the
+		 * index can have grown by the time the fill runs.  This arms
+		 * the next n fill attempts to behave as if it had grown by
+		 * snapshort entries since the count, so a test can drive the
+		 * re-count — and the vector's slack, which is what decides
+		 * whether a given growth needs one — without racing for
+		 * either.  One is spent per fill attempt, not per open, and
+		 * an open makes up to Snaptries of those.  Inert while
+		 * snapshort is 0.
+		 */
+		qlock(&s->qlstate);
+		s->snapstale = n;
+		qunlock(&s->qlstate);
+	}else if(strcmp(name, "snapshort") == 0){
+		/* how far the count is behind the index, for the above */
+		qlock(&s->qlstate);
+		s->snapshort = n;
+		qunlock(&s->qlstate);
 	}else if(strcmp(name, "reclaim") == 0)
 		s->reclaimearly = n != 0;
 	else if(strcmp(name, "publish") == 0)
@@ -870,6 +917,8 @@ setdefaults(Storecfg *c)
 		c->stagems = Stagemsdflt;
 	if(c->emapcache == 0)
 		c->emapcache = Emapcachedflt;
+	if(c->objsnapmax == 0)
+		c->objsnapmax = Objsnapmaxdflt;
 	/*
 	 * §2.8's triggers.  They only ever fire in the checkpointer
 	 * proc, so a caller that wants no automatic checkpoint at all —
@@ -1083,8 +1132,44 @@ storeopen(Dev *d, Storecfg *cfg)
 void
 storeclose(Store *s)
 {
+	ulong n;
+	int die;
+
 	if(s == nil)
 		return;
+	/*
+	 * §9: a snapshot is the caller's, so this frees none of them —
+	 * and a store freed under one leaves every later objsnapent
+	 * reading the freed Store, where it finds no qid.path match and
+	 * answers 0, "this entry is gone", rather than faulting.  That
+	 * is a plausible lie: a fid-lifetime bug in a server becomes a
+	 * silently short /obj listing.  There is no answer this can give
+	 * that is not one, so it says so out loud instead.
+	 *
+	 * The count is read and the decision taken under one hold of
+	 * qlstate, but the death is outside it, and that is not an
+	 * oversight.  sysfatal ends with exits(), which on Plan 9 ends
+	 * the calling PROC and not its rfork(RFMEM) group: a qlstate
+	 * carried into it is a QLock no one will ever unlock, and every
+	 * sibling that touches the store afterwards sleeps in Rendez for
+	 * ever.  Measured, with the sysfatal moved inside the hold: the
+	 * T1 case for this call wedges two procs and never returns.
+	 *
+	 * What the window between the unlock and the death costs is
+	 * nothing a conforming caller can see.  It is reachable only by
+	 * opening or closing a snapshot concurrently with storeclose,
+	 * and a caller doing that has already broken the contract this
+	 * call exists to enforce — every snapshot MUST be closed before
+	 * the store is, which orders them, so there is no legitimate
+	 * concurrent open or close for the window to mis-judge.
+	 */
+	qlock(&s->qlstate);
+	n = s->nobjsnap;
+	die = n > 0;
+	qunlock(&s->qlstate);
+	if(die)
+		sysfatal("storeclose: %lud object snapshot%s still open",
+			n, n == 1 ? "" : "s");
 	qlock(&s->cklk);
 	s->stop = 1;
 	rwakeupall(&s->ckrz);
@@ -1133,6 +1218,7 @@ storestat(Store *s, Storestat *st)
 	st->nslots = s->sb.nslots;
 	st->nlive = s->nlive;
 	st->ntomb = s->ntomb;
+	st->nobjsnap = s->nobjsnap;
 	st->ndirty = s->ndirtused;
 	st->nlost = s->nlost;
 	qunlock(&s->qlstate);

@@ -9,11 +9,13 @@ TESTS=\
 	geomtest\
 	devtest\
 	supertest\
+	montest\
 	fmtcktest\
 	storetest\
 	objtest\
 	scrubtest\
 	committest\
+	enumtest\
 
 LIB=../lib/libshoal.a$O
 HFILES=../lib/shoal.h ../lib/store.h t1.h

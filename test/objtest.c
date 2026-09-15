@@ -2051,9 +2051,34 @@ tbounds(void)
 		istrue("a stage of a zero-length oid says bad object name",
 			strncmp(e, "bad object name", 15) == 0);
 	}
-	/* ... and a discard of something that is not a tombstone */
-	refused("a discard of a live object", objdiscard(s, o, 1, 2, 1, 2),
-		"not discardable");
+	/*
+	 * ... and a discard of something that is not a tombstone, at a
+	 * key the live entry does not carry: "w" is at (ver 1, wepoch
+	 * 1).  layer-a §1.5's check (i) is one condition — a tombstone
+	 * at exactly the key named — and this store answers its two
+	 * halves in that order, the state before the key, so what a
+	 * caller is told about a live object is that it is not a
+	 * tombstone and never that the key is wrong.  The whole string
+	 * is asserted because the ORDER is what it discriminates: with
+	 * the key tested first this reads `tombstone at (1, 1), discard
+	 * names (1, 2)', which sends the caller to re-read a record
+	 * whose state is the real objection.
+	 */
+	refused("a discard of a live object at a wrong key",
+		objdiscard(s, o, 1, 2, 1, 2),
+		"not discardable: not a tombstone");
+	/*
+	 * The same at the object's OWN key, where check (i)'s key half
+	 * cannot answer at all, so the state half is the only thing left
+	 * that can refuse the call: this is what a check (i) deleted
+	 * outright would leave green.
+	 */
+	if(objstat(s, o, 1, &oi) < 0)
+		fail("objstat w: %r");
+	else
+		refused("a discard of a live object at its own key",
+			objdiscard(s, o, 1, oi.ver, oi.wepoch, oi.wepoch + 1),
+			"not discardable: not a tombstone");
 
 	/*
 	 * The refusal is the whole of what happened: no record was

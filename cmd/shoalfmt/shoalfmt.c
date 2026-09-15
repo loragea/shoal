@@ -12,6 +12,25 @@
  * partitions, and a plain file otherwise; a file is the image form the
  * T1 tests and an operator inspecting a copy both work against, and -z
  * gives it a size.
+ *
+ * -z truncates whatever the image already holds, so it must not run
+ * before ANY refusal that would have stopped the run: `shoalfmt -z'
+ * over a store it then refuses to ream, or at a size it then refuses
+ * as a geometry, would otherwise leave the operator a shortened
+ * image and a store that no longer checks.  The order is: open the
+ * image at its own length; run both reformat guards, since an image
+ * carrying a valid object-store superblock or a valid monitor header
+ * is a store and neither is overwritten or shortened without -r;
+ * size the geometry against the length -z ASKS FOR; and only then
+ * reopen at that length and format.  A refused run leaves the file
+ * byte-identical, length included — and leaves no file at all where
+ * the run's own -z had just created one.
+ *
+ * A first open that fails is not by itself "no image there yet": a
+ * path that exists and will not open read-write would be CREATED by
+ * the second open, truncating it with no guard run at all.  So the
+ * path is stat'd, and only a path that is not there falls through to
+ * -z's create.
  */
 
 static void
@@ -105,6 +124,45 @@ hexstr(char *buf, uchar *p, int n)
 	return buf;
 }
 
+/* the image's own length, which is not the device's rounded size */
+static vlong
+ownlen(char *path, Dev *d)
+{
+	Dir *dir;
+	vlong n;
+
+	if((dir = dirstat(path)) == nil)
+		return d->size;
+	n = dir->length;
+	free(dir);
+	return n;
+}
+
+/*
+ * A run that CREATED the image and then refused destroys nothing by
+ * removing it again: there was no file on that path before the run,
+ * so §12's "a refused run leaves the file byte-identical, its length
+ * included" is kept by the path holding no file once more.  Without
+ * this, a geometry refusal after -z's create leaves an image at the
+ * refused length, and an operator who corrects the flag and re-runs
+ * without -z formats that leftover at the wrong one.
+ *
+ * It is an atexit rather than a remove beside each refusal because
+ * every exit between the create and the end of the run is a sysfatal,
+ * which ends in exits(), which runs this — including the ones the
+ * library raises and any added later.  The successful path disarms
+ * it.  Armed before the create, so that a create which fails partway
+ * leaves nothing either.
+ */
+static char *created;
+
+static void
+rmcreated(void)
+{
+	if(created != nil)
+		remove(created);
+}
+
 void
 main(int argc, char **argv)
 {
@@ -112,8 +170,10 @@ main(int argc, char **argv)
 	Fmtcfg c;
 	Super s;
 	Sbsel sel;
-	char *path, hb[33];
-	vlong size;
+	Monhsel hs;
+	Dir *dir;
+	char *path, hb[33], err[ERRMAX];
+	vlong size, have;
 	uvlong meta;
 	int ream, noflush;
 
@@ -174,22 +234,65 @@ main(int argc, char **argv)
 			sysfatal("-z sizes a file image, not a partition");
 		if((d = sdopen(path, noflush ? Dnoflush : 0)) == nil)
 			sysfatal("%s: %r", path);
-	}else{
+		have = d->size;
+	}else if((d = fileopen(path, c.secsz, 0, 0)) == nil){
+		rerrstr(err, sizeof err);
+		if((dir = dirstat(path)) != nil){
+			/*
+			 * It is there and will not open read-write: a
+			 * directory, a permission, a file server saying no.
+			 * -z cannot help, and creating over it would be
+			 * the truncation this order exists to prevent.
+			 */
+			free(dir);
+			sysfatal("%s: %s", path, err);
+		}
+		/*
+		 * No image there yet: a new one has nothing to destroy,
+		 * so -z creates it at its size.
+		 */
+		if(size == 0)
+			sysfatal("%s: %s; -z sizes a new file image", path,
+				err);
+		if(atexit(rmcreated) == 0)
+			sysfatal("atexit: %r");
+		created = path;
 		if((d = fileopen(path, c.secsz, size, 0)) == nil)
 			sysfatal("%s: %r", path);
-	}
+		size = 0;
+		have = d->size;
+	}else
+		have = ownlen(path, d);
 	c.secsz = d->secsz;
 
 	/*
 	 * Reaming a disk destroys an instance's identity, and layer-a
 	 * §1.5 makes that a reformat-before-rejoin event, so it takes
-	 * a flag.
+	 * a flag.  A monitor map partition (§10) is a store this tool
+	 * would destroy just as completely, and it is not this tool's
+	 * to destroy without being told either.
 	 */
 	if(!ream){
 		if(superselect(d, &sel) == 0)
 			sysfatal("%s already carries a valid superblock "
 				"(copy %d, gen %llud); -r to ream it", path,
 				sel.start, sel.sb[sel.start].gen);
+		if(monhdrsel(d, &hs) == 0)
+			sysfatal("%s already carries a valid monitor header "
+				"(copy %d, slotsz %lud, retain %lud); -r to "
+				"format over it", path, hs.use,
+				hs.h[hs.use].slotsz, hs.h[hs.use].retain);
+	}
+
+	/* the geometry, against the size asked for, before resizing */
+	if(geometry(&s, &c, size != 0 ? size : have) < 0)
+		sysfatal("%s: %r", path);
+
+	/* every refusal is past: now the image may be resized */
+	if(size != 0){
+		devclose(d);
+		if((d = fileopen(path, c.secsz, size, 0)) == nil)
+			sysfatal("%s: %r", path);
 	}
 
 	if(geometry(&s, &c, d->size) < 0)
@@ -217,6 +320,7 @@ main(int argc, char **argv)
 
 	if(fmtstore(d, &s) < 0)
 		sysfatal("%s: %r", path);
+	created = nil;		/* the run finished; the image stays */
 	devclose(d);
 	exits(nil);
 }

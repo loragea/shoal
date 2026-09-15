@@ -578,6 +578,7 @@ typedef struct Storecfg Storecfg;
 typedef struct Storestat Storestat;
 typedef struct Objinfo Objinfo;
 typedef struct Stage Stage;
+typedef struct Objsnap Objsnap;
 
 /*
  * Store and Stage are opaque outside lib/: their definitions are in
@@ -588,6 +589,7 @@ typedef struct Stage Stage;
  */
 #pragma incomplete Store
 #pragma incomplete Stage
+#pragma incomplete Objsnap
 
 enum
 {
@@ -601,6 +603,7 @@ enum
 	Stagetotdflt	= 16384,	/* §3.6, grains per process */
 	Stagemsdflt	= 30000,
 	Emapcachedflt	= 4096,		/* §9's LRU */
+	Objsnapmaxdflt	= 8,		/* §9's concurrent-snapshot bound */
 	Qidbatch	= 1024,		/* §2.2's qidnext batch */
 };
 
@@ -618,6 +621,7 @@ struct Storecfg
 	ulong	ckwaitms;
 	ulong	stagemax, stagetot, stagems;
 	ulong	emapcache;
+	ulong	objsnapmax;		/* §9's bound on open snapshots */
 };
 
 struct Storestat
@@ -635,6 +639,7 @@ struct Storestat
 	int	broken;			/* a log write failed: §3.2 */
 	uvlong	nslots;			/* the index's size, for §8's cursor */
 	uvlong	nlive, ntomb, nlost;	/* nlost: /lost, §8 */
+	uvlong	nobjsnap;		/* §9's open object snapshots */
 	uvlong	ndirty, ndirtydrop;
 	uvlong	nreplay, pmax;
 	/*
@@ -664,7 +669,17 @@ struct Objinfo
 };
 
 Store*	storeopen(Dev*, Storecfg*);
-void	storeclose(Store*);	/* stop the procs; write nothing */
+/*
+ * Stop the procs and free the store; it writes nothing.  Every object
+ * snapshot taken from it (objsnapopen, below) MUST be closed first: a
+ * snapshot is the caller's, so this frees none of them, and the store
+ * they name would be gone underneath them.  A store closed with one
+ * still open is a fid-lifetime bug in the caller, and this `sysfatal's
+ * naming the count rather than leaving the snapshot to answer from
+ * freed memory — which it would do plausibly, entry by entry, as
+ * "that entry is gone".
+ */
+void	storeclose(Store*);
 int	storecheckpoint(Store*);
 void	storestat(Store*, Storestat*);
 void	storehook(Store*, char *name, uvlong n);	/* §13's -X hooks */
@@ -673,9 +688,9 @@ void	storehook(Store*, char *name, uvlong n);	/* §13's -X hooks */
  * local verification — §5 step 10's condemned slots and §8's
  * corrupt-flagged entries alike.  storelost answers the i'th slot, or
  * ~0 past the end; Storestat.nlost is how many there are.  The two
- * are read together and the list moves under a concurrent scrub, so a
- * walker that wants a consistent picture is the caller's problem, as
- * every other enumeration here is.
+ * are read together and the list moves under a concurrent scrub, so
+ * this is a cursor over the live list rather than a picture of it: a
+ * caller that needs a picture takes lostsnap's copy (below).
  */
 ulong	storelost(Store*, ulong i);
 int	storefullsync(Store*, char *peer);
@@ -779,6 +794,125 @@ int	objscrub(Store*, uchar *oid, int oidlen, Vfy*);
 int	objslot(Store*, ulong slot, uchar *oid, int *oidlen, Objinfo*);
 
 /*
+ * §9's snapshot-at-open enumeration: what a server's /obj, /tombs and
+ * /advert fids read, and layer-a §2.2's SHOULD for the first two.
+ *
+ * objsnapopen takes the vector of {slot, qid.path} of every index
+ * entry whose state is in kinds — Snaplive for /obj, Snaptomb for
+ * /tombs, both for /advert — and holds no lock once it returns.  12
+ * bytes an entry, §9's sizing.  The snapshot holds no reference the
+ * engine must honour: it is a list of names, and an entry a later
+ * discard removes simply becomes gone.
+ *
+ * It takes TWO holds of the state lock to do that, one per step —
+ * the count, the vector allocated outside any hold, the fill — and
+ * two more for every re-count the index forces by growing past the
+ * vector's slack in between, which is why it can fail with `object
+ * snapshot: the index moved under 8 counts'.  The bound below costs
+ * no hold of its own: it is tested and taken inside the first count's.
+ * A refused open is 2·Snaptries + 1 holds, the last of them giving
+ * the bound's slot back.  That failure is pathological and not
+ * ordinary: the vector is allocated with slack over the count, so a
+ * create rate would have to outrun a malloc eight times running to
+ * provoke it.  It is not a layer-a §2.6
+ * condition — nothing is full and nothing is broken — so it carries
+ * no §2.6 prefix (§3.7), and a server SHOULD retry the open once
+ * before answering a client at all.
+ *
+ * Access is by POSITION, not by slot, which is what lets a server map
+ * a Tread offset onto an entry and restart from 0 on a re-read, the
+ * way a Plan 9 directory read works.  objsnapent answers entry i: 1
+ * with the oid, *oidlen and the Objinfo rendered from the LIVE index
+ * under a short hold of the state lock, exactly as objslot does; 0
+ * when that entry is gone; -1 past the end or on a condemned store.
+ * objsnapcount is the number of entries, and it does not change: an
+ * object created after the open is not in the vector at all.
+ *
+ * **Gone is two conditions.**  The slot's qid.path no longer matches
+ * the snapshot's — the object was discarded and the slot reused, or
+ * the slot was freed — OR the slot's state is no longer in the
+ * snapshot's kinds.  The second is not a refinement of the first:
+ * §2.3 keeps an object's qid.path across delete, tombstone and
+ * re-create, so a live object deleted after a /obj open still matches
+ * on qid.path and is now a tombstone, which layer-a §2.2 says /obj
+ * MUST NOT list; a tombstone re-created over after a /tombs open
+ * matches too and is now live.
+ *
+ * The number of snapshots open at once is bounded by Storecfg's
+ * objsnapmax (§9: policy, default Objsnapmaxdflt), because the cost
+ * is per open fid; an open past it answers `disk full' (layer-a
+ * §2.6).  The bound is tested and the count taken in one step under
+ * one hold of the state lock — the hold the open's first count takes
+ * anyway — so two opens racing cannot both find room; an open that
+ * fails after that gives the count back, and Storestat counts an open
+ * in flight.  objsnapclose releases the count.  A snapshot is the
+ * caller's and storeclose frees nothing of the caller's, so every
+ * snapshot MUST be closed before the store it was taken from is:
+ * storeclose `sysfatal's on a store that still has one open, because
+ * the alternative is a snapshot answering "gone" for every entry out
+ * of freed memory.  Closing one twice is UNDEFINED, exactly as
+ * freeing the same pointer twice is: the second call reads a handle
+ * the first freed, whose first word the pool has already overwritten,
+ * so there is nothing it can check and no guard that would help.
+ */
+enum
+{
+	Snaplive	= 1<<0,		/* /obj */
+	Snaptomb	= 1<<1,		/* /tombs */
+	Snapboth	= Snaplive|Snaptomb,	/* /advert */
+};
+
+Objsnap*	objsnapopen(Store*, int kinds);
+ulong		objsnapcount(Objsnap*);
+int		objsnapent(Objsnap*, ulong i, uchar *oid, int *oidlen,
+			Objinfo*);
+void		objsnapclose(Objsnap*);
+
+/*
+ * The other two enumerations layer-a §2.2 makes a snapshot MUST, as
+ * copies taken at open rather than as cursors: /dirty and /lost are
+ * bounded by the dirty region and by what fails local verification,
+ * so a copy is the whole of what a renderer needs.
+ *
+ * dirtysnap answers a malloc'd array of every record in the dirty set
+ * (layer-a §7.1), taken under one hold of the lock that guards it;
+ * the Dirtyrec carries the record's oid, oidlen, peer, peerlen and
+ * epoch, and its op is 1 (add) because a record that is in the set is
+ * one that was added.  lostsnap answers the same for /lost (layer-a
+ * §7.5): one entry per slot storelost would name, with the oid and
+ * the Objinfo beside it so a renderer need not go back to the index.
+ * storelost stays: it is what a walker that wants the live list uses.
+ *
+ * The /lost copy names every one of those slots, §5 step 10's
+ * included — an index entry that would not unpack is itself the
+ * damage, so that entry has no oid to give: its oidlen is 0 and its
+ * Objinfo is the slot number, state Sfree and zeroes, and a renderer
+ * emits the line with no `oid='.  Any other rule would make the copy
+ * disagree with Storestat.nlost.
+ *
+ * fullsyncsnap answers the other half of /dirty: a malloc'd array of
+ * the names of the peers carrying §7.1's coarse fullsync flag, which
+ * no record in the dirty set names — the exhaustion drop sets it on
+ * the peer whose records it has just dropped.  A renderer of /dirty
+ * therefore takes two copies, one call each.  The names live in the
+ * same allocation as the pointer array, so one free releases both.
+ *
+ * All three answer 0 with *np 0 and *p nil when there is nothing to
+ * report, -1 on failure, and the array is the caller's to free.
+ */
+typedef struct Lostent Lostent;
+struct Lostent
+{
+	int	oidlen;
+	uchar	oid[Oidmax];
+	Objinfo	oi;		/* oi.slot is the slot storelost names */
+};
+
+int	dirtysnap(Store*, Dirtyrec **dp, ulong *np);
+int	lostsnap(Store*, Lostent **lp, ulong *np);
+int	fullsyncsnap(Store*, char ***pp, ulong *np);
+
+/*
  * §8's block repair.  a is block blk as fetched from a holder of a
  * copy at the same key (layer-a §5.6's op=get), n its covered length.
  * The bytes are accepted only against the *stored* dig[i], and only
@@ -810,3 +944,171 @@ void	stagediscard(Stage*);
  * still calls stagediscard, which then finds nothing left to release.
  */
 void	stagesweep(Store*, vlong now);
+
+/*
+ * The monitor's map slot store, docs/design/store.md §10.
+ *
+ * A raw partition of a few MiB through which the monitor makes a
+ * published cluster map durable before it acknowledges the publish
+ * (layer-a §8.2).  The map text is opaque to it: this store keeps
+ * bytes and a length and never parses, compares or orders them —
+ * including their epochs, which layer-a §8.3's forceepoch and §8.6's
+ * rebuild path may legitimately republish out of order.
+ *
+ *	sector 0	header, copy 0
+ *	hdr.curoff	current-map slot 0
+ *			current-map slot 1
+ *	hdr.histoff	retain history slots, a ring
+ *	last sector	header, copy 1
+ *
+ * Error strings: only an oversize map answers a layer-a §2.6 wire
+ * error, `disk full', which §10 requires of it.  Every other refusal
+ * here is local to the monitor and carries no §2.6 prefix (§3.7).
+ */
+enum
+{
+	Monvers		= 1,		/* format version of every header */
+	Monslotszdflt	= 65536,	/* §10's default slotsz */
+	Monretaindflt	= 8,		/* §10's default ring length */
+	Monretainmin	= 2,		/* layer-a §5.2 clause 2 reads E−1 */
+	Monminbytes	= 1024*1024,	/* §10: shoalmonfmt refuses less */
+};
+
+typedef struct Mon Mon;
+typedef struct Monhdr Monhdr;
+typedef struct Monhsel Monhsel;
+typedef struct Monfmtcfg Monfmtcfg;
+typedef struct Monmap Monmap;
+typedef struct Monstat Monstat;
+
+/*
+ * Mon is opaque outside lib/, like Store: 2c(1) signs a function
+ * taking a pointer to it from the type's definition, so a file that
+ * has the definition and one that has not would disagree.
+ */
+#pragma incomplete Mon
+
+/* the header, written only at format */
+struct Monhdr
+{
+	ulong	vers;
+	ulong	slotsz;
+	ulong	retain;
+	uvlong	curoff;		/* sector of current-map slot 0 */
+	uvlong	histoff;	/* sector of history slot 0 */
+};
+
+/*
+ * Both header copies.  Nothing writes either after format, so they
+ * are identical by construction: the rule is "take either valid copy,
+ * refuse if neither", and two valid copies that DIFFER are a refusal
+ * naming the field rather than a choice — the operator has mixed two
+ * partitions' halves, or the media is lying.
+ */
+struct Monhsel
+{
+	Monhdr	h[2];
+	int	valid[2];
+	char	why[2][ERRMAX];	/* why a copy is invalid */
+	int	use;		/* copy to take, -1 if neither */
+};
+
+int	monhdrsel(Dev*, Monhsel*);
+
+/*
+ * Format.  Every refusal shoalmonfmt makes it makes here, so that a
+ * T1 program drives the tool's decisions and not its argument
+ * parsing: a slotsz that is not a multiple of secsz or is under two
+ * sectors, a retain under Monretainmin, a device under Monminbytes or
+ * too small for 2 header sectors and 2+retain slots, and a valid
+ * monitor header without ream.  warnsuper reports §12's warning — the
+ * target already carries a valid object-store superblock, so the unit
+ * is an instance's — which is a warning and not a refusal.
+ *
+ * A fresh store holds both current slots as VALID empty maps at len 0,
+ * seq 0, epoch 0, and the header sector of every history slot zeroed.
+ * "The store holds no map" is then the chosen slot's len being 0, and
+ * "neither current slot valid" always means damage.
+ */
+struct Monfmtcfg
+{
+	ulong	slotsz;		/* 0: Monslotszdflt; on return, what was used */
+	ulong	retain;		/* 0: Monretaindflt; on return, what was used */
+	int	ream;		/* format over a valid monitor header */
+	int	warnsuper;	/* out: §12's object-store superblock warning */
+	uvlong	curoff, histoff;/* out: sectors */
+	uvlong	used;		/* out: bytes the format occupies */
+};
+
+int	monfmt(Dev*, Monfmtcfg*);
+
+/*
+ * The geometry and size half of those refusals, against a size that
+ * need not be the device's own, filling in c's defaults.  It is what
+ * lets `shoalmonfmt -z' refuse the size it was asked for before it
+ * shortens the image to it (§12): a refused run leaves the file
+ * byte-identical.  monfmt makes the same check of the device itself.
+ */
+int	monfmtcheck(Dev*, vlong size, Monfmtcfg*);
+
+/*
+ * One published map.  text is the store's own and is valid until the
+ * next commit or monclose; a caller that wants it longer copies it.
+ */
+struct Monmap
+{
+	uchar	*text;
+	ulong	len;
+	uvlong	seq;
+	uvlong	epoch;
+};
+
+struct Monstat
+{
+	ulong	slotsz, retain;
+	uvlong	curoff, histoff;
+	ulong	nhist;		/* valid history entries, phantoms apart */
+	ulong	nphantom;	/* ring slots ignored at open (§10) */
+	uvlong	seq, epoch;
+	ulong	len;		/* of the current map */
+	int	hasmap;		/* 0 on a fresh store: len is 0 */
+	int	cur;		/* current-map slot in use */
+	int	hdr;		/* header copy the open took */
+	int	hdrother;	/* the other copy was valid too */
+};
+
+/*
+ * Open reads both header copies, both current slots and the whole
+ * ring, chooses the current map by §2.2's rule keyed on seq, and
+ * marks every history slot whose seq exceeds the chosen current
+ * slot's as a phantom — a publish that wrote its ring entry and never
+ * published its map.  A phantom is ignored by every accessor and is
+ * the first slot the next commit reuses.  Open WRITES NOTHING and
+ * works on a Drdonly device.  It refuses a store with no valid header
+ * and one with neither current slot valid.
+ *
+ * moncommit is §10's two steps with one flush each; it answers
+ * `disk full' and leaves the store unchanged when secsz+len exceeds
+ * slotsz, and a failed ring write fails the commit with the current
+ * map untouched.  Each slot is READ BACK after its flush and checked,
+ * so a write that reports success and does not land fails the commit
+ * exactly as a failed one does (§10); a device that loses the bytes
+ * after acknowledging the flush is outside the model.  A read-back
+ * whose READ fails, twice, is a third outcome: the commit fails
+ * saying the publish is INDETERMINATE, because the slot may be on the
+ * platter.  Such a slot is not served by this process and its seq is
+ * spent, so a retry outranks it; a monitor that fails a publish has
+ * not acknowledged it, and the map may still be there at the next
+ * open (§10).  moncurrent answers 0 for "this store holds no map".
+ * monhistory walks the ring newest-first, position 0 being the
+ * current map itself, and answers 0 past the end.  monlookup answers
+ * the entry for an epoch, taking the greater seq when two carry one
+ * epoch.
+ */
+Mon*	monopen(Dev*);
+void	monclose(Mon*);
+int	moncommit(Mon*, void *text, ulong len, uvlong epoch);
+int	moncurrent(Mon*, Monmap*);
+int	monhistory(Mon*, ulong i, Monmap*);
+int	monlookup(Mon*, uvlong epoch, Monmap*);
+void	monstat(Mon*, Monstat*);

@@ -140,6 +140,24 @@ struct Omap
 	Emape	*c;
 };
 
+/*
+ * A directory snapshot, §9.  The two parallel arrays are the vector
+ * of {slot, qid.path} §9 sizes at 12 bytes an entry, taken under one
+ * hold of qlstate at open; kinds is the set of states that open asked
+ * for, and is the other half of what makes an entry gone.  Nothing
+ * here is a reference the engine must honour: the slot may be freed,
+ * reused or re-stated under it, which is exactly what the two tests
+ * in objsnapent detect.
+ */
+struct Objsnap
+{
+	Store	*s;
+	int	kinds;
+	ulong	n;
+	ulong	*slot;
+	uvlong	*qidpath;
+};
+
 struct Store
 {
 	Dev	*d;
@@ -164,6 +182,9 @@ struct Store
 	ulong	*hash;
 	ulong	nhash;
 	ulong	nlive, ntomb;
+	ulong	nobjsnap;		/* §9's open snapshots; qlstate's */
+	ulong	snapstale;		/* §13's snapstale point; qlstate's */
+	ulong	snapshort;		/* ... by how many entries; qlstate's */
 
 	/* the two slot spaces, §6.  resv is a stage's reservation. */
 	uchar	*slotused;
@@ -339,6 +360,7 @@ void	zerodigest(Store*, uvlong len, ulong i, uchar *dig);
 void	ienthash(Store*, ulong slot);
 void	ientunhash(Store*, ulong slot);
 long	ientfind(Store*, uchar *oid, int oidlen);
+void	ientinfo(Store*, ulong slot, Objinfo*);	/* caller holds qlstate */
 
 /* commit.c — the log, group commit and the flusher */
 int	logcommit(Store*, Item*);
@@ -352,6 +374,7 @@ void	ckptproc(void*);
 int	publishlocked(Store*);
 
 /* store.c */
+int	storeserving(Store*);	/* 0 and an error set on a condemned store */
 int	storeproc(Store*, void (*)(void*), void*);
 void	storeprocdone(Store*);
 void	storecondemn(Store*, ulong slot);	/* §5 step 10, at run time */

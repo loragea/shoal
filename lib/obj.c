@@ -274,32 +274,6 @@ updcommit(Upd *u, int state, uvlong ver, uvlong wepoch, vlong mtime,
 }
 
 /*
- * §3.2: a store whose apply failed after its record was durable is
- * serving in-memory state that its own log no longer describes, so it
- * answers nothing until it has been opened again and replayed.  The
- * commit path refuses through the same flag (broken).  Both are
- * qllog's, which is where the batch that condemns the store sets them
- * and where §3.2's failseq is read beside them.  It is taken alone and
- * released before this call takes any other, so §7 rule 1 — no proc
- * holds two state locks at once — still holds as stated.
- */
-static int
-serving(Store *s)
-{
-	int f;
-
-	qlock(&s->qllog);
-	f = s->fatal;
-	qunlock(&s->qllog);
-	if(f){
-		werrstr("store condemned: in-memory state no longer matches "
-			"the log; open it again");
-		return 0;
-	}
-	return 1;
-}
-
-/*
  * Every grain access goes through these two.  §0: `interrupted' on
  * one of them is a flushed request and unwinds into §3.3's step-7
  * exit — the stage is discarded and nothing durable was touched — so
@@ -826,9 +800,8 @@ int
 objstat(Store *s, uchar *oid, int oidlen, Objinfo *oi)
 {
 	long slot;
-	Ient *e;
 
-	if(!serving(s))
+	if(!storeserving(s))
 		return -1;
 	qlock(&s->qlstate);
 	if((slot = ientfind(s, oid, oidlen)) < 0){
@@ -836,18 +809,7 @@ objstat(Store *s, uchar *oid, int oidlen, Objinfo *oi)
 		werrstr("no such object");
 		return -1;
 	}
-	e = &s->idx[slot];
-	memset(oi, 0, sizeof *oi);
-	oi->slot = slot;
-	oi->emapslot = e->emapslot;
-	oi->qidpath = e->qidpath;
-	oi->len = e->len;
-	oi->ver = e->ver;
-	oi->wepoch = e->wepoch;
-	oi->mtime = e->mtime;
-	memmove(oi->csum, e->csum, Csumlen);
-	oi->state = e->state;
-	oi->corrupt = (e->flags & Icorrupt) != 0;
+	ientinfo(s, slot, oi);
 	qunlock(&s->qlstate);
 	return 0;
 }
@@ -868,7 +830,7 @@ objcreate(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 	 * s->idx below and answer `object exists' — a §2.6 wire error —
 	 * out of memory the store itself has declared untrustworthy.
 	 */
-	if(!serving(s))
+	if(!storeserving(s))
 		return -1;
 	if(oidlen < 1 || oidlen > Oidmax){
 		werrstr("bad object name: oid length %d", oidlen);
@@ -1104,7 +1066,7 @@ objtrunc(Store *s, uchar *oid, int oidlen, uvlong len, uvlong ver,
 	Omap mold;
 	uchar *buf;
 
-	if(!serving(s))
+	if(!storeserving(s))
 		return -1;
 	if(len > s->sb.objmax){
 		werrstr("object too large");
@@ -1153,7 +1115,7 @@ objremove(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 	Upd u;
 	Omap mold;
 
-	if(!serving(s))
+	if(!storeserving(s))
 		return -1;
 	/*
 	 * objcreate's rule, and here it is the sharp one: a delete bumps
@@ -1276,7 +1238,7 @@ objdiscard(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 	Ient *e;
 	long slot;
 
-	if(!serving(s))
+	if(!storeserving(s))
 		return -1;
 	qlock(&s->qlstate);
 	if((slot = ientfind(s, oid, oidlen)) < 0){
@@ -1324,7 +1286,7 @@ objread(Store *s, uchar *oid, int oidlen, void *a, long n, uvlong off)
 	ulong blk, boff, g;
 	long slot;
 
-	if(!serving(s))
+	if(!storeserving(s))
 		return -1;
 	if(n < 0){
 		werrstr("negative read");
@@ -1424,7 +1386,7 @@ objverify(Store *s, uchar *oid, int oidlen, Vfy *v)
 	long slot;
 
 	memset(v, 0, sizeof *v);
-	if(!serving(s))
+	if(!storeserving(s))
 		return -1;
 	qlock(&s->qlstate);
 	if((slot = ientfind(s, oid, oidlen)) < 0){
@@ -1567,7 +1529,7 @@ objslot(Store *s, ulong slot, uchar *oid, int *oidlen, Objinfo *oi)
 {
 	Ient *e;
 
-	if(!serving(s))
+	if(!storeserving(s))
 		return -1;
 	if(slot >= s->sb.nslots){
 		werrstr("slot %lud, nslots %lud", slot, s->sb.nslots);
@@ -1582,17 +1544,7 @@ objslot(Store *s, ulong slot, uchar *oid, int *oidlen, Objinfo *oi)
 	}
 	memmove(oid, e->oid, e->oidlen);
 	*oidlen = e->oidlen;
-	memset(oi, 0, sizeof *oi);
-	oi->slot = slot;
-	oi->emapslot = e->emapslot;
-	oi->qidpath = e->qidpath;
-	oi->len = e->len;
-	oi->ver = e->ver;
-	oi->wepoch = e->wepoch;
-	oi->mtime = e->mtime;
-	memmove(oi->csum, e->csum, Csumlen);
-	oi->state = e->state;
-	oi->corrupt = (e->flags & Icorrupt) != 0;
+	ientinfo(s, slot, oi);
 	qunlock(&s->qlstate);
 	return 1;
 }
@@ -1635,7 +1587,7 @@ objrepair(Store *s, uchar *oid, int oidlen, ulong blk, void *a, long n)
 	ulong g, cov;
 	int match;
 
-	if(!serving(s))
+	if(!storeserving(s))
 		return -1;
 	if(objstat(s, oid, oidlen, &oi) < 0)
 		return -1;
@@ -1863,7 +1815,7 @@ stagewrite1(Stage *g, void *a, long n, uvlong off)
 	long left;
 
 	s = g->s;
-	if(!serving(s))
+	if(!storeserving(s))
 		return -1;
 	/*
 	 * §3.6: off is a peer's u64 straight off a /repl fid, so the
@@ -2149,7 +2101,7 @@ stagefinal(Stage *g, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 		return stagefail(g);
 	}
 	qunlock(&s->qlstate);
-	if(!serving(s))
+	if(!storeserving(s))
 		return stagefail(g);
 	/*
 	 * layer-a §1.3: ver starts at 1 on create, and absence is not
