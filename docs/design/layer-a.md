@@ -1032,7 +1032,9 @@ across libm implementations — the reason weighted HRW's usual
 `-w/ln(u)` form is rejected outright. The first draft reserved this
 rule without saying what was hashed, which made it unimplementable;
 the strings above are the reservation. Until it is ratified, a v1
-monitor MUST reject `weight` ≠ 100 with `bad ctl`.
+monitor MUST reject `weight` ≠ 100 with `bad map` (§8.1): `weight`
+is set by a map text and by no ctl verb, so the refusal is a map
+validation and carries the prefix §8.1 lists for it.
 
 Consequence to state plainly: v1 fills disks in proportion to
 *count*, not capacity. A cluster with a 1 TB and an 8 TB disk on
