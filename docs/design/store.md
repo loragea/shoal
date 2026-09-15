@@ -3603,7 +3603,11 @@ fails *over a phantom victim*, after which the retry reuses that same
 slot and the never-published epoch is still unanswerable at the next
 start; a ring write that fails *over a valid victim*, with the ring
 full, after which the live store still answers the oldest epoch,
-counts no phantom, and agrees with the restart; a current-slot write
+counts no phantom, and agrees with the restart; the same ring full
+under an *indeterminate* ring write that landed nothing, where the
+victim is on the platter and is nonetheless dropped from history and
+made a phantom, because a read-back that would not read cannot tell
+that case from an unacknowledged map having landed; a current-slot write
 that fails and is retried *in the same
 session*, where the phantom mark has to hold in memory with no restart
 to rebuild it; `disk full` on an

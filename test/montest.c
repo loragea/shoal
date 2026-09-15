@@ -1209,6 +1209,105 @@ tringfailvalid(void)
 }
 
 /*
+ * A ring write that is INDETERMINATE over a committed victim, with
+ * the ring full.  The write reported success and so did its flush,
+ * but the read-back would not read — twice — so §10 says nothing
+ * about what the slot now holds, and the failure path must NOT go
+ * back to the platter for the victim the way it does after a
+ * determinate failure.
+ *
+ * The schedule is built so that the platter DOES still hold the
+ * victim: the ring write lands nothing (Sfdrop) while reporting
+ * success, so a re-read would find the victim valid at a seq the
+ * current map's reaches and put it back as committed history.  That
+ * is the wrong answer even though the bytes are there, because the
+ * read-back's failure means the store cannot tell this case from the
+ * one where an unacknowledged map landed instead, and the slot must
+ * stay first in line for reuse either way.  Without the guard the
+ * ring write's failure is invisible in the books.
+ */
+static void
+tringfailindet(void)
+{
+	Dev *sim, *d;
+	Mon *m;
+	Monstat st;
+	Monmap mm;
+	uchar hdr[Secsz];
+	char text[32], err[ERRMAX];
+	vlong voff;
+	int i;
+
+	sim = fresh();
+	d = shimopen(sim);
+	if((m = mustopen(d, "ringindet")) == nil){
+		devclose(d);
+		devclose(sim);
+		return;
+	}
+	/* retain commits: every ring slot valid, none a phantom */
+	for(i = 1; i <= Retain; i++){
+		snprint(text, sizeof text, "map=%d", i);
+		commit(m, "ringindet", text, i);
+	}
+	monstat(m, &st);
+	eqv("ringindet: the ring is full", st.nhist, Retain);
+	eqv("ringindet: with no phantom", st.nphantom, 0);
+
+	/* the victim is the oldest entry: seq 1, epoch 1 */
+	voff = -1;
+	for(i = 0; i < Retain; i++){
+		simpeek(sim, histoffs(&st, i), hdr, Secsz);
+		if(memcmp(hdr, "shoalmap", 8) == 0 && GBIT64(hdr + 32) == 1)
+			voff = histoffs(&st, i);
+	}
+	checks++;
+	if(voff < 0){
+		fail("ringindet: the oldest entry is not on the disk");
+		monclose(m);
+		devclose(d);
+		devclose(sim);
+		return;
+	}
+
+	/*
+	 * The write lands nowhere and says it succeeded, so the victim
+	 * survives underneath it; the read-back that would have caught
+	 * that cannot be read, on either attempt.
+	 */
+	simfaultat(sim, Sfdrop, 1, voff, st.slotsz);
+	shimarm(rdback(1, 0, 1));
+	checks++;
+	if(moncommit(m, "map=E", 5, Retain + 1) == 0)
+		fail("ringindet: an indeterminate ring write reported "
+			"success");
+	rerrstr(err, sizeof err);
+	istrue("ringindet: the refusal says the publish is indeterminate",
+		strstr(err, "indeterminate") != nil);
+	shimarm(0);
+	monstat(m, &st);
+	eqv("ringindet: the current map is untouched", st.epoch, Retain);
+	eqv("ringindet: the victim is no longer history", st.nhist,
+		Retain - 1);
+	eqv("ringindet: and is counted as a phantom", st.nphantom, 1);
+	eqi("ringindet: the oldest epoch answers nothing",
+		monlookup(m, 1, &mm), 0);
+
+	/* and the retry takes that slot back, ahead of any other */
+	checks++;
+	if(moncommit(m, "map=E", 5, Retain + 1) < 0)
+		fail("ringindet: the retry: %r");
+	monstat(m, &st);
+	eqv("ringindet: the retry consumed the phantom", st.nphantom, 0);
+	eqv("ringindet: the ring is full again", st.nhist, Retain);
+	eqi("ringindet: and the oldest epoch is gone for good",
+		monlookup(m, 1, &mm), 0);
+	monclose(m);
+	devclose(d);
+	devclose(sim);
+}
+
+/*
  * The monitor retries in the SAME session after a current-slot write
  * fails.  Nothing restarts here, so the phantom mark that failure
  * leaves has to hold in memory: the ring entry for the map that was
@@ -2040,6 +2139,7 @@ main(int, char**)
 	thistfail();
 	tringfailphantom();
 	tringfailvalid();
+	tringfailindet();
 	tcurfailretry();
 	treadretry(1, 0);
 	treadretry(0, 0);
