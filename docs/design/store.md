@@ -2713,7 +2713,13 @@ count takes that hold anyway, and the open takes its slot the moment
 it passes the bound, so two opens racing cannot both find room — and
 an open that then fails gives the slot back in a hold of its own, so
 `/status` counts an open in flight along with the opens that
-completed. A close releases the count.
+completed. A close releases the count. **Giving the slot back is
+releasing a claim**, so a failing open's bail-out carries the same
+free predicate an `objsnapclose` does: the slot is the open's claim
+from the moment the bound is passed, and an open in flight when
+`storeclose` runs is therefore the store's last claim — `storeclose`
+finds the count non-zero, defers, and the bail-out is what releases
+the memory.
 
 **A snapshot MAY outlive `storeclose`.** The store's memory is not
 released while one names it: `storeclose` stops the procs, then takes
@@ -3579,7 +3585,7 @@ record is written and then a byte-wise mixture of its old and its new
 header bytes is placed on the platter, which is what a torn write
 leaves and what the sweep must be exhaustive over.
 
-Seven of §13's points are *mutations* or schedules rather than
+Eight of §13's points are *mutations* or schedules rather than
 crashes, and are built into the store as hooks that are inert unless
 a test asks for them: `reclaim` (reclaim log space before the checkpoint's
 superblock write returns), `publish` (force an `epochhigh` publish
@@ -3604,7 +3610,14 @@ the count did, so a test can drive §9's re-count — and the vector's
 slack, which is what decides whether a given growth needs one —
 without racing for either; one arming is spent per fill attempt
 rather than per open, an open makes up to `Snaptries` of them, and
-the point is inert while `snapshort` is 0).
+the point is inert while `snapshort` is 0), and `snaphold` (park the
+next enumeration open with the bound's slot taken until `storeclose`
+has set `closed`, and let it go on again there — one arming parks one
+open, and the sleep drops `qlstate` so the close can take it). The
+last is what makes §9's *bail-out* free deterministic: an open that
+holds the slot when the store is closed is the store's last claim, so
+its failure path is the one that frees the `Store`, and without the
+point a test could only race for that window.
 
 **The freed hook is not one of those points.** `Storecfg.freed` and
 `freedarg` are a callback rather than an `-X` name, because what they

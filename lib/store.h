@@ -193,6 +193,15 @@ struct Store
 	int	closed;			/* qlstate's */
 	ulong	snapstale;		/* §13's snapstale point; qlstate's */
 	ulong	snapshort;		/* ... by how many entries; qlstate's */
+	/*
+	 * §13's snaphold point: park one objsnapopen with the bound's
+	 * slot taken until storeclose has set `closed', so a test can
+	 * drive the window in which that open holds the store's last
+	 * claim instead of racing for it.  Cleared by the open that
+	 * takes it, so one arming parks one open.
+	 */
+	int	snaphold;		/* qlstate's */
+	Rendez	snaprz;			/* on qlstate: the open parked there */
 
 	/* the two slot spaces, §6.  resv is a stage's reservation. */
 	uchar	*slotused;

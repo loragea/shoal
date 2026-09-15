@@ -121,6 +121,7 @@ objsnapopen(Store *s, int kinds)
 	Objsnap *sn;
 	Ient *e;
 	ulong i, n, want, cap, have, grew, try;
+	int last;
 
 	if(!storeserving(s))
 		return nil;
@@ -175,6 +176,21 @@ objsnapopen(Store *s, int kinds)
 				return nil;
 			}
 			s->nobjsnap++;
+			/*
+			 * §13's snaphold point: park here, with the slot
+			 * taken and every way out of the loop still ahead,
+			 * until storeclose has set `closed'.  That is the
+			 * window in which this open holds the store's last
+			 * claim and the bail-out below is what releases
+			 * it.  rsleep drops qlstate, so storeclose can
+			 * take it to set the flag and wake this open
+			 * again.  Inert unless a test asks for it.
+			 */
+			if(s->snaphold){
+				s->snaphold = 0;
+				while(!s->closed)
+					rsleep(&s->snaprz);
+			}
 		}
 		want = snapwant(s, kinds);
 		qunlock(&s->qlstate);
@@ -252,12 +268,25 @@ objsnapopen(Store *s, int kinds)
 	 */
 	werrstr("object snapshot: the index moved under %d counts", Snaptries);
 bad:
+	/*
+	 * Giving the slot back is giving up a claim, so this path frees
+	 * the Store on exactly the terms objsnapclose does: the slot IS
+	 * this open's claim from the increment above on — nothing can
+	 * have freed the store under an open that holds one — and an
+	 * open in flight when storeclose runs is the last claim, which
+	 * storeclose then leaves to whoever gives it up.  Predicate
+	 * under the hold, free after the unlock, because the QLock is a
+	 * field of the memory going away.
+	 */
 	qlock(&s->qlstate);
 	s->nobjsnap--;
+	last = s->closed && s->nobjsnap == 0;
 	qunlock(&s->qlstate);
 	free(sn->slot);
 	free(sn->qidpath);
 	free(sn);
+	if(last)
+		storefree(s);
 	return nil;
 }
 

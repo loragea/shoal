@@ -1035,6 +1035,133 @@ tclosesnapcond(void)
 }
 
 /*
+ * §9's bail-out, which is a release like any other.  An open takes
+ * the bound's slot under its first count and gives it back at `bad'
+ * if anything after that fails, so an open in flight when
+ * storeclose runs is holding the store's LAST claim: storeclose
+ * finds the count non-zero, defers, and the open's own failure path
+ * is what must free the Store.  Nothing here is raced for — §13's
+ * snaphold point parks the open with the slot taken until `closed'
+ * is set, and snapstale makes the pass it wakes into refuse — so
+ * this is one driven interleaving and not a probability.
+ *
+ * The opener is a proc of its own because storeclose has to run
+ * while the open is inside the engine, and it keeps what it was
+ * answered in shared memory: errstr is per-proc, so the refusal has
+ * to be copied out where the main proc can read it.
+ */
+static Store *bailstore;
+static Objsnap *bailsn;
+static char bailerr[ERRMAX];
+static int baildone;
+
+static void
+bailopen(void *a)
+{
+	USED(a);
+	bailerr[0] = '\0';
+	if((bailsn = objsnapopen(bailstore, Snaplive)) == nil)
+		rerrstr(bailerr, sizeof bailerr);
+	baildone = 1;
+}
+
+/* an open that was neither an entry nor a refusal is neither */
+static void
+refusedas(char *what, Objsnap *sn, char *err, char *want)
+{
+	checks++;
+	if(sn != nil){
+		fail("%s was accepted", what);
+		return;
+	}
+	if(strncmp(err, want, strlen(want)) != 0)
+		fail("%s: %s, want %s", what, err, want);
+}
+
+/*
+ * The shape both of the tests below drive: an open parked at the
+ * snaphold point with the bound's slot taken, a storeclose under it,
+ * and the open then let go against a store that is closed.  stale is
+ * how many fill attempts are armed to find the index grown, which is
+ * what decides where the woken open goes — one sends it round the
+ * loop once more, past Snaptries leaves it no way out but `bad'.
+ * The store is gone by the time this returns; 1 if the shape came
+ * off, and what the open answered is in bailsn and bailerr.
+ */
+static int
+closebail(ulong stale, char *what)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	int k, ok;
+
+	ok = 0;
+	spawnforget();
+	d = newdisk();
+	if((s = mustwatched(d, 0, what)) == nil){
+		devclose(d);
+		return 0;
+	}
+	mk(s, "e0");
+	storehook(s, "snapshort", Nslackshort);
+	storehook(s, "snapstale", stale);
+	storehook(s, "snaphold", 1);
+	bailstore = s;
+	bailsn = nil;
+	baildone = 0;
+	if(spawnproc(bailopen, nil) < 0){
+		fail("%s: spawn: %r", what);
+		goto out;
+	}
+	/*
+	 * The slot is taken under qlstate and the open parks inside
+	 * that same hold, so a storestat that comes back with the
+	 * count at 1 is a store whose opener is parked: there is no
+	 * other way for it to have released the lock.
+	 */
+	st.nobjsnap = 0;
+	for(k = 0; k < 2000; k++){
+		storestat(s, &st);
+		if(st.nobjsnap == 1)
+			break;
+		sleep(5);
+	}
+	istrue("the open in flight takes the bound's slot", st.nobjsnap == 1);
+	if(st.nobjsnap != 1)
+		goto out;
+	storeclose(s);
+	s = nil;
+	eqv("a store closed under an open in flight is not freed", nfreed, 0);
+	for(k = 0; k < 2000 && !baildone; k++)
+		sleep(5);
+	istrue("the parked open finishes once the store is closed", baildone);
+	ok = baildone;
+out:
+	/*
+	 * A bail-out here still owns the store, and closing it comes
+	 * before the reaping: killspawned takes the store's own procs
+	 * with it, and storeclose waits for them.
+	 */
+	if(s != nil)
+		storeclose(s);
+	killspawned();
+	devclose(d);
+	return ok;
+}
+
+static void
+tclosesnapbail(void)
+{
+	if(!closebail(1000, "an open bailing out on a closed store"))
+		return;
+	istrue("an open that bails out on a closed store is refused",
+		bailsn == nil);
+	objsnapclose(bailsn);		/* nil unless the refusal failed */
+	eqv("and the bail-out frees the store it last held", nfreed, 1);
+}
+
+/*
  * §9's close race, in the three shapes the deferred free has to
  * survive.  All three put four procs on four snapshots of one store
  * and close the store under them; what differs is who closes the
@@ -2603,6 +2730,7 @@ main(int argc, char **argv)
 	tclosesnap();
 	tclosesnapplain();
 	tclosesnapcond();
+	tclosesnapbail();
 	tclosesnaprace();
 	tdirty();
 	tfullsync();

@@ -151,6 +151,20 @@ storehook(Store *s, char *name, uvlong n)
 		qlock(&s->qlstate);
 		s->snapshort = n;
 		qunlock(&s->qlstate);
+	}else if(strcmp(name, "snaphold") == 0){
+		/*
+		 * §9's open takes the bound's slot under its first count
+		 * and gives it back at its bail-out, so an open in flight
+		 * when storeclose runs can be holding the store's last
+		 * claim — and then the bail-out is what frees the Store.
+		 * This parks the next open with the slot taken until
+		 * storeclose has set `closed', so a test drives that
+		 * interleaving instead of racing for it.  One arming
+		 * parks one open; inert while 0.
+		 */
+		qlock(&s->qlstate);
+		s->snaphold = n != 0;
+		qunlock(&s->qlstate);
 	}else if(strcmp(name, "reclaim") == 0)
 		s->reclaimearly = n != 0;
 	else if(strcmp(name, "publish") == 0)
@@ -965,6 +979,7 @@ storeopen(Dev *d, Storecfg *cfg)
 	s->relrz.l = &s->qllog;
 	s->donerz.l = &s->qllog;
 	s->holdrz.l = &s->qllog;
+	s->snaprz.l = &s->qlstate;
 	s->flrz.l = &s->fllk;
 	s->ckrz.l = &s->cklk;
 	s->procrz.l = &s->proclk;
@@ -1197,6 +1212,7 @@ storeclose(Store *s)
 	 */
 	qlock(&s->qlstate);
 	s->closed = 1;
+	rwakeupall(&s->snaprz);		/* §13's snaphold point, if one parked */
 	last = s->nobjsnap == 0;
 	qunlock(&s->qlstate);
 	if(last)

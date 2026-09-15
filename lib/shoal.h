@@ -862,7 +862,10 @@ int	objslot(Store*, ulong slot, uchar *oid, int *oidlen, Objinfo*);
  * one hold of the state lock — the hold the open's first count takes
  * anyway — so two opens racing cannot both find room; an open that
  * fails after that gives the count back, and Storestat counts an open
- * in flight.  objsnapclose releases the count.
+ * in flight.  objsnapclose releases the count.  Giving the count back
+ * releases a claim like any other, so an open in flight when
+ * storeclose runs holds the store's last one and its own failure
+ * path is what frees the Store.
  *
  * **A snapshot MAY outlive storeclose**, and it is the ONLY thing
  * that may: the Store* itself is invalid the moment storeclose
