@@ -2593,9 +2593,11 @@ For `/obj`, `/tombs` and `/advert` an open takes the vector of
 `{u32 slot, u64 qidpath}` of every entry whose state it asked for —
 live for `/obj`, tomb for `/tombs`, both for `/advert` — and holds no
 lock once it returns. That is 12 bytes an entry, **3.1 MB at 2.6·10^5
-objects and 12 MB at `nslots = 2^20`**, held as two parallel arrays
-rather than one array of a struct, because a `{u32, u64}` struct is
-16 bytes on amd64 and the 4 in every 16 buys nothing. It takes
+objects and 12 MB at `nslots = 2^20`**, plus the slack below — a
+sixteenth and 16 entries, so 13 MB rather than 12 at `nslots = 2^20`
+— held as two parallel arrays rather than one array of a struct,
+because a `{u32, u64}` struct is 16 bytes on amd64 and the 4 in every
+16 buys nothing. It takes
 **two** holds of `qlstate` (§7) to do that on the quiet path, one per
 step — the count under one, the 12 MB allocated outside any, the fill
 under the next — and two more for every re-count the index forces.
@@ -2917,7 +2919,9 @@ The read-back is **two device reads per slot** — the header sector,
 then the text — and not one, because it goes through the same slot
 reader the start does, which must bounds-check `len` before it reads
 the `len` bytes that field names (a torn length field must not drive
-a read past the slot). Reading `roundup(secsz+len, secsz)` in one
+a read past the slot). It is one read for a `len = 0` map, the empty
+map a fresh format leaves in both current slots (§2.2's tie): there
+are no text bytes to read and the reader does not ask for any. Reading `roundup(secsz+len, secsz)` in one
 request would be possible here, where `len` is known, at the price of
 a second reader; the four extra requests a commit makes are noise
 beside its two flushes, so it keeps the one reader.
@@ -2985,10 +2989,14 @@ and a write that landed nothing left it there intact. An entry read
 back valid whose `seq` is not above the current map's is history this
 store can still answer, so it goes back into memory as it is found:
 the live store keeps answering that epoch and counts no phantom it
-does not hold, instead of both until the next open. A slot that reads
-back unreadable or invalid, and a slot whose write was indeterminate —
-where the read-back has already failed twice and this read is not
-attempted — take the invalid-and-phantom mark above.
+does not hold, instead of both until the next open. Three kinds of
+slot take the invalid-and-phantom mark above instead: one that reads
+back unreadable or invalid; one that reads back **valid at a `seq`
+above the current map's**, which is a phantom on the platter and the
+case the mark exists for, since leaving it as history would let the
+next published map raise `seq` over a map that was never published;
+and one whose write was indeterminate, where the read-back has
+already failed twice and this read is not attempted at all.
 
 **The store never compares epochs.** It records the epoch it is given
 beside the map and orders nothing by it: layer-a §8.3's `forceepoch`
@@ -3027,9 +3035,9 @@ epoch `E−1`, so one history slot is a floor rather than a preference
 for the current-map slot, and the same again for the history slot
 that precedes it, so a publish is ~17 ms whether it carries a
 placement change or a single `stale` mark. The read-back of each slot
-is two reads — the checksum's sector, then `len` bytes rounded up —
-so a commit issues four beside its two flushes, which is noise beside
-them. That is what
+is two reads — the checksum's sector, then `len` bytes rounded up, or
+the sector alone for a `len = 0` map — so a commit issues four beside
+its two flushes, which is noise beside them. That is what
 makes layer-a §5.4 step 5a affordable — the alternative
 `docs/platform/9front-storage.md` measured, a file plus a gefs sync,
 costs 530–620 ms and would blow `replms` regularly.
