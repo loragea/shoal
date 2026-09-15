@@ -3580,7 +3580,8 @@ nothing (`Sfdrop`) or lands a mix of old and new bytes
 (`Sftearbyte`), on the ring slot and on the current slot in turn,
 each failing the commit and leaving the restart on the previous map
 with position 0 still equal to it; the read-back's own READ failing,
-on each slot in turn — once, where the retry carries the commit
+on each slot in turn and on each of a read-back's two reads, the
+header sector and the text — once, where the retry carries the commit
 through, and twice, where the publish is indeterminate: the commit
 fails saying so, the slot is not served, its `seq` is spent, and the
 retry of the same session is what the restart serves rather than the
