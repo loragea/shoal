@@ -195,6 +195,20 @@ mustsnap(Store *s, int kinds, char *what)
 	return sn;
 }
 
+/* a store whose §9 bound is not the default, to watch the knob's value */
+static Store*
+openbound(Dev *d, ulong max, char *what)
+{
+	Store *s;
+	Storecfg c;
+
+	tcfg(&c);
+	c.objsnapmax = max;
+	if((s = storeopen(d, &c)) == nil)
+		fail("%s: storeopen: %r", what);
+	return s;
+}
+
 /*
  * §9's deferred free, watched.  A store closed under an open snapshot
  * is freed by the LAST objsnapclose and not by storeclose, and there
@@ -646,6 +660,13 @@ out:
  * nslots = 2^20 — so the store answers layer-a §2.6's `disk full'
  * rather than growing without limit, and a close gives the count
  * back.
+ *
+ * The refusal is watched WHOLE and not by its prefix alone: §9 makes
+ * the prefix normative and the detail after it policy, and a detail
+ * no test reads could be dropped or left naming a constant in
+ * silence.  The second half runs the same bound at objsnapmax = 2,
+ * which is what tells a refusal that reports the configured knob
+ * from one that reports the default.
  */
 static void
 tbound(void)
@@ -654,6 +675,7 @@ tbound(void)
 	Store *s;
 	Storestat st;
 	Objsnap *sn[Objsnapmaxdflt+1], *over;
+	char want[64];
 	int i;
 
 	d = newdisk();
@@ -671,7 +693,9 @@ tbound(void)
 	eqv("the store reports every open snapshot", st.nobjsnap,
 		Objsnapmaxdflt);
 	over = objsnapopen(s, Snaplive);
-	refused("an open past the bound", over != nil ? 0 : -1, "disk full");
+	snprint(want, sizeof want, "disk full: %d object snapshots open, "
+		"objsnapmax %d", Objsnapmaxdflt, Objsnapmaxdflt);
+	refused("an open past the bound", over != nil ? 0 : -1, want);
 	objsnapclose(over);		/* nil unless the bound failed */
 	objsnapclose(sn[0]);
 	storestat(s, &st);
@@ -702,6 +726,34 @@ tbound(void)
 		objsnapclose(sn[i]);
 	storestat(s, &st);
 	eqv("closing them all releases every count", st.nobjsnap, 0);
+	storeclose(s);
+	devclose(d);
+
+	/*
+	 * The same bound at a configured value.  Two opens are admitted,
+	 * the third is refused naming that value and not the default, and
+	 * the count is still 2 after it: an open past the bound is
+	 * refused before it takes a slot, so there is none to give back.
+	 */
+	d = newdisk();
+	if((s = openbound(d, 2, "the bound at objsnapmax 2")) == nil)
+		return;
+	mk(s, "y0");
+	for(i = 0; i < 2; i++)
+		if((sn[i] = objsnapopen(s, Snaplive)) == nil)
+			fail("objsnapopen %d of 2 at objsnapmax 2: %r", i);
+	storestat(s, &st);
+	eqv("two opens at objsnapmax 2", st.nobjsnap, 2);
+	over = objsnapopen(s, Snaplive);
+	refused("a third open at objsnapmax 2", over != nil ? 0 : -1,
+		"disk full: 2 object snapshots open, objsnapmax 2");
+	objsnapclose(over);		/* nil unless the bound failed */
+	storestat(s, &st);
+	eqv("and the refusal took no slot", st.nobjsnap, 2);
+	for(i = 0; i < 2; i++)
+		objsnapclose(sn[i]);
+	storestat(s, &st);
+	eqv("closing both releases the count", st.nobjsnap, 0);
 	storeclose(s);
 	devclose(d);
 }

@@ -389,3 +389,34 @@ a monitor that publishes without the read-back still conforms.
 **Implementation policy:** all of it — the read-back, the retry-once,
 the indeterminate outcome and its spent `seq`, and the decision not
 to extend the check to §3.2 and §2.2.
+
+## D20 — The enumeration-snapshot bound answers `disk full` (2026-09-15)
+
+**Decision:** An `objsnapopen` refused by §9's `objsnapmax` answers
+layer-a §2.6's `disk full`, with detail naming the count and the
+knob: `disk full: <n> object snapshots open, objsnapmax <max>`.
+`design/store.md` §3.7's table now carries the condition and §9
+states the text.
+**Rationale:** The vector is space the instance must find to serve
+the open, and §2.6's `disk full` entry is deliberately open-ended —
+"any operation that needs space". The alternatives lose on their own
+terms: a new §2.6 prefix is a wire change for a condition only an
+admin listing and the store's own reconcile and reclaim walks can
+reach, on an enumeration §2.2 already makes advisory and whose peer
+equivalent (`op=list`) takes no snapshot; `not ready` is normative
+for handoff and currency and is RETRYABLE; an internal-invariant
+string is what §3.7 reserves for conditions a caller cannot produce,
+which a ninth open is not; queueing the open behind the oldest close
+parks a call holding no claim on the `Store`, which D16's quiesce
+rule forbids being in flight at `storeclose`, so a bounded shutdown
+would wait on an admin's fid. §10's map-too-big refusal settled the
+same question the same way: the exhaustion prefix, with the
+specifics in the detail and in `/status`, because the more specific
+string was the misdirecting one.
+**Normative:** that a refusal of an enumeration open for want of
+room carries `disk full` and no other §2.6 prefix — the set is
+prefix-free and §3.7's carve-out makes the mapping normative.
+**Implementation policy:** that the bound exists at all, its default
+of 8, the detail after the prefix, and reporting the open count in
+`/status`. An implementation that never refuses such an open is
+conforming.

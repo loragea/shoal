@@ -179,7 +179,8 @@ objsnapopen(Store *s, int kinds)
 			if(s->nobjsnap >= s->cfg.objsnapmax){
 				qunlock(&s->qlstate);
 				werrstr("disk full: %lud object snapshots "
-					"already open", s->nobjsnap);
+					"open, objsnapmax %lud",
+					s->nobjsnap, s->cfg.objsnapmax);
 				free(sn);
 				return nil;
 			}

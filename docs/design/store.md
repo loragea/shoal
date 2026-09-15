@@ -1601,6 +1601,7 @@ own `not primary: n5.0` is the pattern. Callers can act on these:
 | a read, verify or update through an extent-map entry that failed its `csum128` (§5 step 9) — block repair excepted, below; a read, write or truncate of a copy whose `corrupt` flag is set (§8); a block repair whose bytes do not hash to the stored `dig[i]` | `checksum mismatch` |
 | a discard whose record fails layer-a §1.5's receiver checks: not a tombstone, not at exactly the named key, or its `wepoch` not strictly below the given epoch | `not discardable` |
 | no grain, index slot, extent-map slot, staged-grain budget, or log space after §6's bounded wait | `disk full` |
+| an enumeration-snapshot open past §9's `objsnapmax` | `disk full` |
 
 **Everything else is an internal-invariant error**: a condition the
 API's contract says a caller cannot produce, or one the media
@@ -2711,25 +2712,39 @@ snapshot that tested `qidpath` alone would list both.
 
 The store reports `objsnap=full` and never uses layer-a §2.2's
 `objsnap=partial` escape: the engine takes the whole vector or
-refuses the open. Reporting the field in `/status` is the server's
-half and waits on the 9P surface. The cost is per open fid, so the
-store bounds how many snapshots may be open at once (`objsnapmax`,
-policy, default 8) and answers a further open `disk full` (layer-a
-§2.6) rather than growing without limit; at 2^20 slots eight of them
-are 96 MB, which is the number §14(9) says is answered for the Layer
-B envelope and not for this design's own maximum. The test and the
-count are **one step under one hold** of `qlstate` — the open's first
-count takes that hold anyway, and the open takes its slot the moment
-it passes the bound, so two opens racing cannot both find room — and
-an open that then fails gives the slot back in a hold of its own, so
-`/status` counts an open in flight along with the opens that
-completed. A close releases the count. **Giving the slot back is
-releasing a claim**, so a failing open's bail-out carries the same
-free predicate an `objsnapclose` does: the slot is the open's claim
-from the moment the bound is passed, and an open in flight when
-`storeclose` runs is therefore the store's last claim — `storeclose`
-finds the count non-zero, defers, and the bail-out is what releases
-the memory.
+refuses the open. Reporting that field in `/status`, and the open
+count beside it, is the server's half and waits on the 9P surface.
+
+The cost is per open fid, so the store bounds how many snapshots may
+be open at once (`objsnapmax`, policy, default 8) rather than growing
+without limit; at 2^20 slots eight of them are 102 MB, which is the
+number §14(9) says is answered for the Layer B envelope and not for
+this design's own maximum. An open past the bound answers
+`disk full: <n> object snapshots open, objsnapmax <max>` — layer-a
+§2.6's `disk full`, whose entry covers any operation that needs space,
+with the detail naming the space and the knob. It is **not** an
+internal-invariant error (§3.7): a ninth open is a legal call and not
+a caller's bug, so it is a refusal a client library may key on; and
+it is not a new prefix, because §2.6's set is normative and
+prefix-free and this condition is reachable only by an admin listing
+or the store's own reconcile and reclaim walks, on an enumeration
+layer-a §2.2 already makes advisory. The detail is what stops it
+misdirecting an operator, exactly as §10's map-too-big refusal
+answers `disk full` and reports the sizes rather than answering
+`bad map`.
+
+The bound's test and its count are **one step under one hold** of
+`qlstate` — the open's first count takes that hold anyway, and the
+open takes its slot the moment it passes the bound, so two opens
+racing cannot both find room — and an open that then fails gives the
+slot back in a hold of its own, so `/status` counts an open in flight
+along with the opens that completed. A close releases the count.
+**Giving the slot back is releasing a claim**, so a failing open's
+bail-out carries the same free predicate an `objsnapclose` does: the
+slot is the open's claim from the moment the bound is passed, and an
+open in flight when `storeclose` runs is therefore the store's last
+claim — `storeclose` finds the count non-zero, defers, and the
+bail-out is what releases the memory.
 
 **A snapshot MAY outlive `storeclose`.** The store's memory is not
 released while one names it: `storeclose` stops the procs, then takes
@@ -3876,8 +3891,9 @@ snapshot each walked by position with an entry created, deleted,
 created over and discarded under it, both halves of the gone rule
 discriminated one at a time, a live copy condemned under an open
 `/obj` and still answered with `corrupt=1` rather than dropped (D14),
-the bound on open snapshots, the `disk full` past it and the refusal
-of a `kinds` the engine has no state for, three snapshots outliving
+the bound on open snapshots at its default and at `objsnapmax = 2`,
+the whole `disk full` text past it and the refusal of a `kinds` the
+engine has no state for, three snapshots outliving
 a `storeclose` — every read through them refused `store closed`,
 an entry deleted before the close included, so that the refusal is
 watched where the *gone* answer was available; `objsnapcount` still
