@@ -875,9 +875,10 @@ int	objslot(Store*, ulong slot, uchar *oid, int *oidlen, Objinfo*);
  * still answers, objsnapent answers -1 `store closed' — refusing
  * rather than lying "gone" for every entry — and the memory goes at
  * the LAST objsnapclose.  objsnapopen on a store some other snapshot
- * is holding alive that way refuses `store closed' too, but that is
- * a courtesy inside an undefined call and not a guarantee the
- * pointer can keep.  Closing one twice is UNDEFINED, exactly as
+ * is holding alive that way refuses `store closed' too — on each of
+ * its count passes, so a close that lands while it re-counts is seen
+ * — but that is a courtesy inside an undefined call and not a
+ * guarantee the pointer can keep.  Closing one twice is UNDEFINED, exactly as
  * freeing the same pointer twice is: the second call reads a handle
  * the first freed, whose first word the pool has already overwritten,
  * so there is nothing it can check and no guard that would help.

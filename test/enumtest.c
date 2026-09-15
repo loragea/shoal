@@ -1042,8 +1042,15 @@ tclosesnapcond(void)
  * finds the count non-zero, defers, and the open's own failure path
  * is what must free the Store.  Nothing here is raced for — §13's
  * snaphold point parks the open with the slot taken until `closed'
- * is set, and snapstale makes the pass it wakes into refuse — so
- * this is one driven interleaving and not a probability.
+ * is set, and snapstale sends the pass it wakes into round again,
+ * where the close is what refuses it — so this is one driven
+ * interleaving and not a probability.
+ *
+ * That second pass is the other half of what this watches.  The
+ * `closed' test is made on EVERY count pass and not only the first,
+ * so a storeclose that lands while an open is re-counting is seen
+ * and the open is refused; an open that tested it once would hand
+ * back a snapshot of a store it had been told was closed.
  *
  * The opener is a proc of its own because storeclose has to run
  * while the open is inside the engine, and it keeps what it was
@@ -1153,10 +1160,10 @@ out:
 static void
 tclosesnapbail(void)
 {
-	if(!closebail(1000, "an open bailing out on a closed store"))
+	if(!closebail(1, "an open re-counting across a storeclose"))
 		return;
-	istrue("an open that bails out on a closed store is refused",
-		bailsn == nil);
+	refusedas("an open re-counting across a storeclose", bailsn,
+		bailerr, "store closed");
 	objsnapclose(bailsn);		/* nil unless the refusal failed */
 	eqv("and the bail-out frees the store it last held", nfreed, 1);
 }

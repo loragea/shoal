@@ -2749,7 +2749,8 @@ and `objsnapopen`, `dirtysnap`, `lostsnap`, `fullsyncsnap` and
 `storestat` on a closed store are undefined exactly as they were.
 `objsnapopen` does refuse `store closed` when it is reached on a
 store some other snapshot is holding alive — it is inside the hold it
-takes anyway — but that is a courtesy inside an undefined call, not a
+takes anyway, on each of the open's count passes, so a close landing
+while the open re-counts is seen rather than skipped — but that is a courtesy inside an undefined call, not a
 guarantee the pointer can keep; the other four are given no such
 check, because advertising one there would promise what a dangling
 pointer cannot deliver.

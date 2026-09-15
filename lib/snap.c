@@ -146,28 +146,36 @@ objsnapopen(Store *s, int kinds)
 		 * one anyway.  Every way out of here that is not a
 		 * snapshot gives the slot back at `bad'.  A re-count is a
 		 * fresh pass of this loop, where the slot is already this
-		 * open's and the test is not made again.  One bound check
+		 * open's and the bound is not tested again.  One bound check
 		 * and not two — a second one anywhere else would be a
 		 * check no test could discriminate, and so a check that
 		 * could be deleted in silence.
 		 */
 		qlock(&s->qlstate);
+		/*
+		 * §9: only an Objsnap handle may outlive storeclose, so a
+		 * closed store takes no new one.  Tested on EVERY pass and
+		 * not just the first: a re-count puts this open back here
+		 * with the store's lock dropped in between, which is time
+		 * enough for a storeclose to land, and an open that only
+		 * looked once would hand back a snapshot of a store it has
+		 * been told is closed.  Past the first pass the slot is
+		 * already this open's, so the refusal gives it back at
+		 * `bad' like every other way out.  The check is sound only
+		 * because some other snapshot is holding this Store alive
+		 * for us to read the flag out of — a Store* is invalid the
+		 * moment storeclose returns, and this refusal promises
+		 * nothing beyond that.
+		 */
+		if(s->closed){
+			qunlock(&s->qlstate);
+			werrstr("store closed");
+			if(try > 0)
+				goto bad;
+			free(sn);
+			return nil;
+		}
 		if(try == 0){
-			/*
-			 * §9: only an Objsnap handle may outlive
-			 * storeclose, so a closed store takes no new
-			 * one.  The check is sound only because some
-			 * other snapshot is holding this Store alive
-			 * for us to read the flag out of — a Store* is
-			 * invalid the moment storeclose returns, and
-			 * this refusal promises nothing beyond that.
-			 */
-			if(s->closed){
-				qunlock(&s->qlstate);
-				werrstr("store closed");
-				free(sn);
-				return nil;
-			}
 			if(s->nobjsnap >= s->cfg.objsnapmax){
 				qunlock(&s->qlstate);
 				werrstr("disk full: %lud object snapshots "
