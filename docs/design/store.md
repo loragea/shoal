@@ -1109,14 +1109,22 @@ checkpoint cannot reclaim log space holds the log above `ckhigh` for
 ever, so the checkpointer would re-attempt with no wait at all — and
 a commit inside §6's wait asks for one every millisecond besides. A
 failing checkpoint therefore sets a retry floor: `ckbackms` (policy,
-default 100 ms), doubling per consecutive failure to `ckms` and
-staying there, cleared by any success. Neither trigger may re-arm
-inside that window, and neither may a commit's request; an explicit
-checkpoint request — a tool's, a test's — is not paced by it and
-resets it. The floor is what makes the attempt count a rate an
-operator can read, and what keeps a store that cannot free log space
-from contending on the log's lock with the very commits waiting for
-it.
+default 100 ms), doubling per consecutive failure and capped at
+`max(ckbackms, min(ckms, ckwaitms))` — never below the configured
+floor, and never above §6's bounded wait — and reset to `ckbackms` by
+any success. Neither trigger may re-arm inside that window, and
+neither may a commit's request; an explicit checkpoint request — a
+tool's, a test's — is not paced by it and resets it. The floor is
+what makes the attempt count a rate an operator can read, and what
+keeps a store that cannot free log space from contending on the log's
+lock with the very commits waiting for it.
+
+§6's wait is the upper bound because the floor is what a healed
+device waits behind: a floor longer than the wait would leave a
+commit refused for log space naming a failure a later checkpoint has
+already cured, for as long as the floor ran. Capped there, a device
+that heals is retried within one wait, and no commit carries a cured
+error for longer than `ckwaitms` after the device came back.
 
 **A checkpointer that cannot succeed again is named as such.** §0's
 `Echange` condemns the *fid*: every later read, write and flush on it
@@ -2071,7 +2079,10 @@ the entry's `mtime`, which is why the tombstone keeps one.
   empty, so that refusal names the cause behind the wire error:
   `disk full: log full and the checkpoint fails: <error>`. A failure
   a later checkpoint has cured does not: the store's log drains
-  again, and this refusal is then the ordinary one.
+  again, and this refusal is then the ordinary one. The changeover is
+  bounded by this bullet's own wait — §2.8's retry floor is capped at
+  it — so the first attempt after the device heals falls inside one
+  `ckwaitms` and no commit names a cured failure for longer than that.
   If the checkpointer is **dead** rather than stuck (§2.8) — its fid
   condemned, so no later checkpoint can succeed — the refusal says so
   instead: `disk full: log full and the checkpointer is dead:
@@ -3941,12 +3952,15 @@ a device that heals — the same store's next full log, with nothing
 checkpointing, answering the bare `disk full` — §2.8's retry floor
 under a live checkpointer proc, read as a rate of failed attempts
 across a second and as the speed of the explicit requests it exempts,
-and a fid condemned under the checkpointer, which is dead rather than
-stuck, stops the retries and is what §6's refusal then names — §2.8's dirty-page
-trigger surviving a condemnation that lands while a checkpoint runs,
-and a store opened, written and replayed at a `blksz` four times the
-device's `Wunit`), `objtest` (§2.7's extent-map slot
-rule over all three transitions and both the crash and the re-replay
+and read again over a floor configured well below its cap — the
+doubling and the cap as attempt counts over two windows, and the cap
+as a healed device the paced checkpointer picks up inside one §6 wait
+— and a fid condemned under the checkpointer, which is dead rather
+than stuck, stops the retries and is what §6's refusal then names —
+§2.8's dirty-page trigger surviving a condemnation that lands while a
+checkpoint runs, and a store opened, written and replayed at a `blksz`
+four times the device's `Wunit`), `objtest` (§2.7's extent-map slot rule
+over all three transitions and both the crash and the re-replay
 schedules, §2.4's invariant on the shrinking side, §3.5's deferred
 reuse of grains and of slots under a held batch, §3.6's stage lifetimes,
 bounds and `final=1` arbitration including D14's corrupt receiver,
