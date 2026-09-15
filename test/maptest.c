@@ -657,6 +657,34 @@ tblank(void)
 	free(t);
 }
 
+/*
+ * §3.3's spellings, which render an instance's state wherever a
+ * caller shows one.  Reached indirectly through two of instdone's
+ * error details, which is not a test of them.
+ */
+static void
+tnames(void)
+{
+	if(strcmp(statusname(Snew), "new") != 0 ||
+	   strcmp(statusname(Sin), "in") != 0 ||
+	   strcmp(statusname(Sout), "out") != 0 ||
+	   strcmp(statusname(Sdead), "dead") != 0)
+		fail("statusname: %s %s %s %s", statusname(Snew),
+			statusname(Sin), statusname(Sout),
+			statusname(Sdead));
+	if(strcmp(upname(Uyes), "yes") != 0 ||
+	   strcmp(upname(Uheal), "heal") != 0 ||
+	   strcmp(upname(Uno), "no") != 0)
+		fail("upname: %s %s %s", upname(Uyes), upname(Uheal),
+			upname(Uno));
+	checks += 2;
+	/* neither invents a spelling for a value §3.3 does not define */
+	if(strcmp(statusname(-1), "?") != 0 || strcmp(upname(99), "?") != 0)
+		fail("names: an undefined value renders as `%s'/`%s'",
+			statusname(-1), upname(99));
+	checks++;
+}
+
 /* ------------------------------------------------------------------ */
 /* §4: placement                                                       */
 
@@ -1700,6 +1728,7 @@ main(int, char**)
 	tcomments();
 	tdefaults();
 	tblank();
+	tnames();
 	tvectors();
 	ttiebreak();
 	tunderrep();
