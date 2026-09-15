@@ -533,6 +533,41 @@ tcomments(void)
 	mapfree(m);
 }
 
+/*
+ * A thousand blank lines in front of §3.1's example, which the record
+ * arrays are sized against: only a line that can start a record is
+ * counted, so the map still parses whole and every record is there.
+ * Nothing here asserts a heap size; what it asserts is that the
+ * arrays are big enough for the records the text really holds.
+ */
+static void
+tblank(void)
+{
+	char *t;
+	Cmap *m;
+	int i, n;
+
+	n = 1000 + strlen(good) + 1;
+	if((t = malloc(n)) == nil)
+		sysfatal("malloc: %r");
+	for(i = 0; i < 1000; i++)
+		t[i] = '\n';
+	strcpy(t + 1000, good);
+	if((m = mapparse(t, strlen(t))) == nil)
+		fail("1000 blank lines: %r");
+	else{
+		if(m->epoch != 41 || m->nnode != 1 || m->ninst != 2 ||
+		   m->nstale != 1)
+			fail("1000 blank lines: %d node %d instance %d "
+				"stale", m->nnode, m->ninst, m->nstale);
+		if(mapinst(m, "n2.1") == nil || mapinst(m, "n5.0") == nil)
+			fail("1000 blank lines: an instance is missing");
+		mapfree(m);
+	}
+	checks++;
+	free(t);
+}
+
 /* ------------------------------------------------------------------ */
 /* §4: placement                                                       */
 
@@ -1456,6 +1491,7 @@ main(int, char**)
 	theader();
 	tunknown();
 	tcomments();
+	tblank();
 	tvectors();
 	ttiebreak();
 	tunderrep();

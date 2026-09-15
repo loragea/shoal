@@ -857,6 +857,21 @@ markrefsok(Cmap *m)
 	return 0;
 }
 
+/*
+ * n objects of sz bytes, zeroed, or nil with an errstr: the count
+ * comes from the map text, and malloc takes a ulong, so the product
+ * is computed in uvlong and refused rather than wrapped.
+ */
+static void*
+allocn(uvlong n, uvlong sz)
+{
+	if(sz == 0 || n > 0xffffffffULL / sz){
+		werrstr("out of memory");
+		return nil;
+	}
+	return mallocz((ulong)(n * sz), 1);
+}
+
 void
 mapfree(Cmap *m)
 {
@@ -876,7 +891,8 @@ mapparse(char *text, long n)
 	Cmap *m;
 	char *s, *e, *nl;
 	long i;
-	int nrec, start;
+	long nrec;
+	int start;
 
 	for(i = 0; i < n; i++){
 		if(text[i] == '\n' || text[i] == '\t')
@@ -888,23 +904,38 @@ mapparse(char *text, long n)
 	}
 
 	/*
-	 * A record starts on a line that is neither blank nor a
-	 * comment nor indented, so counting those bounds every record
-	 * array at once and nothing below has to grow one.
+	 * Every record array is sized by the lines that can START a
+	 * record: unindented, not blank, not a comment (§3.1, §0).
+	 * Sizing by newlines instead charged 720 bytes of heap for a
+	 * blank line as for a record, so a map of blank lines cost
+	 * about 720 times its own text.  What bounds nrec in practice
+	 * is the monitor, which is where a map text comes from:
+	 * store.md §10 refuses to commit a text longer than a slot
+	 * less its header sector — lib/mon.c's moncommit, 64 KiB at
+	 * the default slotsz — which is some thirty thousand record
+	 * lines.  Nothing here rests on that bound, though: allocn
+	 * computes every size in uvlong and refuses one a ulong
+	 * cannot hold, ulong being 32 bits in this dialect.
 	 */
-	nrec = 1;
-	for(i = 0; i < n; i++)
-		if(text[i] == '\n' && i + 1 < n)
+	nrec = 0;
+	start = 1;
+	for(i = 0; i < n; i++){
+		if(start && text[i] != '\n' && text[i] != ' ' &&
+		   text[i] != '\t' && text[i] != '#')
 			nrec++;
+		start = text[i] == '\n';
+	}
+	if(nrec < 1)
+		nrec = 1;		/* mallocz(0) is not a size */
 
 	memset(&p, 0, sizeof p);
 	if((m = mallocz(sizeof *m, 1)) == nil)
 		return nil;
 	p.m = m;
-	m->inst = mallocz(nrec * sizeof *m->inst, 1);
-	m->stale = mallocz(nrec * sizeof *m->stale, 1);
-	m->node = mallocz(nrec * sizeof *m->node, 1);
-	m->pnode = mallocz(nrec * sizeof *m->pnode, 1);
+	m->inst = allocn(nrec, sizeof *m->inst);
+	m->stale = allocn(nrec, sizeof *m->stale);
+	m->node = allocn(nrec, sizeof *m->node);
+	m->pnode = allocn(nrec, sizeof *m->pnode);
 	p.buf = mallocz(n + 1, 1);
 	if(m->inst == nil || m->stale == nil || m->node == nil ||
 	   m->pnode == nil || p.buf == nil){
