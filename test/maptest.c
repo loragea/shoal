@@ -544,6 +544,55 @@ tcomments(void)
 }
 
 /*
+ * What a record may leave out, and what it is then.  §3.2 gives the
+ * header no defaults except the two layer-a prints itself: `retain',
+ * which §8.2 writes as "(default 8)", and `placerule', whose only v1
+ * value is `nodes'.  §3.3 defaults `zone' to `default' and the rest
+ * of an instance's optional attributes are conservative: weight 100
+ * (the only value §4.4 accepts), fenced no ("no otherwise"), class
+ * empty, since 0.
+ */
+static void
+tdefaults(void)
+{
+	static char t[] =
+		"map=vec epoch=7\n"
+		"\tmonid=00112233445566778899aabbccddeeff\n"
+		"\tobjmax=16777216 blksz=16384 replicas=2\n"
+		"\tcsumalg=blake2s256 placehash=blake2s256-64\n"
+		"\tpollms=1000 leasems=3000 replms=1000 deadms=10000\n"
+		"\toutmins=60 tombdays=7 mincopies=1\n"
+		"instance=n2.1 onnode=n2 addr=tcp!a!1\n"
+		"\tuuid=3f1c9a20b47e4d18a0c6e5721b93df04\n"
+		"\tstatus=in up=yes\n";
+	Cmap *m;
+	Cinst *i;
+
+	if((m = mapparse(t, strlen(t))) == nil){
+		fail("defaults: a map with no retain= was rejected: %r");
+		return;
+	}
+	if(m->retain != 8)
+		fail("defaults: an absent retain is %lud, not 8", m->retain);
+	if(strcmp(m->placerule, "nodes") != 0)
+		fail("defaults: an absent placerule is %s", m->placerule);
+	checks += 2;
+	if((i = mapinst(m, "n2.1")) == nil)
+		fail("defaults: no n2.1");
+	else{
+		if(strcmp(i->zone, "default") != 0)
+			fail("defaults: an absent zone is %s", i->zone);
+		if(i->weight != 100 || i->fenced != 0 || i->since != 0 ||
+		   i->class[0] != '\0')
+			fail("defaults: weight %lud fenced %d since %llud "
+				"class `%s'", i->weight, i->fenced, i->since,
+				i->class);
+		checks += 2;
+	}
+	mapfree(m);
+}
+
+/*
  * A thousand blank lines in front of §3.1's example, which the record
  * arrays are sized against: only a line that can start a record is
  * counted, so the map still parses whole and every record is there.
@@ -1615,6 +1664,7 @@ main(int, char**)
 	theader();
 	tunknown();
 	tcomments();
+	tdefaults();
 	tblank();
 	tvectors();
 	ttiebreak();

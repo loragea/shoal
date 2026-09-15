@@ -45,9 +45,15 @@ enum
 	Hretain		= 1<<14,
 	Hplacerule	= 1<<15,
 
+	/*
+	 * §3.2 tables the header attributes and gives no defaults, so
+	 * all of them are required but the two layer-a itself prints
+	 * a default for: `retain', which §8.2 writes as "(default 8)",
+	 * and `placerule', whose only v1 value is `nodes' (§3.2).
+	 */
 	Hneed = Hepoch|Hmonid|Hobjmax|Hblksz|Hreplicas|Hcsumalg|
 		Hplacehash|Hpollms|Hleasems|Hreplms|Hdeadms|Houtmins|
-		Htombdays|Hmincopies|Hretain,
+		Htombdays|Hmincopies,
 };
 
 /* instance attributes */
@@ -627,7 +633,6 @@ mapdone(Parse *p)
 			{ Hleasems, "leasems" }, { Hreplms, "replms" },
 			{ Hdeadms, "deadms" }, { Houtmins, "outmins" },
 			{ Htombdays, "tombdays" }, { Hmincopies, "mincopies" },
-			{ Hretain, "retain" },
 		};
 		int i;
 
@@ -949,6 +954,7 @@ mapparse(char *text, long n)
 	memmove(p.buf, text, n);
 	p.buf[n] = '\0';
 	strcpy(m->placerule, "nodes");	/* §3.2: v1's only value */
+	m->retain = Monretaindflt;	/* §8.2 prints this default */
 
 	s = p.buf;
 	e = p.buf + n;
