@@ -393,6 +393,25 @@ casetext(Case *c)
 	return badbyte;
 }
 
+/*
+ * An error string reaches a caller's Rerror body, which §0 makes
+ * 7-bit ASCII and ERRMAX-bounded, and which this parser would itself
+ * reject a byte of in a map text.  So every detail is ASCII: no
+ * section mark, no UTF-8 of any kind.
+ */
+static void
+tascii(char *name, char *err)
+{
+	int i;
+
+	for(i = 0; err[i] != '\0'; i++)
+		if((uchar)err[i] < 0x20 || (uchar)err[i] > 0x7e){
+			fail("%s: error byte %#.2ux in `%s' is not 7-bit "
+				"printable ascii", name, (uchar)err[i], err);
+			return;
+		}
+}
+
 static void
 tmatrix(void)
 {
@@ -427,7 +446,8 @@ tmatrix(void)
 		else if(strstr(err, cases[i].want) == nil)
 			fail("%s: error `%s' does not name `%s'",
 				cases[i].name, err, cases[i].want);
-		checks++;
+		tascii(cases[i].name, err);
+		checks += 2;
 	}
 }
 
@@ -1604,8 +1624,11 @@ tnext(void)
 	mapfree(next);
 
 	next = epochmap(42, monid1);
+	werrstr("");
 	if(mapnextok(cur, next, 0))
 		fail("commit: a changed monid was accepted");
+	rerrstr(err, sizeof err);
+	tascii("commit monid", err);
 	if(!mapnextok(cur, next, 1))
 		fail("commit: forceepoch did not lift the monid check");
 	checks += 2;
@@ -1629,6 +1652,7 @@ tnext(void)
 	rerrstr(err, sizeof err);
 	if(strstr(err, "epoch 5 is not above 41") == nil)
 		fail("commit: a forced regression answers `%s'", err);
+	tascii("commit", err);
 	mapfree(next);
 	next = epochmap(99, monid1);
 	if(!mapnextok(cur, next, 1))

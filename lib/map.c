@@ -95,6 +95,13 @@ struct Parse
 	Cstale	*stale;
 };
 
+/*
+ * Every error string below is 7-bit ASCII and says its rule in words.
+ * These reach a caller's Rerror body, where §0 makes the whole text
+ * 7-bit ASCII and bounds the body at ERRMAX; a section mark is two
+ * bytes of that budget and a byte this very parser rejects in a map,
+ * so no `§' (or any other byte outside 0x20..0x7e) appears in one.
+ */
 static int
 badmap(char *fmt, ...)
 {
@@ -364,7 +371,7 @@ mapattr(Parse *p, char *a, char *v)
 		if(setu32(&m->replicas, v, a) < 0)
 			return -1;
 		if(m->replicas < 1)
-			return badmap("replicas 0, under the 1 §3.2 requires");
+			return badmap("replicas 0, and one is the least");
 		if(m->replicas > Maxplace)
 			return badmap("replicas %lud over the %d this build "
 				"places", m->replicas, Maxplace);
@@ -437,15 +444,16 @@ mapattr(Parse *p, char *a, char *v)
 		if(setu32(&m->retain, v, a) < 0)
 			return -1;
 		if(m->retain < Monretainmin)
-			return badmap("retain %lud, under the %d §8.2 keeps "
-				"for §5.2 clause 2", m->retain, Monretainmin);
+			return badmap("retain %lud, under the %d maps the "
+				"monitor must keep", m->retain,
+				Monretainmin);
 		return 0;
 	}
 	if(strcmp(a, "placerule") == 0){
 		if(once(p, Hplacerule, a) < 0)
 			return -1;
 		if(strcmp(v, "nodes") != 0)
-			return badmap("placerule %s: v1 has nodes (§4.5)", v);
+			return badmap("placerule %s: v1 has nodes", v);
 		strcpy(m->placerule, v);
 		return 0;
 	}
@@ -502,8 +510,8 @@ instattr(Parse *p, char *a, char *v)
 		if(setu32(&i->weight, v, a) < 0)
 			return -1;
 		if(i->weight != 100)
-			return badmap("%s: weight %lud, and v1 takes only 100 "
-				"(§4.4)", i->iid, i->weight);
+			return badmap("%s: weight %lud, and v1 takes only "
+				"100", i->iid, i->weight);
 		return 0;
 	}
 	if(strcmp(a, "status") == 0){
@@ -1048,19 +1056,19 @@ mapnextok(Cmap *cur, Cmap *next, int force)
 		}
 	}
 	if(next->objmax != cur->objmax){
-		badmap("objmax changed, and §8.5 fixes it");
+		badmap("objmax changed, and it is immutable");
 		return 0;
 	}
 	if(next->blksz != cur->blksz){
-		badmap("blksz changed, and §8.5 fixes it");
+		badmap("blksz changed, and it is immutable");
 		return 0;
 	}
 	if(strcmp(next->csumalg, cur->csumalg) != 0){
-		badmap("csumalg changed, and §8.5 fixes it");
+		badmap("csumalg changed, and it is immutable");
 		return 0;
 	}
 	if(strcmp(next->placehash, cur->placehash) != 0){
-		badmap("placehash changed, and §8.5 fixes it");
+		badmap("placehash changed, and it is immutable");
 		return 0;
 	}
 	return 1;
