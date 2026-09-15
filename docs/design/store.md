@@ -3853,21 +3853,27 @@ discriminated one at a time, a live copy condemned under an open
 `/obj` and still answered with `corrupt=1` rather than dropped (D14),
 the bound on open snapshots, the `disk full` past it and the refusal
 of a `kinds` the engine has no state for, three snapshots outliving
-a `storeclose` — every read through them refused `store closed`
-while `objsnapcount` still answers, a further `objsnapopen` refused,
-and §13's freed hook fired exactly once and only at the third
-`objsnapclose` — beside a store closed with nothing open, which the
-same hook shows freed inside `storeclose`, and a store condemned and
-then closed, which answers `store condemned`; that close raced by
-four procs on four snapshots in each of its three shapes, thirty
-runs apiece — the procs only rendering, with the caller's device
-closed the instant `storeclose` returns; each proc closing its own
-snapshot against `storeclose`'s own decision; and each proc closing
-the instant it is told `store closed`, which is what catches a
-`closed` set before the proc wait — with the store freed exactly
-once every time, an open whose vector
-the index outgrows between the
-count and the fill, and the two terms of that vector's slack told
+a `storeclose` — every read through them refused `store closed`,
+an entry deleted before the close included, so that the refusal is
+watched where the *gone* answer was available; `objsnapcount` still
+answering; a further `objsnapopen` refused; and §13's freed hook
+fired exactly once and only at the third `objsnapclose` — beside a
+store closed with nothing open, which the same hook shows freed
+inside `storeclose`, and a store condemned and then closed, which
+answers `store condemned`; an open parked at §13's `snaphold` point
+with the bound's slot taken while the store is closed under it,
+refused `store closed` on the count pass it wakes into and its
+bail-out shown to be what frees the `Store`; the same hook fired
+once by a `storeopen` that failed on a device with no superblock;
+that close raced by four procs on four snapshots in each of its
+three shapes, thirty runs apiece — the procs only rendering, with
+the caller's device closed the instant `storeclose` returns; each
+proc closing its own snapshot against `storeclose`'s own decision;
+and each proc closing the instant it is told `store closed`, which
+is what catches a `closed` set before the proc wait — with the store
+freed exactly once every time, an open whose vector the index
+outgrows between the count and the fill, and the two terms of that
+vector's slack told
 apart — one growth refused by a ten-entry index, whose slack is the
 flat sixteen, and absorbed by an 800-entry one, whose sixteenth is
 fifty besides — two thousand opens under four churning procs with
