@@ -1422,26 +1422,22 @@ adoptwhy(int r)
 /*
  * §6.4 F1 and F4.  F1 fences when leasems has elapsed since the last
  * successful refresh; an instance that has never refreshed has no map
- * and is fenced by the same rule.  A clock that has gone backwards is
- * outside §6.4's assumption of monotonic elapsed time and is read as
- * no time having passed, which fences nobody spuriously.
+ * and is fenced by the same rule.  A clock that has gone backwards
+ * breaks §6.4's one assumption about clocks — that elapsed time can
+ * be measured — and an interval that cannot be measured counts as
+ * elapsed: fenced, kind lease, until the next successful refresh
+ * moves `last' forward.  This function is the only thing between a
+ * deposed primary and the D2 violation §6.4 exists to prevent, and
+ * one poll interval of `not ready' is the cheaper mistake.
  */
 int
 fencekind(Fence *f, vlong now)
 {
-	vlong d;
 	int k;
 
 	k = Fencenone;
-	if(!f->refreshed)
+	if(!f->refreshed || now < f->last || now - f->last >= (vlong)f->leasems)
 		k |= Fencelease;
-	else{
-		d = now - f->last;
-		if(d < 0)
-			d = 0;
-		if(d >= (vlong)f->leasems)
-			k |= Fencelease;
-	}
 	if(f->oper)
 		k |= Fenceoper;
 	return k;

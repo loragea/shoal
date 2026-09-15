@@ -1423,6 +1423,17 @@ tfence(void)
 		fail("F1: not fenced long after the lease");
 	checks += 4;
 
+	/*
+	 * A clock that has gone backwards cannot measure the interval
+	 * §6.4 F1 is about, so the lease counts as elapsed rather
+	 * than as nothing having passed.
+	 */
+	if(fencekind(&f, 9999) != Fencelease)
+		fail("F1: a clock 1 ms backwards leaves the lease running");
+	if(fencekind(&f, -990000) != Fencelease)
+		fail("F1: a clock far backwards leaves the lease running");
+	checks += 2;
+
 	/* a refresh clears it (§6.4 F1: "until a refresh succeeds") */
 	fencerefresh(&f, 99000);
 	if(fencekind(&f, 99500) != Fencenone)

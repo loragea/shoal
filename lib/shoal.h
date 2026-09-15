@@ -1468,6 +1468,11 @@ char*	adoptwhy(int);
  * mismatch is not one.  maprefresh is that rule in one call — it
  * adopts and clears the lease fence together, or does neither.
  *
+ * A `now' below `last' is a clock that has gone backwards, which is
+ * §6.4's assumption broken rather than an interval: it counts as the
+ * lease having elapsed, so the instance is fenced until a refresh
+ * succeeds.
+ *
  * F4's operator fence is a separate flag with the same effect, and
  * clearing it MUST NOT clear a lease-derived fence; since fencekind
  * derives both from state rather than latching a bit, it cannot.
