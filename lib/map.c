@@ -969,20 +969,30 @@ mapinst(Cmap *m, char *iid)
 /*
  * §8.1's commit-time validation, the half that needs the current map:
  * the epoch is exactly current+1 and §8.5's immutable attributes are
- * unchanged.  `force' is forceepoch's exemption (§8.6) and lifts
- * exactly the epoch and monid checks.
+ * unchanged.  `force' is forceepoch's exemption (§8.6), which lifts
+ * the monid check outright and replaces `exactly current+1' with
+ * `above current' — §8.1 sets the next epoch to "an arbitrary higher
+ * value", §6.1 makes the epoch strictly increasing and §8.6.2 forbids
+ * publishing an epoch that cannot be proved the highest, so the
+ * exemption is from the +1, not from increasing.
  */
 int
 mapnextok(Cmap *cur, Cmap *next, int force)
 {
-	if(!force){
+	if(force){
+		if(next->epoch <= cur->epoch){
+			badmap("epoch %llud is not above %llud", next->epoch,
+				cur->epoch);
+			return 0;
+		}
+	}else{
 		if(next->epoch != cur->epoch + 1){
 			badmap("epoch %llud is not %llud+1", next->epoch,
 				cur->epoch);
 			return 0;
 		}
 		if(strcmp(next->monid, cur->monid) != 0){
-			badmap("monid changed, and §8.5 fixes it");
+			badmap("monid changed, and it is immutable");
 			return 0;
 		}
 	}

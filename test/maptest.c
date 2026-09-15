@@ -1254,6 +1254,7 @@ tfence(void)
 static void
 tnext(void)
 {
+	char err[ERRMAX];
 	Cmap *cur, *next;
 
 	cur = epochmap(41, monid0);
@@ -1278,6 +1279,32 @@ tnext(void)
 		fail("commit: forceepoch did not lift the monid check");
 	checks += 2;
 	mapfree(next);
+
+	/*
+	 * §8.6's exemption is from `exactly current+1', not from
+	 * increasing: §8.1 sets the next epoch to an arbitrary
+	 * HIGHER value, §6.1 makes the epoch strictly increasing and
+	 * §8.6.2 forbids publishing one that cannot be proved the
+	 * highest.  Equal and lower are refused under force too.
+	 */
+	next = epochmap(41, monid0);
+	if(mapnextok(cur, next, 1))
+		fail("commit: forceepoch accepted an equal epoch");
+	mapfree(next);
+	next = epochmap(5, monid0);
+	werrstr("");
+	if(mapnextok(cur, next, 1))
+		fail("commit: forceepoch accepted a lower epoch");
+	rerrstr(err, sizeof err);
+	if(strstr(err, "epoch 5 is not above 41") == nil)
+		fail("commit: a forced regression answers `%s'", err);
+	mapfree(next);
+	next = epochmap(99, monid1);
+	if(!mapnextok(cur, next, 1))
+		fail("commit: forceepoch refused a higher epoch with a "
+			"new monid: %r");
+	mapfree(next);
+	checks += 4;
 	mapfree(cur);
 
 	/* §8.5's other immutables, which forceepoch does not lift */

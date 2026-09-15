@@ -1299,9 +1299,13 @@ struct Cmap
  * mapnextok is §8.1's commit-time half of the same validation, which
  * needs two maps: next's epoch MUST be exactly cur's plus one and
  * §8.5's immutable attributes MUST be unchanged.  force is the
- * `forceepoch' exemption (§8.6), which lifts exactly those two
- * checks on epoch and monid and nothing else.  It answers 0 with
- * `bad map: …' when next may not be committed over cur.
+ * `forceepoch' exemption (§8.6): it lifts the monid check and
+ * replaces the epoch relation with cur's epoch < next's, which is
+ * §8.1's "arbitrary higher value", §6.1's strictly increasing epoch
+ * and §8.6.2's "MUST NOT publish an epoch it cannot prove is the
+ * highest".  A regression under force is refused here and nowhere
+ * else.  mapnextok answers 0 with `bad map: …' when next may not be
+ * committed over cur.
  */
 Cmap*	mapparse(char *text, long n);
 void	mapfree(Cmap*);
