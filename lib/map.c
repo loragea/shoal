@@ -1115,8 +1115,16 @@ mapplace(Cmap *m, char *oid, Cinst **out, int nout)
 		return 0;
 	sc = sbuf;
 	if(m->npnode > (int)nelem(sbuf) &&
-	   (sc = malloc(m->npnode * sizeof *sc)) == nil)
-		return 0;
+	   (sc = malloc(m->npnode * sizeof *sc)) == nil){
+		/*
+		 * Not 0: |P| = 0 is §4.3's legal "nothing places here",
+		 * which mapprimary turns into `object unavailable' on
+		 * the wire, and an allocation failure must not be
+		 * spelled as an answer about the map.
+		 */
+		werrstr("out of memory");
+		return -1;
+	}
 	for(i = 0; i < m->npnode; i++)
 		sc[i] = maphash(oid, 'N', m->pnode[i]);
 
@@ -1180,7 +1188,8 @@ mapprimary(Cmap *m, char *oid)
 	Cinst *p[Maxplace];
 	int i, np;
 
-	np = mapplace(m, oid, p, nelem(p));
+	if((np = mapplace(m, oid, p, nelem(p))) < 0)
+		return nil;		/* mapplace's errstr stands */
 	for(i = 0; i < np; i++)
 		if(p[i]->up == Uyes)
 			return p[i];
@@ -1191,8 +1200,11 @@ int
 mapunderrep(Cmap *m, char *oid)
 {
 	Cinst *p[Maxplace];
+	int np;
 
-	return mapplace(m, oid, p, nelem(p)) < (int)m->replicas;
+	if((np = mapplace(m, oid, p, nelem(p))) < 0)
+		return -1;		/* mapplace's errstr stands */
+	return np < (int)m->replicas;
 }
 
 /*
@@ -1305,10 +1317,12 @@ mapwitness(Witreq *w, Cwit *out, int nout)
 	int i, k, n, np, npv, npp, why;
 
 	m = w->m;
-	np = mapplace(m, w->oid, p, nelem(p));
+	if((np = mapplace(m, w->oid, p, nelem(p))) < 0)
+		return -1;		/* mapplace's errstr stands */
 	npp = 0;
 	if(prevmap(w)){
-		npv = mapplace(w->prev, w->oid, pv, nelem(pv));
+		if((npv = mapplace(w->prev, w->oid, pv, nelem(pv))) < 0)
+			return -1;
 		/* the same instances, named in the map at E */
 		for(i = 0; i < npv; i++)
 			if((ip = mapinst(m, pv[i]->iid)) != nil)

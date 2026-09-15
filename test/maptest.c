@@ -771,6 +771,97 @@ tunderrep(void)
 }
 
 /*
+ * Above 32 nodes mapplace scores over an allocated array instead of
+ * its stack one, which the five-instance vector cluster never
+ * reaches.  Forty nodes of one instance each; the answers were
+ * computed outside this codebase, python3:
+ *
+ *	import hashlib
+ *	H=lambda x: int.from_bytes(
+ *		hashlib.blake2s(x,digest_size=32).digest()[:8],'big')
+ *	nodes = ["nn%d" % i for i in range(40)]
+ *
+ * gives, descending by H(oid||0x00||'N'||nid):
+ *
+ *  alpha  nn9  fd2e952d5c055b95   nn6  f1a208c16492f97f
+ *         nn21 f1611eef853ec9be   nn35 eeaee7cb8ac34f20
+ *  beta   nn39 fc54bdb6a445fe22   nn24 fb563b3ecfe5986a
+ *         nn30 f68f8d053bbc2933   nn5  e3e0340e2442a26c
+ *
+ * and each node carries exactly one status=in instance, so the
+ * instance round has one candidate and takes it.
+ */
+static Cmap*
+bigmap(char *rep)
+{
+	static char body[40*128];
+	char *s, *e;
+	int i;
+
+	s = body;
+	e = body + sizeof body;
+	for(i = 0; i < 40; i++)
+		s = seprint(s, e, "instance=nn%d.0 onnode=nn%d addr=tcp!a!%d "
+			"uuid=%.32d status=in up=yes\n", i, i, i + 1, i);
+	return build(rep, nil, body);
+}
+
+static void
+tbignodes(void)
+{
+	static char *alpha3[] = { "nn9.0", "nn6.0", "nn21.0" };
+	static char *beta3[] = { "nn39.0", "nn24.0", "nn30.0" };
+	Cmap *m;
+	Cinst *p[Maxplace], *pr;
+	int i, np;
+
+	m = bigmap(nil);
+	if(m->npnode != 40)
+		fail("40 nodes: |V| is %d", m->npnode);
+	np = mapplace(m, "alpha", p, nelem(p));
+	if(np != 2 || strcmp(p[0]->iid, alpha3[0]) != 0 ||
+	   strcmp(p[1]->iid, alpha3[1]) != 0)
+		fail("40 nodes: P(alpha) at R=2 is %s,%s", np > 0 ?
+			p[0]->iid : "-", np > 1 ? p[1]->iid : "-");
+	np = mapplace(m, "beta", p, nelem(p));
+	if(np != 2 || strcmp(p[0]->iid, beta3[0]) != 0 ||
+	   strcmp(p[1]->iid, beta3[1]) != 0)
+		fail("40 nodes: P(beta) at R=2 is %s,%s", np > 0 ?
+			p[0]->iid : "-", np > 1 ? p[1]->iid : "-");
+	if((pr = mapprimary(m, "alpha")) == nil ||
+	   strcmp(pr->iid, alpha3[0]) != 0)
+		fail("40 nodes: the primary for alpha is %s",
+			pr == nil ? "none" : pr->iid);
+	if(mapunderrep(m, "alpha") != 0)
+		fail("40 nodes: |P|=2 at R=2 is under-replicated");
+	checks += 5;
+	mapfree(m);
+
+	m = bigmap("3");
+	np = mapplace(m, "alpha", p, nelem(p));
+	if(np != 3)
+		fail("40 nodes: |P| %d at R=3", np);
+	else
+		for(i = 0; i < 3; i++)
+			if(strcmp(p[i]->iid, alpha3[i]) != 0)
+				fail("40 nodes: R=3 P[%d] is %s, want %s",
+					i, p[i]->iid, alpha3[i]);
+	np = mapplace(m, "beta", p, nelem(p));
+	if(np != 3)
+		fail("40 nodes: |P| %d at R=3 for beta", np);
+	else
+		for(i = 0; i < 3; i++)
+			if(strcmp(p[i]->iid, beta3[i]) != 0)
+				fail("40 nodes: R=3 P[%d] for beta is %s, "
+					"want %s", i, p[i]->iid, beta3[i]);
+	/* |P| is the whole count even when out[] is shorter */
+	if(mapplace(m, "alpha", p, 1) != 3)
+		fail("40 nodes: |P| with nout=1");
+	checks += 3;
+	mapfree(m);
+}
+
+/*
  * §4.3: the serving primary is the first member of P(oid) with
  * up=yes, and P is stable across an up change — a flap promotes the
  * next member without moving a byte.
@@ -1495,6 +1586,7 @@ main(int, char**)
 	tvectors();
 	ttiebreak();
 	tunderrep();
+	tbignodes();
 	tprimary();
 	tdown();
 	twitness();

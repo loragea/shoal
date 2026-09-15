@@ -1325,7 +1325,12 @@ char*	upname(int up);
  * §4.3 step 4's structural under-replication, which a caller reports
  * and still serves.  It answers the whole |P| even when out[] is
  * shorter, filling the first nout entries, so a caller may size
- * out[] by what it can use.
+ * out[] by what it can use.  Above 32 nodes it allocates the score
+ * array; that failing, it answers −1 with `out of memory' in the
+ * error string rather than 0, which would be a statement about the
+ * map.  mapprimary then answers nil with that errstr still set, and
+ * mapunderrep and mapwitness answer −1: an allocation failure is
+ * never a placement answer.
  *
  * placecmp is the order both HRW rounds sort by — descending score,
  * ties to the byte-wise greater id, the longer id winning when one is
@@ -1336,7 +1341,9 @@ char*	upname(int up);
  *
  * mapprimary is §4.3's serving primary: the first member of P(oid)
  * with up=yes, or nil when there is none, which is the object's
- * `object unavailable' at this epoch.  Being it is necessary and not
+ * `object unavailable' at this epoch — or nil with an error string,
+ * which is not.  mapunderrep answers 1, 0, or −1 for the same
+ * failure.  Being it is necessary and not
  * sufficient to serve: §5.2's grace and currency check are the rest.
  */
 uvlong	maphash(char *oid, int dom, char *id);
@@ -1404,10 +1411,11 @@ struct Cwit
  *
  * stray[] is the locally known stray holders of clause 3, as iids;
  * one that names no instance of m is ignored.  mapwitness answers
- * |W| and fills the first nout entries, so an out[] of m->ninst
- * entries always holds the whole set.  witblocker answers the first
- * Wblock witness, which is the one whose name belongs in the
- * `not ready' this check produces, or nil when the check may
+ * |W|, or −1 with an error string when placement could not be
+ * computed, and fills the first nout entries, so an out[] of
+ * m->ninst entries always holds the whole set.  witblocker answers
+ * the first Wblock witness, which is the one whose name belongs in
+ * the `not ready' this check produces, or nil when the check may
  * complete once its Wquery responses are in.
  */
 typedef struct Witreq Witreq;
