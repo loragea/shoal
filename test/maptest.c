@@ -188,6 +188,7 @@ static Case cases[] =
 	{ "stalebadreporter",	nil,			"names no instance" },
 	{ "dupstale",		nil,			"two stale records" },
 	{ "indentedcomment",	nil,			"is not attr=value" },
+	{ "selfmark",		nil,		"reporter is the subject" },
 };
 
 /* one instance record, spelled from parts, for the rejection cases */
@@ -367,8 +368,17 @@ casetext(Case *c)
 				"instance=n2.1 onnode=n2 addr=a "
 				"uuid=3f1c9a20b47e4d18a0c6e5721b93df04 "
 				"status=in up=yes\n"
-				"stale=n2.1 reporter=n2.1 since=3\n"
-				"stale=n2.1 reporter=n2.1 since=4\n");
+				"instance=n2.2 onnode=n2 addr=b "
+				"uuid=3f1c9a20b47e4d18a0c6e5721b93df05 "
+				"status=in up=yes\n"
+				"stale=n2.1 reporter=n2.2 since=3\n"
+				"stale=n2.1 reporter=n2.2 since=4\n");
+	if(strcmp(c->name, "selfmark") == 0)
+		return withhdr(
+				"instance=n2.1 onnode=n2 addr=a "
+				"uuid=3f1c9a20b47e4d18a0c6e5721b93df04 "
+				"status=in up=yes\n"
+				"stale=n2.1 reporter=n2.1 since=3\n");
 	if(strcmp(c->name, "indentedcomment") == 0)
 		return withhdr("\t# an indented # is a continuation, not a "
 				"comment\n");

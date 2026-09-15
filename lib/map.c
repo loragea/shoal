@@ -604,6 +604,17 @@ staledone(Parse *p)
 	s = p->stale;
 	if((p->seen & Tneed) != Tneed)
 		return badmap("stale=%s: no reporter=", s->subject);
+	/*
+	 * §7.1 gives a mark one meaning — "instance reporter has acked
+	 * at least one write that the subject did not take" — which is
+	 * not a thing an instance can say about itself, and §5.2 would
+	 * have such a mark keep its own subject out of every currency
+	 * check that names it.  One mark per ORDERED PAIR, and X,X is
+	 * not a pair.
+	 */
+	if(strcmp(s->reporter, s->subject) == 0)
+		return badmap("stale=%s: the reporter is the subject",
+			s->subject);
 	/* §7.1: one mark per ordered pair, so at most one record */
 	for(i = 0; i < p->m->nstale; i++){
 		t = &p->m->stale[i];
