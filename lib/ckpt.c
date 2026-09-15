@@ -465,6 +465,30 @@ checkpoint(Store *s)
 }
 
 /*
+ * §2.8's cap on the retry floor.  Two bounds, and the order of them
+ * is the decision: the floor is never below the configured ckbackms,
+ * because that is what the operator asked a failing checkpointer to
+ * wait, and never above §6's bounded wait, because a floor longer
+ * than the wait keeps refusing commits with a failure a healed device
+ * has already cured -- the committer waits ckwaitms, and a
+ * checkpointer that will not retry inside it cannot clear ckstuck
+ * before the refusal reads it.  Capping at ckms alone is not enough:
+ * the shipped ckms is 30 s against a 5 s wait.
+ */
+static ulong
+ckfloorcap(Store *s)
+{
+	ulong cap;
+
+	cap = s->cfg.ckms;
+	if(s->cfg.ckwaitms < cap)
+		cap = s->cfg.ckwaitms;
+	if(cap < s->cfg.ckbackms)
+		cap = s->cfg.ckbackms;
+	return cap;
+}
+
+/*
  * Run one checkpoint, keeping what it said if it failed.  Nothing a
  * client does reports a checkpoint failure -- the commit path only
  * sees the log not being reclaimed -- so what is kept here is where
@@ -487,11 +511,14 @@ checkpoint(Store *s)
  * paces one -- ckhigh is a level and not an interval -- so a store
  * whose checkpoint cannot reclaim log space would re-attempt with no
  * wait at all, taking qllog twice per attempt against the very
- * commits waiting for the space.  The floor starts at cfg.ckbackms
- * and doubles per consecutive failure up to cfg.ckms, and any
- * success clears it.  A FORCED run -- storecheckpoint, a tool's or a
- * test's -- is not paced by it and resets the doubling first, so a
- * caller driving checkpoints by hand runs at full speed.
+ * commits waiting for the space.  The floor starts at cfg.ckbackms,
+ * doubles per consecutive failure, and is capped by ckfloorcap below
+ * at max(ckbackms, min(ckms, ckwaitms)); any success resets it to
+ * cfg.ckbackms, which the zero here stands for -- the floor is out
+ * of force until the next failure arms it.  A FORCED run --
+ * storecheckpoint, a tool's or a test's -- is not paced by it and
+ * resets the doubling first, so a caller driving checkpoints by hand
+ * runs at full speed.
  *
  * A fid condemned by §0's Echange is the other half: every later
  * read, write and flush on it fails without reaching the device, so
@@ -504,6 +531,7 @@ static int
 ckrun(Store *s, int forced)
 {
 	char e[ERRMAX];
+	ulong cap;
 	int r, dead;
 
 	dead = 0;
@@ -524,13 +552,13 @@ ckrun(Store *s, int forced)
 		if(dead)
 			s->ckdead = 1;
 		strecpy(s->ckerrstr, s->ckerrstr + sizeof s->ckerrstr, e);
+		cap = ckfloorcap(s);
 		if(s->ckbackms == 0)
 			s->ckbackms = s->cfg.ckbackms;
-		else if(s->ckbackms < s->cfg.ckms){
+		else if(s->ckbackms < cap)
 			s->ckbackms *= 2;
-			if(s->ckbackms > s->cfg.ckms)
-				s->ckbackms = s->cfg.ckms;
-		}
+		if(s->ckbackms > cap)
+			s->ckbackms = cap;
 		s->ckwake = nsec() + (vlong)s->ckbackms*1000000LL;
 	}else{
 		s->ckstuck = 0;

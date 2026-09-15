@@ -598,7 +598,8 @@ enum
 	Ckmsdflt	= 30000,	/* §2.8 */
 	Ckhighdflt	= 4,		/* checkpoint past logsecs/ckhigh used */
 	Ckwaitmsdflt	= 5000,		/* §6's bounded wait */
-	Ckbackmsdflt	= 100,		/* §2.8's retry floor after a failure */
+	Ckbackmsdflt	= 100,		/* §2.8's retry floor after a failure,
+					 * capped at Ckwaitmsdflt here */
 	Logresvdiv	= 16,		/* §6's reserved tail */
 	Stagemaxdflt	= 2048,		/* §3.6, grains per stage */
 	Stagetotdflt	= 16384,	/* §3.6, grains per process */
@@ -620,7 +621,9 @@ struct Storecfg
 	ulong	ckms;
 	ulong	ckhigh;
 	ulong	ckwaitms;
-	ulong	ckbackms;		/* §2.8's retry floor, doubling to ckms */
+	ulong	ckbackms;		/* §2.8's retry floor: doubling per
+					 * consecutive failure, capped at
+					 * max(ckbackms, min(ckms, ckwaitms)) */
 	ulong	stagemax, stagetot, stagems;
 	ulong	emapcache;
 	ulong	objsnapmax;		/* §9's bound on open snapshots */

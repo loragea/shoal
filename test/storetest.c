@@ -1524,6 +1524,35 @@ tckfail(void)
 	devclose(d);
 }
 
+enum
+{
+	Ckpbackms	= 500,	/* tckpace's floor, and its wait */
+	Ckpexemptms	= 1000,	/* its ceiling on 20 explicit checkpoints */
+};
+
+/*
+ * openstoreck's live checkpointer with a retry floor of its own.
+ * tckpace times the exemption, so the margin it has is the floor an
+ * explicit checkpoint would wait against the 5 ms tick it really
+ * waits; 500 ms rather than the 100 ms default makes that gap a
+ * hundredfold and costs the passing run nothing.  ckwaitms rises with
+ * it so that the floor stays inside §2.8's cap rather than above §6's
+ * wait.
+ */
+static Store*
+openstorepace(Dev *d)
+{
+	Storecfg c;
+
+	tcfg(&c);
+	c.nockptproc = 0;
+	c.ckhigh = 8;
+	c.ckms = 50;
+	c.ckwaitms = Ckpbackms;
+	c.ckbackms = Ckpbackms;
+	return storeopen(d, &c);
+}
+
 /*
  * §2.8's retry floor, and storecheckpoint's exemption from it.
  *
@@ -1534,18 +1563,26 @@ tckfail(void)
  * log above ckhigh for ever and re-attempts with no wait at all.  The
  * proc is therefore what this test runs, and the floor is read as a
  * rate: ckfailed sampled across a second.  The window is a second and
- * the floor is 100 ms, so ten or so attempts are expected and forty is
- * a generous ceiling; unpaced it was measured in the tens of thousands.
+ * the floor is the 500 ms openstorepace configures, so a couple of
+ * attempts are expected and forty is a generous ceiling; unpaced it
+ * was measured in the tens of thousands.
  *
  * A committer inside §6's wait is the second unpaced path and is paced
  * by the same floor, which is what the fill loop leaves behind: its
  * last commits sat in that wait asking once a millisecond.
  *
- * The exemption is the other half and is timed rather than counted: 20
- * explicit checkpoints over the same refusing region are 20 attempts
- * that run at once, where the floor would make them two seconds.  This
- * is what keeps tckfail's 400 hand-driven checkpoints inside AGENTS.md's
- * seconds budget.
+ * The exemption is the other half, and it is the one check in T1 whose
+ * verdict is a wall clock.  It cannot be made count-based: a paced
+ * explicit path runs the same 20 attempts an exempt one does and
+ * arrives at the same ckfailed, only later, so nothing but elapsed
+ * time tells them apart.  What can be widened is the gap being timed,
+ * and that is why openstorepace configures a 500 ms floor rather than
+ * taking the 100 ms default: 20 explicit checkpoints wait the 5 ms
+ * checkpointer tick each and were measured at 103 ms in all, where
+ * the floor would make them ten seconds.  The ceiling is 1000 ms --
+ * ten times the measured cost and a tenth of the paced one.  The
+ * exemption is also what keeps tckfail's 400 hand-driven checkpoints
+ * inside AGENTS.md's seconds budget.
  *
  * Mutations: the floor test is dropped from ckdue and from ckptproc's
  * wait (mut ck-no-backoff); the explicit path obeys the floor too (mut
@@ -1566,7 +1603,7 @@ tckpace(void)
 
 	d = newdisk();
 	spawnforget();
-	if((s = openstoreck(d)) == nil){
+	if((s = openstorepace(d)) == nil){
 		fail("a store with a live checkpointer: %r");
 		devclose(d);
 		return;
@@ -1618,7 +1655,7 @@ tckpace(void)
 		nok, 0);
 	istrue("every explicit checkpoint ran", st.ckfailed - nex >= 20);
 	checks++;
-	if(ms >= 500)
+	if(ms >= Ckpexemptms)
 		fail("20 explicit checkpoints took %lld ms: the floor paced "
 			"them", ms);
 
@@ -1629,6 +1666,159 @@ tckpace(void)
 		fail("a healed device still refuses the checkpoint: %r");
 	storestat(s, &st);
 	eqv("a checkpoint that succeeds is no longer stuck", st.ckstuck, 0);
+	storeclose(s);
+	free(buf);
+	devclose(d);
+}
+
+
+enum
+{
+	Ckfbackms	= 10,	/* the retry floor tckfloor configures */
+	Ckfwaitms	= 200,	/* §6's wait: the cap the floor may not pass */
+	Ckfms		= 5000,	/* far above the wait, as the defaults are */
+	Ckfwinms	= 4000,	/* tckfloor's sampling window */
+};
+
+/*
+ * A live checkpointer configured so that both halves of §2.8's floor
+ * are visible: the floor starts a twentieth of its cap, and the cap is
+ * ckwaitms because ckms is far above it -- the relation the shipped
+ * defaults have.  ckhigh is turned up for the same reason openstoreck
+ * turns it up: the T1 log is 64 KiB.
+ */
+static Store*
+openstorefloor(Dev *d)
+{
+	Storecfg c;
+
+	tcfg(&c);
+	c.nockptproc = 0;
+	c.ckhigh = 8;
+	c.ckms = Ckfms;
+	c.ckwaitms = Ckfwaitms;
+	c.ckbackms = Ckfbackms;
+	return storeopen(d, &c);
+}
+
+/*
+ * §2.8's retry floor DOUBLES per consecutive failure, and is capped at
+ * max(ckbackms, min(ckms, ckwaitms)) -- never below the floor the
+ * operator configured, never above §6's bounded wait.
+ *
+ * tckpace above proves the floor exists at all, but it cannot see
+ * either half of this: openstoreck runs ckms = 50 under the default
+ * ckbackms = 100, so the first failure puts the floor at its cap and
+ * it never moves.  This test configures ckbackms a twentieth of the
+ * cap (10 ms) and leaves ckms far above ckwaitms, which is the
+ * relation the shipped defaults have (30 s against 5 s), so the cap is
+ * ckwaitms = 200 ms and the floor climbs 10, 20, 40, 80, 160, 200 to
+ * reach it.
+ *
+ * Both halves are read as ATTEMPT COUNTS over two four-second windows
+ * rather than as the time of any single retry, because a wall-clock
+ * assertion on one event is what flakes.  An explicit checkpoint is
+ * exempt from the floor and resets it, which is what opens window 1:
+ * window 1 therefore spans the climb and window 2 the steady state at
+ * the cap.  Four seconds at a 200 ms cap is about 20 attempts, against
+ * about 320 with the floor stuck at ckbackms and about 1 with the
+ * doubling unclamped -- by the time window 2 opens an unclamped floor
+ * is past 2.5 s.  Measured on the T1 machine: 23 and 19.  The bounds
+ * are 100 and 4, so the nearest margin is 4.3x.
+ *
+ * The cap's purpose is the last check and is a count of one: a device
+ * that heals is retried within one §6 wait, so a commit is never
+ * refused with a cured error for longer than ckwaitms.  Sleeping four
+ * ckwaitms without asking for anything, the store must have cleared
+ * ckstuck by itself; an uncapped floor is still asleep.
+ *
+ * Mutations: the floor never doubles and stays at ckbackms (mut
+ * ck-no-doubling); the doubling is not clamped at all (mut ck-no-cap);
+ * the clamp is cfg.ckms alone, as it was before the cap became
+ * min(ckms, ckwaitms) (mut ck-cap-ckms).
+ */
+static void
+tckfloor(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Super sb;
+	Sbsel sel;
+	uchar *buf, oid[Oidmax];
+	uvlong n0, n1, n2;
+	int i;
+
+	d = newdisk();
+	spawnforget();
+	if((s = openstorefloor(d)) == nil){
+		fail("a store with a live checkpointer: %r");
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(2*Blk, 79);
+	oidof(oid, "floor");
+	if(objcreate(s, oid, 2, 1, 1, nil, 0, nil) < 0)
+		fail("objcreate: %r");
+	if(objwrite(s, oid, 2, buf, 2*Blk, 0, 2, 1, nil, 0) < 0)
+		fail("objwrite: %r");
+	checks++;
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+
+	/* armed after a clean start: every checkpoint from here fails */
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	sb = sel.sb[sel.start];
+	simfaultat(d, Sfeio, 0, (vlong)sb.emapoff*sb.secsz,
+		(vlong)sb.emapsecs*sb.secsz);
+
+	/* the log fills past ckhigh and stays there: nothing reclaims it */
+	for(i = 0; i < 400; i++)
+		if(objwrite(s, oid, 2, buf, 2*Blk, 0, 3 + i, 1, nil, 0) < 0)
+			break;
+	storestat(s, &st);
+	istrue("the live checkpointer is failing", st.ckstuck != 0);
+	istrue("and the log is what ran out", st.logfree < sb.logsecs/2);
+
+	/*
+	 * An explicit checkpoint resets the floor, so the window below
+	 * starts at ckbackms whatever the fill loop left behind.
+	 */
+	checks++;
+	if(storecheckpoint(s) >= 0)
+		fail("a checkpoint over the refusing region succeeded");
+	storestat(s, &st);
+	n0 = st.ckfailed;
+	sleep(Ckfwinms);
+	storestat(s, &st);
+	n1 = st.ckfailed;
+	sleep(Ckfwinms);
+	storestat(s, &st);
+	n2 = st.ckfailed;
+	checks++;
+	if(n1 - n0 > 100)
+		fail("the floor does not double: %llud attempts in the %d ms "
+			"after a reset", n1 - n0, Ckfwinms);
+	checks++;
+	if(n2 - n1 > 100)
+		fail("the floor does not hold once doubled: %llud attempts "
+			"in %d ms", n2 - n1, Ckfwinms);
+	checks++;
+	if(n2 - n1 < 4)
+		fail("the floor is not capped at the bounded wait: %llud "
+			"attempts in %d ms", n2 - n1, Ckfwinms);
+
+	/*
+	 * Healed, and asked for nothing: a floor capped at ckwaitms is
+	 * retried inside one wait, so the paced checkpointer clears the
+	 * stuck flag on its own.
+	 */
+	simfault(d, Sfnone, 0);
+	sleep(4*Ckfwaitms);
+	storestat(s, &st);
+	eqv("a healed device is retried inside one bounded wait",
+		st.ckstuck, 0);
 	storeclose(s);
 	free(buf);
 	devclose(d);
@@ -2373,6 +2563,7 @@ main(int argc, char **argv)
 	treplaymaps();
 	tckfail();
 	tckpace();
+	tckfloor();
 	tckdead();
 	tckdirty();
 	tnodirty();

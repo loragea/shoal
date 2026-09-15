@@ -120,7 +120,7 @@ objsnapopen(Store *s, int kinds)
 {
 	Objsnap *sn;
 	Ient *e;
-	ulong i, n, want, cap, have, grew, try;
+	ulong i, n, want, cap, have, grew, try, nopen;
 	int last;
 
 	if(!storeserving(s))
@@ -177,10 +177,19 @@ objsnapopen(Store *s, int kinds)
 		}
 		if(try == 0){
 			if(s->nobjsnap >= s->cfg.objsnapmax){
+				/*
+				 * The count the test read, not the one a
+				 * close may have left by the time the text
+				 * is formatted: §9's bound is tested and
+				 * taken under one hold, and a refusal that
+				 * named a count below the maximum would
+				 * read as self-contradictory.
+				 */
+				nopen = s->nobjsnap;
 				qunlock(&s->qlstate);
 				werrstr("disk full: %lud object snapshots "
 					"open, objsnapmax %lud",
-					s->nobjsnap, s->cfg.objsnapmax);
+					nopen, s->cfg.objsnapmax);
 				free(sn);
 				return nil;
 			}

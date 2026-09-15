@@ -1109,14 +1109,22 @@ checkpoint cannot reclaim log space holds the log above `ckhigh` for
 ever, so the checkpointer would re-attempt with no wait at all — and
 a commit inside §6's wait asks for one every millisecond besides. A
 failing checkpoint therefore sets a retry floor: `ckbackms` (policy,
-default 100 ms), doubling per consecutive failure to `ckms` and
-staying there, cleared by any success. Neither trigger may re-arm
-inside that window, and neither may a commit's request; an explicit
-checkpoint request — a tool's, a test's — is not paced by it and
-resets it. The floor is what makes the attempt count a rate an
-operator can read, and what keeps a store that cannot free log space
-from contending on the log's lock with the very commits waiting for
-it.
+default 100 ms), doubling per consecutive failure and capped at
+`max(ckbackms, min(ckms, ckwaitms))` — never below the configured
+floor, and never above §6's bounded wait — and reset to `ckbackms` by
+any success. Neither trigger may re-arm inside that window, and
+neither may a commit's request; an explicit checkpoint request — a
+tool's, a test's — is not paced by it and resets it. The floor is
+what makes the attempt count a rate an operator can read, and what
+keeps a store that cannot free log space from contending on the log's
+lock with the very commits waiting for it.
+
+§6's wait is the upper bound because the floor is what a healed
+device waits behind: a floor longer than the wait would leave a
+commit refused for log space naming a failure a later checkpoint has
+already cured, for as long as the floor ran. Capped there, a device
+that heals is retried within one wait, and no commit carries a cured
+error for longer than `ckwaitms` after the device came back.
 
 **A checkpointer that cannot succeed again is named as such.** §0's
 `Echange` condemns the *fid*: every later read, write and flush on it
@@ -2025,11 +2033,17 @@ and §3.6's `op=full` over one, each add `blkcount(len)` to a
 index entry's `len` is intact — it is the extent-map entry that is
 damaged — so the count is an upper bound, and exact for an object
 with no holes. It is memory only and starts at zero at every start,
-because what it describes is the bitmap's error and the bitmap is
-what a rebuild corrects; the standing number over a disk's life is
-§12's `shoalck` cross-check. Not every leak is countable: a slot §5
-step 10 condemned for an index entry that does not unpack has no
-readable `len`, so it raises `lost=` and nothing else.
+because it is one session's observation of what that session left
+marked and not a property of the disk: an ordinary restart does not
+rebuild the bitmap — §5 step 11 rebuilds only when step 5 set the
+flag — so after one the grains are still marked and the count still
+reads zero. The standing number over a disk's life is §12's `shoalck`
+cross-check, and the two need not agree: this count is
+`blkcount(len)`, an upper bound for a sparse object, while the
+cross-check reports the grains actually marked and unreferenced. Not
+every leak is countable: a slot §5 step 10 condemned for an index
+entry that does not unpack has no readable `len`, so it raises
+`lost=` and nothing else.
 
 What survives is the 256-byte index entry. Layer-a §1.5's discard,
 once its three cluster-wide conditions hold, commits an `Eslot` and
@@ -2071,7 +2085,10 @@ the entry's `mtime`, which is why the tombstone keeps one.
   empty, so that refusal names the cause behind the wire error:
   `disk full: log full and the checkpoint fails: <error>`. A failure
   a later checkpoint has cured does not: the store's log drains
-  again, and this refusal is then the ordinary one.
+  again, and this refusal is then the ordinary one. The changeover is
+  bounded by this bullet's own wait — §2.8's retry floor is capped at
+  it — so the first attempt after the device heals falls inside one
+  `ckwaitms` and no commit names a cured failure for longer than that.
   If the checkpointer is **dead** rather than stuck (§2.8) — its fid
   condemned, so no later checkpoint can succeed — the refusal says so
   instead: `disk full: log full and the checkpointer is dead:
@@ -2212,7 +2229,7 @@ nothing is ever taken under them.
 | Lock | Covers |
 |---|---|
 | the flush lock | the coalescing flusher's ticket counters (§3.2): who is issuing the one device flush and who is waiting for it |
-| the checkpoint lock | the checkpointer's request and completion counters, its wake-up, and the failure state a checkpoint leaves behind (§2.8): the stuck flag, the count of failed attempts and the last failure's text, which §6's refusal reads under it. The checkpoint itself runs with it released |
+| the checkpoint lock | the checkpointer's request and completion counters — the paced pair a trigger or a committer advances and the exempt pair an explicit `storecheckpoint` advances (§2.8) — its wake-up, and the failure state a checkpoint leaves behind (§2.8): the stuck flag, the dead flag, the retry floor in force and the earliest time a paced attempt may run behind it, the count of failed attempts and the last failure's text, which §6's refusal reads under it. The checkpoint itself runs with it released |
 | the proc lock | the count of procs the store has started, so `storeclose` can wait for them |
 
 **Releasing the store itself is under no lock at all**, and is
@@ -2808,14 +2825,16 @@ count beside it, is the server's half and waits on the 9P surface.
 
 The cost is per open fid, so the store bounds how many snapshots may
 be open at once (`objsnapmax`, policy, default 8) rather than growing
-without limit; at 2^20 slots eight of them are 102 MB, which is the
-number §14(9) says is answered for the Layer B envelope and not for
-this design's own maximum. An open past the bound answers
-`disk full: <n> object snapshots open, objsnapmax <max>` — layer-a
-§2.6's `disk full`, whose entry covers any operation that needs space,
-with the detail naming the space and the knob. It is **not** an
-internal-invariant error (§3.7): a ninth open is a legal call and not
-a caller's bug, so it is a refusal a client library may key on; and
+without limit; at 2^20 slots one fid is the 12 MB vector plus the
+slack above — a sixteenth and 16 entries, so 12.75 MiB — and eight of
+them are 102 MB, which is the number §14(9) says is answered for the
+Layer B envelope and not for this design's own maximum. An open past
+the bound answers `disk full: <n> object snapshots open, objsnapmax
+<max>` — layer-a §2.6's `disk full`, whose entry covers any operation
+that needs space, with the detail naming the space and the knob. It
+is **not** an internal-invariant error (§3.7): a ninth open is a legal
+call and not a caller's bug, so it is a refusal a client library may
+key on; and
 it is not a new prefix, because §2.6's set is normative and
 prefix-free and this condition is reachable only by an admin listing
 or the store's own reconcile and reclaim walks, on an enumeration
@@ -2827,9 +2846,12 @@ answers `disk full` and reports the sizes rather than answering
 The bound's test and its count are **one step under one hold** of
 `qlstate` — the open's first count takes that hold anyway, and the
 open takes its slot the moment it passes the bound, so two opens
-racing cannot both find room — and an open that then fails gives the
-slot back in a hold of its own, so `/status` counts an open in flight
-along with the opens that completed. A close releases the count.
+racing cannot both find room. The count the refusal names is that
+same count, read under the hold that tested it rather than as the
+text is formatted, so it cannot come out below the maximum it is
+being refused against. An open that then fails gives the slot back in
+a hold of its own, so `/status` counts an open in flight along with
+the opens that completed. A close releases the count.
 **Giving the slot back is releasing a claim**, so a failing open's
 bail-out carries the same free predicate an `objsnapclose` does: the
 slot is the open's claim from the moment the bound is passed, and an
@@ -3941,12 +3963,15 @@ a device that heals — the same store's next full log, with nothing
 checkpointing, answering the bare `disk full` — §2.8's retry floor
 under a live checkpointer proc, read as a rate of failed attempts
 across a second and as the speed of the explicit requests it exempts,
-and a fid condemned under the checkpointer, which is dead rather than
-stuck, stops the retries and is what §6's refusal then names — §2.8's dirty-page
-trigger surviving a condemnation that lands while a checkpoint runs,
-and a store opened, written and replayed at a `blksz` four times the
-device's `Wunit`), `objtest` (§2.7's extent-map slot
-rule over all three transitions and both the crash and the re-replay
+and read again over a floor configured well below its cap — the
+doubling and the cap as attempt counts over two windows, and the cap
+as a healed device the paced checkpointer picks up inside one §6 wait
+— and a fid condemned under the checkpointer, which is dead rather
+than stuck, stops the retries and is what §6's refusal then names —
+§2.8's dirty-page trigger surviving a condemnation that lands while a
+checkpoint runs, and a store opened, written and replayed at a `blksz`
+four times the device's `Wunit`), `objtest` (§2.7's extent-map slot rule
+over all three transitions and both the crash and the re-replay
 schedules, §2.4's invariant on the shrinking side, §3.5's deferred
 reuse of grains and of slots under a held batch, §3.6's stage lifetimes,
 bounds and `final=1` arbitration including D14's corrupt receiver,
@@ -4425,7 +4450,9 @@ rather than an amendment, because it touches the wire.
    snapshot is affordable — 3.1 MB at 2.6·10^5 objects but 12 MB per
    open fid at `nslots = 2^20`, so `objsnap=partial` is unnecessary at
    the Layer B envelope and not demonstrated unnecessary at this
-   design's own maximum (§9).
+   design's own maximum (§9). That 12 MB is the vector alone; §9's
+   102 MB for eight fids is the same vector with its allocation
+   slack, 12.75 MiB each.
 
 10. **A `Tflush` after the commit still owes the cleanup half of step
     7.** Once the commit is durable the discard half is vacuous but

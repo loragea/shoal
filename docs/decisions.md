@@ -359,13 +359,15 @@ entry that is not there.
 **Decision:** A failed checkpoint keeps §2.8's reaction — no
 condemnation, no self-check, no device probe, no page rewrite, no
 full-checkpoint fallback — and gains two things it lacked. First, a
-retry floor (`ckbackms`, default 100 ms, doubling to `ckms`), obeyed
-by both of §2.8's triggers and by a committer's request inside §6's
-wait, and exempted only for an explicit `storecheckpoint`. Second, a
-`dead` condition distinct from `stuck`, set when the failing
-checkpoint's device fid is condemned (§0's `Echange`), never cleared
-short of a restart, stopping the paced retries and named in §6's
-refusal.
+retry floor (`ckbackms`, default 100 ms, doubling per consecutive
+failure and capped at `max(ckbackms, min(ckms, ckwaitms))` — never
+below the configured floor, never above §6's bounded wait — and reset
+to `ckbackms` by any success), obeyed by both of §2.8's triggers and
+by a committer's request inside §6's wait, and exempted only for an
+explicit `storecheckpoint`. Second, a `dead` condition distinct from
+`stuck`, set when the failing checkpoint's device fid is condemned
+(§0's `Echange`), never cleared short of a restart, stopping the
+paced retries and named in §6's refusal.
 **Rationale:** Nothing a checkpoint failure damages is at risk — the
 log is the authority above `cklogoff`, §3.4's rule makes replay cover
 every partial landing, and the damaged bytes are never read while the
@@ -376,7 +378,12 @@ wrong was the cadence: `ckhigh` is a level with no time term and the
 checkpointer skips its tick whenever a trigger is true, so a store
 that cannot reclaim log space re-attempted with no sleep at all —
 measured at 66 715 attempts per second — taking the log's lock twice
-per attempt against the very commits waiting for the space. And
+per attempt against the very commits waiting for the space. The cap
+is §6's wait and not `ckms` alone because the floor is what a healed
+device waits behind: at the shipped 30 s `ckms` against a 5 s
+`ckwaitms` a floor allowed to reach `ckms` would go on refusing
+commits with a cured error for up to 30 s after the device came back,
+where the same floor capped at the wait is retried inside it. And
 `Echange` is not a device that may heal; reporting it as one sends
 the operator to look at a disk instead of restarting the store.
 **Normative:** none. `disk full` remains layer-a §2.6's prefix and is
