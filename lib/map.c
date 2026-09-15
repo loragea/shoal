@@ -1069,8 +1069,6 @@ mapplace(Cmap *m, char *oid, Cinst **out, int nout)
 		sc[i] = maphash(oid, 'N', m->pnode[i]);
 
 	np = m->replicas;
-	if(np > m->npnode)
-		np = m->npnode;			/* §4.3 step 4: |P| < R */
 	prev = -1;
 	n = 0;
 	for(k = 0; k < np; k++){
@@ -1078,7 +1076,8 @@ mapplace(Cmap *m, char *oid, Cinst **out, int nout)
 		 * The next node in descending order: the greatest that
 		 * ranks below the one taken last.  The order is total
 		 * because node ids are distinct, so this needs no
-		 * scratch marks and no sort.
+		 * scratch marks and no sort; running out of nodes
+		 * before R of them is §4.3 step 4's |P| < R.
 		 */
 		best = -1;
 		for(i = 0; i < m->npnode; i++){
@@ -1090,7 +1089,7 @@ mapplace(Cmap *m, char *oid, Cinst **out, int nout)
 				best = i;
 		}
 		if(best < 0)
-			break;
+			break;		/* §4.3 step 4: |P| < R is legal */
 		prev = best;
 
 		pick = nil;
