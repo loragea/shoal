@@ -2978,13 +2978,26 @@ unreachable where it makes it.
 
 **Each slot is read back after its flush** and checked — magic,
 `vers`, `len` within the slot, the checksum over `secsz+len`, and the
-`seq`, `len` and `epoch` just written. That is what makes step 1's "a
-torn ring write … fails the commit" true rather than hopeful: a
-`Sfdrop` or a torn write reports success, survives its flush and
-lands nothing, and without the read-back the running monitor holds a
-ring entry the platter does not — so position 0 would stop being the
-current map and layer-a §8.2's `E−1` entry would be unanswerable at
-the next start.
+`seq`, `len` and `epoch` just written. It is for exactly one fault: a
+device that **reports a successful write, acknowledges the flush after
+it, and does not hold the bytes at the offset the write named** —
+nothing landed, or part of it did. That is the empty or partial case
+of the torn write §3.2 already allows the device, and neither return
+value says anything about it; a read through the same device is the
+only thing that does.
+
+Both slots are read back, and the **current-map** slot is the one that
+pays for it. A ring slot the platter does not hold costs layer-a
+§8.2's retention MUST: position 0 stops being the current map, the
+entry the next publish owes as `E−1` is missing, and an instance falls
+back to layer-a §5.2 clause 2's substitution — correct, and wider than
+it needs to be. A **current** slot the platter does not hold costs the
+cluster. The monitor has acknowledged epoch `E`, every instance has
+adopted it and made `epochhigh = E` durable (layer-a §6.3), and this
+monitor's next start serves `E−1`; every instance then rejects the map
+as an epoch regression and stays fenced until an operator runs
+`forceepoch` (layer-a §8.3). No later publish, restart or crash rule
+recovers it, because the fault is that the acknowledgement was given.
 
 A slot that **reads back and is not the one written** says the map is
 not durable, and the commit fails exactly as a failed write does:
@@ -3029,6 +3042,18 @@ bytes anyway is outside this store's model, exactly as it is outside
 the object store's: §13's simulated disk makes durability after a
 flush its contract, and §3.2's `-w` assertion is what an operator
 gives for a unit whose flush does not reach the platter.
+
+Nothing on the target platform is known to drop an accepted write
+this way: `docs/platform/9front-storage.md` §5 has `devsd` do no
+caching of its own and issue one request per `pwrite`, §6 lost none
+of 7519 acknowledged raw writes and tore none, and the one lying
+mechanism that document names — the legacy IDE driver's faked
+`SYNCHRONIZE CACHE` — is precisely the case a read-back cannot catch.
+The monitor pays the four reads anyway and §3.2's log does not, and
+the difference is not the device: an instance that loses an
+acknowledged log record is one of `R` copies and layer-a repairs it by
+arbitration and heal, while the monitor's map is the cluster's only
+copy (layer-a §6.5). The guard is bought for the single copy.
 
 **Choose on start:** read both current-map slots, take the valid one
 with the greater `seq`; two valid slots at equal `seq` — which is what
