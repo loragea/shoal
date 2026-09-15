@@ -982,6 +982,18 @@ haswit(Cwit *w, int n, char *iid, int why, int how)
 	return 0;
 }
 
+/*
+ * witblocker walks the entries mapwitness filled, so it takes
+ * min(|W|, nout) and not |W| (shoal.h).  Every caller here passes
+ * nelem(ws), which is over m->ninst in every map below, but the
+ * clamp is where a caller's is.
+ */
+static Cinst*
+blocker(Cwit *w, int n, int nout)
+{
+	return witblocker(w, n < nout ? n : nout);
+}
+
 static int
 inwit(Cwit *w, int n, char *iid)
 {
@@ -1142,7 +1154,7 @@ tskip(void)
 				t[i].nwit);
 		if(inwit(ws, n, "n3.2") != t[i].inwit)
 			fail("skip %s: clause 4 membership", t[i].name);
-		b = witblocker(ws, n);
+		b = blocker(ws, n, nelem(ws));
 		if(t[i].blocked && (b == nil || strcmp(b->iid, "n3.2") != 0))
 			fail("skip %s: an up=no in-scope reporter must block",
 				t[i].name);
@@ -1230,7 +1242,7 @@ tscope(void)
 			"reporter is not Wskip");
 	if(haswit(ws, n, "n4.0", Wreporter, -1))
 		fail("scope: the substitution reached clause 4");
-	if((b = witblocker(ws, n)) != nil)
+	if((b = blocker(ws, n, nelem(ws))) != nil)
 		fail("scope: blocked by %s under substitution", b->iid);
 	checks += 3;
 
@@ -1240,7 +1252,7 @@ tscope(void)
 	if(!haswit(ws, n, "n4.0", Wprev, Wskip))
 		fail("scope: with no E−1 map an out-of-scope up=no "
 			"reporter is not Wskip");
-	if((b = witblocker(ws, n)) != nil)
+	if((b = blocker(ws, n, nelem(ws))) != nil)
 		fail("scope: blocked by %s with no E−1 map", b->iid);
 	checks += 2;
 
@@ -1250,7 +1262,7 @@ tscope(void)
 	if(!haswit(ws, n, "n4.0", Wreporter, Wblock))
 		fail("scope: an in-scope up=no reporter at E−1 is not "
 			"Wblock");
-	b = witblocker(ws, n);
+	b = blocker(ws, n, nelem(ws));
 	if(b == nil || strcmp(b->iid, "n4.0") != 0)
 		fail("scope: the blocker is %s, want n4.0",
 			b == nil ? "none" : b->iid);
@@ -1300,7 +1312,7 @@ twitdead(void)
 	n = mapwitness(&w, ws, nelem(ws));
 	if(inwit(ws, n, "n3.2"))
 		fail("witness: status=dead is a witness");
-	if(witblocker(ws, n) != nil)
+	if(blocker(ws, n, nelem(ws)) != nil)
 		fail("witness: a dead reporter blocks");
 	checks += 2;
 	mapfree(m);

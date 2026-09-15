@@ -1413,10 +1413,16 @@ struct Cwit
  * one that names no instance of m is ignored.  mapwitness answers
  * |W|, or −1 with an error string when placement could not be
  * computed, and fills the first nout entries, so an out[] of
- * m->ninst entries always holds the whole set.  witblocker answers
- * the first Wblock witness, which is the one whose name belongs in
- * the `not ready' this check produces, or nil when the check may
- * complete once its Wquery responses are in.
+ * m->ninst entries always holds the whole set.
+ *
+ * witblocker answers the first Wblock witness, which is the one
+ * whose name belongs in the `not ready' this check produces, or nil
+ * when the check may complete once its Wquery responses are in.  The
+ * n it is passed MUST be min(|W|, nout) — mapwitness answers the
+ * whole |W| but fills and classifies only the first nout entries, so
+ * handing it mapwitness's answer unclamped walks off a shorter
+ * out[].  An out[] of m->ninst entries needs no clamp, since |W| can
+ * never exceed it.
  */
 typedef struct Witreq Witreq;
 struct Witreq
