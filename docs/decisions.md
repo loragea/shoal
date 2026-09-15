@@ -522,10 +522,14 @@ refuses the following; each is a choice this implementation makes where
 layer-a is silent, and the reasons are one apiece:
 
 - **Every header attribute of §3.2 is required** except `retain`, which
-  is 8 when absent, and `placerule`, which is `nodes` — the two layer-a
-  itself prints a default for (§8.2, §3.2). §3.2 tables the attributes
-  and gives no other default, and a timer this build invented a value
-  for would be a timer the operator did not choose.
+  is 8 when absent, and `placerule`, which is `nodes`. Only `retain`'s
+  default is layer-a's own: §8.2 keeps "the last `retain` (default 8)
+  published maps". §3.2 prints no default for `placerule` — it defines
+  `nodes`, reserves `zones` and makes a v1 monitor reject it, which
+  leaves `nodes` the only value this build could choose but leaves the
+  choosing to this build. §3.2 gives no other default at all, and a
+  timer this build invented a value for would be a timer the operator
+  did not choose.
 - **An instance record requires `onnode`, `addr`, `uuid`, `status`,
   `up`**; `class` is empty when absent, `zone` is `default` (§3.3 says
   so), `weight` 100, `fenced` `no` (§3.3's "`no` otherwise"), `since` 0.
@@ -595,14 +599,23 @@ rule is one-directional).
 that fails validation is refused with `bad map` and no other §2.6
 prefix. That an indented line is a continuation whose tokens are
 `attr=value`, and a comment starts at column 0, is §0 and §3, not a
-choice made here.
+choice made here. So are three rules the list above repeats rather
+than invents, each of them wire-visible: node and zone names match
+`1*63(ALPHA / DIGIT / "-" / "_")` (§3.3, "Zone names share the
+node-name grammar"), exactly one `map` record is present (§3.1), and
+every byte of a map text is 7-bit ASCII (§0). A reimplementation that
+took a 64-byte node name, a two-`map` text or a high byte would
+disagree with this one about what a map is.
 
-**Implementation policy:** every refusal in the list above — which
-attributes are required and what an absent one defaults to, the length
-caps, `Maxplace = 64`, the degenerate-value refusals, the duplicate
-rules, the dangling-mark and self-mark refusals, and the wording of
-every detail after `bad map: `. A conforming implementation may accept
-any of them, or refuse more.
+**Implementation policy:** every refusal in the list above except the
+three the paragraph before names — which attributes are required and
+what an absent one defaults to, the caps on the cluster name, `addr`,
+`class` and the instance index, `Maxplace = 64`, the degenerate-value
+refusals, the refusal of a duplicate attribute inside one record and
+of a second `node`, `instance` or `stale` record for one subject, the
+dangling-mark and self-mark refusals, and the wording of every detail
+after `bad map: `. A conforming implementation may accept any of
+them, or refuse more.
 
 ## D22 — Witness scoping without the E−1 map, and the fence and adoption edges (2026-09-15)
 
@@ -672,7 +685,10 @@ sentences are separate MUSTs, each naming its own `/status` flag.
 **Implementation policy:** what this library does when it holds no
 `E−1` map (evaluate clause 4's `E` half alone, and leave the
 `/maps/<E−1>` fetch to the caller) — an implementation that fetches
-inside the check, or blocks until it has the map, conforms equally;
+inside the check, or blocks until it has the map, conforms equally,
+while one that never fetches does not: §5.2's case-(ii) lemma needs
+clause 4's `E−1` half, so obtaining that map is an obligation of the
+caller and not an option this library's silence grants it;
 the order in which the two §6.3 conditions are tested, and this
 library's shape for them — one `int` of flag bits, `adoptwhy` naming
 one bit at a time, the rendering of `/status` left to the server;
