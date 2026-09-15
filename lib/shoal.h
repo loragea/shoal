@@ -646,6 +646,7 @@ struct Storestat
 	uvlong	qidnext, epochhigh;
 	int	monidset;
 	uvlong	grainfree, staged;
+	uvlong	grainleak;		/* §6: marked, named by nothing */
 	uvlong	slotfree, emapfree;
 	uvlong	logfree;		/* sectors */
 	uvlong	logwait;		/* commits in §6's wait for log space */
