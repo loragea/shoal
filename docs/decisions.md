@@ -619,8 +619,9 @@ them, or refuse more.
 
 ## D22 — Witness scoping without the E−1 map, and the fence and adoption edges (2026-09-15)
 
-**Decision:** Four edges layer-a leaves to the implementation, settled
-in `lib/map.c`:
+**Decision:** Four edges at the map library's boundary, settled in
+`lib/map.c` — two are layer-a's own rules read precisely, two are
+ours:
 
 - **§5.2's substitution belongs to clause 2 alone.** `mapwitness`
   applies "substitute every instance with `status` ∈ {new,in,out}" to
