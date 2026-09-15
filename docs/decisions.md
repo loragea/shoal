@@ -438,3 +438,70 @@ bitmap rebuild, and the scrub-driven shadow-bitmap mechanism with
 its generation stamp. A conforming implementation may reclaim the
 grains some other way, or not report them at all, so long as it
 never frees a grain no map it read named.
+
+## D19 — The monitor reads every map slot back; the object store does not (2026-09-15)
+
+**Decision:** A monitor map commit reads each slot back through the
+ordinary slot reader after that slot's flush and fails the commit if
+the slot is not the one written; a read-back whose *read* fails is
+retried once and then fails the commit with the publish declared
+indeterminate (`design/store.md` §10). §3.2's log commit and §2.2's
+superblock publish keep no such check.
+**Rationale:** The check is for one fault — a device that reports a
+successful write, acknowledges the flush after it, and does not hold
+the bytes: the empty or partial case of the torn write §3.2 already
+allows. It proves acceptance, not durability, and cannot see a device
+that loses bytes after acknowledging a flush. It is not a documented
+failure mode of 9front's sd(3) path (`platform/9front-storage.md` §5,
+§6). It is guarded here and not in the object store because the
+monitor's map has no replica (`design/layer-a.md` §6.5): a lost log
+record is one of `R` copies and layer-a repairs it, while a
+current-map slot the platter does not hold means the monitor has
+acknowledged an epoch it will not serve after a restart, and layer-a
+§6.3's regression rule then leaves the cluster fenced until an
+operator runs `forceepoch`. Cost is ~0.8 ms against a ~17 ms publish
+and is not an argument.
+**Considered and rejected:** dropping the check (leaves the
+acknowledgement unchecked on the only copy); the ring slot alone
+(drops the worse of the two cases); the current slot alone (demotes
+§8.2's retention MUST to best-effort); the header sector alone
+(cannot evaluate the checksum, which is what catches a torn text);
+making it conditional on `-w` (backwards — under `-w` no flush is
+issued, so the read-back is the only check there is).
+**Normative:** none. No on-disk field, offset or wire string changes;
+layer-a §8.2 requires durable-before-ack and not ack-iff-durable, so
+a monitor that publishes without the read-back still conforms.
+**Implementation policy:** all of it — the read-back, the retry-once,
+the indeterminate outcome and its spent `seq`, and the decision not
+to extend the check to §3.2 and §2.2.
+
+## D20 — The enumeration-snapshot bound answers `disk full` (2026-09-15)
+
+**Decision:** An `objsnapopen` refused by §9's `objsnapmax` answers
+layer-a §2.6's `disk full`, with detail naming the count and the
+knob: `disk full: <n> object snapshots open, objsnapmax <max>`.
+`design/store.md` §3.7's table now carries the condition and §9
+states the text.
+**Rationale:** The vector is space the instance must find to serve
+the open, and §2.6's `disk full` entry is deliberately open-ended —
+"any operation that needs space". The alternatives lose on their own
+terms: a new §2.6 prefix is a wire change for a condition only an
+admin listing and the store's own reconcile and reclaim walks can
+reach, on an enumeration §2.2 already makes advisory and whose peer
+equivalent (`op=list`) takes no snapshot; `not ready` is normative
+for handoff and currency and is RETRYABLE; an internal-invariant
+string is what §3.7 reserves for conditions a caller cannot produce,
+which a ninth open is not; queueing the open behind the oldest close
+parks a call holding no claim on the `Store`, which D16's quiesce
+rule forbids being in flight at `storeclose`, so a bounded shutdown
+would wait on an admin's fid. §10's map-too-big refusal settled the
+same question the same way: the exhaustion prefix, with the
+specifics in the detail and in `/status`, because the more specific
+string was the misdirecting one.
+**Normative:** that a refusal of an enumeration open for want of
+room carries `disk full` and no other §2.6 prefix — the set is
+prefix-free and §3.7's carve-out makes the mapping normative.
+**Implementation policy:** that the bound exists at all, its default
+of 8, the detail after the prefix, and reporting the open count in
+`/status`. An implementation that never refuses such an open is
+conforming.

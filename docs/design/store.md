@@ -1633,6 +1633,7 @@ own `not primary: n5.0` is the pattern. Callers can act on these:
 | a read, verify or update through an extent-map entry that failed its `csum128` (§5 step 9) — block repair excepted, below; a read, write or truncate of a copy whose `corrupt` flag is set (§8); a block repair whose bytes do not hash to the stored `dig[i]` | `checksum mismatch` |
 | a discard whose record fails layer-a §1.5's receiver checks: not a tombstone, not at exactly the named key, or its `wepoch` not strictly below the given epoch | `not discardable` |
 | no grain, index slot, extent-map slot, staged-grain budget, or log space after §6's bounded wait | `disk full` |
+| an enumeration-snapshot open past §9's `objsnapmax` | `disk full` |
 
 **Everything else is an internal-invariant error**: a condition the
 API's contract says a caller cannot produce, or one the media
@@ -2802,25 +2803,39 @@ snapshot that tested `qidpath` alone would list both.
 
 The store reports `objsnap=full` and never uses layer-a §2.2's
 `objsnap=partial` escape: the engine takes the whole vector or
-refuses the open. Reporting the field in `/status` is the server's
-half and waits on the 9P surface. The cost is per open fid, so the
-store bounds how many snapshots may be open at once (`objsnapmax`,
-policy, default 8) and answers a further open `disk full` (layer-a
-§2.6) rather than growing without limit; at 2^20 slots eight of them
-are 96 MB, which is the number §14(9) says is answered for the Layer
-B envelope and not for this design's own maximum. The test and the
-count are **one step under one hold** of `qlstate` — the open's first
-count takes that hold anyway, and the open takes its slot the moment
-it passes the bound, so two opens racing cannot both find room — and
-an open that then fails gives the slot back in a hold of its own, so
-`/status` counts an open in flight along with the opens that
-completed. A close releases the count. **Giving the slot back is
-releasing a claim**, so a failing open's bail-out carries the same
-free predicate an `objsnapclose` does: the slot is the open's claim
-from the moment the bound is passed, and an open in flight when
-`storeclose` runs is therefore the store's last claim — `storeclose`
-finds the count non-zero, defers, and the bail-out is what releases
-the memory.
+refuses the open. Reporting that field in `/status`, and the open
+count beside it, is the server's half and waits on the 9P surface.
+
+The cost is per open fid, so the store bounds how many snapshots may
+be open at once (`objsnapmax`, policy, default 8) rather than growing
+without limit; at 2^20 slots eight of them are 102 MB, which is the
+number §14(9) says is answered for the Layer B envelope and not for
+this design's own maximum. An open past the bound answers
+`disk full: <n> object snapshots open, objsnapmax <max>` — layer-a
+§2.6's `disk full`, whose entry covers any operation that needs space,
+with the detail naming the space and the knob. It is **not** an
+internal-invariant error (§3.7): a ninth open is a legal call and not
+a caller's bug, so it is a refusal a client library may key on; and
+it is not a new prefix, because §2.6's set is normative and
+prefix-free and this condition is reachable only by an admin listing
+or the store's own reconcile and reclaim walks, on an enumeration
+layer-a §2.2 already makes advisory. The detail is what stops it
+misdirecting an operator, exactly as §10's map-too-big refusal
+answers `disk full` and reports the sizes rather than answering
+`bad map`.
+
+The bound's test and its count are **one step under one hold** of
+`qlstate` — the open's first count takes that hold anyway, and the
+open takes its slot the moment it passes the bound, so two opens
+racing cannot both find room — and an open that then fails gives the
+slot back in a hold of its own, so `/status` counts an open in flight
+along with the opens that completed. A close releases the count.
+**Giving the slot back is releasing a claim**, so a failing open's
+bail-out carries the same free predicate an `objsnapclose` does: the
+slot is the open's claim from the moment the bound is passed, and an
+open in flight when `storeclose` runs is therefore the store's last
+claim — `storeclose` finds the count non-zero, defers, and the
+bail-out is what releases the memory.
 
 **A snapshot MAY outlive `storeclose`.** The store's memory is not
 released while one names it: `storeclose` stops the procs, then takes
@@ -3069,13 +3084,26 @@ unreachable where it makes it.
 
 **Each slot is read back after its flush** and checked — magic,
 `vers`, `len` within the slot, the checksum over `secsz+len`, and the
-`seq`, `len` and `epoch` just written. That is what makes step 1's "a
-torn ring write … fails the commit" true rather than hopeful: a
-`Sfdrop` or a torn write reports success, survives its flush and
-lands nothing, and without the read-back the running monitor holds a
-ring entry the platter does not — so position 0 would stop being the
-current map and layer-a §8.2's `E−1` entry would be unanswerable at
-the next start.
+`seq`, `len` and `epoch` just written. It is for exactly one fault: a
+device that **reports a successful write, acknowledges the flush after
+it, and does not hold the bytes at the offset the write named** —
+nothing landed, or part of it did. That is the empty or partial case
+of the torn write §3.2 already allows the device, and neither return
+value says anything about it; a read through the same device is the
+only thing that does.
+
+Both slots are read back, and the **current-map** slot is the one that
+pays for it. A ring slot the platter does not hold costs layer-a
+§8.2's retention MUST: position 0 stops being the current map, the
+entry the next publish owes as `E−1` is missing, and an instance falls
+back to layer-a §5.2 clause 2's substitution — correct, and wider than
+it needs to be. A **current** slot the platter does not hold costs the
+cluster. The monitor has acknowledged epoch `E`, every instance has
+adopted it and made `epochhigh = E` durable (layer-a §6.3), and this
+monitor's next start serves `E−1`; every instance then rejects the map
+as an epoch regression and stays fenced until an operator runs
+`forceepoch` (layer-a §8.3). No later publish, restart or crash rule
+recovers it, because the fault is that the acknowledgement was given.
 
 A slot that **reads back and is not the one written** says the map is
 not durable, and the commit fails exactly as a failed write does:
@@ -3120,6 +3148,18 @@ bytes anyway is outside this store's model, exactly as it is outside
 the object store's: §13's simulated disk makes durability after a
 flush its contract, and §3.2's `-w` assertion is what an operator
 gives for a unit whose flush does not reach the platter.
+
+Nothing on the target platform is known to drop an accepted write
+this way: `docs/platform/9front-storage.md` §5 has `devsd` do no
+caching of its own and issue one request per `pwrite`, §6 lost none
+of 7519 acknowledged raw writes and tore none, and the one lying
+mechanism that document names — the legacy IDE driver's faked
+`SYNCHRONIZE CACHE` — is precisely the case a read-back cannot catch.
+The monitor pays the four reads anyway and §3.2's log does not, and
+the difference is not the device: an instance that loses an
+acknowledged log record is one of `R` copies and layer-a repairs it by
+arbitration and heal, while the monitor's map is the cluster's only
+copy (layer-a §6.5). The guard is bought for the single copy.
 
 **Choose on start:** read both current-map slots, take the valid one
 with the greater `seq`; two valid slots at equal `seq` — which is what
@@ -3948,8 +3988,9 @@ snapshot each walked by position with an entry created, deleted,
 created over and discarded under it, both halves of the gone rule
 discriminated one at a time, a live copy condemned under an open
 `/obj` and still answered with `corrupt=1` rather than dropped (D14),
-the bound on open snapshots, the `disk full` past it and the refusal
-of a `kinds` the engine has no state for, three snapshots outliving
+the bound on open snapshots at its default and at `objsnapmax = 2`,
+the whole `disk full` text past it and the refusal of a `kinds` the
+engine has no state for, three snapshots outliving
 a `storeclose` — every read through them refused `store closed`,
 an entry deleted before the close included, so that the refusal is
 watched where the *gone* answer was available; `objsnapcount` still
