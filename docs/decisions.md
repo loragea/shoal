@@ -624,9 +624,11 @@ in `lib/map.c`:
 - **A clock that has gone backwards fences.** `now < last` counts as
   `leasems` having elapsed: kind `lease`, until the next successful
   refresh.
-- **`monid` is checked before the epoch, and one code is answered.**
-  `mapadoptable` answers `Mapmonid` for a map from another authority
-  even when its epoch also regresses.
+- **Both §6.3 refusals are reported when both hold.** `mapadoptable`
+  answers the OR of the refusals: a map from another authority at an
+  epoch below the one held sets `monidmismatch=yes` and
+  `epochregress=yes` both. `adoptwhy` names the flag of one bit and
+  the caller renders each bit it finds set.
 - **`forceepoch` is exempt from "exactly `current+1`", not from
   increasing.** `mapnextok(cur, next, 1)` requires
   `next->epoch > cur->epoch` and lifts only the `monid` check.
@@ -644,9 +646,17 @@ A backwards clock breaks the one assumption §6.4 makes about clocks —
 that elapsed time can be measured — and F1 is the only thing between a
 deposed primary and the D2 violation fencing exists to prevent; one
 poll interval of `not ready` against an acked write lost is not a close
-call. The `monid` tripwire fires first because a map from a different
-authority is not a map whose epoch is comparable to ours, and one
-`/status` flag is enough to send an operator to §8.6. And §8.1's
+call. §6.3 states its two refusals as independent MUSTs, each naming its
+own flag: an instance "MUST reject a map whose `epoch` is lower than
+the epoch it currently holds … and MUST report the condition in
+`/status` (`epochregress=yes`)", and it "MUST refuse … any map whose
+`monid` differs, reporting `monidmismatch=yes` in `/status`". Neither
+sentence is conditioned on the other, and the accident §6.3 says the
+tripwire exists for — "a freshly created monitor … being pointed at a
+live cluster" — has both properties, so answering one code left
+`epochregress=yes` unset for exactly the case the rule was written
+for. Nothing in §6.3 orders the two conditions, so the order they are
+tested in is free; dropping one is not. And §8.1's
 exemption is worded "sets the next epoch to an arbitrary **higher**
 value", §6.1 makes the epoch strictly increasing and §8.6.2 forbids
 publishing an epoch a monitor cannot prove is the highest — an
@@ -656,14 +666,17 @@ exemption from the `+1` only.
 scoping, are layer-a's (§5.2) and a reimplementation must match them.
 So is the `force` epoch relation: §6.1's strictly increasing epoch and
 §8.6.2's proof obligation, of which §8.1's exemption lifts only the
-`+1`.
+`+1`. So is reporting both §6.3 conditions when both hold: its two
+sentences are separate MUSTs, each naming its own `/status` flag.
 
 **Implementation policy:** what this library does when it holds no
 `E−1` map (evaluate clause 4's `E` half alone, and leave the
 `/maps/<E−1>` fetch to the caller) — an implementation that fetches
 inside the check, or blocks until it has the map, conforms equally;
-the order of the two §6.3 refusals and answering one code rather than
-both; and the backwards-clock reading, since §6.4's assumption makes
+the order in which the two §6.3 conditions are tested, and this
+library's shape for them — one `int` of flag bits, `adoptwhy` naming
+one bit at a time, the rendering of `/status` left to the server;
+and the backwards-clock reading, since §6.4's assumption makes
 the case undefined rather than decided. Also policy, and a known cost:
 `mapprimary` and `mapunderrep` each recompute the whole placement, so a
 `/status` path reporting both runs the HRW twice — measured against

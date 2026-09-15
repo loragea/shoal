@@ -1187,8 +1187,8 @@ void	monstat(Mon*, Monstat*);
  * §2.6's `bad map' with a detail after a colon, and that is the only
  * §2.6 prefix anything here produces (store.md §3.7's mapping rule).
  * An instance's refusal to adopt a map is not a wire error at all —
- * §6.3 reports it in /status — so mapadoptable answers a code, not a
- * string.
+ * §6.3 reports it in /status — so mapadoptable answers flag bits,
+ * not a string.
  */
 enum
 {
@@ -1469,14 +1469,21 @@ Cinst*	witblocker(Cwit*, int n);
  * pair (highest adopted epoch, pinned monid) — store.md §2.2 says
  * where it lives — plus whether it has ever adopted a map.
  * mapadoptable decides and changes nothing; mapadopted records an
- * adoption that went ahead.  adoptwhy names the /status flag a
- * refusal sets, or nil for Mapok.
+ * adoption that went ahead.
+ *
+ * §6.3 makes two independent MUSTs, one per flag, so the codes below
+ * are BITS and mapadoptable answers the OR of every refusal that
+ * holds: the map that trips both — another authority's, at an epoch
+ * below ours — must report both flags.  adoptwhy names the /status
+ * flag of ONE bit, and answers nil for anything that is not a single
+ * known bit; a caller renders each bit it finds set, rendering
+ * /status itself being the server's job and not this library's.
  */
 enum
 {
-	Mapok	= 0,
-	Mapregress,	/* epoch below the one held: epochregress=yes */
-	Mapmonid,	/* monid differs from the pin: monidmismatch=yes */
+	Mapok		= 0,
+	Mapregress	= 1<<0,	/* epoch below the one held: epochregress=yes */
+	Mapmonid	= 1<<1,	/* monid differs from the pin: monidmismatch=yes */
 };
 
 typedef struct Adopt Adopt;
@@ -1487,9 +1494,9 @@ struct Adopt
 	uvlong	epoch;
 };
 
-int	mapadoptable(Adopt*, Cmap*);
+int	mapadoptable(Adopt*, Cmap*);	/* Mapok, or the OR of the refusals */
 void	mapadopted(Adopt*, Cmap*);
-char*	adoptwhy(int);
+char*	adoptwhy(int bit);		/* one bit's /status flag, or nil */
 
 /*
  * §6.4's fence state.  Times are milliseconds on the caller's own

@@ -1512,11 +1512,34 @@ tadopt(void)
 		fail("adopt: the monid flag is %s", adoptwhy(Mapmonid));
 	checks += 2;
 	mapfree(m);
+
+	/*
+	 * §6.3 makes two MUSTs, each with its own /status flag, and the
+	 * accident it names — a freshly created monitor pointed at a
+	 * live cluster — trips both: a foreign monid BELOW the held
+	 * epoch must answer both flags, not whichever was tested first.
+	 */
 	m = epochmap(1, monid1);
-	if(mapadoptable(&a, m) != Mapmonid)
-		fail("adopt: a foreign monid below the held epoch");
+	if(mapadoptable(&a, m) != (Mapmonid|Mapregress))
+		fail("adopt: a foreign monid below the held epoch answers "
+			"%d, not both flags", mapadoptable(&a, m));
 	if(adoptwhy(Mapok) != nil)
 		fail("adopt: Mapok names a flag");
+	if(adoptwhy(Mapmonid|Mapregress) != nil)
+		fail("adopt: two bits at once name one flag");
+	checks += 3;
+	mapfree(m);
+
+	/* and each condition alone still answers its own bit alone */
+	m = epochmap(1, monid0);
+	if(mapadoptable(&a, m) != Mapregress)
+		fail("adopt: a regression alone answers %d",
+			mapadoptable(&a, m));
+	mapfree(m);
+	m = epochmap(99, monid1);
+	if(mapadoptable(&a, m) != Mapmonid)
+		fail("adopt: a foreign monid alone answers %d",
+			mapadoptable(&a, m));
 	checks += 2;
 	mapfree(m);
 }

@@ -1426,19 +1426,29 @@ witblocker(Cwit *w, int n)
 }
 
 /*
- * §6.3.  The monid tripwire is answered before the epoch, because a
- * map from a different authority is not a map whose epoch means
- * anything next to ours: an instance that has never adopted takes
- * whatever monid its first map carries.
+ * §6.3 states two refusals, each a MUST of its own with a /status
+ * flag of its own: a map whose epoch is below the one held is
+ * rejected and reports epochregress=yes, and a map whose monid
+ * differs from the pin is rejected and reports monidmismatch=yes.
+ * Neither sentence mentions the other, and the accident §6.3 names —
+ * a freshly created monitor pointed at a live cluster — trips both,
+ * so this answers the OR of every refusal that holds and leaves no
+ * flag unset.  An instance that has never adopted takes whatever
+ * monid its first map carries and has no epoch to regress from.
  */
 int
 mapadoptable(Adopt *a, Cmap *m)
 {
-	if(a->pinned && strcmp(a->monid, m->monid) != 0)
-		return Mapmonid;
-	if(a->pinned && m->epoch < a->epoch)
-		return Mapregress;
-	return Mapok;
+	int r;
+
+	r = Mapok;
+	if(!a->pinned)
+		return r;
+	if(strcmp(a->monid, m->monid) != 0)
+		r |= Mapmonid;
+	if(m->epoch < a->epoch)
+		r |= Mapregress;
+	return r;
 }
 
 void
@@ -1451,10 +1461,15 @@ mapadopted(Adopt *a, Cmap *m)
 	a->epoch = m->epoch;
 }
 
+/*
+ * One bit, one flag name.  A caller renders every bit mapadoptable
+ * set, one at a time; a value that is not a single known bit — Mapok,
+ * or two bits at once — names no one flag and answers nil.
+ */
 char*
-adoptwhy(int r)
+adoptwhy(int bit)
 {
-	switch(r){
+	switch(bit){
 	case Mapregress:	return "epochregress";
 	case Mapmonid:		return "monidmismatch";
 	}
