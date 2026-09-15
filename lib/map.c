@@ -658,6 +658,14 @@ mapdone(Parse *p)
 		for(i = 0; i < nelem(h); i++)
 			if((p->seen & h[i].bit) == 0)
 				return badmap("header has no %s=", h[i].name);
+		/*
+		 * Hneed and the table above are two lists of one fact.
+		 * Should they ever drift apart, refuse the map anyway:
+		 * falling through here would accept a header missing a
+		 * required attribute because no name could be printed
+		 * for it.
+		 */
+		return badmap("header is missing a required attribute");
 	}
 	if(m->leasems <= m->pollms)
 		return badmap("leasems %lud is not over pollms %lud",
