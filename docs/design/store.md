@@ -2742,8 +2742,16 @@ the store's own reference; there is no second counter beside
 taken before the close then **fail** `store closed` (a local error,
 no layer-a §2.6 prefix — nothing is full and nothing is broken, §3.7)
 rather than answering *gone*: `objsnapent` tests `closed` as the
-first statement inside the hold it already takes, before it touches
-`s->idx`, which `storefree` is what destroys. `objsnapcount` still
+first statement inside the hold it already takes, ahead of the
+`qidpath` and state tests that would otherwise answer *gone* for an
+entry deleted or discarded since the open. That position is what
+makes the refusal win over the lie, and it is a **contract refusal
+and not a memory guard**: `storefree` is the only thing that frees
+`s->idx`, and it cannot have run while this snapshot holds the
+store, so the index underneath is whole and still matching. What the
+test guards is that a store which has stopped serving — its procs
+gone, its device the caller's to have closed already — answers
+nothing out of what it happens to still hold in memory. `objsnapcount` still
 answers, because it reads the handle and not the store. A store that
 is condemned (§3.2) *and* closed answers `store condemned`, because
 `storeserving` runs ahead of the hold; both are true, and neither is

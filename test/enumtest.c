@@ -924,6 +924,7 @@ tclosesnap(void)
 	Objsnap *sn[3], *over;
 	Objinfo oi;
 	uchar got[Oidmax];
+	long gone;
 	int i, oidlen;
 
 	d = newdisk();
@@ -939,12 +940,29 @@ tclosesnap(void)
 			devclose(d);
 			return;
 		}
+	/*
+	 * One entry made gone before the close, so that the refusal is
+	 * tested where the other answer is available.  The `closed'
+	 * test is the first statement inside objsnapent's hold, ahead
+	 * of the qid.path and state tests: put it after them and this
+	 * position answers 0 — `that entry is gone' — which is the lie
+	 * §9 refuses to serve, entry by entry, to a server that closed
+	 * its store under a live fid.  Nothing here is about memory:
+	 * s->idx is whole, since storefree is the only thing that frees
+	 * it and these three snapshots are holding the store.
+	 */
+	gone = mustpos(sn[0], "e1", "storeclose");
+	rmv(s, "e1", 2);
+	eqv("a delete before the close answers gone",
+		objsnapent(sn[0], gone, got, &oidlen, &oi), 0);
 	storeclose(s);
 	eqv("a store closed under three snapshots is not freed", nfreed, 0);
 	eqv("and the snapshot still counts its entries",
 		objsnapcount(sn[0]), 2);
 	refused("objsnapent after the store was closed",
 		objsnapent(sn[0], 0, got, &oidlen, &oi), "store closed");
+	refused("a gone entry after the store was closed",
+		objsnapent(sn[0], gone, got, &oidlen, &oi), "store closed");
 	refused("the last entry after the store was closed",
 		objsnapent(sn[2], 1, got, &oidlen, &oi), "store closed");
 	/*

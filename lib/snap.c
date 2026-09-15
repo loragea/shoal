@@ -332,14 +332,22 @@ objsnapent(Objsnap *sn, ulong i, uchar *oid, int *oidlen, Objinfo *oi)
 	slot = sn->slot[i];
 	qlock(&s->qlstate);
 	/*
-	 * §9: the store may have been closed under this snapshot, and
-	 * then the index this would render from is gone while the Store
-	 * around it is not.  The test is the FIRST thing inside the
-	 * hold — not a hold of its own, which would double the 2.6·10^5
-	 * short holds a full walk costs for nothing — and it precedes
-	 * every touch of s->idx.  A store that is condemned as well as
+	 * §9: the store may have been closed under this snapshot, and a
+	 * closed store answers nothing.  This is a CONTRACT refusal and
+	 * not a memory guard: storefree is the only thing that frees
+	 * s->idx and it cannot have run while this snapshot holds the
+	 * store, so the entry below is whole and still matching — what
+	 * the test refuses is a store that has stopped serving, whose
+	 * procs are gone and whose device the caller may already have
+	 * closed, answering out of what it happens to still hold.  It is
+	 * the FIRST thing inside the hold — not a hold of its own, which
+	 * would double the 2.6·10^5 short holds a full walk costs for
+	 * nothing — and being first is what makes the refusal win over
+	 * the two tests below, which would answer 0, "that entry is
+	 * gone", for an entry deleted or discarded since the open: the
+	 * lie §9 exists to refuse.  A store that is condemned as well as
 	 * closed answers `store condemned', because storeserving above
-	 * runs first; both are true and neither is the "gone" lie.
+	 * runs first; both are true and neither is the lie.
 	 */
 	if(s->closed){
 		qunlock(&s->qlstate);
