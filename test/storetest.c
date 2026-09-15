@@ -18,6 +18,13 @@
 enum
 {
 	Blk	= 4096,			/* the small geometry's blksz */
+	/*
+	 * The condemned-slot fixture's object: three blocks with a
+	 * short last one, so that blkcount(len) and len/blksz differ
+	 * and a count of the grains it holds cannot be either by
+	 * accident (§6's leaked-grain count).
+	 */
+	Wlen	= 2*Blk + Blk/2,
 };
 
 /*
@@ -635,6 +642,58 @@ tcondemn(void)
 }
 
 /*
+ * The fixture §5 step 10's condemnation is read from, and §6's
+ * leaked-grain count with it: a store holding one three-block object
+ * whose extent-map entry has been damaged on the disk after the
+ * checkpoint that wrote it.  The store is closed and the damage done
+ * when this returns, so the caller opens it and decides what reads
+ * it.  The object's last block is short (Wlen), which is what makes
+ * a count of its grains discriminating: blkcount(Wlen) is 3 and
+ * Wlen/blksz is 2.
+ */
+static Dev*
+badmapdisk(Shadow *sh, Objinfo *oi, char *what)
+{
+	Dev *d;
+	Store *s;
+	Sbsel sel;
+	Super sup;
+	uchar *buf, oid[Oidmax], junk[8];
+
+	d = newdisk();
+	if((s = mustopen(d, what)) == nil){
+		devclose(d);
+		return nil;
+	}
+	mkobj(s, "wide", 1);
+	buf = mkbuf(Wlen, 21);
+	wr(s, "wide", sh, buf, Wlen, 0, 2);
+	free(buf);
+	oidof(oid, "wide");
+	memset(oi, 0, sizeof *oi);
+	if(objstat(s, oid, 4, oi) < 0)
+		fail("%s: objstat wide: %r", what);
+	istrue("a three-block object has an extent-map slot",
+		oi->emapslot != 0);
+	if(storecheckpoint(s) < 0)
+		fail("%s: storecheckpoint: %r", what);
+	storeclose(s);
+
+	/*
+	 * Damage a digest rather than a grain number, so that a store
+	 * that served the entry would answer with real bytes: what is
+	 * being tested is that it does not serve it at all.
+	 */
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	sup = sel.sb[sel.start];
+	memset(junk, 0xa5, sizeof junk);
+	simpoke(d, emapentoff(&sup, oi->emapslot) + sup.emapsz - sizeof junk,
+		junk, sizeof junk);
+	return d;
+}
+
+/*
  * §5 step 9 and step 10 at run time.  An extent-map entry that fails
  * its csum128 and that replay did not touch is media damage the log
  * does not cover: the slot goes to /lost with kind=corrupt and is not
@@ -652,45 +711,21 @@ tbadmap(void)
 	Shadow sh;
 	Objinfo oi, oi2;
 	Vfy vfy;
-	Sbsel sel;
-	Super sup;
 	Stage *g;
-	uchar *buf, *other, rd[64], junk[8], oid[Oidmax];
+	uchar *other, rd[64], oid[Oidmax];
 	char err[ERRMAX];
-	ulong slot, gf, sf;
-	uvlong nl, ef;
+	ulong gf, sf;
+	uvlong nl, ef, gh;
 
 	memset(&sh, 0, sizeof sh);
-	d = newdisk();
-	if((s = mustopen(d, "a damaged extent map")) == nil)
+	if((d = badmapdisk(&sh, &oi, "a damaged extent map")) == nil){
+		free(sh.p);
 		return;
-	mkobj(s, "wide", 1);
-	buf = mkbuf(3*Blk, 21);
-	wr(s, "wide", &sh, buf, 3*Blk, 0, 2);
+	}
 	oidof(oid, "wide");
-	if(objstat(s, oid, 4, &oi) < 0)
-		fail("objstat wide: %r");
-	slot = oi.emapslot;
-	istrue("a three-block object has an extent-map slot", slot != 0);
-	if(storecheckpoint(s) < 0)
-		fail("storecheckpoint: %r");
-	storeclose(s);
-
-	/*
-	 * Damage a digest rather than a grain number, so that a store
-	 * that served the entry would answer with real bytes: what is
-	 * being tested is that it does not serve it at all.
-	 */
-	if(superselect(d, &sel) < 0)
-		sysfatal("superselect: %r");
-	sup = sel.sb[sel.start];
-	memset(junk, 0xa5, sizeof junk);
-	simpoke(d, emapentoff(&sup, slot) + sup.emapsz - sizeof junk, junk,
-		sizeof junk);
 
 	if((s = mustopen(d, "a damaged extent map, replayed")) == nil){
 		devclose(d);
-		free(buf);
 		free(sh.p);
 		return;
 	}
@@ -742,7 +777,7 @@ tbadmap(void)
 	if(objverify(s, oid, 4, &vfy) >= 0)
 		fail("a damaged extent map was verified through");
 	checks++;
-	if(objwrite(s, oid, 4, buf, 64, 0, 3, 1, nil, 0) >= 0)
+	if(objwrite(s, oid, 4, rd, sizeof rd, 0, 3, 1, nil, 0) >= 0)
 		fail("a write was served through a damaged extent map");
 
 	/*
@@ -767,7 +802,6 @@ tbadmap(void)
 	storeclose(s);
 	if((s = mustopen(d, "a damaged extent map, restarted")) == nil){
 		devclose(d);
-		free(buf);
 		free(sh.p);
 		return;
 	}
@@ -781,7 +815,7 @@ tbadmap(void)
 		fail("a condemned slot lost its object across a restart: %r");
 	else{
 		eqv("the restarted slot keeps its key", oi2.ver, 2);
-		eqv("and its length", oi2.len, 3*Blk);
+		eqv("and its length", oi2.len, Wlen);
 	}
 	/*
 	 * The condemnation is durable in the entry's own Icorrupt bit
@@ -808,17 +842,25 @@ tbadmap(void)
 	 */
 	storestat(s, &st);
 	ef = st.emapfree;
-	if((g = stageopen(s, oid, 4, 3*Blk, 0)) == nil)
+	gh = st.grainfree;
+	/*
+	 * §6: nothing has leaked yet.  The condemned entry still names
+	 * its grains — badly, but it names them — and a rebuild would
+	 * re-mark exactly what is marked now.  The count is what the
+	 * heal below turns from an inference into a number.
+	 */
+	eqv("a condemned slot on its own leaks nothing", st.grainleak, 0);
+	if((g = stageopen(s, oid, 4, Wlen, 0)) == nil)
 		fail("stageopen: %r");
 	else{
-		other = mkbuf(3*Blk, 55);
-		if(stagewrite(g, other, 3*Blk, 0) < 0)
+		other = mkbuf(Wlen, 55);
+		if(stagewrite(g, other, Wlen, 0) < 0)
 			fail("stagewrite: %r");
 		checks++;
 		if(stagefinal(g, 2, 1, nil, 0) < 0)
 			fail("op=full to a condemned copy: %r");
 		else{
-			shwrite(&sh, other, 3*Blk, 0);
+			shwrite(&sh, other, Wlen, 0);
 			if(objstat(s, oid, 4, &oi2) < 0)
 				fail("objstat after the heal: %r");
 			else{
@@ -841,12 +883,115 @@ tbadmap(void)
 			 */
 			eqv("and the map it moved off is released",
 				st.emapfree, ef);
+			/*
+			 * §6: the heal is a leaking exit, exactly as a
+			 * delete is.  It rebuilds the map in a fresh slot
+			 * over fresh grains, and nothing names the three
+			 * the damaged entry held, so the disk pays for the
+			 * object twice: grainfree falls by the three the
+			 * heal took, and grainleak counts the three left
+			 * marked.  blkcount(Wlen) is that 3 and Wlen/blksz
+			 * is 2, so a count that used the division would
+			 * report 2 here.
+			 */
+			eqv("a heal over a condemned slot takes fresh grains",
+				st.grainfree, gh - 3);
+			eqv("and counts the ones it left marked",
+				st.grainleak, 3);
 		}
 		free(other);
 	}
 	storeclose(s);
 	devclose(d);
-	free(buf);
+	free(sh.p);
+}
+
+/*
+ * §6's leaked-grain count from the other leaking exit, and the
+ * rebuild that ends it.  A delete of a condemned slot is accepted
+ * (§8, D14), and its `nfree' names nothing: the entry that named the
+ * object's grains is the damage.  So the delete frees no space, the
+ * store counts what it left marked, and §5 step 11's rebuild —
+ * `shoalck -R' — is what returns it.
+ *
+ * The count is where the two mutations that matter show up.  Drop the
+ * increment and the store is back to reporting a leak only through an
+ * offline cross-check; free blkcount(len) grains the delete cannot
+ * name, and the three grains this object still owns go back to the
+ * allocator with the bitmap saying they are free — which the rebuild
+ * assertion below catches as well, since it then has nothing to
+ * return.
+ */
+static void
+tleakdel(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Shadow sh;
+	Objinfo oi;
+	uchar rd[64], oid[Oidmax];
+	uvlong gf;
+
+	memset(&sh, 0, sizeof sh);
+	if((d = badmapdisk(&sh, &oi, "a delete over a damaged map")) == nil){
+		free(sh.p);
+		return;
+	}
+	oidof(oid, "wide");
+	if((s = mustopen(d, "a damaged extent map, before the delete")) == nil){
+		devclose(d);
+		free(sh.p);
+		return;
+	}
+	checks++;
+	if(objread(s, oid, 4, rd, sizeof rd, 0) >= 0)
+		fail("an extent map that failed its checksum was served");
+	storestat(s, &st);
+	eqv("the first read condemns the slot", st.nlost, 1);
+	eqv("and nothing has leaked yet", st.grainleak, 0);
+	gf = st.grainfree;
+
+	checks++;
+	if(objremove(s, oid, 4, 3, 1, nil, 0) < 0)
+		fail("op=delete over a condemned slot: %r");
+	storestat(s, &st);
+	eqv("the tombstone takes the slot out of /lost", st.nlost, 0);
+	/*
+	 * The delete reads no map, so its `nfree' names nothing and no
+	 * grain is returned.  A delete that freed blkcount(len) grains
+	 * anyway would be freeing numbers it never read: the allocator
+	 * would hand out grains this object's bytes are still in, which
+	 * is the silent corruption §5 step 10 exists to prevent.
+	 */
+	eqv("a delete over a condemned slot frees no grain", st.grainfree,
+		gf);
+	eqv("and counts the grains it left marked", st.grainleak, 3);
+	storeclose(s);
+
+	/*
+	 * §5 step 11's rebuild, forced: what `shoalck -R' drives.  The
+	 * tombstone holds no map, so the scan finds nothing naming the
+	 * three grains and they come back free — this is the assertion
+	 * that says the offline rebuild is what returns the space.  The
+	 * count goes with them: it is memory only, so a start is what
+	 * clears it (§6) and nothing carries one across.  That last
+	 * assertion is an invariant, not a discriminating one — there
+	 * is no path by which a non-zero count could survive a start —
+	 * and it is here so that a count someone later made durable
+	 * would have to answer for itself.
+	 */
+	if((s = openrebuild(d, "shoalck -R over a leaked object")) == nil){
+		devclose(d);
+		free(sh.p);
+		return;
+	}
+	storestat(s, &st);
+	eqv("a rebuild returns the leaked grains", st.grainfree, gf + 3);
+	eqv("and the restarted store starts the count at zero",
+		st.grainleak, 0);
+	storeclose(s);
+	devclose(d);
 	free(sh.p);
 }
 
@@ -2221,6 +2366,7 @@ main(int argc, char **argv)
 	tckmark();
 	tcondemn();
 	tbadmap();
+	tleakdel();
 	tlogread();
 	treplayapply();
 	treclaimfault();

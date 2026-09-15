@@ -209,6 +209,22 @@ mustopen(Dev *d, char *what)
 	return s;
 }
 
+/* §5 step 11's rebuild, forced: what `shoalck -R' drives */
+static Store*
+openrebuild(Dev *d, char *what)
+{
+	Storecfg c;
+	Store *s;
+
+	tcfg(&c);
+	c.forcerebuild = 1;
+	if((s = storeopen(d, &c)) == nil){
+		fail("%s: storeopen: %r", what);
+		return nil;
+	}
+	return s;
+}
+
 static uchar*
 mkbuf(long n, int seed)
 {

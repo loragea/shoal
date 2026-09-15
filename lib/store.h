@@ -217,6 +217,13 @@ struct Store
 	uvlong	nbmpage;
 	uvlong	graincur;
 	uvlong	grainfree;
+	/*
+	 * §6's leaked-grain count: what the apply of a record over a
+	 * condemned slot left marked and named by nothing.  Memory only
+	 * — it describes an error in the bitmap, and the bitmap is what
+	 * a rebuild corrects — and qlstate's, like grainfree.
+	 */
+	uvlong	grainleak;
 	Sgrain	**stagebuck;		/* §6's hash of reserved grains */
 	Sgrain	*stagefree;		/* recycled nodes */
 	ulong	nstagebuck;

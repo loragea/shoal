@@ -360,7 +360,21 @@ applyrec(Store *s, Objrec *o, Emape *c)
 	 * this record's to set or clear.  /lost carries both conditions
 	 * (layer-a §7.5), so its membership is recomputed from the entry
 	 * after both have been written.
+	 *
+	 * This is also the one point that can count what the record left
+	 * behind (§6).  The damaged entry named the object's grains and
+	 * nothing else does, so neither a delete's `nfree' nor §3.6's
+	 * op=full can release them: they stay marked until a bitmap
+	 * rebuild.  The index entry's own `len' is intact — the damage
+	 * is in the extent map — so blkcount of it is the count, an
+	 * upper bound in general and exact for an object with no holes.
+	 * It is read here, before the record's len overwrites it.  A
+	 * slot §5 step 10 condemned for an index entry that does not
+	 * unpack has no readable len at all: its entry is zero, so this
+	 * adds nothing and /lost is the only report of it.
 	 */
+	if(e->bad)
+		s->grainleak += blkcount(e->len, s->sb.blksz);
 	e->bad = 0;
 	e->qidpath = o->qidpath;
 	e->len = o->len;

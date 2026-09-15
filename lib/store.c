@@ -1255,6 +1255,7 @@ storestat(Store *s, Storestat *st)
 	qlock(&s->qlstate);
 	st->grainfree = s->grainfree;
 	st->staged = s->nstaged;
+	st->grainleak = s->grainleak;
 	st->slotfree = s->slotfree;
 	st->emapfree = s->emapfree;
 	st->nslots = s->sb.nslots;

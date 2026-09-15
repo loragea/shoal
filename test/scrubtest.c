@@ -110,22 +110,6 @@ refusedinternal(char *what, int r)
 		fail("%s: %s, want the block-repair refusal", what, e);
 }
 
-/* §5 step 11's rebuild, forced: what `shoalck -R' drives */
-static Store*
-openrebuild(Dev *d, char *what)
-{
-	Storecfg c;
-	Store *s;
-
-	tcfg(&c);
-	c.forcerebuild = 1;
-	if((s = storeopen(d, &c)) == nil){
-		fail("%s: storeopen: %r", what);
-		return nil;
-	}
-	return s;
-}
-
 static void
 scrub(Store *s, char *name, Vfy *v, char *what)
 {

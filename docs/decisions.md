@@ -387,3 +387,54 @@ and the statistics. A conforming implementation may pace a failing
 checkpointer any other way, or name a permanently failed one
 differently, so long as a store that cannot checkpoint does not spin
 and an operator can tell a device that may heal from one that cannot.
+
+## D18 — A condemned slot's grains are reclaimed online by the scrubber; `shoalck -R` is the interim (2026-09-15, Victor)
+
+**Decision:** A slot §5 step 10 condemned leaks the grains its
+damaged extent map named: `op=delete` over it commits a tombstone
+whose `nfree` names nothing, and §3.6's `op=full` over it rebuilds
+the map in a fresh slot over fresh grains. The permanent reclaim is
+**online and scrub-driven** — wave 1d's scrubber already reads every
+live entry's map, so its pass accumulates a shadow bitmap and swaps
+it in page by page under `qlstate`, behind a write barrier on the
+two bitmap mutators — and it needs a per-slot generation stamp,
+because the block repair and the `corrupt`-flag commit both publish
+with the four-tuple unchanged while the map changes. The scrubber
+does not exist yet, so what the store does today is *account*: each
+leaking exit adds `blkcount(len)` to a memory-only **leaked-grain
+count**, reported as `grainleak=` and starting at zero at every
+start, which is where a rebuild happens. The grains come back at
+that rebuild: `shoalck -R`, or §5 step 11 when start found a damaged
+bitmap page. `design/store.md` §6, §8 and §13 say so, with the
+scrub half marked as not built.
+**Owner's direction (Victor):** "manual intervention needed? That
+sounds VERY bad … should be folded into scrub."
+**Rationale:** Keeping the offline rebuild as the *permanent* answer
+was rejected even though the quantity is bounded and small — one
+media fault in one 41-sector extent-map entry condemns one slot and
+leaks at most `objmax`, 16 MiB at the defaults, and `-R` is about
+three minutes on one instance of a replicated cluster. An operator
+procedure for a condition the store can fix itself is the wrong
+shape: the walk pays the same full map scan either way, so what an
+online rebuild buys is not the work but the downtime, and the scrub
+is the one pass that pays the I/O anyway and that gives the per-slot
+validation for free by running inside the object's `Reqqueue`. The
+alternatives were rejected on cost: a durable "rebuild at next
+start" flag needs a new superblock field, hence a `Storevers` bump
+and a reformat, and pays out as a surprise slow start months later;
+a `/ctl` verb spends a change to layer-a §2.5's normative grammar,
+on a file that does not exist yet; `-R` against a live store is two
+allocators and two superblock publishers over one partition, which
+§2.2 forbids outright. The counter lands now on its own merits: the
+leak was previously visible only through `shoalck`'s offline
+cross-check, so a serving store could not distinguish space in use
+from space marked and referenced by nothing, and that number is what
+says when a pass would be worth its I/O.
+**Normative:** none. Nothing here reaches a wire or an on-disk
+format; `/status`'s only normative field is `epoch=` (layer-a §2.2).
+**Implementation policy:** all of it — the count and its name, that
+it is memory-only and an upper bound, the interim reliance on a
+bitmap rebuild, and the scrub-driven shadow-bitmap mechanism with
+its generation stamp. A conforming implementation may reclaim the
+grains some other way, or not report them at all, so long as it
+never frees a grain no map it read named.

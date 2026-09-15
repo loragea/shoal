@@ -2013,8 +2013,23 @@ A slot §5 step 10 condemned is the exception, and it is the point of
 allowing the delete at all: the entry that named its grains is the
 damaged bytes, so the delete reads no map and its `nfree` names
 **nothing**. The extent-map slot is still released and the tombstone
-is still clean; the grains come back at a bitmap rebuild and not
-before (§3.6, §8, §12).
+is still clean. Until the scrub-driven rebuild §8 describes exists,
+the grains come back at the next **bitmap rebuild** and not before —
+`shoalck -R` (§12), or §5 step 11 when step 5 set the flag — and the
+count below is what reports them meanwhile (§3.6, §8, §12).
+
+The store counts what it left behind. A delete of a condemned slot,
+and §3.6's `op=full` over one, each add `blkcount(len)` to a
+**leaked-grain count** that `/status` reports as `grainleak=`: the
+index entry's `len` is intact — it is the extent-map entry that is
+damaged — so the count is an upper bound, and exact for an object
+with no holes. It is memory only and starts at zero at every start,
+because what it describes is the bitmap's error and the bitmap is
+what a rebuild corrects; the standing number over a disk's life is
+§12's `shoalck` cross-check. Not every leak is countable: a slot §5
+step 10 condemned for an index entry that does not unpack has no
+readable `len`, so it raises `lost=` and nothing else.
+
 What survives is the 256-byte index entry. Layer-a §1.5's discard,
 once its three cluster-wide conditions hold, commits an `Eslot` and
 the slot returns to the free list. The discard names the tombstone's
@@ -2518,7 +2533,11 @@ only exit: `op=full` is a condemned copy's other repair, and an
 object being deleted cluster-wide has no live copy left to push one,
 so layer-a §1.5's tombstone discard would wait on this witness
 forever. The tombstone releases the extent-map slot, so the next
-bitmap rebuild (§2.5, `shoalck -R`) returns the grains.
+bitmap rebuild returns the grains — `shoalck -R` (§2.5, §12), or §5
+step 11 when step 5 set the flag. Until one runs they are marked and
+referenced by nothing, and §6's `grainleak=` is the store's own count
+of them; ending the takedown that reclaim costs today is the open
+half of the scrub below.
 
 A corrupt copy loses arbitration against everything including absence
 (layer-a §1.3), which the server enforces by refusing to advertise
@@ -2544,6 +2563,42 @@ two-vCPU node that also runs the write path. The engine's own calls
 make that discipline available rather than enforce it: each is one
 object's worth of work, serialised by the caller exactly as every
 other call in §7 is.
+
+**The pass is also where a condemned slot's grains come back.** *Not
+built: this is the other half wave 1d's scrubber carries, and until
+it exists the reclaim is the offline `shoalck -R` of §6 and §12.* The
+pass already reads every live entry's extent map, so a walk that
+accumulates those grains into a **shadow bitmap** and swaps it in
+costs almost no I/O beyond the pass itself, and it takes the takedown
+out of the answer. It breaks no §7 rule. The bitmap has exactly two
+mutators after start, the mark and the clear of §6's allocator, and
+both are already called under `qlstate` at apply time, so a **write
+barrier** that mirrors each into the shadow while a pass is live
+keeps the two copies current. The map reads happen outside the lock
+under `qlemap`'s pin, as every other map read does (§7 rules 1 and
+2), and the per-slot hold is an entry copy plus at most `nblkmax`
+bit-sets — tens of microseconds, far under §9's ~23 ms enumeration
+hold. The **swap goes page by page** under `qlstate`, installing and
+dirtying only the pages that differ: §5 step 11's rebuild dirties
+every page, which on a serving store is §2.5's 32 MiB and ~2036
+writes and would turn §6's `ckwaitms` wait into a spurious `disk
+full`. Chunking is safe because the barrier keeps both copies current
+until the last page lands. The staged set needs no barrier — a staged
+grain carries no bitmap bit (§6) — but the `grainfree` recount at the
+swap must subtract `nstaged` separately.
+
+What the walk needs and the store does not have is a **per-slot
+generation stamp**. The four-tuple is not a sufficient validation of
+an entry re-read outside `qlstate`: the block repair above and the
+`corrupt`-flag commit both publish with the four-tuple unchanged
+while the map changes (§2.7), so a walk that compared keys would OR
+in a stale map's grains. §16a(11) names the same shape for §9's
+enumeration — a chunked scan under a generation counter bumped by
+every apply that moves a slot — and one counter in the index entry
+serves both; the alternative is to run each per-slot step inside the
+object's `Reqqueue`, which is what this scrub walks in anyway. §6's
+`grainleak=` is what says how much a pass would return, and so what
+says when the work is worth doing.
 
 **What a corrupt object answers to `op=meta`.** No available answer
 is right: reporting the key claims an arbitration position layer-a
@@ -3831,7 +3886,9 @@ idempotence, §2.5's replay-coverage rule in all three of the
 cases it exists to tell apart, the automatic bitmap rebuild, §2.2's
 publisher and its durability orderings, §5 step 10's condemnation
 after — and only after — replay and again when a damaged extent map
-is first read, §2.6's exhaustion dropping one peer's records on the
+is first read, the grains a condemned slot's delete and its `op=full`
+leave marked, counted in `grainleak=` and returned by a rebuild,
+§2.6's exhaustion dropping one peer's records on the
 live path and on replay alike, §3.2's refusal to start without a
 flush channel, §4's re-hashing over every shape of write that changes
 a block's covered length, replay's closing write-back of its extent
@@ -4583,7 +4640,11 @@ rather than an amendment, because it touches the wire.
     a slot shows the index moved under it. That keeps `objsnap=full`
     — a restart is not a partial vector — at the price of a scan
     that can be made to starve by a continuous create rate, which is
-    why it is not built on speculation. T2.
+    why it is not built on speculation. §8's scrub-driven bitmap
+    rebuild wants the same counter for a different reason —
+    validating an extent map it re-read outside `qlstate`, which the
+    four-tuple cannot do — so whichever is built first builds it for
+    both. T2.
 
 ### (b) Product calls
 
