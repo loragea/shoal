@@ -683,14 +683,18 @@ struct Objinfo
 
 Store*	storeopen(Dev*, Storecfg*);
 /*
- * Stop the procs and free the store; it writes nothing.  Every object
- * snapshot taken from it (objsnapopen, below) MUST be closed first: a
- * snapshot is the caller's, so this frees none of them, and the store
- * they name would be gone underneath them.  A store closed with one
- * still open is a fid-lifetime bug in the caller, and this `sysfatal's
- * naming the count rather than leaving the snapshot to answer from
- * freed memory — which it would do plausibly, entry by entry, as
- * "that entry is gone".
+ * Stop the procs and give the store up; it writes nothing, and the
+ * device stays the caller's to close.  The Store* is INVALID the
+ * moment this returns — every call below takes one, and none of them
+ * may be made afterwards.
+ *
+ * The single exception is an object snapshot (objsnapopen, below): a
+ * snapshot MAY outlive this call.  It still names a Store that is
+ * still there, objsnapent through it then fails `store closed', and
+ * the store's memory is released when the LAST such snapshot is
+ * closed.  So a caller that closes the store first loses its listing
+ * and nothing else: no fatal, and no snapshot answering "that entry
+ * is gone" for every entry out of freed memory.
  */
 void	storeclose(Store*);
 int	storecheckpoint(Store*);
@@ -858,12 +862,19 @@ int	objslot(Store*, ulong slot, uchar *oid, int *oidlen, Objinfo*);
  * one hold of the state lock — the hold the open's first count takes
  * anyway — so two opens racing cannot both find room; an open that
  * fails after that gives the count back, and Storestat counts an open
- * in flight.  objsnapclose releases the count.  A snapshot is the
- * caller's and storeclose frees nothing of the caller's, so every
- * snapshot MUST be closed before the store it was taken from is:
- * storeclose `sysfatal's on a store that still has one open, because
- * the alternative is a snapshot answering "gone" for every entry out
- * of freed memory.  Closing one twice is UNDEFINED, exactly as
+ * in flight.  objsnapclose releases the count.
+ *
+ * **A snapshot MAY outlive storeclose**, and it is the ONLY thing
+ * that may: the Store* itself is invalid the moment storeclose
+ * returns, so objsnapopen, dirtysnap, lostsnap, fullsyncsnap and
+ * storestat on a closed store are undefined as before.  A snapshot
+ * that outlives one keeps the Store's memory alive, so objsnapcount
+ * still answers, objsnapent answers -1 `store closed' — refusing
+ * rather than lying "gone" for every entry — and the memory goes at
+ * the LAST objsnapclose.  objsnapopen on a store some other snapshot
+ * is holding alive that way refuses `store closed' too, but that is
+ * a courtesy inside an undefined call and not a guarantee the
+ * pointer can keep.  Closing one twice is UNDEFINED, exactly as
  * freeing the same pointer twice is: the second call reads a handle
  * the first freed, whose first word the pool has already overwritten,
  * so there is nothing it can check and no guard that would help.

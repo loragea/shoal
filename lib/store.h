@@ -183,6 +183,14 @@ struct Store
 	ulong	nhash;
 	ulong	nlive, ntomb;
 	ulong	nobjsnap;		/* §9's open snapshots; qlstate's */
+	/*
+	 * §9: storeclose has run.  It is the store's OWN reference, not
+	 * a flag beside one — the memory goes when `closed && nobjsnap
+	 * == 0', tested under qlstate by storeclose and by every
+	 * objsnapclose, so there is no second counter to drift out of
+	 * step with the bound's.
+	 */
+	int	closed;			/* qlstate's */
 	ulong	snapstale;		/* §13's snapstale point; qlstate's */
 	ulong	snapshort;		/* ... by how many entries; qlstate's */
 

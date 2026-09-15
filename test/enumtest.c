@@ -196,6 +196,47 @@ mustsnap(Store *s, int kinds, char *what)
 }
 
 /*
+ * §9's deferred free, watched.  A store closed under an open snapshot
+ * is freed by the LAST objsnapclose and not by storeclose, and there
+ * is no answer that discriminates the two: a read through a snapshot
+ * whose Store was freed early answers `store closed' correctly, out
+ * of the freed memory.  So these tests watch §13's freed hook, which
+ * the engine calls as its last act before the Store's memory goes.
+ *
+ * nfreed is a plain counter in bss, which RFMEM shares, so the
+ * concurrent shapes below see the same one their workers do.  Only
+ * the main proc reads it, and only after its workers have finished.
+ */
+static int nfreed;
+
+static void
+sawfree(void *a)
+{
+	USED(a);
+	nfreed++;
+}
+
+static Store*
+mustwatched(Dev *d, int ckproc, char *what)
+{
+	Store *s;
+	Storecfg c;
+
+	nfreed = 0;
+	tcfg(&c);
+	c.freed = sawfree;
+	if(ckproc){
+		/* §2.8's checkpointer, so storeclose has a proc to wait for */
+		c.nockptproc = 0;
+		c.ckhigh = 8;
+		c.ckms = 50;
+	}
+	if((s = storeopen(d, &c)) == nil)
+		fail("%s: storeopen: %r", what);
+	return s;
+}
+
+/*
  * The position of the entry naming name, and -1 if the snapshot does
  * not answer it.  A server maps a Tread offset onto a position; a
  * test that wants to mutate one entry has to find it the same way.
@@ -860,79 +901,136 @@ tsnapslack(void)
 }
 
 /*
- * §9: every snapshot MUST be closed before the store is, and a
- * storeclose that finds one open says so out loud.  Without that the
- * entries are rendered from a freed Store, which does not fault: the
- * walk finds no qid.path match and answers `gone' for every one of
- * them, so a fid-lifetime bug in a server serves a silently short
- * /obj listing.  The child is the proc that dies, so this one can
- * watch it: RFMEM so it shares the store, RFFDG so the standard
- * error it redirects is its own.
+ * §9: a snapshot MAY outlive the storeclose of the store it came
+ * from, and it is the only thing that may.  The Store's memory is
+ * held by the snapshot, so nothing reads freed memory; reads through
+ * it fail `store closed' rather than finding no qid.path match and
+ * answering `gone' for every entry, which is the lie a server would
+ * serve as a silently short /obj listing; and the memory goes at the
+ * LAST objsnapclose, which is what the freed hook watches.
+ *
+ * The hook is the whole of the discrimination: a storeclose that
+ * freed the store regardless would answer these same reads `store
+ * closed', correctly, out of the freed memory.  The one thing NOT
+ * tested here is storestat after the close — it answers too, and out
+ * of the same freed memory, but §9 makes it undefined on a closed
+ * store, so a test of it would fix behaviour the contract refuses.
  */
 static void
 tclosesnap(void)
 {
 	Dev *d;
 	Store *s;
-	Objsnap *sn;
-	Waitmsg *w;
-	int pid, fd, ok;
+	Objsnap *sn[3], *over;
+	Objinfo oi;
+	uchar got[Oidmax];
+	int i, oidlen;
 
 	d = newdisk();
-	if((s = mustopen(d, "storeclose under an open snapshot")) == nil)
+	if((s = mustwatched(d, 0, "storeclose under open snapshots")) == nil)
 		return;
 	mk(s, "e0");
 	mk(s, "e1");
-	if((sn = mustsnap(s, Snaplive, "storeclose")) == nil){
-		storeclose(s);
-		devclose(d);
-		return;
-	}
-	switch(pid = rfork(RFPROC|RFMEM|RFFDG)){
-	case -1:
-		fail("rfork: %r");
-		objsnapclose(sn);
-		storeclose(s);
-		devclose(d);
-		return;
-	case 0:
-		close(2);
-		if((fd = open("/dev/null", OWRITE)) >= 0 && fd != 2)
-			dup(fd, 2);
-		storeclose(s);
-		exits("storeclose returned");
-	}
-	ok = 0;
-	checks++;
-	if((w = wait()) == nil)
-		fail("wait for the closing child: %r");
-	else{
-		if(w->pid != pid)
-			fail("waited on pid %d, want the closing child %d",
-				w->pid, pid);
-		else if(w->msg[0] == '\0')
-			fail("storeclose under an open snapshot returned");
-		else if(strstr(w->msg, "object snapshot") == nil)
-			fail("storeclose under an open snapshot died with "
-				"`%s', want the snapshot count", w->msg);
-		else
-			ok = 1;
-		free(w);
-	}
+	for(i = 0; i < nelem(sn); i++)
+		if((sn[i] = mustsnap(s, Snaplive, "storeclose")) == nil){
+			while(--i >= 0)
+				objsnapclose(sn[i]);
+			storeclose(s);
+			devclose(d);
+			return;
+		}
+	storeclose(s);
+	eqv("a store closed under three snapshots is not freed", nfreed, 0);
+	eqv("and the snapshot still counts its entries",
+		objsnapcount(sn[0]), 2);
+	refused("objsnapent after the store was closed",
+		objsnapent(sn[0], 0, got, &oidlen, &oi), "store closed");
+	refused("the last entry after the store was closed",
+		objsnapent(sn[2], 1, got, &oidlen, &oi), "store closed");
 	/*
-	 * Only if the child really did die before storefree: under the
-	 * unguarded close it freed this proc's store, and touching it
-	 * again would fault over the FAIL line above.
+	 * Past the end is still the handle's own answer: objsnapent
+	 * tests i against the vector before it looks at the store at
+	 * all, so a closed store does not change what an out-of-range
+	 * position means.
 	 */
-	if(ok){
-		Storestat st;
+	refused("an entry past the end of a closed store's snapshot",
+		objsnapent(sn[0], 2, got, &oidlen, &oi), "entry 2");
+	over = objsnapopen(s, Snaplive);
+	refused("objsnapopen on a closed store", over != nil ? 0 : -1,
+		"store closed");
+	objsnapclose(over);		/* nil unless the refusal failed */
+	objsnapclose(sn[0]);
+	eqv("one of three closed: still not freed", nfreed, 0);
+	objsnapclose(sn[1]);
+	eqv("two of three closed: still not freed", nfreed, 0);
+	objsnapclose(sn[2]);
+	eqv("the last close frees the store", nfreed, 1);
+	devclose(d);
+}
 
+/*
+ * The other half of §9's rule: nothing is deferred when nothing is
+ * open.  A store closed with no snapshot — including one whose
+ * snapshots were all closed first, which is what a correct server
+ * does — is freed inside storeclose itself.
+ */
+static void
+tclosesnapplain(void)
+{
+	Dev *d;
+	Store *s;
+	Objsnap *sn;
+
+	d = newdisk();
+	if((s = mustwatched(d, 0, "storeclose with nothing open")) == nil)
+		return;
+	mk(s, "e0");
+	if((sn = mustsnap(s, Snaplive, "the snapshot closed first")) != nil)
 		objsnapclose(sn);
-		storestat(s, &st);
-		eqv("and the store closes once the count is back to nothing",
-			st.nobjsnap, 0);
+	eqv("closing the snapshot does not free the open store", nfreed, 0);
+	storeclose(s);
+	eqv("a store closed with no snapshot open frees at once", nfreed, 1);
+	devclose(d);
+}
+
+/*
+ * §3.2's condemnation and §9's close are both true at once, and the
+ * condemnation is what the snapshot is told: objsnapent runs
+ * storeserving — which reads the condemned flag under qllog — before
+ * it takes qlstate, so `store condemned' wins over `store closed'.
+ * Neither is the `gone' lie, and §9 says which comes out.  This is
+ * §0's Echange shape: the store is condemned first and closed after.
+ */
+static void
+tclosesnapcond(void)
+{
+	Dev *d;
+	Store *s;
+	Objsnap *sn;
+	Objinfo oi;
+	uchar got[Oidmax];
+	int oidlen;
+
+	d = newdisk();
+	if((s = mustwatched(d, 0, "a condemned store, then closed")) == nil)
+		return;
+	mk(s, "e0");
+	if((sn = mustsnap(s, Snaplive, "a condemned store, then closed"))
+	== nil){
 		storeclose(s);
+		devclose(d);
+		return;
 	}
+	storehook(s, "fatal", 1);
+	refused("objsnapent on a condemned store, before the close",
+		objsnapent(sn, 0, got, &oidlen, &oi), "store condemned");
+	storeclose(s);
+	eqv("a condemned store closed under a snapshot is not freed",
+		nfreed, 0);
+	refused("objsnapent on a store condemned and then closed",
+		objsnapent(sn, 0, got, &oidlen, &oi), "store condemned");
+	objsnapclose(sn);
+	eqv("and its last close frees it all the same", nfreed, 1);
 	devclose(d);
 }
 
@@ -2312,6 +2410,8 @@ main(int argc, char **argv)
 	tsnapstale();
 	tsnapslack();
 	tclosesnap();
+	tclosesnapplain();
+	tclosesnapcond();
 	tdirty();
 	tfullsync();
 	tlost();

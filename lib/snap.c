@@ -152,6 +152,21 @@ objsnapopen(Store *s, int kinds)
 		 */
 		qlock(&s->qlstate);
 		if(try == 0){
+			/*
+			 * §9: only an Objsnap handle may outlive
+			 * storeclose, so a closed store takes no new
+			 * one.  The check is sound only because some
+			 * other snapshot is holding this Store alive
+			 * for us to read the flag out of — a Store* is
+			 * invalid the moment storeclose returns, and
+			 * this refusal promises nothing beyond that.
+			 */
+			if(s->closed){
+				qunlock(&s->qlstate);
+				werrstr("store closed");
+				free(sn);
+				return nil;
+			}
 			if(s->nobjsnap >= s->cfg.objsnapmax){
 				qunlock(&s->qlstate);
 				werrstr("disk full: %lud object snapshots "
@@ -279,6 +294,21 @@ objsnapent(Objsnap *sn, ulong i, uchar *oid, int *oidlen, Objinfo *oi)
 		return -1;
 	slot = sn->slot[i];
 	qlock(&s->qlstate);
+	/*
+	 * §9: the store may have been closed under this snapshot, and
+	 * then the index this would render from is gone while the Store
+	 * around it is not.  The test is the FIRST thing inside the
+	 * hold — not a hold of its own, which would double the 2.6·10^5
+	 * short holds a full walk costs for nothing — and it precedes
+	 * every touch of s->idx.  A store that is condemned as well as
+	 * closed answers `store condemned', because storeserving above
+	 * runs first; both are true and neither is the "gone" lie.
+	 */
+	if(s->closed){
+		qunlock(&s->qlstate);
+		werrstr("store closed");
+		return -1;
+	}
 	e = &s->idx[slot];
 	if(e->qidpath != sn->qidpath[i] || !inkinds(e->state, sn->kinds)){
 		qunlock(&s->qlstate);
@@ -293,8 +323,18 @@ objsnapent(Objsnap *sn, ulong i, uchar *oid, int *oidlen, Objinfo *oi)
 }
 
 /*
- * Releases the bound's slot and frees the handle.  nil is a no-op, so
- * a caller can close whatever an open handed it.  Closing the same
+ * Releases the bound's slot and frees the handle — and, if this was
+ * the last snapshot of a store that storeclose has already run on,
+ * the Store's memory with it (§9): `closed' is the store's own
+ * reference, so `closed && nobjsnap == 0' is the whole free
+ * predicate, evaluated here under qlstate and acted on after the
+ * unlock.  Nobody can be waiting on that qlstate when the predicate
+ * holds — every party that can block on it holds a count this one
+ * has just given back, or is storeclose, which set `closed' only
+ * after its procs had stopped.
+ *
+ * nil is a no-op, so a caller can close whatever an open handed it.
+ * Closing the same
  * snapshot twice is undefined exactly as freeing the same pointer
  * twice is, and for the same reason: Objsnap.s is the handle's first
  * word, which the pool overwrites with its free-list links the moment
@@ -305,13 +345,17 @@ void
 objsnapclose(Objsnap *sn)
 {
 	Store *s;
+	int last;
 
 	if(sn == nil)
 		return;
 	s = sn->s;
 	qlock(&s->qlstate);
 	s->nobjsnap--;
+	last = s->closed && s->nobjsnap == 0;
 	qunlock(&s->qlstate);
+	if(last)
+		storefree(s);
 	free(sn->slot);
 	free(sn->qidpath);
 	free(sn);

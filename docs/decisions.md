@@ -305,3 +305,44 @@ it holds nothing that could resurrect the object, and on the next
 pass it confirms `absent=1` and is not sent the discard at all.
 **Normative:** the answer.
 **Implementation policy:** none.
+
+## D16 — A snapshot outlives `storeclose`; neither fatal nor "gone" (2026-09-15, Victor)
+
+**Decision:** `storeclose` under an open object snapshot no longer
+`sysfatal`s. It stops the store's procs, then sets `closed` under
+`qlstate`; the `Store`'s memory is released by whoever observes
+`closed && nobjsnap == 0` — `storeclose` itself when no snapshot is
+open, otherwise the last `objsnapclose`. A snapshot taken before the
+close still answers `objsnapcount`, and `objsnapent` through it
+fails `store closed` (a local error, no layer-a §2.6 prefix, §3.7).
+An `Objsnap` handle is the **only** thing that may outlive a
+`storeclose`: the `Store*` is invalid as before, so `dirtysnap`,
+`lostsnap`, `fullsyncsnap` and `storestat` are given no such check.
+`design/store.md` §9 and §7 now say so.
+**Owner's direction (Victor):** "a fs that just dies" is the wrong
+shape; serving wrong data is worse, but neither is acceptable.
+**Rationale:** Both prior answers were rejected. The *lie* — delete
+the fatal and let a freed `Store` be rendered — is not a fault but a
+plausible short listing: the walk finds no `qidpath` match and
+answers *gone* for every entry, so a fid-lifetime bug in a server
+surfaces as a silently truncated `/obj`. The *fatal* answers a
+caller's bug by killing a file server. Deferring the free by a
+reference costs one `int` and closes a third hazard neither answer
+touches: a freed `Store` address can be handed straight back to the
+next `storeopen` — §0's `Echange` close-and-reopen is that shape —
+and `Objsnap.s` is a bare pointer with no generation, so an old
+`/obj` fid would render entries out of the *new* store. The old
+`Store` cannot be freed while a snapshot names it, so the reuse is
+unreachable. `closed` doubles as the store's own reference rather
+than sitting beside a second counter, so nothing can drift out of
+step with the bound's `nobjsnap`; and it is set only after the proc
+wait, since a last `objsnapclose` during that wait would otherwise
+free the `Store` while `storeclose` slept inside it.
+**Normative:** none. Nothing here reaches a wire or an on-disk
+format.
+**Implementation policy:** all of it — that a snapshot may outlive
+the close at all, the `store closed` text, which calls are given the
+check and which stay undefined, and the refcount as the mechanism. A
+conforming implementation may refuse the close, or defer it, or hold
+the store alive some other way, so long as no caller is served an
+entry that is not there.
