@@ -20,16 +20,23 @@
  * walk of 2.6·10^5 entries is 2.6·10^5 short holds and blocks nothing
  * for longer than one of them.
  *
- * **The open takes TWO holds on the happy path**, not one: it counts
- * the index under the first, releases it to allocate the vector —
- * 12 MB at nslots = 2^20, which §7 rule 2 will not have under a state
- * lock — and fills under the second.  The index moves between them
- * routinely, because dropping qlstate puts this open behind every
- * apply already queued for it, so the vector is allocated with slack
- * (below) and the fill is refused only when the index outgrew even
- * that.  A refused fill counts and allocates again, up to Snaptries
- * times, and an open that never settles fails — the one failure
- * objsnapopen has that is neither a §2.6 condition nor out of memory.
+ * **The open takes TWO holds of qlstate on the quiet path**, and they
+ * are the two steps it has: the count — which on the first pass also
+ * tests and takes §9's bound, so the slot costs no hold of its own —
+ * and the fill.  Between them the vector is allocated, 12 MB at
+ * nslots = 2^20, which §7 rule 2 will not have under a state lock.
+ * The index moves between them routinely, because dropping qlstate
+ * puts this open behind every apply already queued for it, so the
+ * vector is allocated with slack (below) and the fill is refused only
+ * when the index outgrew even that.  A refused fill counts and
+ * allocates again, up to Snaptries times, so the count is
+ *
+ *	2 per attempt, plus 1 on any path out that is not a
+ *	snapshot, to give the bound's slot back
+ *
+ * — 2 on the quiet path, 4 with one re-count, and 2·Snaptries + 1 =
+ * 17 on the refusal, which is the one failure objsnapopen has that is
+ * neither a §2.6 condition nor out of memory.
  *
  * **What the OPEN costs is not small, and §7 rule 2's letter is what
  * it satisfies rather than its number.**  The walk stops at the
@@ -113,7 +120,7 @@ objsnapopen(Store *s, int kinds)
 {
 	Objsnap *sn;
 	Ient *e;
-	ulong i, n, want, cap, have, lim, try;
+	ulong i, n, want, cap, have, grew, try;
 
 	if(!storeserving(s))
 		return nil;
@@ -127,28 +134,33 @@ objsnapopen(Store *s, int kinds)
 	}
 	sn->s = s;
 	sn->kinds = kinds;
-	/*
-	 * §9's bound, tested and taken in one step under one hold: the
-	 * slot is this open's from the moment the test passes, so two
-	 * opens racing cannot both find room, and an open past the bound
-	 * costs no allocation.  Every way out of here that is not a
-	 * snapshot gives the slot back at `bad'.  One check and not two —
-	 * a second one anywhere else would be a check no test could
-	 * discriminate, and so a check that could be deleted in silence.
-	 */
-	qlock(&s->qlstate);
-	if(s->nobjsnap >= s->cfg.objsnapmax){
-		qunlock(&s->qlstate);
-		werrstr("disk full: %lud object snapshots already open",
-			s->nobjsnap);
-		free(sn);
-		return nil;
-	}
-	s->nobjsnap++;
-	qunlock(&s->qlstate);
 	for(try = 0; try < Snaptries; try++){
-		/* the count, under the lock */
+		/*
+		 * The count, under the lock — and on the first pass §9's
+		 * bound, tested and taken in the same hold rather than in
+		 * one of its own.  The slot is this open's from the moment
+		 * the test passes, so two opens racing cannot both find
+		 * room, and an open past the bound costs no allocation —
+		 * both at no hold of its own, since the count needs this
+		 * one anyway.  Every way out of here that is not a
+		 * snapshot gives the slot back at `bad'.  A re-count is a
+		 * fresh pass of this loop, where the slot is already this
+		 * open's and the test is not made again.  One bound check
+		 * and not two — a second one anywhere else would be a
+		 * check no test could discriminate, and so a check that
+		 * could be deleted in silence.
+		 */
 		qlock(&s->qlstate);
+		if(try == 0){
+			if(s->nobjsnap >= s->cfg.objsnapmax){
+				qunlock(&s->qlstate);
+				werrstr("disk full: %lud object snapshots "
+					"already open", s->nobjsnap);
+				free(sn);
+				return nil;
+			}
+			s->nobjsnap++;
+		}
 		want = snapwant(s, kinds);
 		qunlock(&s->qlstate);
 		cap = want + want/Snapslackdiv + Snapslackmin;
@@ -183,21 +195,21 @@ objsnapopen(Store *s, int kinds)
 		 * settles it.
 		 */
 		have = snapwant(s, kinds);
-		lim = cap;
 		/*
-		 * §13's snapstale point: pretend the vector came back one
-		 * entry short of the index, which is what an index that grew
-		 * past the slack leaves, so a test can drive the re-count
-		 * without racing for it.  One armed count is spent per fill
-		 * attempt, so an open spends up to Snaptries of them.  Inert
-		 * unless a test asks for it.
+		 * §13's snapstale point: pretend the index grew by snapshort
+		 * entries between the count and here, so a test can drive
+		 * the re-count — and the slack, which is what decides
+		 * whether a given growth needs one — without racing for
+		 * either.  One armed attempt is spent per fill attempt, so
+		 * an open spends up to Snaptries of them.  Inert unless a
+		 * test asks for it.
 		 */
-		if(s->snapstale > 0){
+		grew = 0;
+		if(s->snapstale > 0 && s->snapshort > 0){
 			s->snapstale--;
-			if(have > 0 && have - 1 < lim)
-				lim = have - 1;
+			grew = s->snapshort;
 		}
-		if(have > lim){
+		if(have + grew > cap){
 			qunlock(&s->qlstate);
 			continue;
 		}

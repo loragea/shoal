@@ -134,15 +134,22 @@ storehook(Store *s, char *name, uvlong n)
 		/*
 		 * §9's snapshot open counts the index, allocates the vector
 		 * outside the lock and fills it under a second hold, so the
-		 * index can have grown by the time the fill runs.  This makes
-		 * the next n fill attempts find the vector one entry short of
-		 * the index, which is what a growth past the vector's slack
-		 * leaves, so a test can drive the re-count without racing for
-		 * it.  One is spent per fill attempt, not per open, and an
-		 * open makes up to Snaptries of those.
+		 * index can have grown by the time the fill runs.  This arms
+		 * the next n fill attempts to behave as if it had grown by
+		 * snapshort entries since the count, so a test can drive the
+		 * re-count — and the vector's slack, which is what decides
+		 * whether a given growth needs one — without racing for
+		 * either.  One is spent per fill attempt, not per open, and
+		 * an open makes up to Snaptries of those.  Inert while
+		 * snapshort is 0.
 		 */
 		qlock(&s->qlstate);
 		s->snapstale = n;
+		qunlock(&s->qlstate);
+	}else if(strcmp(name, "snapshort") == 0){
+		/* how far the count is behind the index, for the above */
+		qlock(&s->qlstate);
+		s->snapshort = n;
 		qunlock(&s->qlstate);
 	}else if(strcmp(name, "reclaim") == 0)
 		s->reclaimearly = n != 0;

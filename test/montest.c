@@ -172,22 +172,26 @@ curoffs(Monstat *st, int i)
 }
 
 /*
- * A shim device over the simulated disk that fails a run of reads by
- * ORDINAL.  The sim aims a fault at a byte range, and a slot's write
+ * A shim device over the simulated disk that fails NAMED reads, by
+ * ordinal.  The sim aims a fault at a byte range, and a slot's write
  * and its read-back cover the same range, so a range fault cannot
  * pick out the read-back — which is the one §10 distinguishes from
  * the write before it.  Counting is what can: a commit issues its
- * reads only as read-backs, two per slot (the header sector, then the
- * text), so reads 1 and 2 are the ring slot's and 3 and 4 the current
- * slot's.  Everything else passes through, so the sim's faults,
- * crashes, trace and simpeek all still work underneath.
+ * reads only as read-backs, and a read-back is two reads, the slot's
+ * header sector and then its text, so a commit that needs no retry
+ * issues 1 and 2 for the ring slot and 3 and 4 for the current one.
+ * A read-back that is retried repeats both, which is why the set is a
+ * mask rather than a run: failing a slot's TEXT read on both attempts
+ * means failing reads b+2 and b+4 and letting b+1 and b+3 through.
+ * Everything else passes through, so the sim's faults, crashes, trace
+ * and simpeek all still work underneath.
  */
 typedef struct Shim Shim;
 struct Shim
 {
 	Dev	*s;		/* the sim underneath */
 	int	nrd;		/* reads since shimarm */
-	int	rd0, rdn;	/* fail rdn reads from ordinal rd0 */
+	ulong	rdfail;		/* fail the reads whose ordinal is set */
 };
 
 static Shim shim;
@@ -199,7 +203,7 @@ shimrd(Dev *d, void *a, long n, vlong off)
 
 	sh = d->aux;
 	sh->nrd++;
-	if(sh->rdn > 0 && sh->nrd >= sh->rd0 && sh->nrd < sh->rd0 + sh->rdn){
+	if(sh->nrd < 32 && (sh->rdfail & 1UL<<sh->nrd) != 0){
 		werrstr("i/o error");
 		return -1;
 	}
@@ -259,13 +263,33 @@ shimopen(Dev *s)
 	return d;
 }
 
-/* fail n reads from the next commit's read number first */
+/* fail the next commit's reads at these ordinals; 0 disarms */
 static void
-shimarm(int first, int n)
+shimarm(ulong rdfail)
 {
 	shim.nrd = 0;
-	shim.rd0 = first;
-	shim.rdn = n;
+	shim.rdfail = rdfail;
+}
+
+/*
+ * The ordinals of one slot's read-back, as a mask.  b is the reads a
+ * commit issues before this slot's first attempt: none for the ring
+ * slot, the current slot's two for the current one.  Attempt 1 is
+ * b+1 (header) and b+2 (text); the retry, if there is one, is b+3 and
+ * b+4 — the header is read again, since slotread is one reader and
+ * the text's length comes out of the header.
+ */
+static ulong
+rdback(int onring, int ontext, int both)
+{
+	int b;
+	ulong m;
+
+	b = onring ? 0 : 2;
+	m = 1UL << (ontext ? b + 2 : b + 1);
+	if(both)
+		m |= 1UL << (ontext ? b + 4 : b + 2);
+	return m;
 }
 
 /*
@@ -1185,6 +1209,105 @@ tringfailvalid(void)
 }
 
 /*
+ * A ring write that is INDETERMINATE over a committed victim, with
+ * the ring full.  The write reported success and so did its flush,
+ * but the read-back would not read — twice — so §10 says nothing
+ * about what the slot now holds, and the failure path must NOT go
+ * back to the platter for the victim the way it does after a
+ * determinate failure.
+ *
+ * The schedule is built so that the platter DOES still hold the
+ * victim: the ring write lands nothing (Sfdrop) while reporting
+ * success, so a re-read would find the victim valid at a seq the
+ * current map's reaches and put it back as committed history.  That
+ * is the wrong answer even though the bytes are there, because the
+ * read-back's failure means the store cannot tell this case from the
+ * one where an unacknowledged map landed instead, and the slot must
+ * stay first in line for reuse either way.  Without the guard the
+ * ring write's failure is invisible in the books.
+ */
+static void
+tringfailindet(void)
+{
+	Dev *sim, *d;
+	Mon *m;
+	Monstat st;
+	Monmap mm;
+	uchar hdr[Secsz];
+	char text[32], err[ERRMAX];
+	vlong voff;
+	int i;
+
+	sim = fresh();
+	d = shimopen(sim);
+	if((m = mustopen(d, "ringindet")) == nil){
+		devclose(d);
+		devclose(sim);
+		return;
+	}
+	/* retain commits: every ring slot valid, none a phantom */
+	for(i = 1; i <= Retain; i++){
+		snprint(text, sizeof text, "map=%d", i);
+		commit(m, "ringindet", text, i);
+	}
+	monstat(m, &st);
+	eqv("ringindet: the ring is full", st.nhist, Retain);
+	eqv("ringindet: with no phantom", st.nphantom, 0);
+
+	/* the victim is the oldest entry: seq 1, epoch 1 */
+	voff = -1;
+	for(i = 0; i < Retain; i++){
+		simpeek(sim, histoffs(&st, i), hdr, Secsz);
+		if(memcmp(hdr, "shoalmap", 8) == 0 && GBIT64(hdr + 32) == 1)
+			voff = histoffs(&st, i);
+	}
+	checks++;
+	if(voff < 0){
+		fail("ringindet: the oldest entry is not on the disk");
+		monclose(m);
+		devclose(d);
+		devclose(sim);
+		return;
+	}
+
+	/*
+	 * The write lands nowhere and says it succeeded, so the victim
+	 * survives underneath it; the read-back that would have caught
+	 * that cannot be read, on either attempt.
+	 */
+	simfaultat(sim, Sfdrop, 1, voff, st.slotsz);
+	shimarm(rdback(1, 0, 1));
+	checks++;
+	if(moncommit(m, "map=E", 5, Retain + 1) == 0)
+		fail("ringindet: an indeterminate ring write reported "
+			"success");
+	rerrstr(err, sizeof err);
+	istrue("ringindet: the refusal says the publish is indeterminate",
+		strstr(err, "indeterminate") != nil);
+	shimarm(0);
+	monstat(m, &st);
+	eqv("ringindet: the current map is untouched", st.epoch, Retain);
+	eqv("ringindet: the victim is no longer history", st.nhist,
+		Retain - 1);
+	eqv("ringindet: and is counted as a phantom", st.nphantom, 1);
+	eqi("ringindet: the oldest epoch answers nothing",
+		monlookup(m, 1, &mm), 0);
+
+	/* and the retry takes that slot back, ahead of any other */
+	checks++;
+	if(moncommit(m, "map=E", 5, Retain + 1) < 0)
+		fail("ringindet: the retry: %r");
+	monstat(m, &st);
+	eqv("ringindet: the retry consumed the phantom", st.nphantom, 0);
+	eqv("ringindet: the ring is full again", st.nhist, Retain);
+	eqi("ringindet: and the oldest epoch is gone for good",
+		monlookup(m, 1, &mm), 0);
+	monclose(m);
+	devclose(d);
+	devclose(sim);
+}
+
+/*
  * The monitor retries in the SAME session after a current-slot write
  * fails.  Nothing restarts here, so the phantom mark that failure
  * leaves has to hold in memory: the ring entry for the map that was
@@ -1255,17 +1378,25 @@ tcurfailretry(void)
  * platter and a media read has its own transients: the read is
  * retried once, and a commit whose read-back needed the retry is an
  * ordinary successful commit.
+ *
+ * Run over both reads of the read-back.  A read-back is the slot's
+ * header sector and then its text, and a failure of EITHER says the
+ * same thing — the slot could not be read back — so both must set
+ * the flag that makes slotverify retry.  With only the header read
+ * covered, dropping the text read's flag leaves a failed text read
+ * reading as "it read back and it is not the slot written", which is
+ * a claim about the write and not about the read.
  */
 static void
-treadretry(int onring)
+treadretry(int onring, int ontext)
 {
 	Dev *sim, *d;
 	Mon *m;
 	Monstat st;
 	char what[64];
 
-	snprint(what, sizeof what, "readretry %s",
-		onring ? "ring" : "current");
+	snprint(what, sizeof what, "readretry %s %s",
+		onring ? "ring" : "current", ontext ? "text" : "header");
 	sim = fresh();
 	d = shimopen(sim);
 	if((m = mustopen(d, what)) == nil){
@@ -1277,12 +1408,12 @@ treadretry(int onring)
 	commit(m, what, "map=B", 2);
 
 	/* one read of the slot's read-back fails; the retry does not */
-	shimarm(onring ? 1 : 3, 1);
+	shimarm(rdback(onring, ontext, 0));
 	checks++;
 	if(moncommit(m, "map=C", 5, 3) < 0)
 		fail("%s: a read-back that read on the retry failed the "
 			"commit: %r", what);
-	shimarm(0, 0);
+	shimarm(0);
 	monstat(m, &st);
 	eqv2(what, "the retried read-back published the map", st.epoch, 3);
 	eqv2(what, "at its own seq", st.seq, 3);
@@ -1314,7 +1445,7 @@ treadretry(int onring)
  * share a seq.
  */
 static void
-tindeterminate(int onring)
+tindeterminate(int onring, int ontext)
 {
 	Dev *sim, *d;
 	Mon *m;
@@ -1322,8 +1453,8 @@ tindeterminate(int onring)
 	Monmap mm;
 	char what[64], err[ERRMAX];
 
-	snprint(what, sizeof what, "indeterminate %s",
-		onring ? "ring" : "current");
+	snprint(what, sizeof what, "indeterminate %s %s",
+		onring ? "ring" : "current", ontext ? "text" : "header");
 	sim = fresh();
 	d = shimopen(sim);
 	if((m = mustopen(d, what)) == nil){
@@ -1334,8 +1465,8 @@ tindeterminate(int onring)
 	commit(m, what, "map=A", 1);
 	commit(m, what, "map=B", 2);
 
-	/* the read-back and its one retry both fail */
-	shimarm(onring ? 1 : 3, 2);
+	/* the read-back and its one retry both fail, at the same read */
+	shimarm(rdback(onring, ontext, 1));
 	checks++;
 	if(moncommit(m, "map=C", 5, 3) == 0)
 		fail("%s: a commit whose read-back would not read reported "
@@ -1343,7 +1474,7 @@ tindeterminate(int onring)
 	rerrstr(err, sizeof err);
 	istrue("the refusal says the publish is indeterminate",
 		strstr(err, "indeterminate") != nil);
-	shimarm(0, 0);
+	shimarm(0);
 	monstat(m, &st);
 	eqv2(what, "the live store is still B", st.epoch, 2);
 	eqv2(what, "at seq 2", st.seq, 2);
@@ -2008,11 +2139,16 @@ main(int, char**)
 	thistfail();
 	tringfailphantom();
 	tringfailvalid();
+	tringfailindet();
 	tcurfailretry();
-	treadretry(1);
-	treadretry(0);
-	tindeterminate(1);
-	tindeterminate(0);
+	treadretry(1, 0);
+	treadretry(0, 0);
+	treadretry(1, 1);
+	treadretry(0, 1);
+	tindeterminate(1, 0);
+	tindeterminate(0, 0);
+	tindeterminate(1, 1);
+	tindeterminate(0, 1);
 	tring();
 	tfull();
 	theader();

@@ -1990,8 +1990,12 @@ key and the caller's current map epoch, and the store re-checks
 §1.5's two receiver conditions inside the call, under one hold of the
 state lock — the
 record is a tombstone at exactly that key, its `wepoch` strictly
-below the epoch — answering `not discardable` otherwise (§3.7). The
-checks are atomic among themselves, so they judge one record where a
+below the epoch — answering `not discardable` otherwise (§3.7).
+Check (i)'s two halves are answered **state first**, so a live record
+is refused as not a tombstone whether or not the key matches; the
+detail after the prefix is implementation policy (§3.7), and pointing
+a caller at a key when the state is the objection would send it to
+re-read the wrong thing. The checks are atomic among themselves, so they judge one record where a
 separate stat-then-discard could race an `op=delete`; the window
 between the checks and the `Eslot` commit is closed by the caller's
 per-object queue (§7), as for every mutation.
@@ -2589,13 +2593,19 @@ For `/obj`, `/tombs` and `/advert` an open takes the vector of
 `{u32 slot, u64 qidpath}` of every entry whose state it asked for —
 live for `/obj`, tomb for `/tombs`, both for `/advert` — and holds no
 lock once it returns. That is 12 bytes an entry, **3.1 MB at 2.6·10^5
-objects and 12 MB at `nslots = 2^20`**, held as two parallel arrays
-rather than one array of a struct, because a `{u32, u64}` struct is
-16 bytes on amd64 and the 4 in every 16 buys nothing. It takes
-**two** holds of `qlstate` (§7) to do that on the happy path and up
-to `Snaptries` pairs of holds when the index keeps growing under it —
-the count under one, the 12 MB allocated outside any, the fill under
-the next — and it can fail: see "What the open costs" below. The
+objects and 12 MB at `nslots = 2^20`**, plus the slack below — a
+sixteenth and 16 entries, so 13 MB rather than 12 at `nslots = 2^20`
+— held as two parallel arrays rather than one array of a struct,
+because a `{u32, u64}` struct is 16 bytes on amd64 and the 4 in every
+16 buys nothing. It takes
+**two** holds of `qlstate` (§7) to do that on the quiet path, one per
+step — the count under one, the 12 MB allocated outside any, the fill
+under the next — and two more for every re-count the index forces.
+The bound below costs no hold of its own: it is tested and taken
+inside the first count's. So the holds an open takes are
+`2·(fill attempts)` on any path that yields a snapshot, and
+`2·Snaptries + 1` = **17** on the refusal, whose last hold gives the
+bound's slot back. It can fail: see "What the open costs" below. The
 vector is a list of names and not a reference the engine must honour:
 a discard of an entry it names is neither refused nor delayed by it.
 
@@ -2627,8 +2637,9 @@ counter that would bound the hold if T2 shows the 23 ms matters; it
 is not built.
 
 **The second hold, and the one way the open can fail.** The open
-counts the index under `qlstate`, releases it, allocates, and re-takes
-it to fill. The index moves in between as a matter of course, because
+counts the index under `qlstate` — testing and taking the bound in
+that same hold, the first time round — releases it, allocates, and
+re-takes it to fill. The index moves in between as a matter of course, because
 releasing `qlstate` puts the open *behind* every apply already queued
 for it; this is the common case, not a corner. Three of the four
 things that can have happened cost nothing:
@@ -2638,7 +2649,13 @@ things that can have happened cost nothing:
   true count and a *complete* snapshot;
 - the count **grew** but still fits — the vector is allocated with
   **slack**, a sixteenth of the count and never fewer than 16
-  entries, so ordinary churn needs no second attempt at all;
+  entries, so ordinary churn needs no second attempt at all. The
+  flat 16 is what T1's four-proc churn needs, since the net growth
+  between the count and the fill is bounded by the procs holding an
+  object absent rather than by the index's size; the sixteenth is
+  that same hedge at a server's hundreds of procs. No churn at T1
+  scale tells the two apart, so §13's `snapstale`/`snapshort` point
+  is what does;
 - the count did not move.
 
 The fourth is an index that grew past the slack. The vector cannot
@@ -2678,9 +2695,10 @@ policy, default 8) and answers a further open `disk full` (layer-a
 §2.6) rather than growing without limit; at 2^20 slots eight of them
 are 96 MB, which is the number §14(9) says is answered for the Layer
 B envelope and not for this design's own maximum. The test and the
-count are **one step under one hold** of `qlstate` — the open takes
-its slot the moment it passes the bound, so two opens racing cannot
-both find room — and an open that then fails gives the slot back, so
+count are **one step under one hold** of `qlstate` — the open's first
+count takes that hold anyway, and the open takes its slot the moment
+it passes the bound, so two opens racing cannot both find room — and
+an open that then fails gives the slot back in a hold of its own, so
 `/status` counts an open in flight along with the opens that
 completed. A close releases the count. A snapshot is the
 caller's, and `storeclose` frees nothing of the caller's, so every
@@ -2901,7 +2919,9 @@ The read-back is **two device reads per slot** — the header sector,
 then the text — and not one, because it goes through the same slot
 reader the start does, which must bounds-check `len` before it reads
 the `len` bytes that field names (a torn length field must not drive
-a read past the slot). Reading `roundup(secsz+len, secsz)` in one
+a read past the slot). It is one read for a `len = 0` map, the empty
+map a fresh format leaves in both current slots (§2.2's tie): there
+are no text bytes to read and the reader does not ask for any. Reading `roundup(secsz+len, secsz)` in one
 request would be possible here, where `len` is known, at the price of
 a second reader; the four extra requests a commit makes are noise
 beside its two flushes, so it keeps the one reader.
@@ -2969,10 +2989,14 @@ and a write that landed nothing left it there intact. An entry read
 back valid whose `seq` is not above the current map's is history this
 store can still answer, so it goes back into memory as it is found:
 the live store keeps answering that epoch and counts no phantom it
-does not hold, instead of both until the next open. A slot that reads
-back unreadable or invalid, and a slot whose write was indeterminate —
-where the read-back has already failed twice and this read is not
-attempted — take the invalid-and-phantom mark above.
+does not hold, instead of both until the next open. Three kinds of
+slot take the invalid-and-phantom mark above instead: one that reads
+back unreadable or invalid; one that reads back **valid at a `seq`
+above the current map's**, which is a phantom on the platter and the
+case the mark exists for, since leaving it as history would let the
+next published map raise `seq` over a map that was never published;
+and one whose write was indeterminate, where the read-back has
+already failed twice and this read is not attempted at all.
 
 **The store never compares epochs.** It records the epoch it is given
 beside the map and orders nothing by it: layer-a §8.3's `forceepoch`
@@ -3011,9 +3035,9 @@ epoch `E−1`, so one history slot is a floor rather than a preference
 for the current-map slot, and the same again for the history slot
 that precedes it, so a publish is ~17 ms whether it carries a
 placement change or a single `stale` mark. The read-back of each slot
-is two reads — the checksum's sector, then `len` bytes rounded up —
-so a commit issues four beside its two flushes, which is noise beside
-them. That is what
+is two reads — the checksum's sector, then `len` bytes rounded up, or
+the sector alone for a `len = 0` map — so a commit issues four beside
+its two flushes, which is noise beside them. That is what
 makes layer-a §5.4 step 5a affordable — the alternative
 `docs/platform/9front-storage.md` measured, a file plus a gefs sync,
 costs 530–620 ms and would blow `replms` regularly.
@@ -3154,8 +3178,15 @@ length included**, and the lengths a refusal quotes are the file's
 own rather than the sector-rounded device size. `-z` on a path with
 no file there creates it at that size, where there is nothing to
 destroy — and the hint that `-z` is what sizes a new image belongs to
-that refusal alone, not to a path that is there and will not open.
-`-z` against an `sd` partition is refused by both.
+that refusal alone, not to a path that is there and will not open. A
+run that creates the image at step 2 and is then refused at step 3 or
+4 **removes what it created**, so that path holds no file again: the
+byte-identical rule is kept for a path that had a file, and for a
+path that had none the only length any refusal could leave behind is
+the one the run was refused for. An operator who corrects the flag
+and re-runs without `-z` then gets the same "no image there yet"
+refusal rather than a format at the wrong length. `-z` against an
+`sd` partition is refused by both.
 
 **`shoalfmt`** — format or ream an object-store partition.
 
@@ -3357,11 +3388,15 @@ that is a warning about the unit rather than about these bytes.
 Every one of those decisions is `monfmt`'s or `monfmtcheck`'s rather
 than the command's, so that a T1 program drives them without exec'ing
 anything — the same constraint on the code layout that puts the store
-engine in `libshoal` above. Three are the command's, and all three
-are about a file image the library is never handed: the length to
-open it at, whether `-z` may shorten it, and the refusal over an
-object-store superblock, which `monfmt` reports to its caller as
-§2.1's warning and leaves the caller to decide.
+engine in `libshoal` above. Five are the command's, and all five are
+about a file image the library is never handed: the length to open it
+at, whether `-z` may shorten it, the refusal over an object-store
+superblock — which `monfmt` reports to its caller as §2.1's warning
+and leaves the caller to decide — the refusal over a valid monitor
+header, which `monfmt` makes again for a library caller but which the
+command reaches first and is therefore the one an operator reads, and
+the removal of an image the run's own `-z` created before a later
+step refused it.
 
 **Carving the partitions** is the operator's step and uses stock
 tools. On a whole disk, `disk/fdisk -aw /dev/sdXX/data` creates a
@@ -3514,11 +3549,13 @@ while the committer is still inside the flush), and `fatal` (put the
 store into §3.2's condemned state, which the commit path itself
 reaches only from an apply that failed after its record was durable —
 a case §3.2 makes unreachable, so a test cannot arrive at it any
-other way), and `snapstale:n` (give the next *n* enumeration
-fill attempts a vector one entry short of the index, which is what an
-index that grew past the vector's slack leaves, so a test can drive
-§9's re-count without racing for it — one is spent per fill attempt
-rather than per open, and an open makes up to `Snaptries` of them).
+other way), and `snapstale:n` with `snapshort:k` (arm the next *n*
+enumeration fill attempts to find the index *k* entries larger than
+the count did, so a test can drive §9's re-count — and the vector's
+slack, which is what decides whether a given growth needs one —
+without racing for either; one arming is spent per fill attempt
+rather than per open, an open makes up to `Snaptries` of them, and
+the point is inert while `snapshort` is 0).
 Each T1 test names the requirement it discriminates and the mutation
 that must break it; **each mutation is run**, per
 `AGENTS.md`.
@@ -3563,7 +3600,8 @@ nothing (`Sfdrop`) or lands a mix of old and new bytes
 (`Sftearbyte`), on the ring slot and on the current slot in turn,
 each failing the commit and leaving the restart on the previous map
 with position 0 still equal to it; the read-back's own READ failing,
-on each slot in turn — once, where the retry carries the commit
+on each slot in turn and on each of a read-back's two reads, the
+header sector and the text — once, where the retry carries the commit
 through, and twice, where the publish is indeterminate: the commit
 fails saying so, the slot is not served, its `seq` is spent, and the
 retry of the same session is what the restart serves rather than the
@@ -3585,7 +3623,11 @@ fails *over a phantom victim*, after which the retry reuses that same
 slot and the never-published epoch is still unanswerable at the next
 start; a ring write that fails *over a valid victim*, with the ring
 full, after which the live store still answers the oldest epoch,
-counts no phantom, and agrees with the restart; a current-slot write
+counts no phantom, and agrees with the restart; the same ring full
+under an *indeterminate* ring write that landed nothing, where the
+victim is on the platter and is nonetheless dropped from history and
+made a phantom, because a read-back that would not read cannot tell
+that case from an unacknowledged map having landed; a current-slot write
 that fails and is retried *in the same
 session*, where the phantom mark has to hold in memory with no restart
 to rebuild it; `disk full` on an
@@ -3696,7 +3738,10 @@ discriminated one at a time, a live copy condemned under an open
 the bound on open snapshots, the `disk full` past it and the refusal
 of a `kinds` the engine has no state for, a `storeclose` under an
 open snapshot, an open whose vector the index outgrows between the
-count and the fill, two thousand opens under four churning procs with
+count and the fill, and the two terms of that vector's slack told
+apart — one growth refused by a ten-entry index, whose slack is the
+flat sixteen, and absorbed by an 800-entry one, whose sixteenth is
+fifty besides — two thousand opens under four churning procs with
 not one refused and no count outside what the churn can produce,
 every one of the five enumerations refusing on a condemned store, a
 checkpoint taken mid-walk, the `/dirty` copy against a moving set and
