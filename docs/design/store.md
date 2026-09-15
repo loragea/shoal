@@ -2223,7 +2223,7 @@ nothing is ever taken under them.
 | Lock | Covers |
 |---|---|
 | the flush lock | the coalescing flusher's ticket counters (§3.2): who is issuing the one device flush and who is waiting for it |
-| the checkpoint lock | the checkpointer's request and completion counters, its wake-up, and the failure state a checkpoint leaves behind (§2.8): the stuck flag, the count of failed attempts and the last failure's text, which §6's refusal reads under it. The checkpoint itself runs with it released |
+| the checkpoint lock | the checkpointer's request and completion counters — the paced pair a trigger or a committer advances and the exempt pair an explicit `storecheckpoint` advances (§2.8) — its wake-up, and the failure state a checkpoint leaves behind (§2.8): the stuck flag, the dead flag, the retry floor in force and the earliest time a paced attempt may run behind it, the count of failed attempts and the last failure's text, which §6's refusal reads under it. The checkpoint itself runs with it released |
 | the proc lock | the count of procs the store has started, so `storeclose` can wait for them |
 
 **Releasing the store itself is under no lock at all**, and is
