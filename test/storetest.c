@@ -1524,6 +1524,35 @@ tckfail(void)
 	devclose(d);
 }
 
+enum
+{
+	Ckpbackms	= 500,	/* tckpace's floor, and its wait */
+	Ckpexemptms	= 1000,	/* its ceiling on 20 explicit checkpoints */
+};
+
+/*
+ * openstoreck's live checkpointer with a retry floor of its own.
+ * tckpace times the exemption, so the margin it has is the floor an
+ * explicit checkpoint would wait against the 5 ms tick it really
+ * waits; 500 ms rather than the 100 ms default makes that gap a
+ * hundredfold and costs the passing run nothing.  ckwaitms rises with
+ * it so that the floor stays inside §2.8's cap rather than above §6's
+ * wait.
+ */
+static Store*
+openstorepace(Dev *d)
+{
+	Storecfg c;
+
+	tcfg(&c);
+	c.nockptproc = 0;
+	c.ckhigh = 8;
+	c.ckms = 50;
+	c.ckwaitms = Ckpbackms;
+	c.ckbackms = Ckpbackms;
+	return storeopen(d, &c);
+}
+
 /*
  * §2.8's retry floor, and storecheckpoint's exemption from it.
  *
@@ -1534,18 +1563,26 @@ tckfail(void)
  * log above ckhigh for ever and re-attempts with no wait at all.  The
  * proc is therefore what this test runs, and the floor is read as a
  * rate: ckfailed sampled across a second.  The window is a second and
- * the floor is 100 ms, so ten or so attempts are expected and forty is
- * a generous ceiling; unpaced it was measured in the tens of thousands.
+ * the floor is the 500 ms openstorepace configures, so a couple of
+ * attempts are expected and forty is a generous ceiling; unpaced it
+ * was measured in the tens of thousands.
  *
  * A committer inside §6's wait is the second unpaced path and is paced
  * by the same floor, which is what the fill loop leaves behind: its
  * last commits sat in that wait asking once a millisecond.
  *
- * The exemption is the other half and is timed rather than counted: 20
- * explicit checkpoints over the same refusing region are 20 attempts
- * that run at once, where the floor would make them two seconds.  This
- * is what keeps tckfail's 400 hand-driven checkpoints inside AGENTS.md's
- * seconds budget.
+ * The exemption is the other half, and it is the one check in T1 whose
+ * verdict is a wall clock.  It cannot be made count-based: a paced
+ * explicit path runs the same 20 attempts an exempt one does and
+ * arrives at the same ckfailed, only later, so nothing but elapsed
+ * time tells them apart.  What can be widened is the gap being timed,
+ * and that is why openstorepace configures a 500 ms floor rather than
+ * taking the 100 ms default: 20 explicit checkpoints wait the 5 ms
+ * checkpointer tick each and were measured at 103 ms in all, where
+ * the floor would make them ten seconds.  The ceiling is 1000 ms --
+ * ten times the measured cost and a tenth of the paced one.  The
+ * exemption is also what keeps tckfail's 400 hand-driven checkpoints
+ * inside AGENTS.md's seconds budget.
  *
  * Mutations: the floor test is dropped from ckdue and from ckptproc's
  * wait (mut ck-no-backoff); the explicit path obeys the floor too (mut
@@ -1566,7 +1603,7 @@ tckpace(void)
 
 	d = newdisk();
 	spawnforget();
-	if((s = openstoreck(d)) == nil){
+	if((s = openstorepace(d)) == nil){
 		fail("a store with a live checkpointer: %r");
 		devclose(d);
 		return;
@@ -1618,7 +1655,7 @@ tckpace(void)
 		nok, 0);
 	istrue("every explicit checkpoint ran", st.ckfailed - nex >= 20);
 	checks++;
-	if(ms >= 500)
+	if(ms >= Ckpexemptms)
 		fail("20 explicit checkpoints took %lld ms: the floor paced "
 			"them", ms);
 
