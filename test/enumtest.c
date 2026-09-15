@@ -1034,6 +1034,197 @@ tclosesnapcond(void)
 	devclose(d);
 }
 
+/*
+ * §9's close race, in the three shapes the deferred free has to
+ * survive.  All three put four procs on four snapshots of one store
+ * and close the store under them; what differs is who closes the
+ * snapshots and when.
+ *
+ * - Srender: the workers only render, and the main proc closes every
+ *   snapshot after they have finished.  This is the shape that says
+ *   a render in flight when storeclose runs is answered and not
+ *   faulted, and the device — which is the caller's — is closed the
+ *   instant storeclose returns, so it also says storefree needs
+ *   nothing of it.
+ * - Sclose: each worker closes its own snapshot when it is done, so
+ *   the last close races storeclose's own decision.  Whichever sees
+ *   `closed && nobjsnap == 0' frees, and exactly one must.
+ * - Stight: each worker polls until it is told `store closed' and
+ *   closes at once, which is the earliest after the flag a caller
+ *   can manage.  That is the one shape that catches a storeclose
+ *   which sets `closed' before waiting for its procs: the last close
+ *   then frees the Store while storeclose is still asleep inside it
+ *   on procrz, and both free it.  Sclose and Stight run a real
+ *   checkpointer for storeclose to have a proc to wait for.
+ */
+enum
+{
+	Nclosew		= 4,		/* workers, one snapshot each */
+	Nclosent	= 6,		/* entries in the index */
+	Ncloseloop	= 400,		/* renders a worker attempts */
+	Ncloserun	= 30,		/* runs of each shape */
+	Ntightloop	= 200000,	/* renders Stight gives up after */
+
+	Srender		= 0,
+	Sclose,
+	Stight,
+};
+
+typedef struct Closew Closew;
+struct Closew
+{
+	Objsnap	*sn;
+	int	done;
+	int	bad;		/* an answer that was neither an entry
+				 * nor `store closed' */
+};
+static Closew closew[Nclosew];
+
+/* 1, 0 or a refusal that says `store closed'; anything else is bad */
+static int
+closeread(Closew *w, ulong i)
+{
+	Objinfo oi;
+	uchar got[Oidmax];
+	char e[ERRMAX];
+	int r, oidlen;
+
+	r = objsnapent(w->sn, i, got, &oidlen, &oi);
+	if(r < 0){
+		rerrstr(e, sizeof e);
+		if(strcmp(e, "store closed") != 0)
+			w->bad = 1;
+	}else if(r != 0 && r != 1)
+		w->bad = 1;
+	return r;
+}
+
+static void
+closerender(void *a)
+{
+	Closew *w;
+	int k;
+
+	w = a;
+	for(k = 0; k < Ncloseloop; k++)
+		closeread(w, k % Nclosent);
+	w->done = 1;
+}
+
+static void
+closeworker(void *a)
+{
+	Closew *w;
+	int k;
+
+	w = a;
+	for(k = 0; k < Ncloseloop; k++)
+		closeread(w, k % Nclosent);
+	objsnapclose(w->sn);
+	w->done = 1;
+}
+
+static void
+closetight(void *a)
+{
+	Closew *w;
+	int k;
+
+	w = a;
+	for(k = 0; k < Ntightloop; k++)
+		if(closeread(w, k % Nclosent) < 0)
+			break;
+	objsnapclose(w->sn);
+	w->done = 1;
+}
+
+static void
+closerace(int shape, int run)
+{
+	Dev *d;
+	Store *s;
+	void (*fn)(void*);
+	char nm[16];
+	int i, k, alldone;
+
+	spawnforget();
+	d = newdisk();
+	if((s = mustwatched(d, shape != Srender, "the storeclose race"))
+	== nil)
+		return;
+	for(i = 0; i < Nclosent; i++){
+		snprint(nm, sizeof nm, "r%d", i);
+		mk(s, nm);
+	}
+	fn = closerender;
+	if(shape == Sclose)
+		fn = closeworker;
+	else if(shape == Stight)
+		fn = closetight;
+	for(i = 0; i < Nclosew; i++){
+		closew[i].done = 0;
+		closew[i].bad = 0;
+		if((closew[i].sn = mustsnap(s, Snaplive,
+		"the storeclose race")) == nil)
+			goto out;
+		if(spawnproc(fn, &closew[i]) < 0){
+			fail("the storeclose race: spawn: %r");
+			goto out;
+		}
+	}
+	storeclose(s);
+	devclose(d);		/* the device is the caller's, and goes now */
+	d = nil;
+	for(k = 0; k < 4000; k++){
+		alldone = 1;
+		for(i = 0; i < Nclosew; i++)
+			if(!closew[i].done)
+				alldone = 0;
+		if(alldone)
+			break;
+		sleep(5);
+	}
+	alldone = 1;
+	for(i = 0; i < Nclosew; i++)
+		if(!closew[i].done)
+			alldone = 0;
+	istrue("every worker in the storeclose race finished", alldone);
+	if(!alldone){
+		print("FAIL: shape %d run %d\n", shape, run);
+		goto out;
+	}
+	for(i = 0; i < Nclosew; i++)
+		if(closew[i].bad){
+			fail("a worker racing storeclose (shape %d run %d) "
+				"was answered something that was neither an "
+				"entry nor `store closed'", shape, run);
+			break;
+		}
+	checks++;
+	if(shape == Srender){
+		eqv("the store is not freed while four snapshots hold it",
+			nfreed, 0);
+		for(i = 0; i < Nclosew; i++)
+			objsnapclose(closew[i].sn);
+	}
+	eqv("the store is freed exactly once out of the close race",
+		nfreed, 1);
+out:
+	killspawned();
+	if(d != nil)
+		devclose(d);
+}
+
+static void
+tclosesnaprace(void)
+{
+	int shape, run;
+
+	for(shape = Srender; shape <= Stight; shape++)
+		for(run = 0; run < Ncloserun; run++)
+			closerace(shape, run);
+}
+
 /* ---- /dirty ---- */
 
 static void
@@ -2412,6 +2603,7 @@ main(int argc, char **argv)
 	tclosesnap();
 	tclosesnapplain();
 	tclosesnapcond();
+	tclosesnaprace();
 	tdirty();
 	tfullsync();
 	tlost();

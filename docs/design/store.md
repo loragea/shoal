@@ -3806,7 +3806,14 @@ while `objsnapcount` still answers, a further `objsnapopen` refused,
 and §13's freed hook fired exactly once and only at the third
 `objsnapclose` — beside a store closed with nothing open, which the
 same hook shows freed inside `storeclose`, and a store condemned and
-then closed, which answers `store condemned`, an open whose vector
+then closed, which answers `store condemned`; that close raced by
+four procs on four snapshots in each of its three shapes, thirty
+runs apiece — the procs only rendering, with the caller's device
+closed the instant `storeclose` returns; each proc closing its own
+snapshot against `storeclose`'s own decision; and each proc closing
+the instant it is told `store closed`, which is what catches a
+`closed` set before the proc wait — with the store freed exactly
+once every time, an open whose vector
 the index outgrows between the
 count and the fill, and the two terms of that vector's slack told
 apart — one growth refused by a ten-entry index, whose slack is the
