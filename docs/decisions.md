@@ -353,3 +353,37 @@ check and which stay undefined, and the refcount as the mechanism. A
 conforming implementation may refuse the close, or defer it, or hold
 the store alive some other way, so long as no caller is served an
 entry that is not there.
+
+## D17 — A failing checkpointer backs off, and a dead one is named (2026-09-15)
+
+**Decision:** A failed checkpoint keeps §2.8's reaction — no
+condemnation, no self-check, no device probe, no page rewrite, no
+full-checkpoint fallback — and gains two things it lacked. First, a
+retry floor (`ckbackms`, default 100 ms, doubling to `ckms`), obeyed
+by both of §2.8's triggers and by a committer's request inside §6's
+wait, and exempted only for an explicit `storecheckpoint`. Second, a
+`dead` condition distinct from `stuck`, set when the failing
+checkpoint's device fid is condemned (§0's `Echange`), never cleared
+short of a restart, stopping the paced retries and named in §6's
+refusal.
+**Rationale:** Nothing a checkpoint failure damages is at risk — the
+log is the authority above `cklogoff`, §3.4's rule makes replay cover
+every partial landing, and the damaged bytes are never read while the
+store is up — so a self-check protects nothing, a rewrite is what the
+next checkpoint already does, and a probe can classify nothing the
+failing write's own error string did not already carry. What was
+wrong was the cadence: `ckhigh` is a level with no time term and the
+checkpointer skips its tick whenever a trigger is true, so a store
+that cannot reclaim log space re-attempted with no sleep at all —
+measured at 66 715 attempts per second — taking the log's lock twice
+per attempt against the very commits waiting for the space. And
+`Echange` is not a device that may heal; reporting it as one sends
+the operator to look at a disk instead of restarting the store.
+**Normative:** none. `disk full` remains layer-a §2.6's prefix and is
+unchanged; what follows it is implementation policy (§3.7).
+**Implementation policy:** all of it — the floor and its defaults,
+the doubling and its cap, the stuck/dead split, the refusal wording,
+and the statistics. A conforming implementation may pace a failing
+checkpointer any other way, or name a permanently failed one
+differently, so long as a store that cannot checkpoint does not spin
+and an operator can tell a device that may heal from one that cannot.

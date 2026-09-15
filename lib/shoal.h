@@ -598,6 +598,7 @@ enum
 	Ckmsdflt	= 30000,	/* §2.8 */
 	Ckhighdflt	= 4,		/* checkpoint past logsecs/ckhigh used */
 	Ckwaitmsdflt	= 5000,		/* §6's bounded wait */
+	Ckbackmsdflt	= 100,		/* §2.8's retry floor after a failure */
 	Logresvdiv	= 16,		/* §6's reserved tail */
 	Stagemaxdflt	= 2048,		/* §3.6, grains per stage */
 	Stagetotdflt	= 16384,	/* §3.6, grains per process */
@@ -619,6 +620,7 @@ struct Storecfg
 	ulong	ckms;
 	ulong	ckhigh;
 	ulong	ckwaitms;
+	ulong	ckbackms;		/* §2.8's retry floor, doubling to ckms */
 	ulong	stagemax, stagetot, stagems;
 	ulong	emapcache;
 	ulong	objsnapmax;		/* §9's bound on open snapshots */
@@ -662,10 +664,18 @@ struct Storestat
 	 * succeeded since — is what tells a full log from a stuck one,
 	 * and ckerr is what that one said (empty when not stuck).
 	 * ckfailed counts failed ATTEMPTS over the store's life: a
-	 * stuck store re-attempts on every checkpoint tick, so it is a
-	 * rate of retrying rather than a count of distinct outages.
+	 * stuck store re-attempts no faster than §2.8's retry floor, so
+	 * it is a rate of retrying rather than a count of distinct
+	 * outages.
+	 *
+	 * ckdead is the stronger condition: the failing checkpoint's
+	 * device fid is condemned (§0's Echange), so no later checkpoint
+	 * can succeed and nothing short of closing and opening the store
+	 * clears it.  A dead checkpointer stops attempting, so ckfailed
+	 * stands still while ckdead is set.
 	 */
 	int	ckstuck;
+	int	ckdead;
 	uvlong	ckfailed;
 	char	ckerr[ERRMAX];
 };

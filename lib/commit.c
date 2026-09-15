@@ -463,6 +463,11 @@ applybatch(Store *s, Batch *b)
  * ckwaitms and the tick is milliseconds, so the lag is in the noise —
  * but it is a lag, and a Rendez here would only look like it removed
  * one, since the tick is what the checkpointer's own triggers need.
+ *
+ * This is a counter and not ckforce: the wait runs once a
+ * millisecond, so over a checkpointer that is failing it is the
+ * fastest of §2.8's retry paths, and it is paced by the same floor as
+ * the triggers.  Only storecheckpoint is exempt.
  */
 static void
 askcheckpoint(Store *s)
@@ -733,7 +738,7 @@ logcommit(Store *s, Item *ci)
 	Item *it;
 	Batch *b;
 	vlong t0;
-	int ckstuck;
+	int ckstuck, ckdead;
 	char cke[ERRMAX];
 	int full, oom, forced, r;
 
@@ -862,9 +867,13 @@ logcommit(Store *s, Item *ci)
 		 */
 		qlock(&s->cklk);
 		ckstuck = s->ckstuck;
+		ckdead = s->ckdead;
 		strecpy(cke, cke + sizeof cke, s->ckerrstr);
 		qunlock(&s->cklk);
-		if(ckstuck)
+		if(ckdead)
+			werrstr("disk full: log full and the checkpointer "
+				"is dead: %s", cke);
+		else if(ckstuck)
 			werrstr("disk full: log full and the checkpoint "
 				"fails: %s", cke);
 		else

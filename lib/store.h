@@ -278,8 +278,15 @@ struct Store
 	QLock	cklk;
 	Rendez	ckrz;			/* on cklk: a checkpoint completed */
 	uvlong	ckreq, ckdone;
+	uvlong	ckforce, ckfdone;	/* requests from storecheckpoint alone:
+					 * §2.8's retry floor does not pace
+					 * them, and ckreq cannot tell them
+					 * from a committer's ask */
 	int	ckret, ckbusy, ckproc;	/* ckret: the last one's return */
 	int	ckstuck;		/* the LAST checkpoint failed */
+	int	ckdead;			/* the fid is condemned: §2.8 */
+	ulong	ckbackms;		/* the floor in force, doubling */
+	vlong	ckwake;			/* no paced attempt before this nsec */
 	uvlong	ckfailed;		/* checkpoint attempts that failed */
 	char	ckerrstr[ERRMAX];	/* what the last failure said */
 	vlong	cklast;
