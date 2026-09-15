@@ -2643,7 +2643,13 @@ things that can have happened cost nothing:
   true count and a *complete* snapshot;
 - the count **grew** but still fits — the vector is allocated with
   **slack**, a sixteenth of the count and never fewer than 16
-  entries, so ordinary churn needs no second attempt at all;
+  entries, so ordinary churn needs no second attempt at all. The
+  flat 16 is what T1's four-proc churn needs, since the net growth
+  between the count and the fill is bounded by the procs holding an
+  object absent rather than by the index's size; the sixteenth is
+  that same hedge at a server's hundreds of procs. No churn at T1
+  scale tells the two apart, so §13's `snapstale`/`snapshort` point
+  is what does;
 - the count did not move.
 
 The fourth is an index that grew past the slack. The vector cannot
@@ -3531,11 +3537,13 @@ while the committer is still inside the flush), and `fatal` (put the
 store into §3.2's condemned state, which the commit path itself
 reaches only from an apply that failed after its record was durable —
 a case §3.2 makes unreachable, so a test cannot arrive at it any
-other way), and `snapstale:n` (give the next *n* enumeration
-fill attempts a vector one entry short of the index, which is what an
-index that grew past the vector's slack leaves, so a test can drive
-§9's re-count without racing for it — one is spent per fill attempt
-rather than per open, and an open makes up to `Snaptries` of them).
+other way), and `snapstale:n` with `snapshort:k` (arm the next *n*
+enumeration fill attempts to find the index *k* entries larger than
+the count did, so a test can drive §9's re-count — and the vector's
+slack, which is what decides whether a given growth needs one —
+without racing for either; one arming is spent per fill attempt
+rather than per open, an open makes up to `Snaptries` of them, and
+the point is inert while `snapshort` is 0).
 Each T1 test names the requirement it discriminates and the mutation
 that must break it; **each mutation is run**, per
 `AGENTS.md`.
@@ -3718,7 +3726,10 @@ discriminated one at a time, a live copy condemned under an open
 the bound on open snapshots, the `disk full` past it and the refusal
 of a `kinds` the engine has no state for, a `storeclose` under an
 open snapshot, an open whose vector the index outgrows between the
-count and the fill, two thousand opens under four churning procs with
+count and the fill, and the two terms of that vector's slack told
+apart — one growth refused by a ten-entry index, whose slack is the
+flat sixteen, and absorbed by an 800-entry one, whose sixteenth is
+fifty besides — two thousand opens under four churning procs with
 not one refused and no count outside what the churn can produce,
 every one of the five enumerations refusing on a condemned store, a
 checkpoint taken mid-walk, the `/dirty` copy against a moving set and

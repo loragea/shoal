@@ -52,6 +52,18 @@ enum
 	Nsnapopen	= 2000,
 	Nfixed		= 700,			/* live, never touched */
 	Nfixtomb	= 200,			/* tombstones, never touched */
+
+	/*
+	 * tsnapslack's two halves.  §9 sizes the snapshot vector at the
+	 * count plus a sixteenth plus sixteen entries, and Nslackshort
+	 * is a growth chosen to sit between the two terms: past the
+	 * sixteen a small index gets, and inside the sixteenth of
+	 * Nslack, which is 50.  A store of Nslack entries therefore
+	 * absorbs it without a re-count and a store of ten does not,
+	 * which is what tells the two terms apart.
+	 */
+	Nslack		= 800,
+	Nslackshort	= 32,
 };
 
 static Dev*
@@ -708,9 +720,11 @@ out:
  * outgrown the vector by then, and a vector short of the index is
  * objsnap=partial, which the engine does not have: it counts and
  * allocates again.  The vector's slack makes that rare enough that a
- * test cannot race for it, so §13's snapstale point hands the fill a
- * vector one entry short of the index instead — one per fill attempt,
- * so an open spends up to Snaptries of them.
+ * test cannot race for it, so §13's snapstale point tells the fill
+ * the index grew by snapshort entries since the count instead — one
+ * armed attempt per fill attempt, so an open spends up to Snaptries
+ * of them.  Nslackshort is past the slack a ten-entry index carries,
+ * so every armed attempt here re-counts.
  */
 static void
 tsnapstale(void)
@@ -730,6 +744,7 @@ tsnapstale(void)
 		snprint(nm, sizeof nm, "s%lud", i);
 		mk(s, nm);
 	}
+	storehook(s, "snapshort", Nslackshort);
 	storehook(s, "snapstale", 1);
 	if((sn = mustsnap(s, Snaplive, "a stale count")) == nil)
 		goto out;
@@ -759,6 +774,7 @@ tsnapstale(void)
 	storestat(s, &st);
 	eqv("and the refusal took no count with it", st.nobjsnap, 0);
 	storehook(s, "snapstale", 0);
+	storehook(s, "snapshort", 0);
 	if((sn = objsnapopen(s, Snaplive)) == nil)
 		fail("objsnapopen once the index settles: %r");
 	else{
@@ -766,6 +782,79 @@ tsnapstale(void)
 		objsnapclose(sn);
 	}
 out:
+	storeclose(s);
+	devclose(d);
+}
+
+/*
+ * §9 sizes the vector at the count plus a sixteenth plus sixteen
+ * entries, and the sixteenth is the term that is there for a
+ * server's hundreds of procs rather than for T1's four: at this
+ * scale the index's NET growth between the count and the fill is
+ * bounded by the procs holding an object absent, not by the index's
+ * size, so no churn a T1 program can mount reaches it and a store of
+ * any size here is covered by the sixteen alone.  §13's snapstale
+ * point is what reaches it instead, and the two halves below bracket
+ * one growth between the two terms: past the sixteen a ten-entry
+ * index gets, inside the fifty a store of Nslack carries besides.
+ * Sizing the vector at the count plus the flat sixteen leaves the
+ * second half refused.
+ */
+static void
+tsnapslack(void)
+{
+	Dev *d;
+	Store *s;
+	Objsnap *sn;
+	Walk *w;
+	char nm[32];
+	ulong i;
+
+	d = bigdisk();
+	if((s = openstoreck(d)) == nil){
+		fail("the vector's slack: storeopen: %r");
+		devclose(d);
+		return;
+	}
+	spawnforget();
+	for(i = 0; i < 10; i++){
+		snprint(nm, sizeof nm, "k%04lud", i);
+		mk(s, nm);
+	}
+	/*
+	 * The control.  Ten entries carry sixteen of slack and nothing
+	 * else, so a growth of Nslackshort is past the vector on every
+	 * attempt and the open runs out of them — which is what says
+	 * Nslackshort is a growth the flat term cannot absorb, and so
+	 * that the other half is the sixteenth's doing.
+	 */
+	storehook(s, "snapshort", Nslackshort);
+	storehook(s, "snapstale", 1000);
+	sn = objsnapopen(s, Snaplive);
+	refused("a growth past the flat slack of a small index",
+		sn != nil ? 0 : -1, "object snapshot: the index moved");
+	objsnapclose(sn);		/* nil unless the refusal failed */
+
+	for(i = 10; i < Nslack; i++){
+		snprint(nm, sizeof nm, "k%04lud", i);
+		mk(s, nm);
+	}
+	if((sn = objsnapopen(s, Snaplive)) == nil)
+		fail("the same growth inside a sixteenth of %d: %r", Nslack);
+	else{
+		eqv("an index whose sixteenth covers the growth is not "
+			"refused", objsnapcount(sn), Nslack);
+		w = newwalk(Nslack);
+		walkall(sn, w, 'k');
+		eqv("and the vector it filled is whole", w->nlive, Nslack);
+		eqv("with no entry answered twice", w->ndup, 0);
+		eqv("and nothing else in it", w->nother, 0);
+		walkfree(w);
+		objsnapclose(sn);
+	}
+	storehook(s, "snapstale", 0);
+	storehook(s, "snapshort", 0);
+	killspawned();
 	storeclose(s);
 	devclose(d);
 }
@@ -2221,6 +2310,7 @@ main(int argc, char **argv)
 	tbound();
 	tsnapcondemned();
 	tsnapstale();
+	tsnapslack();
 	tclosesnap();
 	tdirty();
 	tfullsync();

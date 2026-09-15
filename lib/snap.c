@@ -120,7 +120,7 @@ objsnapopen(Store *s, int kinds)
 {
 	Objsnap *sn;
 	Ient *e;
-	ulong i, n, want, cap, have, lim, try;
+	ulong i, n, want, cap, have, grew, try;
 
 	if(!storeserving(s))
 		return nil;
@@ -195,21 +195,21 @@ objsnapopen(Store *s, int kinds)
 		 * settles it.
 		 */
 		have = snapwant(s, kinds);
-		lim = cap;
 		/*
-		 * §13's snapstale point: pretend the vector came back one
-		 * entry short of the index, which is what an index that grew
-		 * past the slack leaves, so a test can drive the re-count
-		 * without racing for it.  One armed count is spent per fill
-		 * attempt, so an open spends up to Snaptries of them.  Inert
-		 * unless a test asks for it.
+		 * §13's snapstale point: pretend the index grew by snapshort
+		 * entries between the count and here, so a test can drive
+		 * the re-count — and the slack, which is what decides
+		 * whether a given growth needs one — without racing for
+		 * either.  One armed attempt is spent per fill attempt, so
+		 * an open spends up to Snaptries of them.  Inert unless a
+		 * test asks for it.
 		 */
-		if(s->snapstale > 0){
+		grew = 0;
+		if(s->snapstale > 0 && s->snapshort > 0){
 			s->snapstale--;
-			if(have > 0 && have - 1 < lim)
-				lim = have - 1;
+			grew = s->snapshort;
 		}
-		if(have > lim){
+		if(have + grew > cap){
 			qunlock(&s->qlstate);
 			continue;
 		}
