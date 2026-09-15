@@ -16,6 +16,7 @@ TESTS=\
 	scrubtest\
 	committest\
 	enumtest\
+	maptest\
 
 LIB=../lib/libshoal.a$O
 HFILES=../lib/shoal.h ../lib/store.h t1.h
