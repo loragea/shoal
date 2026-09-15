@@ -2764,13 +2764,12 @@ pointer with no generation, so the refcount is what makes the
 address-reuse confusion unreachable: the old `Store` cannot be freed
 while a snapshot names it.
 
-Closing a
-snapshot twice is **undefined**, exactly as freeing the same pointer
-twice is, and for the same reason: the second call reads a handle the
-first freed, whose first word — the store pointer everything in the
-close goes through — the allocator has already overwritten with its
-own free-list links. There is nothing a guard in the close could
-test, so there is none.
+Closing a snapshot twice is **undefined**, exactly as freeing the
+same pointer twice is, and for the same reason: the second call reads
+a handle the first freed, whose first word — the store pointer
+everything in the close goes through — the allocator has already
+overwritten with its own free-list links. There is nothing a guard in
+the close could test, so there is none.
 
 **`/dirty` and `/lost` are copies rather than cursors.** Both sets are
 bounded — by the dirty region (§2.6) and by what fails local
