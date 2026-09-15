@@ -1057,7 +1057,7 @@ mapplace(Cmap *m, char *oid, Cinst **out, int nout)
 {
 	uvlong sbuf[32], *sc, sbest, si;
 	Cinst *pick, *ip;
-	int i, k, np, best, prev;
+	int i, k, n, np, best, prev;
 
 	if(m->npnode == 0)
 		return 0;
@@ -1072,6 +1072,7 @@ mapplace(Cmap *m, char *oid, Cinst **out, int nout)
 	if(np > m->npnode)
 		np = m->npnode;			/* §4.3 step 4: |P| < R */
 	prev = -1;
+	n = 0;
 	for(k = 0; k < np; k++){
 		/*
 		 * The next node in descending order: the greatest that
@@ -1105,12 +1106,21 @@ mapplace(Cmap *m, char *oid, Cinst **out, int nout)
 				sbest = si;
 			}
 		}
-		if(k < nout)
-			out[k] = pick;
+		/*
+		 * A chosen node always has a status=in instance, since
+		 * that is what put it in V; emitting nothing for one
+		 * that does not keeps P free of holes rather than
+		 * handing a caller a member to dereference.
+		 */
+		if(pick == nil)
+			continue;
+		if(n < nout)
+			out[n] = pick;
+		n++;
 	}
 	if(sc != sbuf)
 		free(sc);
-	return k;
+	return n;
 }
 
 Cinst*
