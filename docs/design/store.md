@@ -1990,8 +1990,12 @@ key and the caller's current map epoch, and the store re-checks
 §1.5's two receiver conditions inside the call, under one hold of the
 state lock — the
 record is a tombstone at exactly that key, its `wepoch` strictly
-below the epoch — answering `not discardable` otherwise (§3.7). The
-checks are atomic among themselves, so they judge one record where a
+below the epoch — answering `not discardable` otherwise (§3.7).
+Check (i)'s two halves are answered **state first**, so a live record
+is refused as not a tombstone whether or not the key matches; the
+detail after the prefix is implementation policy (§3.7), and pointing
+a caller at a key when the state is the objection would send it to
+re-read the wrong thing. The checks are atomic among themselves, so they judge one record where a
 separate stat-then-discard could race an `op=delete`; the window
 between the checks and the `Eslot` commit is closed by the caller's
 per-object queue (§7), as for every mutation.
