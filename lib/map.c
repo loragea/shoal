@@ -798,8 +798,6 @@ line(Parse *p, char *s, int start)
 		if(attr(p, a, v) < 0)
 			return -1;
 	}
-	if(start && first)
-		return badmap("empty record line");
 	return 0;
 }
 
@@ -1194,10 +1192,13 @@ mapplace(Cmap *m, char *oid, Cinst **out, int nout)
 			}
 		}
 		/*
-		 * A chosen node always has a status=in instance, since
-		 * that is what put it in V; emitting nothing for one
-		 * that does not keeps P free of holes rather than
-		 * handing a caller a member to dereference.
+		 * A chosen node always has a status=in instance in a
+		 * Cmap this file built — placenodes derives V from the
+		 * same Cinst.node field the round above rescans — but
+		 * Cmap is a public struct and a hand-built one can
+		 * reach here, so emit nothing rather than hand a caller
+		 * a hole in P to dereference.  No validation rule is
+		 * what makes this unreachable, so it is not mutated.
 		 */
 		if(pick == nil)
 			continue;
@@ -1248,6 +1249,11 @@ mapdown(Cmap *m, char *iid)
 
 	if((i = mapinst(m, iid)) == nil)
 		return 1;
+	/*
+	 * status=dead decides nothing for a map this file parsed,
+	 * since §3.3 makes dead imply up=no and mapparse enforces it;
+	 * it guards a hand-built Cmap, like mapplace's hole above.
+	 */
 	return i->up == Uno || i->status == Sout || i->status == Sdead;
 }
 
