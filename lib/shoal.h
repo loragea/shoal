@@ -622,6 +622,19 @@ struct Storecfg
 	ulong	stagemax, stagetot, stagems;
 	ulong	emapcache;
 	ulong	objsnapmax;		/* §9's bound on open snapshots */
+	/*
+	 * §13's free-observation hook: called by the engine as its last
+	 * act before the Store's own memory goes, whichever path
+	 * released it — a storeopen that failed, storeclose, or the
+	 * last objsnapclose of a snapshot that outlived one (§9).  Inert
+	 * when nil, which is what every caller but a test leaves it.
+	 * It exists because the deferred free has no other observable:
+	 * a read through a snapshot whose Store was freed early answers
+	 * correctly out of freed memory, so a test that watched answers
+	 * alone would pass the use-after-free.
+	 */
+	void	(*freed)(void*);
+	void	*freedarg;
 };
 
 struct Storestat

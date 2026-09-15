@@ -3556,6 +3556,21 @@ slack, which is what decides whether a given growth needs one —
 without racing for either; one arming is spent per fill attempt
 rather than per open, an open makes up to `Snaptries` of them, and
 the point is inert while `snapshort` is 0).
+
+**The freed hook is not one of those points.** `Storecfg.freed` and
+`freedarg` are a callback rather than an `-X` name, because what they
+observe is not an injected fault but the engine releasing the
+`Store`'s own memory: the engine calls it as its last act before that
+memory goes, on every path that releases a store — a `storeopen` that
+failed part-way, `storeclose`, and the last `objsnapclose` of a
+snapshot that outlived one (§9) — and it is inert while nil, which is
+what everything but a test leaves it. It exists because §9's deferred
+free has **no other observable**: a read through a snapshot whose
+`Store` was freed early answers *correctly* out of freed memory, and
+so does `storestat`, so a test that watched the answers alone would
+pass a use-after-free and only the allocator would notice, later and
+somewhere else.
+
 Each T1 test names the requirement it discriminates and the mutation
 that must break it; **each mutation is run**, per
 `AGENTS.md`.

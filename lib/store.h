@@ -376,6 +376,7 @@ int	publishlocked(Store*);
 /* store.c */
 int	storeserving(Store*);	/* 0 and an error set on a condemned store */
 int	storeproc(Store*, void (*)(void*), void*);
+void	storefree(Store*);	/* the Store's memory; §13's freed hook */
 void	storeprocdone(Store*);
 void	storecondemn(Store*, ulong slot);	/* §5 step 10, at run time */
 void	lostupdate(Store*, ulong slot);		/* /lost membership, §8 */

@@ -861,7 +861,15 @@ condemn(Store *s)
 	return 0;
 }
 
-static void
+/*
+ * The Store's own memory, released by whichever path gave up the last
+ * claim on it: a storeopen that failed part-way, storeclose, or — for
+ * a store closed under an open snapshot (§9) — the last objsnapclose.
+ * It touches s->d nowhere, so the caller's device may already be
+ * closed; and it destroys exactly what objsnapent renders, which is
+ * why §9 defers it rather than letting a snapshot read through it.
+ */
+void
 storefree(Store *s)
 {
 	Peer *p, *pn;
@@ -897,6 +905,13 @@ storefree(Store *s)
 	free(s->stagebuck);
 	free(s->zeroblk);
 	free(s->lost);
+	/*
+	 * §13's freed hook, last: the Store's fields are still readable
+	 * here, and this is the one place any of them stops being so, so
+	 * a test can say "the memory is gone" and mean exactly that.
+	 */
+	if(s->cfg.freed != nil)
+		(*s->cfg.freed)(s->cfg.freedarg);
 	free(s);
 }
 
@@ -979,7 +994,7 @@ storeopen(Dev *d, Storecfg *cfg)
 	else{
 		werrstr("%s: no flush channel: refusing to start without -w",
 			d->name);
-		free(s);
+		storefree(s);
 		return nil;
 	}
 
@@ -987,14 +1002,14 @@ storeopen(Dev *d, Storecfg *cfg)
 	if(superselect(d, &sel) < 0){
 		werrstr("%s: no valid superblock: shoalck, then shoalfmt -r "
 			"and refill from peers", d->name);
-		free(s);
+		storefree(s);
 		return nil;
 	}
 	s->sb = sel.sb[sel.start];
 	s->pub = s->sb;
 	if(geomok(s, d) < 0){
 		werrstr("%s: geometry: %r", d->name);
-		free(s);
+		storefree(s);
 		return nil;
 	}
 
