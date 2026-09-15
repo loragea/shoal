@@ -2033,11 +2033,17 @@ and §3.6's `op=full` over one, each add `blkcount(len)` to a
 index entry's `len` is intact — it is the extent-map entry that is
 damaged — so the count is an upper bound, and exact for an object
 with no holes. It is memory only and starts at zero at every start,
-because what it describes is the bitmap's error and the bitmap is
-what a rebuild corrects; the standing number over a disk's life is
-§12's `shoalck` cross-check. Not every leak is countable: a slot §5
-step 10 condemned for an index entry that does not unpack has no
-readable `len`, so it raises `lost=` and nothing else.
+because it is one session's observation of what that session left
+marked and not a property of the disk: an ordinary restart does not
+rebuild the bitmap — §5 step 11 rebuilds only when step 5 set the
+flag — so after one the grains are still marked and the count still
+reads zero. The standing number over a disk's life is §12's `shoalck`
+cross-check, and the two need not agree: this count is
+`blkcount(len)`, an upper bound for a sparse object, while the
+cross-check reports the grains actually marked and unreferenced. Not
+every leak is countable: a slot §5 step 10 condemned for an index
+entry that does not unpack has no readable `len`, so it raises
+`lost=` and nothing else.
 
 What survives is the 256-byte index entry. Layer-a §1.5's discard,
 once its three cluster-wide conditions hold, commits an `Eslot` and
