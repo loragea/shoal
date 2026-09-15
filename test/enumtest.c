@@ -1311,13 +1311,18 @@ closerace(int shape, int run)
 	Store *s;
 	void (*fn)(void*);
 	char nm[16];
-	int i, k, alldone;
+	int i, k, alldone, nhanded;
 
 	spawnforget();
 	d = newdisk();
+	nhanded = 0;
+	for(i = 0; i < Nclosew; i++)
+		closew[i].sn = nil;
 	if((s = mustwatched(d, shape != Srender, "the storeclose race"))
-	== nil)
+	== nil){
+		devclose(d);
 		return;
+	}
 	for(i = 0; i < Nclosent; i++){
 		snprint(nm, sizeof nm, "r%d", i);
 		mk(s, nm);
@@ -1337,8 +1342,10 @@ closerace(int shape, int run)
 			fail("the storeclose race: spawn: %r");
 			goto out;
 		}
+		nhanded++;
 	}
 	storeclose(s);
+	s = nil;
 	devclose(d);		/* the device is the caller's, and goes now */
 	d = nil;
 	for(k = 0; k < 4000; k++){
@@ -1375,7 +1382,21 @@ closerace(int shape, int run)
 	}
 	eqv("the store is freed exactly once out of the close race",
 		nfreed, 1);
+	nhanded = Nclosew;		/* every snapshot is closed by here */
 out:
+	/*
+	 * A shape that bailed out still owns the store and whatever it
+	 * opened before the bail, and closing them has to come before
+	 * the reaping: killspawned takes the store's checkpointer with
+	 * it, and storeclose waits for the procs the store started.
+	 * The snapshots already handed to a worker go with that worker;
+	 * what is left here is closed here, and the store is freed by
+	 * whichever release is last.
+	 */
+	for(i = nhanded; i < Nclosew; i++)
+		objsnapclose(closew[i].sn);
+	if(s != nil)
+		storeclose(s);
 	killspawned();
 	if(d != nil)
 		devclose(d);
