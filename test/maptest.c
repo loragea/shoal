@@ -1028,6 +1028,119 @@ tskip(void)
 	mapfree(prev);
 }
 
+/*
+ * §5.2 attaches its substitution to clause 2 alone ("for this
+ * clause").  Clause 4 and the skip rule scope on the mark's subject
+ * being in P(o) at E or at E−1, and the E−1 half is evaluated only
+ * against a real E−1 map.  The subject here, n5.0, is in no
+ * placement set at E, and its reporter n4.0 is up=no: with no E−1
+ * map n4.0 is a witness by clause 2's substitution alone and must be
+ * skipped, and with an E−1 map that placed n5.0 it must block.
+ */
+static char scopebody[] =
+	"instance=n1.0 onnode=n1 addr=a "
+	"uuid=0000000000000000000000000000000a status=in up=yes\n"
+	"instance=n1.1 onnode=n1 addr=b "
+	"uuid=0000000000000000000000000000000b status=in up=yes\n"
+	"instance=n2.0 onnode=n2 addr=c "
+	"uuid=0000000000000000000000000000000c status=in up=yes\n"
+	"instance=n3.0 onnode=n3 addr=d "
+	"uuid=0000000000000000000000000000000d status=in up=yes\n"
+	"instance=n3.2 onnode=n3 addr=e "
+	"uuid=0000000000000000000000000000000e status=in up=yes\n"
+	"instance=n4.0 onnode=n4 addr=f "
+	"uuid=0000000000000000000000000000000f status=out up=no\n"
+	"instance=n5.0 onnode=n5 addr=g "
+	"uuid=00000000000000000000000000000010 status=out up=yes\n"
+	"stale=n5.0 reporter=n4.0 since=5\n";
+
+/* at E−1 only n2 and n5 place, so n5.0 is in P(alpha) at E−1 */
+static char scopeprev[] =
+	"instance=n1.0 onnode=n1 addr=a "
+	"uuid=0000000000000000000000000000000a status=out up=yes\n"
+	"instance=n1.1 onnode=n1 addr=b "
+	"uuid=0000000000000000000000000000000b status=out up=yes\n"
+	"instance=n2.0 onnode=n2 addr=c "
+	"uuid=0000000000000000000000000000000c status=in up=yes\n"
+	"instance=n3.0 onnode=n3 addr=d "
+	"uuid=0000000000000000000000000000000d status=out up=yes\n"
+	"instance=n3.2 onnode=n3 addr=e "
+	"uuid=0000000000000000000000000000000e status=out up=yes\n"
+	"instance=n4.0 onnode=n4 addr=f "
+	"uuid=0000000000000000000000000000000f status=out up=no\n"
+	"instance=n5.0 onnode=n5 addr=g "
+	"uuid=00000000000000000000000000000010 status=in up=yes\n";
+
+static void
+tscope(void)
+{
+	Witreq w;
+	Cmap *m, *prev;
+	Cwit ws[64];
+	Cinst *p[Maxplace], *b;
+	int n, np;
+
+	m = build(nil, nil, scopebody);
+	prev = build(nil, "6", scopeprev);
+	np = mapplace(prev, "alpha", p, nelem(p));
+	if(np != 2 || (strcmp(p[0]->iid, "n5.0") != 0 &&
+	   strcmp(p[1]->iid, "n5.0") != 0))
+		fail("scope: n5.0 is not in P(alpha) at E−1");
+	np = mapplace(m, "alpha", p, nelem(p));
+	if(np != 2 || strcmp(p[0]->iid, "n2.0") != 0 ||
+	   strcmp(p[1]->iid, "n1.1") != 0)
+		fail("scope: P(alpha) at E is not n2.0,n1.1");
+	checks += 2;
+
+	/* no E−1 map, reconcile open: clause 2 substitutes, 4 does not */
+	memset(&w, 0, sizeof w);
+	w.m = m;
+	w.prev = nil;
+	w.oid = "alpha";
+	w.subst = 1;
+	n = mapwitness(&w, ws, nelem(ws));
+	if(!haswit(ws, n, "n4.0", Wprev, Wskip))
+		fail("scope: under substitution an out-of-scope up=no "
+			"reporter is not Wskip");
+	if(haswit(ws, n, "n4.0", Wreporter, -1))
+		fail("scope: the substitution reached clause 4");
+	if((b = witblocker(ws, n)) != nil)
+		fail("scope: blocked by %s under substitution", b->iid);
+	checks += 3;
+
+	/* no E−1 map and no substitution: the same */
+	w.subst = 0;
+	n = mapwitness(&w, ws, nelem(ws));
+	if(!haswit(ws, n, "n4.0", Wprev, Wskip))
+		fail("scope: with no E−1 map an out-of-scope up=no "
+			"reporter is not Wskip");
+	if((b = witblocker(ws, n)) != nil)
+		fail("scope: blocked by %s with no E−1 map", b->iid);
+	checks += 2;
+
+	/* the E−1 map placed the subject: clause 4 holds and blocks */
+	w.prev = prev;
+	n = mapwitness(&w, ws, nelem(ws));
+	if(!haswit(ws, n, "n4.0", Wreporter, Wblock))
+		fail("scope: an in-scope up=no reporter at E−1 is not "
+			"Wblock");
+	b = witblocker(ws, n);
+	if(b == nil || strcmp(b->iid, "n4.0") != 0)
+		fail("scope: the blocker is %s, want n4.0",
+			b == nil ? "none" : b->iid);
+	checks += 2;
+
+	/* subst is clause 2's alone: it does not unscope clause 4 */
+	w.subst = 1;
+	n = mapwitness(&w, ws, nelem(ws));
+	if(!haswit(ws, n, "n4.0", Wreporter, Wblock))
+		fail("scope: subst moved clause 4 off the E−1 map");
+	checks++;
+
+	mapfree(prev);
+	mapfree(m);
+}
+
 /* §5.2: status=dead is excluded from the witness set outright */
 static void
 twitdead(void)
@@ -1350,6 +1463,7 @@ main(int, char**)
 	tdown();
 	twitness();
 	tskip();
+	tscope();
 	twitdead();
 	tadopt();
 	tfence();

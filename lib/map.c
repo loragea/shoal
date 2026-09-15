@@ -1210,27 +1210,49 @@ addwit(Cwit *out, int nout, int n, Cinst *i, int why)
 }
 
 /*
- * §5.2's witness set.  The E−1 half of clauses 2 and 4 and of the
- * skip rule reads prev only when prev is the map at E−1; otherwise
- * §5.2 substitutes every instance with status in {new,in,out} for the
- * clause, and the same substituted set stands in for "P(o) at E−1"
- * wherever else E−1 placement is asked for, because that set is what
- * §5.2 offers in place of knowing it.
+ * §5.2's witness set.  §5.2 attaches its substitution — "substitute
+ * every instance with status in {new,in,out}" — to clause 2 alone,
+ * "for this clause", and clause 4 and the skip rule take no
+ * substitute: they scope on P(o) at E, plus P(o) at E−1 when this
+ * instance holds the E−1 map, and on P(o) at E alone when it does
+ * not.  Substituting for them would make clause 4 the unscoped
+ * reading §5.2 spends a paragraph ruling out — the substituted set
+ * is every instance but a dead one, so "the reporter of any
+ * unresolved mark, whatever the subject" — under which one down
+ * reporter fails every currency check in the cluster.
  */
+
+/* prev is the map at E−1 itself, which is what clause 2 asks for */
 static int
-prevusable(Witreq *w)
+prevmap(Witreq *w)
 {
-	return !w->subst && w->prev != nil &&
-		w->prev->epoch + 1 == w->m->epoch;
+	return w->prev != nil && w->prev->epoch + 1 == w->m->epoch;
 }
 
-/* was i in P(o) at E−1, under the substitution rule above? */
+/*
+ * Clause 2: P(o) at E−1 when this instance holds that map and its
+ * reconcile pass is complete, and §5.2's substituted set otherwise.
+ */
 static int
-inprev(Witreq *w, Cinst **pp, int npp, Cinst *i)
+clause2(Witreq *w, Cinst **pp, int npp, Cinst *i)
 {
-	if(prevusable(w))
+	if(prevmap(w) && !w->subst)
 		return inplace(pp, npp, i);
 	return i->status == Snew || i->status == Sin || i->status == Sout;
+}
+
+/*
+ * The scope clause 4 and the skip rule share: the mark's subject is
+ * in P(o) at E, or in P(o) at E−1 when that map is held.  subst does
+ * not reach here; with no E−1 map the E−1 half is simply not
+ * evaluated, and fetching /maps/<E−1> is the caller's obligation.
+ */
+static int
+inscope(Witreq *w, Cinst **p, int np, Cinst **pp, int npp, Cinst *i)
+{
+	if(inplace(p, np, i))
+		return 1;
+	return prevmap(w) && inplace(pp, npp, i);
 }
 
 int
@@ -1242,9 +1264,8 @@ mapwitness(Witreq *w, Cwit *out, int nout)
 
 	m = w->m;
 	np = mapplace(m, w->oid, p, nelem(p));
-	npv = 0;
 	npp = 0;
-	if(prevusable(w)){
+	if(prevmap(w)){
 		npv = mapplace(w->prev, w->oid, pv, nelem(pv));
 		/* the same instances, named in the map at E */
 		for(i = 0; i < npv; i++)
@@ -1260,7 +1281,7 @@ mapwitness(Witreq *w, Cwit *out, int nout)
 		why = 0;
 		if(inplace(p, np, ip))
 			why |= Wplace;
-		if(inprev(w, pp, npp, ip))
+		if(clause2(w, pp, npp, ip))
 			why |= Wprev;
 		for(k = 0; k < w->nstray; k++)
 			if(strcmp(ip->iid, w->stray[k]) == 0)
@@ -1274,7 +1295,7 @@ mapwitness(Witreq *w, Cwit *out, int nout)
 				continue;
 			if((sub = mapinst(m, m->stale[k].subject)) == nil)
 				continue;
-			if(inplace(p, np, sub) || inprev(w, pp, npp, sub)){
+			if(inscope(w, p, np, pp, npp, sub)){
 				why |= Wreporter;
 				break;
 			}

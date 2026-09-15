@@ -1388,8 +1388,19 @@ struct Cwit
  * specifically; when it is not, or when subst is set because this
  * instance's reconcile pass for the last placement change has not
  * completed, §5.2 substitutes every instance with status in
- * {new,in,out} for the clause, and this code substitutes that same
- * set wherever the clause-4 and skip rules say "P(o) at E−1".
+ * {new,in,out} — for that clause and for no other.
+ *
+ * Clause 4 and the skip rule are scoped on the mark's subject being
+ * in P(o) at E or at E−1, and take no substitute: with no E−1 map
+ * here (prev nil, or prev at some other epoch) the E−1 half of that
+ * scope is NOT evaluated, whatever subst says.  §5.2 offers the
+ * caller the other way out — fetch /maps/<E−1> from the monitor,
+ * which §8.2 requires it to keep, and pass it as prev — and that
+ * fetch is the caller's obligation, not this code's.  Substituting
+ * for clause 4 instead would scope it on "every instance that is not
+ * dead", which is the unscoped reading §5.2 rules out: one down
+ * reporter of one unresolved mark would then block every currency
+ * check in the cluster.
  *
  * stray[] is the locally known stray holders of clause 3, as iids;
  * one that names no instance of m is ignored.  mapwitness answers
