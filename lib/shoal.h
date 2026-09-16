@@ -657,9 +657,12 @@ struct Storestat
 	 * it: whether a pass is running, how far it has got, and what
 	 * the last one cost.  bmfolded and bmreread are the live pass's
 	 * while one runs and the last pass's once it has ended, so a
-	 * finished pass still says what it did; bmreread counts the
-	 * folds a slot that moved under the walk sent round again, which
-	 * is how much the pass is fighting write traffic.  bmfolding is
+	 * finished pass still says what it did.  bmfolded counts the
+	 * folds that COMPLETED for a `live` slot, so it is progress
+	 * against nlive and a free or tomb slot adds nothing to it;
+	 * bmreread counts the folds a slot that moved under the walk
+	 * sent round again, which is how much the pass is fighting
+	 * write traffic.  bmfolding is
 	 * the folds holding a map read right now, and it is the live
 	 * pass's alone: an end refuses while any is outstanding.
 	 * bmswapped is the bitmap pages the last completed swap
@@ -668,7 +671,7 @@ struct Storestat
 	 * superblock.
 	 */
 	int	bmpass;			/* a rebuild pass is live */
-	uvlong	bmfolded;		/* slots folded */
+	uvlong	bmfolded;		/* live slots folded, completed */
 	uvlong	bmfolding;		/* folds holding a map read */
 	uvlong	bmreread;		/* folds sent round again by the stamp */
 	uvlong	bmswapped;		/* bitmap pages the last swap installed */
@@ -812,10 +815,11 @@ int	storefullsync(Store*, char *peer);
  * already put those grains in the shadow — so the end leaves that
  * much standing and discharges the rest.
  *
- * All four answer 0, or -1 with an error set: on a condemned store
- * (§3.2), on a slot out of range, on a fold or an end with no pass
- * running, on an end the walk did not cover, and on a begin with one
- * already running.  A fold that could not read a map says so ("map
+ * The three that answer do so with 0, or -1 with an error set: on a
+ * condemned store (§3.2), on a slot out of range, on a fold or an end
+ * with no pass running, on an end the walk did not cover, and on a
+ * begin with one already running.  bmpassabort answers nothing: it
+ * has nothing to refuse and nothing to fail at.  A fold that could not read a map says so ("map
  * read"), which is the caller's cue to fold that slot again rather
  * than to give the pass up.  None of them is a §2.6 wire condition,
  * so none carries a §2.6 prefix (§3.7).

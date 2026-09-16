@@ -648,7 +648,7 @@ tonline(void)
 	}
 	storestat(s, &st);
 	eqv("the pass ends", st.bmpass, 0);
-	eqv("the walk folded every slot that holds a record", st.bmfolded, 3);
+	eqv("the walk folded every live slot", st.bmfolded, 2);
 	eqv("nothing moved under it", st.bmreread, 0);
 	istrue("and the swap installed a page", np >= 1 && st.bmswapped == np);
 	eqv("the condemned map's grains come back", st.grainfree, gf + 3);

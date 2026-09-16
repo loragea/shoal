@@ -2625,7 +2625,7 @@ costs the walk nothing, because it folds what the live maps say now
 and the rebuilt map is what the entry names either way. A map whose
 entry fails its checksum is condemned by the fold that read it, as it
 is by every other reader of a map (§5 step 10). `/status` reports
-what a pass is doing — whether one is live, the slots folded, the
+what a pass is doing — whether one is live, the live slots folded, the
 folds in flight, the re-reads the stamp forced and the pages the last
 swap installed — and §6's `grainleak=` is what says how much a pass
 would return, and so what says when the work is worth doing.

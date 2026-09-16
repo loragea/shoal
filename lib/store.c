@@ -1097,9 +1097,9 @@ bmpassfold(Store *s, ulong slot)
 {
 	Ient *e;
 	Emape *c;
-	ulong *g, gen, eslot, i, n, try;
+	ulong gen, eslot, i, n, try;
 	uvlong nblk;
-	int r, act, counted;
+	int r, act;
 
 	if(!storeserving(s))
 		return -1;
@@ -1108,12 +1108,7 @@ bmpassfold(Store *s, ulong slot)
 			s->sb.nslots);
 		return -1;
 	}
-	if((g = malloc(s->sb.nblkmax*sizeof *g)) == nil){
-		werrstr("out of memory");
-		return -1;
-	}
 	r = -1;
-	counted = 0;
 	for(try = 0; try < Bmfoldmax; try++){
 		qlock(&s->qlstate);
 		if(s->bmshadow == nil){
@@ -1134,6 +1129,8 @@ bmpassfold(Store *s, ulong slot)
 		 * what the entry names either way.
 		 */
 		if(e->state == Sfree || e->bad){
+			if(e->state == Slive)
+				s->bmnfold++;
 			foldmark(s, slot);
 			qunlock(&s->qlstate);
 			r = 0;
@@ -1141,15 +1138,12 @@ bmpassfold(Store *s, ulong slot)
 		}
 		gen = e->gen;
 		eslot = e->emapslot;
-		nblk = blkcount(e->len, s->sb.blksz);
-		if(nblk > s->sb.nblkmax)
-			nblk = s->sb.nblkmax;
-		n = nblk;
 		if(eslot == 0){
 			/* §2.3's inline map: the entry is its own map */
-			if(n > 0)
+			if(blkcount(e->len, s->sb.blksz) > 0)
 				shadowgrain(s, e->grain0);
-			s->bmnfold++;
+			if(e->state == Slive)
+				s->bmnfold++;
 			foldmark(s, slot);
 			qunlock(&s->qlstate);
 			r = 0;
@@ -1167,8 +1161,6 @@ bmpassfold(Store *s, ulong slot)
 				slot);
 			break;
 		}
-		for(i = 0; i < n; i++)
-			g[i] = emapgrain(c->p, i);
 
 		qlock(&s->qlstate);
 		/*
@@ -1179,10 +1171,6 @@ bmpassfold(Store *s, ulong slot)
 		 * a retryable refusal rather than as coverage.
 		 */
 		s->bmnflight++;
-		if(!counted){
-			s->bmnfold++;
-			counted = 1;
-		}
 		/*
 		 * §13's bmfold point: park this fold between the map read
 		 * and every validation it makes — the stamp's and the
@@ -1229,25 +1217,28 @@ bmpassfold(Store *s, ulong slot)
 			 * the grains it names.
 			 */
 			storecondemn(s, slot);
+			if(e->state == Slive)
+				s->bmnfold++;
 			foldmark(s, slot);
 			r = 0;
 		}else{
 			/*
-			 * The bound's fallback, when the stamp moved: the
-			 * pinned entry is still this slot's map, and reading
-			 * it here is a read under the lock the apply mutates
-			 * it under.
+			 * The fold, and at the bound the fallback with the
+			 * stamp moved: either way the grains come straight
+			 * off the pinned entry, as §5 step 11's rebuild
+			 * reads them, under the lock the apply mutates them
+			 * under.  Copying them out first would buy nothing —
+			 * the hold is the same nblkmax bit-sets §7 costs it
+			 * either way — and cost an allocation per slot.
 			 */
-			if(e->gen != gen){
-				nblk = blkcount(e->len, s->sb.blksz);
-				if(nblk > s->sb.nblkmax)
-					nblk = s->sb.nblkmax;
-				n = nblk;
-				for(i = 0; i < n; i++)
-					g[i] = emapgrain(c->p, i);
-			}
+			nblk = blkcount(e->len, s->sb.blksz);
+			if(nblk > s->sb.nblkmax)
+				nblk = s->sb.nblkmax;
+			n = nblk;
 			for(i = 0; i < n; i++)
-				shadowgrain(s, g[i]);
+				shadowgrain(s, emapgrain(c->p, i));
+			if(e->state == Slive)
+				s->bmnfold++;
 			foldmark(s, slot);
 			r = 0;
 		}
@@ -1260,23 +1251,31 @@ bmpassfold(Store *s, ulong slot)
 	if(try >= Bmfoldmax)
 		werrstr("bitmap rebuild: slot %lud: the map will not hold "
 			"still", slot);
-	free(g);
 	return r;
 }
 
-/* the clear bits in one page of a bitmap; caller holds qlstate */
+/*
+ * The clear bits in one page of a bitmap, over the first nbit bits of
+ * it.  §2.5's last page is padded out to the page size and §5 step
+ * 11's count stops at ngrains, so a page counted to its end would
+ * make the swap's count and the start-up count disagree by however
+ * much padding the geometry leaves.  Caller holds qlstate.
+ */
 static uvlong
-pagefree(uchar *p, uvlong bytes)
+pagefree(uchar *p, uvlong nbit)
 {
 	uvlong i, n;
 	int b;
 
 	n = 0;
-	for(i = 0; i < bytes; i++)
-		if(p[i] != 0xff)
+	for(i = 0; i + 8 <= nbit; i += 8)
+		if(p[i/8] != 0xff)
 			for(b = 0; b < 8; b++)
-				if((p[i] & (1<<b)) == 0)
+				if((p[i/8] & (1<<b)) == 0)
 					n++;
+	for(; i < nbit; i++)
+		if((p[i/8] & (1<<(i%8))) == 0)
+			n++;
 	return n;
 }
 
@@ -1314,13 +1313,14 @@ coverok(Store *s)
 int
 bmpassend(Store *s, uvlong *npage)
 {
-	uvlong bytes, i, n, was, now;
+	uvlong bits, bytes, nbit, i, n, was, now;
 
 	if(npage != nil)
 		*npage = 0;
 	if(!storeserving(s))
 		return -1;
-	bytes = bmbits(s->sb.blksz)/8;
+	bits = bmbits(s->sb.blksz);
+	bytes = bits/8;
 	qlock(&s->qlstate);
 	if(s->bmshadow == nil){
 		qunlock(&s->qlstate);
@@ -1357,8 +1357,13 @@ bmpassend(Store *s, uvlong *npage)
 			 * copy (§6), so it contributes to neither count and
 			 * the difference passes it over.
 			 */
-			was = pagefree(s->bmap + i*bytes, bytes);
-			now = pagefree(s->bmshadow + i*bytes, bytes);
+			nbit = bits;
+			if(i*bits >= s->sb.ngrains)
+				nbit = 0;
+			else if(s->sb.ngrains - i*bits < bits)
+				nbit = s->sb.ngrains - i*bits;
+			was = pagefree(s->bmap + i*bytes, nbit);
+			now = pagefree(s->bmshadow + i*bytes, nbit);
 			memmove(s->bmap + i*bytes, s->bmshadow + i*bytes,
 				bytes);
 			s->grainfree += now - was;
