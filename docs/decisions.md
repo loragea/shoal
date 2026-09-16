@@ -406,14 +406,19 @@ live entry's map, so its pass accumulates a shadow bitmap and swaps
 it in page by page under `qlstate`, behind a write barrier on the
 two bitmap mutators — and it needs a per-slot generation stamp,
 because the block repair and the `corrupt`-flag commit both publish
-with the four-tuple unchanged while the map changes. The scrubber
-does not exist yet, so what the store does today is *account*: each
-leaking exit adds `blkcount(len)` to a memory-only **leaked-grain
-count**, reported as `grainleak=` and starting at zero at every
-start, which is where a rebuild happens. The grains come back at
-that rebuild: `shoalck -R`, or §5 step 11 when start found a damaged
-bitmap page. `design/store.md` §6, §8 and §13 say so, with the
-scrub half marked as not built.
+with the four-tuple unchanged while the map changes. The engine's half
+of that is built — a pass is begun, one slot at a time is folded into
+the shadow, and the swap installs it page by page behind the barrier
+— and the *pass* that drives it is the server's and is not, so until
+a server drives one the calls are exercised by T1 and by nothing
+else. The count stands beside it: each leaking exit adds
+`blkcount(len)` to a memory-only **leaked-grain count**, reported as
+`grainleak=`, starting at zero at every start and zeroed by the swap
+that returns the grains. The offline reclaim stays what it was —
+`shoalck -R`, or §5 step 11 when start found a damaged bitmap page —
+as the same reclaim on a store that is not serving.
+`design/store.md` §6, §8 and §13 say so, with the server's half
+marked as not built.
 **Owner's direction (Victor):** "manual intervention needed? That
 sounds VERY bad … should be folded into scrub."
 **Rationale:** Keeping the offline rebuild as the *permanent* answer
@@ -698,3 +703,58 @@ the case undefined rather than decided. Also policy, and a known cost:
 `mapprimary` and `mapunderrep` each recompute the whole placement, so a
 `/status` path reporting both runs the HRW twice — measured against
 nothing yet, and cheap at §4.1's envelope.
+
+## D24 — The online rebuild's engine contract: what a fold validates, what the swap counts, what a close does (2026-09-16)
+
+**Decision:** Five calls' worth of contract under D18's mechanism,
+settled in `lib/store.c` and `lib/alloc.c`:
+
+- **The free count moves by the swap's own difference, not by a
+  recount.** Each installed page moves `grainfree` by the clear bits
+  it gained or lost; the whole-bitmap recount `design/store.md` §8
+  used to prescribe is not taken. A staged grain is clear in both
+  copies (§6), so it needs no term of its own either way.
+- **A fold validates by the stamp and re-reads a bounded number of
+  times.** Past that bound it takes the grains from the pinned entry
+  under `qlstate` itself — a memory read under the lock the apply
+  mutates the map under, not a device read — and a slot whose
+  extent-map slot has moved under it goes round again with a fresh
+  pin.
+- **The stamp outlives the slot.** `applyslot` bumps it rather than
+  zeroing it, and a condemnation bumps it although no map changed,
+  because what it records is "what this slot says has moved" and not
+  "the four-tuple has".
+- **A fold that reads a map failing its checksum condemns the slot**,
+  as every other reader of a map does (§5 step 10), and folds nothing.
+- **`storeclose` aborts a live pass.** The contract is still that a
+  caller ends or aborts one first (D16), and a fold parked at §13's
+  hold point is woken by the drop rather than left asleep in a pass
+  that no longer exists.
+
+**Rationale:** The recount is the only one of these with a cost
+argument behind it: at `ngrains` on a 4 TB disk it is ~2.6*10^8 bit
+tests under `qlstate`, which is the hold that chunking the swap
+exists to avoid — §7 rule 2's `/status`, `/ctl` and `Tflush` are
+behind exactly that lock — so taking it at the end would give back
+what the page-by-page swap bought. The difference is exact rather
+than approximate: the barrier keeps both copies current, so a page's
+two counts are taken under one hold of the lock every mutation of
+either copy is made under. The re-read bound is a liveness
+obligation, not a correctness one: without it one object under a
+continuous write rate starves the walk on that slot for ever, and the
+fallback is safe because a pinned entry's bytes are readable under
+`qlstate` by construction (§7). The stamp's survival across a release
+is the case that would otherwise be silently wrong: a slot freed and
+re-created under a walk is the freshest possible entry, and zeroing
+the stamp would make it look unchanged to precisely the reader the
+stamp exists for. And a pass that a close left armed would be a
+barrier writing into freed memory on the next commit, which is why
+the close drops it rather than trusting the caller.
+**Normative:** none. Nothing here reaches a wire or an on-disk
+format; the stamp is memory only and no format field carries it.
+**Implementation policy:** all of it. A conforming implementation may
+recount, may re-read without a bound or run the fold inside the
+object's queue instead, may refuse a close under a live pass rather
+than aborting it, and may reclaim a condemned slot's grains some
+other way entirely — so long as it never frees a grain a map it read
+named.

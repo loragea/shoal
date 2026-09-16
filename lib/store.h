@@ -239,6 +239,21 @@ struct Store
 	 * a rebuild corrects — and qlstate's, like grainfree.
 	 */
 	uvlong	grainleak;
+	/*
+	 * §8's online rebuild pass (D18).  bmshadow is the shadow bitmap
+	 * and it is also the write barrier's arm: while it is not nil,
+	 * grainmark and grainclear mirror every set and clear into it,
+	 * so the two copies stay current until the last page of the swap
+	 * has landed and the swap can therefore be chunked.  All of it
+	 * is qlstate's, like the bitmap it shadows.
+	 */
+	uchar	*bmshadow;		/* nil unless a pass is live */
+	uvlong	bmnfold;		/* slots the pass has folded */
+	uvlong	bmnreread;		/* folds the stamp sent round again */
+	uvlong	bmswapped;		/* pages the last swap installed */
+	int	bmfoldhold;		/* §13's bmfold point: park one fold */
+	int	bmfoldgo;		/* ... until the hook lets it go */
+	Rendez	bmrz;			/* on qlstate: the fold parked there */
 	Sgrain	**stagebuck;		/* §6's hash of reserved grains */
 	Sgrain	*stagefree;		/* recycled nodes */
 	ulong	nstagebuck;
