@@ -997,6 +997,36 @@ int	objrepair(Store*, uchar *oid, int oidlen, ulong blk, void *a, long n);
  * peer-engine-ops work and nowhere else in this header.
  */
 /* --- peer-engine-ops: begin --- */
+/*
+ * **The resulting-csum check** (layer-a §5.5, D23).  A replicated
+ * operation carries the `csum=' the object MUST have once it is
+ * applied, and the receiver MUST compute its own and fail
+ * `checksum mismatch' if they differ.  The six calls below are the
+ * plain calls above with one argument added: `csum' is nil for no
+ * check, or Csumlen bytes the commit's own csum must equal.  The
+ * check is made where that csum is computed, inside the commit path
+ * and BEFORE the log record is written, so a mismatch leaves nothing
+ * durable — which is the whole of what makes it a check and not a
+ * report.  Each plain call is exactly its variant with nil.
+ *
+ * stagefinalcsum checks the csum the staged digests hash to, before
+ * the stage commits; a failure discards the stage like every other
+ * stagefinal outcome (§3.6).
+ *
+ * The arbitration these calls do NOT do is still the caller's: the
+ * server compares keys under the oid's queue (§7) and calls here only
+ * once it has decided, exactly as for the plain forms.
+ */
+int	objcreatecsum(Store*, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
+		uchar *csum, Dirtyrec *dr, int ndr, Objinfo*);
+int	objwritecsum(Store*, uchar *oid, int oidlen, void *a, long n, uvlong off,
+		uvlong ver, uvlong wepoch, uchar *csum, Dirtyrec *dr, int ndr);
+int	objtrunccsum(Store*, uchar *oid, int oidlen, uvlong len, uvlong ver,
+		uvlong wepoch, uchar *csum, Dirtyrec *dr, int ndr);
+int	objremovecsum(Store*, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
+		uchar *csum, Dirtyrec *dr, int ndr);
+int	stagefinalcsum(Stage*, uvlong ver, uvlong wepoch, uchar *csum,
+		Dirtyrec *dr, int ndr);
 /* --- peer-engine-ops: end --- */
 
 /* the dirty set, §2.6 and layer-a §7.1 */

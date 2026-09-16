@@ -1639,6 +1639,7 @@ own `not primary: n5.0` is the pattern. Callers can act on these:
 | an `op=full` at a key the receiver's own key defends (§3.6) | `stale version` |
 | an `op=full` at a version the object model forbids, and a chunk outside its stage's declared length | `bad ctl` |
 | a read, verify or update through an extent-map entry that failed its `csum128` (§5 step 9) — block repair excepted, below; a read, write or truncate of a copy whose `corrupt` flag is set (§8); a block repair whose bytes do not hash to the stored `dig[i]` | `checksum mismatch` |
+| a replicated operation whose resulting `csum` is not the one it named (layer-a §5.5, §3.8, D23) | `checksum mismatch` |
 | a discard whose record fails layer-a §1.5's receiver checks: not a tombstone, not at exactly the named key, or its `wepoch` not strictly below the given epoch | `not discardable` |
 | no grain, index slot, extent-map slot, staged-grain budget, or log space after §6's bounded wait | `disk full` |
 | an enumeration-snapshot open past §9's `objsnapmax` | `disk full` |
@@ -1711,6 +1712,37 @@ them obvious:
   is `op=full` — so they are spelled as one family of
   internal-invariant error, `block repair: slot N: …`, rather than
   splitting on which structure carried the damage.
+
+### 3.8 The peer-channel primitives
+
+*Policy for the mechanics; layer-a §1.5, §5.5, §5.6 and §7.4 own the
+rules.*
+
+What layer-a's peer channels require of a receiver that the write
+path above does not reach — because each of these does something no
+client operation does — is described here; §3.7 carries the error
+strings and D23 the checksum rule.
+
+**The resulting-`csum` check.** layer-a §5.5 requires the receiver of
+a replicated operation to compute the `csum` the object will have and
+fail `checksum mismatch` before the divergent state exists. The check
+is made inside the commit path, at the one point where the new `csum`
+has been computed and no byte of the record has been written, so a
+mismatch costs a discard (§3.3) and leaves the published state
+exactly as it was. Made after the record, it would be a report of a
+divergence rather than a bar to one, and the next start would believe
+the record. For a multi-request `op=full` the check runs over the
+digests the transfer staged, and a failure discards the stage as §3.6
+says every `final=1` outcome does. D23 states what is normative here
+and what is this library's shape.
+
+**What the server still owes.** The engine holds no map and
+arbitrates on no delta path, so layer-a's epoch check, the delta ops'
+predecessor rule, the self-contained ops' key comparison, §5.6's
+re-check that a dropping instance is not in `P(oid)`
+(`still placed`), and §1.5's cluster-wide discard conditions are all
+the caller's, made under the object's queue (§7) before it calls.
+
 
 ## 4. Read path, holes and re-hashing
 
@@ -4049,7 +4081,8 @@ back at a higher key under it, and under concurrent churn with one
 churn proc parked on a tombstone of its own making, so that the
 walk's epoch condition is what holds it off and not its cutoff).
 
-Against the list below that is T1.1–T1.26. One case is not covered
+Against the list below that is T1.1–T1.26 and T1.32. One case
+is not covered
 and waits on something this store does not have yet: **T1.27** waits
 on the server's `Reqqueue` pool (§7), which is what it is about — the
 engine's own scrub and cursor take the same `qlstate` snapshot every
@@ -4304,6 +4337,15 @@ what would close it.
   instead of pushing through the object's `Reqqueue`. Not covered:
   the `Reqqueue` pool is the server's (§7) and is not built, so
   neither is the thing this test discriminates between.
+- **T1.32 the resulting-`csum` check (§3.8, D23).** For each of
+  `objwrite`, `objtrunc`, `objremove`, `objcreate` and `op=full`: learn the `csum` the operation produces on one store,
+  then on an identical one offer a wrong `csum` and assert
+  `checksum mismatch` and that **nothing is durable** — the log's
+  `seqnext` and watermark have not moved, and a restart replays to
+  the state before the call — and then offer the right one and assert
+  it commits the same four-tuple. *Mutation:* make the check after
+  `logcommit` rather than before it, which leaves the refusal in
+  place and the record on the platter.
 
 T1 stays diskless and is `mk test` at the repo root, as `AGENTS.md`
 requires: the simulated disk is a T1 program's own memory.

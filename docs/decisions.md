@@ -698,3 +698,46 @@ the case undefined rather than decided. Also policy, and a known cost:
 `mapprimary` and `mapunderrep` each recompute the whole placement, so a
 `/status` path reporting both runs the HRW twice — measured against
 nothing yet, and cheap at §4.1's envelope.
+
+## D23 — The resulting-`csum` check runs before the record, and the API says so with a variant per call (2026-09-16)
+
+**Decision:** layer-a §5.5's receiver check — "the receiver MUST
+compute its own and MUST fail with `checksum mismatch` if they
+differ" — is made inside the store's commit path, at the point where
+the new `csum` has been computed and no byte of the log record has
+been written, and it answers §2.6's `checksum mismatch`.
+`design/store.md` §3.8 states it and §3.7's table carries the row.
+The library exposes it as one extra argument on a parallel entry
+point per mutating call — `objwritecsum`, `objtrunccsum`,
+`objremovecsum`, `objcreatecsum`, `stagefinalcsum` —
+where nil means no check and each plain call is its variant with nil.
+For a multi-request `op=full` the check runs over the digests the
+transfer staged and a failure discards the stage, as §3.6 says every
+`final=1` outcome does.
+**Rationale:** The check's whole value is that it is a bar rather
+than a report. Made after `logcommit` it would refuse the operation
+and leave its record on the platter, so the next start would replay
+into precisely the divergent state layer-a §5.5 says the check exists
+to prevent — and the caller, holding an error, would have no way to
+know. The one place where the resulting `csum` exists and nothing is
+durable is inside the commit, which is also the only place that sees
+the `csum` of an `op=full`'s staged digests and of a tombstone alike,
+so one check covers five operations. Separate entry points were
+chosen over widening the existing ones because those have hundreds of
+call sites and the argument is meaningful on none of them: a client
+write has no sender to check against. They were chosen over a
+store-wide "expected csum" set before the call because §7 runs many
+committing procs over one `Store` and such a value would belong to
+none of them; and over returning the computed `csum` for the caller
+to compare because by the time the caller could compare, the record
+is durable, which is the failure this row exists to rule out.
+**Normative:** that the check is made before the update becomes
+durable, and that it answers `checksum mismatch` — the spelling is
+layer-a §2.6's and §3.7's carve-out makes the mapping normative. A
+receiver that answers something else, or that commits and then
+reports, does not conform.
+**Implementation policy:** the API shape — a parallel call per
+operation, nil for no check, the plain call defined as the variant
+with nil — and the detail after the prefix. An implementation that
+passes the expected `csum` on one widened signature, or that carries
+it in a per-operation handle, conforms equally.

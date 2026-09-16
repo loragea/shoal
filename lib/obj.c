@@ -41,6 +41,7 @@ struct Upd
 	int	slotresv;		/* this update reserved an index slot */
 	int	emapresv;		/* ... and an extent-map slot */
 	int	keepcsum;		/* publish e.csum rather than recompute */
+	uchar	*expcsum;		/* layer-a §5.5's csum=, or nil */
 };
 
 static void updclose(Upd*);
@@ -215,6 +216,27 @@ updcommit(Upd *u, int state, uvlong ver, uvlong wepoch, vlong mtime,
 		memmove(csum, u->e.csum, Csumlen);
 	else if(updcsum(u, &mold, csum) < 0){
 		updabort(u);
+		return -1;
+	}
+	/*
+	 * layer-a §5.5's resulting-csum check (D23).  A replicated
+	 * operation names the csum the object MUST have once it is
+	 * applied, and the receiver MUST compute its own and refuse
+	 * `checksum mismatch' if they differ: it is the check that
+	 * catches divergence at the moment it would be created.
+	 *
+	 * It is made HERE and nowhere else.  This is the one point at
+	 * which the csum this operation publishes exists and no byte of
+	 * its record has been written, so a refusal costs an updabort
+	 * and leaves the published state exactly as §3.3 leaves it after
+	 * any other discard.  Made after logcommit it would be a report
+	 * of a divergence rather than a bar to one, and the record would
+	 * already be on the platter for replay to believe.
+	 */
+	if(u->expcsum != nil && memcmp(csum, u->expcsum, Csumlen) != 0){
+		updabort(u);
+		werrstr("checksum mismatch: the resulting csum is not the "
+			"one the operation named");
 		return -1;
 	}
 	memset(&o, 0, sizeof o);
@@ -814,9 +836,22 @@ objstat(Store *s, uchar *oid, int oidlen, Objinfo *oi)
 	return 0;
 }
 
+/*
+ * The five plain entry points below are their csum-checking variants
+ * with no expected csum (D23): layer-a §5.5's `csum=' is the
+ * receiver's check and a client write has nobody to check against, so
+ * the argument is nil for every caller but the peer channels.
+ */
 int
 objcreate(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 	Dirtyrec *dr, int ndr, Objinfo *oi)
+{
+	return objcreatecsum(s, oid, oidlen, ver, wepoch, nil, dr, ndr, oi);
+}
+
+int
+objcreatecsum(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
+	uchar *csum, Dirtyrec *dr, int ndr, Objinfo *oi)
 {
 	Upd u;
 	Ient *e;
@@ -935,6 +970,7 @@ objcreate(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 	u.oldnblk = 0;
 	u.newslot = 0;
 	u.oslot = 0;
+	u.expcsum = csum;
 	if(updcommit(&u, Slive, ver, wepoch, time(nil), 0, dr, ndr) < 0){
 		updclose(&u);
 		return -1;
@@ -948,6 +984,14 @@ objcreate(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 int
 objwrite(Store *s, uchar *oid, int oidlen, void *a, long n, uvlong off,
 	uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
+{
+	return objwritecsum(s, oid, oidlen, a, n, off, ver, wepoch, nil,
+		dr, ndr);
+}
+
+int
+objwritecsum(Store *s, uchar *oid, int oidlen, void *a, long n, uvlong off,
+	uvlong ver, uvlong wepoch, uchar *csum, Dirtyrec *dr, int ndr)
 {
 	Upd u;
 	Omap mold;
@@ -1006,7 +1050,10 @@ objwrite(Store *s, uchar *oid, int oidlen, void *a, long n, uvlong off,
 	 * that did not, at the same key: layer-a §1.3's I3 through a
 	 * legal client call.  The existence and bounds tests above still
 	 * run, so a count-0 write to a tombstone or past objmax fails as
-	 * it should.
+	 * it should.  A csum named for one is not checked, and cannot
+	 * need to be: the check bars a divergent state from becoming
+	 * durable (§5.5), and a call that commits no record creates no
+	 * state to diverge.
 	 */
 	if(n == 0)
 		return 0;
@@ -1050,6 +1097,7 @@ objwrite(Store *s, uchar *oid, int oidlen, void *a, long n, uvlong off,
 		return -1;
 	}
 	free(buf);
+	u.expcsum = csum;
 	if(updcommit(&u, Slive, ver, wepoch, time(nil), 0, dr, ndr) < 0){
 		updclose(&u);
 		return -1;
@@ -1061,6 +1109,13 @@ objwrite(Store *s, uchar *oid, int oidlen, void *a, long n, uvlong off,
 int
 objtrunc(Store *s, uchar *oid, int oidlen, uvlong len, uvlong ver,
 	uvlong wepoch, Dirtyrec *dr, int ndr)
+{
+	return objtrunccsum(s, oid, oidlen, len, ver, wepoch, nil, dr, ndr);
+}
+
+int
+objtrunccsum(Store *s, uchar *oid, int oidlen, uvlong len, uvlong ver,
+	uvlong wepoch, uchar *csum, Dirtyrec *dr, int ndr)
 {
 	Upd u;
 	Omap mold;
@@ -1095,6 +1150,7 @@ objtrunc(Store *s, uchar *oid, int oidlen, uvlong len, uvlong ver,
 		return -1;
 	}
 	free(buf);
+	u.expcsum = csum;
 	if(updcommit(&u, Slive, ver, wepoch, time(nil), 0, dr, ndr) < 0){
 		updclose(&u);
 		return -1;
@@ -1111,6 +1167,13 @@ objtrunc(Store *s, uchar *oid, int oidlen, uvlong len, uvlong ver,
 int
 objremove(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 	Dirtyrec *dr, int ndr)
+{
+	return objremovecsum(s, oid, oidlen, ver, wepoch, nil, dr, ndr);
+}
+
+int
+objremovecsum(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
+	uchar *csum, Dirtyrec *dr, int ndr)
 {
 	Upd u;
 	Omap mold;
@@ -1162,6 +1225,7 @@ objremove(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 		updclose(&u);
 		return -1;
 	}
+	u.expcsum = csum;
 	if(updcommit(&u, Stomb, ver, wepoch, time(nil), 0, dr, ndr) < 0){
 		updclose(&u);
 		return -1;
@@ -2067,6 +2131,13 @@ stagehandoff(Stage *g, uvlong lim)
 int
 stagefinal(Stage *g, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 {
+	return stagefinalcsum(g, ver, wepoch, nil, dr, ndr);
+}
+
+int
+stagefinalcsum(Stage *g, uvlong ver, uvlong wepoch, uchar *csum,
+	Dirtyrec *dr, int ndr)
+{
 	Store *s;
 	Upd u;
 	Omap mold;
@@ -2190,6 +2261,15 @@ stagefinal(Stage *g, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 		}
 	}
 	stagehandoff(g, g->nblk);
+	/*
+	 * §3.6: the check runs over the digests the transfer staged,
+	 * inside the commit and before the record is written, so an
+	 * op=full whose bytes do not hash to the csum the sender named
+	 * publishes nothing.  The failure ends the transfer like every
+	 * other final=1 outcome, and stagefail's discard is what
+	 * releases whatever the handle still owns.
+	 */
+	u.expcsum = csum;
 	if(updcommit(&u, Slive, ver, wepoch, time(nil), 0, dr, ndr) < 0){
 		updclose(&u);
 		return stagefail(g);
