@@ -4694,13 +4694,13 @@ would be a wire change.
 
 *Policy, but read it before implementing anything.*
 
-Fifteen places where layer-a is silent, self-defeating, or
+Seventeen places where layer-a is silent, self-defeating, or
 contradicted by the measurements. Each entry states the tension, its
 resolution, and where the argument for it lives; nothing here repeats
 an argument made in a section above. Items 1–5, 8, 9, 11, 12, 13 and
-14 are amendments **made** to `docs/design/layer-a.md`; items 6, 7
-and 15 are recorded here and not made there; item 10 is a **proposal**
-rather than an amendment, because it touches the wire.
+14 are amendments **made** to `docs/design/layer-a.md`; items 6, 7,
+15 and 17 are recorded here and not made there; items 10 and 16 are
+**proposals** rather than amendments, because they touch the wire.
 
 1. **`cur` cannot usefully be durable (layer-a §5.2).** Layer-a
    required currency recorded "durably as `cur=<epoch>`" and, two
@@ -4839,6 +4839,36 @@ rather than an amendment, because it touches the wire.
     deviation from a named field rather than an invented oid. Format
     beyond `oid=` and `kind=` is implementation policy there, so the
     omission is the smaller of the two departures.
+
+16. **layer-a §5.5 requires the resulting-`csum` check but not that
+    it precede the update.** §5.5 has the receiver "compute its own
+    and MUST fail with `checksum mismatch` if they differ" and fixes
+    no moment for it, so a receiver that commits the operation and
+    then reports the mismatch meets the letter while leaving exactly
+    the divergent state the check exists to prevent — durable, for
+    the next start to replay, with the caller holding an error and no
+    way to know. *Proposed, not made:* §5.5 would say the receiver
+    MUST fail **before the operation becomes durable**. It is a
+    proposal rather than an amendment because it strengthens a
+    receiver obligation on the wire. This store already meets it
+    (§3.8), and D23 marks the timing as this store's implementation
+    policy for as long as §5.5 does not carry it.
+
+17. **"A page MUST be internally consistent" is undefined for
+    `op=list` (layer-a §5.6).** §5.6 requires it of a page and does
+    not say what it means, and a chunked scan must read it one way or
+    the other. *Not made; recorded here as this store's reading:* a
+    page is consistent **per entry** — each entry is rendered whole
+    under one hold of the state lock, so no entry mixes two states of
+    one object — and it is duplicate-free, so it ascends strictly in
+    `oid`. It is **not** a snapshot of the instance at one instant:
+    an object created or deleted while the page is being built may or
+    may not appear in it. What §5.6 tolerates between pages — "a
+    reconcile pass MUST tolerate an object created or deleted between
+    pages" — this store may therefore also do within one. The other
+    reading would cost a hold of the state lock across the whole
+    index, which is the 23 ms §9 measures and the cost the chunking
+    exists to avoid. §9 describes what the scan does.
 
 ## 15. Alternatives considered
 

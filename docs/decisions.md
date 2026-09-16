@@ -699,7 +699,7 @@ the case undefined rather than decided. Also policy, and a known cost:
 `/status` path reporting both runs the HRW twice — measured against
 nothing yet, and cheap at §4.1's envelope.
 
-## D23 — The resulting-`csum` check runs before the record, and the API says so with a variant per call (2026-09-16)
+## D23 — The resulting-`csum` check, and a csum-taking variant per call (2026-09-16)
 
 **Decision:** layer-a §5.5's receiver check — "the receiver MUST
 compute its own and MUST fail with `checksum mismatch` if they
@@ -737,12 +737,16 @@ committing procs over one `Store` and such a value would belong to
 none of them; and over returning the computed `csum` for the caller
 to compare because by the time the caller could compare, the record
 is durable, which is the failure this row exists to rule out.
-**Normative:** that the check is made before the update becomes
-durable, and that it answers `checksum mismatch` — the spelling is
-layer-a §2.6's and §3.7's carve-out makes the mapping normative. A
-receiver that answers something else, or that commits and then
-reports, does not conform.
-**Implementation policy:** the API shape — a parallel call per
+**Normative:** that the check is made, and that it answers
+`checksum mismatch` — the spelling is layer-a §2.6's and §3.7's
+carve-out makes the mapping normative. A receiver that answers
+something else does not conform.
+**Implementation policy:** *when* the check is made. layer-a §5.5
+fixes the check and the string and says nothing about the moment, so
+a receiver that commits and then reports conforms to §5.5 as written
+— badly, for the reason above, which is why this store makes the
+check before the record and why `design/store.md` §14(16) proposes
+that §5.5 require it. Also the API shape — a parallel call per
 operation, nil for no check, the plain call defined as the variant
 with nil — and the detail after the prefix. An implementation that
 passes the expected `csum` on one widened signature, or that carries
