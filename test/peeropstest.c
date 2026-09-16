@@ -342,6 +342,79 @@ tadoptover(void)
 	killspawned();
 }
 
+/*
+ * §6's reserved log tail carries commits that release space, so that
+ * a delete blocked for log space is never the commit that cannot be
+ * written.  A re-keying adoption releases nothing — the record is a
+ * tombstone before and after, at the same slot and len 0 — so it is
+ * ordinary traffic and waits like any other, rather than spending the
+ * reserve the delete below depends on.
+ */
+static void
+tadoptresv(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Sbsel sel;
+	Super sb;
+	Objinfo oi;
+	uchar *buf, o[Oidmax];
+	uvlong resv;
+	int i;
+
+	spawnforget();
+	d = newdisk();
+	if((s = mustopen(d, "adoption on the reserved tail")) == nil){
+		devclose(d);
+		killspawned();
+		return;
+	}
+	buf = mkbuf(64, 127);
+	mk(s, "t");			/* the tombstone to re-key */
+	if(rmv(s, "t", 2) < 0)
+		fail("objremove t: %r");
+	mk(s, "w");			/* what fills the log, and the delete */
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	sb = sel.sb[sel.start];
+	resv = sb.logsecs/Logresvdiv;
+	if(resv < 1)
+		resv = 1;
+	for(i = 0; i < 400; i++){
+		storestat(s, &st);
+		if(st.logfree <= resv)
+			break;
+		if(wr(s, "w", buf, 64, 0, 3 + i) < 0)
+			break;
+	}
+	storestat(s, &st);
+	istrue("the log is down to its reserved tail", st.logfree <= resv);
+
+	checks++;
+	if(adopt(s, "t", 9, 4) >= 0)
+		fail("a re-keying adoption drew on §6's reserved tail");
+	else
+		errsays("an adoption on the reserved tail", "disk full");
+	if(ostat(s, "t", &oi) < 0)
+		fail("objstat t after the refused adoption: %r");
+	else{
+		eqv("the refused adoption leaves the tombstone's ver",
+			oi.ver, 2);
+		eqv("... and its wepoch", oi.wepoch, 1);
+	}
+	/* and the delete the reserve is FOR still goes through */
+	oidof(o, "w");
+	checks++;
+	if(objremove(s, o, 1, 900, 1, nil, 0) < 0)
+		fail("delete does not always work on the reserved tail: %r");
+
+	free(buf);
+	storeclose(s);
+	devclose(d);
+	killspawned();
+}
+
 /* ------------------------------------------------------------------ */
 
 /*
@@ -1043,6 +1116,7 @@ main(int argc, char **argv)
 
 	tadoptabsent();
 	tadoptover();
+	tadoptresv();
 	tdrop(0);
 	tdrop(1);
 	tdropedges();

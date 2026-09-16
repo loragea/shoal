@@ -183,8 +183,8 @@ updabort(Upd *u)
 /*
  * Build the Eobj and commit it, then release the pins.  An item is
  * space-freeing — and so may draw on §6's reserved log tail — when it
- * releases grains and allocates none: a delete, a truncate, a
- * tombstone.
+ * releases something and allocates nothing: a delete, a truncate, a
+ * drop.
  */
 static int
 updcommit(Upd *u, int state, uvlong ver, uvlong wepoch, vlong mtime,
@@ -278,8 +278,8 @@ updcommit(Upd *u, int state, uvlong ver, uvlong wepoch, vlong mtime,
 	 * An index slot is the third space this store allocates, and a
 	 * commit that takes one is ordinary traffic however little else
 	 * it does.  Tombstone adoption is what makes the distinction
-	 * bite: it publishes state=tomb, which the freeing test below
-	 * reads as a release, over a slot it has just reserved.
+	 * bite: it publishes state=tomb over a slot it has just
+	 * reserved.
 	 */
 	if(u->slotresv)
 		alloc = 1;
@@ -305,8 +305,23 @@ updcommit(Upd *u, int state, uvlong ver, uvlong wepoch, vlong mtime,
 		it.eslot = u->slot;
 		it.haseslot = 1;
 	}
-	it.freeing = !alloc && (u->nfree > 0 || state == Stomb
-		|| u->newlen < u->e.len);
+	/*
+	 * Each disjunct below is something this commit gives back, or —
+	 * the live-to-tomb one — the delete §6's reserve exists to keep
+	 * possible however little a particular object holds: grains
+	 * named in `freed', a delete, bytes above a shrunk length, and
+	 * the extent-map slot §2.7's Oslot rule releases when an object
+	 * drops to a block or fewer.  Publishing state=tomb is not one
+	 * of them by itself.  Over a record that is a tombstone already
+	 * it releases nothing and is not a delete — which is how a
+	 * re-keying adoption came to be admitted to a batch drawing on
+	 * the reserve while freeing no space at all, and how objcorrupt
+	 * over a tombstone came to be.
+	 */
+	it.freeing = !alloc && (u->nfree > 0
+		|| (state == Stomb && u->e.state == Slive)
+		|| u->newlen < u->e.len
+		|| (u->oslot && u->newslot == 0 && u->e.emapslot != 0));
 	r = logcommit(s, &it);
 	if(r < 0){
 		updabort(u);
