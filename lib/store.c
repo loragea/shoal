@@ -170,20 +170,18 @@ storehook(Store *s, char *name, uvlong n)
 		 * §8's fold reads a slot's map outside qlstate and then
 		 * validates the entry by its generation stamp, and the
 		 * window between the two is what the stamp exists for.
-		 * This parks the next fold in that window until the hook
-		 * is set back to 0, so a test lands its commit there
-		 * instead of racing for it.  One arming parks one fold;
-		 * inert while 0.
+		 * This arms the next n rounds of a fold to park in that
+		 * window, so a test lands its commit there instead of
+		 * racing for it.  Arming also lets a parked round go, and
+		 * a round parks by disarming the go flag itself, so a test
+		 * that drives a fold round after round re-arms with n=1
+		 * each time; 0 disarms the point and releases whatever is
+		 * parked at it.  Inert while 0.
 		 */
 		qlock(&s->qlstate);
-		if(n != 0){
-			s->bmfoldhold = 1;
-			s->bmfoldgo = 0;
-		}else{
-			s->bmfoldhold = 0;
-			s->bmfoldgo = 1;
-			rwakeupall(&s->bmrz);
-		}
+		s->bmfoldhold = n;
+		s->bmfoldgo = 1;
+		rwakeupall(&s->bmrz);
 		qunlock(&s->qlstate);
 	}else if(strcmp(name, "reclaim") == 0)
 		s->reclaimearly = n != 0;
@@ -1047,9 +1045,20 @@ enum
 	 * qlstate itself, which is not a device read and cannot race the
 	 * apply because the apply mutates the map under that same lock.
 	 * The stamp is still what the ordinary path validates, and this
-	 * is only how the loop is made to terminate.
+	 * is only how the loop is made to terminate.  EVERY round counts
+	 * against it, including the rounds the fallback itself sends
+	 * round again, because a bound a round can reset is not one.
 	 */
 	Bmfoldtries	= 8,
+	/*
+	 * And the rounds in all.  Past the bound a fold still starts
+	 * over when the entry has stopped naming the map it pinned,
+	 * which is the one case the fallback cannot answer from those
+	 * bytes; this is what keeps a slot whose extent-map slot moves
+	 * under every round from looping for ever.  Reaching it is a
+	 * refusal the caller retries, not a failed pass.
+	 */
+	Bmfoldmax	= 16,
 };
 
 /* what one round of a fold decided */
@@ -1077,7 +1086,7 @@ bmpassfold(Store *s, ulong slot)
 	}
 	r = -1;
 	counted = 0;
-	for(try = 0;; try++){
+	for(try = 0; try < Bmfoldmax; try++){
 		qlock(&s->qlstate);
 		if(s->bmshadow == nil){
 			qunlock(&s->qlstate);
@@ -1154,8 +1163,9 @@ bmpassfold(Store *s, ulong slot)
 		 * rsleep drops qlstate, which is what lets that commit
 		 * apply; inert unless the hook armed it.
 		 */
-		if(s->bmfoldhold){
-			s->bmfoldhold = 0;
+		if(s->bmfoldhold > 0){
+			s->bmfoldhold--;
+			s->bmfoldgo = 0;
 			while(!s->bmfoldgo)
 				rsleep(&s->bmrz);
 		}
@@ -1171,9 +1181,8 @@ bmpassfold(Store *s, ulong slot)
 			/*
 			 * The loop's bound, reached, and the entry no longer
 			 * names the map this round pinned: round again with
-			 * a fresh pin.
+			 * a fresh pin, and count this round like any other.
 			 */
-			try = 0;
 			act = Fagain;
 		}else if(c->bad){
 			/*
@@ -1220,6 +1229,9 @@ bmpassfold(Store *s, ulong slot)
 		if(act != Fagain)
 			break;
 	}
+	if(try >= Bmfoldmax)
+		werrstr("bitmap rebuild: slot %lud: the map will not hold "
+			"still", slot);
 	free(g);
 	return r;
 }

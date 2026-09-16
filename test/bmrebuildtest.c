@@ -1028,6 +1028,75 @@ tmoved(void)
 	free(fresh);
 }
 
+/*
+ * §8's re-read bound, driven to it.  Every round a fold takes counts
+ * against the bound, so a writer that moves the map under every round
+ * cannot keep the fold re-reading for ever: after eight re-reads the
+ * ninth round takes the fallback and reads the grains off the pinned
+ * entry under qlstate, and what it folds is what a full scan of the
+ * live maps says.  §13's bmfold point is armed a round at a time,
+ * which is what puts each write inside a round rather than beside it.
+ */
+static void
+tbound(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Objinfo oi;
+	uchar *buf;
+	uvlong np;
+	int k;
+
+	np = 0;
+	spawnforget();
+	d = newdisk();
+	if((s = openbm(d, "the re-read bound")) == nil){
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(3*Blk, 163);
+	mk(s, "m");
+	mustwr(s, "m", buf, 3*Blk, 0, 2);
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	if(ostat(s, "m", &oi) < 0)
+		fail("objstat m: %r");
+
+	checks++;
+	if(bmpassbegin(s) < 0)
+		fail("bmpassbegin: %r");
+	storehook(s, "bmfold", 1);
+	foldstart(s, oi.slot);
+	for(k = 0; k < 9; k++){
+		if(!waitpark(s, k, "the fold parks with the map moved "
+			"under it"))
+			break;
+		mustwr(s, "m", buf, Blk, 0, 3 + k);
+		storehook(s, "bmfold", k < 8 ? 1 : 0);
+	}
+	storehook(s, "bmfold", 0);
+	if(waitfold("the fold finishes at its bound")){
+		checks++;
+		if(foldr < 0)
+			fail("the bounded fold: %s", folderr);
+	}
+	storestat(s, &st);
+	eqv("every round counts against the bound", st.bmreread, 8);
+	eqv("and the slot counts once", st.bmfolded, 1);
+	if(foldall(s, oi.slot, "the rest of the walk") == 0){
+		checks++;
+		if(bmpassend(s, &np) < 0)
+			fail("bmpassend: %r");
+	}
+	scanok(s, d, "a fold that reached its re-read bound");
+	whole(s, "m", "a fold at its bound");
+	storeclose(s);
+	killspawned();
+	devclose(d);
+	free(buf);
+}
+
 /* the multi-page geometry: §2.5's swap is page by page, so it needs
  * more than one page to be a swap of anything but the whole */
 static Dev*
@@ -1255,6 +1324,7 @@ main(int argc, char **argv)
 	tcover();
 	tleak();
 	tmoved();
+	tbound();
 	tswap();
 	tabort();
 	tclose();
