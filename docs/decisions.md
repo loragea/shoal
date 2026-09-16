@@ -709,7 +709,7 @@ been written, and it answers §2.6's `checksum mismatch`.
 `design/store.md` §3.8 states it and §3.7's table carries the row.
 The library exposes it as one extra argument on a parallel entry
 point per mutating call — `objwritecsum`, `objtrunccsum`,
-`objremovecsum`, `objcreatecsum`, `stagefinalcsum` —
+`objremovecsum`, `objcreatecsum`, `objadoptcsum`, `stagefinalcsum` —
 where nil means no check and each plain call is its variant with nil.
 For a multi-request `op=full` the check runs over the digests the
 transfer staged and a failure discards the stage, as §3.6 says every
@@ -722,7 +722,7 @@ to prevent — and the caller, holding an error, would have no way to
 know. The one place where the resulting `csum` exists and nothing is
 durable is inside the commit, which is also the only place that sees
 the `csum` of an `op=full`'s staged digests and of a tombstone alike,
-so one check covers five operations. Separate entry points were
+so one check covers six operations. Separate entry points were
 chosen over widening the existing ones because those have hundreds of
 call sites and the argument is meaningful on none of them: a client
 write has no sender to check against. They were chosen over a

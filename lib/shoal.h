@@ -1027,6 +1027,46 @@ int	objremovecsum(Store*, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 		uchar *csum, Dirtyrec *dr, int ndr);
 int	stagefinalcsum(Stage*, uvlong ver, uvlong wepoch, uchar *csum,
 		Dirtyrec *dr, int ndr);
+
+/*
+ * **Tombstone adoption**, layer-a §1.5 and §5.5's op=delete: commit a
+ * tombstone at a key that arrived from elsewhere.  §1.5's adopter
+ * "takes state=tomb, the key and len=0 ... and commits that as its
+ * record", and §5.5 requires op=delete to apply when the receiver
+ * holds no copy — neither of which objremove can do, since it opens
+ * an existing record and answers `no such object' or `object deleted'
+ * for exactly the two records this call is for.
+ *
+ * For an id this instance holds no record of, one commit allocates
+ * the index slot and a fresh qid.path and publishes state=tomb,
+ * len=0 and the csum a zero-length object has (layer-a §1.4: the
+ * hash of an empty digest array).  For an id whose record is already
+ * a tombstone it re-keys that tombstone in place, keeping its slot
+ * and qid.path (§2.3).  A flag on such a record — §8's corrupt or §5
+ * step 10's condemnation — does not stand in the way: a tombstone
+ * holds no content for either to describe, and the commit publishes
+ * the flag clear, exactly as objremove's does.
+ *
+ * **Over a LIVE copy it refuses**, and the refusal carries no §2.6
+ * prefix (§3.7): a live copy is what objremove is for, and the caller
+ * reaches it having arbitrated under the oid's queue.  Adopting over
+ * one here would throw away content on a call whose contract is
+ * metadata only.
+ *
+ * The key is adopted verbatim — the engine arbitrates on no delta
+ * path — so the caller still owes §5.5's comparison (greater than the
+ * local key, or no local copy) before it calls.  A version of 0 is
+ * refused `bad ctl': the key arrives from elsewhere, as op=full's
+ * does, so §3.7 makes it a malformed header rather than a caller bug.
+ * mtime is set to now, which layer-a §1.5 allows for an adopted
+ * tombstone at the price of delaying its discard by tombdays.
+ *
+ * Takes the Edirty records like every other mutating call.
+ */
+int	objadopt(Store*, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
+		Dirtyrec *dr, int ndr);
+int	objadoptcsum(Store*, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
+		uchar *csum, Dirtyrec *dr, int ndr);
 /* --- peer-engine-ops: end --- */
 
 /* the dirty set, §2.6 and layer-a §7.1 */

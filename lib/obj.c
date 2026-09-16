@@ -273,6 +273,15 @@ updcommit(Upd *u, int state, uvlong ver, uvlong wepoch, vlong mtime,
 			alloc = 1;
 	if(u->oslot && u->newslot != 0)
 		alloc = 1;
+	/*
+	 * An index slot is the third space this store allocates, and a
+	 * commit that takes one is ordinary traffic however little else
+	 * it does.  Tombstone adoption is what makes the distinction
+	 * bite: it publishes state=tomb, which the freeing test below
+	 * reads as a release, over a slot it has just reserved.
+	 */
+	if(u->slotresv)
+		alloc = 1;
 
 	memset(&it, 0, sizeof it);
 	it.obj = &o;
@@ -360,6 +369,7 @@ enum
 	Utomb	= 1,	/* a tombstone may be opened */
 	Ubad	= 2,	/* ... and so may a slot §5 step 10 condemned */
 	Ucorrupt = 4,	/* ... and one whose §8 corrupt flag is set */
+	Unolive	= 8,	/* ... but a LIVE entry is refused: objadopt */
 };
 
 static int
@@ -390,6 +400,20 @@ updopen(Upd *u, Store *s, uchar *oid, int oidlen, uvlong newlen, int flags)
 		 */
 		werrstr(e->state == Stomb ? "object deleted"
 			: "no such object");
+		return -1;
+	}
+	/*
+	 * Tombstone adoption's refusal, made under the same hold that
+	 * classified the record so that no delete can slip in between:
+	 * a live copy holds content, and replacing it with metadata
+	 * belongs to objremove, which the server reaches having
+	 * arbitrated.  §3.7's internal kind, so no §2.6 prefix.
+	 */
+	if((flags & Unolive) && e->state == Slive){
+		qunlock(&s->qlstate);
+		werrstr("adopt a tombstone over the live copy at "
+			"(%llud, %llud): the delete path is objremove",
+			e->wepoch, e->ver);
 		return -1;
 	}
 	/*
@@ -1226,6 +1250,105 @@ objremovecsum(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 		return -1;
 	}
 	u.expcsum = csum;
+	if(updcommit(&u, Stomb, ver, wepoch, time(nil), 0, dr, ndr) < 0){
+		updclose(&u);
+		return -1;
+	}
+	updclose(&u);
+	return 0;
+}
+
+/*
+ * layer-a §1.5's tombstone adoption, which §5.5's op=delete needs for
+ * the two records objremove cannot open: an id this instance holds no
+ * record of, and an id whose record is already a tombstone at another
+ * key.  §1.5 is explicit that the adopter "takes state=tomb, the key
+ * and len=0 ... and commits that as its record", and §5.5 that a
+ * self-contained op applies "or the receiver holds no copy" — so
+ * without this call a replicated delete for an object this instance
+ * missed the creation of can never be applied, the tombstone never
+ * arrives, and §1.5's discard waits on this instance for ever.
+ *
+ * There is no safe two-call substitute.  objcreate followed by
+ * objremove publishes a live object at a key the sender never sent,
+ * and a crash between the two leaves it live: exactly the copy §1.3
+ * describes as winning arbitration and overwriting a good one.
+ *
+ * The csum is §1.4's for a zero-length object — the hash of an empty
+ * digest array — and it is not written here: updcsum computes it for
+ * nblk == 0 from the same rule it computes every other csum by, which
+ * is why an adopted tombstone and a deleted one carry the same value
+ * without either path stating it.
+ */
+int
+objadopt(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
+	Dirtyrec *dr, int ndr)
+{
+	return objadoptcsum(s, oid, oidlen, ver, wepoch, nil, dr, ndr);
+}
+
+int
+objadoptcsum(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
+	uchar *csum, Dirtyrec *dr, int ndr)
+{
+	Upd u;
+	long slot;
+	int absent;
+
+	if(!storeserving(s))
+		return -1;
+	/*
+	 * The oid arrives from a peer, so its bound is checked here as
+	 * objcreate and stageopen check theirs: layer-a §2.6's
+	 * `bad object name'.
+	 */
+	if(oidlen < 1 || oidlen > Oidmax){
+		werrstr("bad object name: oid length %d", oidlen);
+		return -1;
+	}
+	/*
+	 * §3.7's rule, and this path falls on stagefinal's side of it:
+	 * the version is the sender's and arrives in an op=delete
+	 * header, so a value layer-a §1.3 forbids is a malformed header
+	 * — §5.5's common set, `bad ctl' — and not the caller bug a 0 on
+	 * create, write, truncate or delete is.
+	 */
+	if(ver == 0){
+		werrstr("bad ctl: op=delete at version 0");
+		return -1;
+	}
+	qlock(&s->qlstate);
+	slot = ientfind(s, oid, oidlen);
+	absent = slot < 0 || s->idx[slot].state == Sfree;
+	qunlock(&s->qlstate);
+	/*
+	 * An absent id takes a fresh index slot and a fresh qid.path in
+	 * the one commit that publishes the tombstone, for updnew's
+	 * reason: a slot reserved by one commit and published by
+	 * another is a window a crash lands in.  An existing tombstone
+	 * is re-keyed in place, keeping §2.3's stable qid.path.
+	 *
+	 * Ubad and Ucorrupt are passed for objremove's reason, not as an
+	 * exception to it: a tombstone holds no content, so neither flag
+	 * describes anything this commit publishes, and refusing would
+	 * strand the record at a key the cluster has moved past.
+	 * Unolive is what keeps a live copy out — tested under the hold
+	 * that classified the record, so the answer cannot be stale.
+	 */
+	if(absent){
+		if(updnew(&u, s, oid, oidlen, 0) < 0)
+			return -1;
+	}else if(updopen(&u, s, oid, oidlen, 0,
+		Utomb|Ubad|Ucorrupt|Unolive) < 0)
+		return -1;
+	u.expcsum = csum;
+	/*
+	 * mtime is now.  layer-a §1.5 allows it in as many words — "if
+	 * the pull resets the record's mtime, condition 2 delays that
+	 * second discard by tombdays; that costs space, not correctness"
+	 * — and the alternative, carrying the sender's mtime, is a field
+	 * op=delete does not have on the wire.
+	 */
 	if(updcommit(&u, Stomb, ver, wepoch, time(nil), 0, dr, ndr) < 0){
 		updclose(&u);
 		return -1;

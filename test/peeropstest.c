@@ -114,11 +114,183 @@ rmv(Store *s, char *name, uvlong ver)
 	return objremove(s, o, strlen(name), ver, 1, nil, 0);
 }
 
+static int
+adopt(Store *s, char *name, uvlong ver, uvlong we)
+{
+	uchar o[Oidmax];
+
+	oidof(o, name);
+	return objadopt(s, o, strlen(name), ver, we, nil, 0);
+}
+
 static Store*
 restart(Store *s, Dev *d, char *what)
 {
 	storeclose(s);
 	return mustopen(d, what);
+}
+
+/* ------------------------------------------------------------------ */
+
+/*
+ * T1.30, adoption.  An id this instance holds no record of becomes a
+ * tombstone at the key that arrived, with len 0 and the csum layer-a
+ * §1.4 gives a zero-length object, and it survives a restart.
+ */
+static void
+tadoptabsent(void)
+{
+	Dev *d;
+	Store *s;
+	Objinfo oi, oi2;
+	Storestat st0, st1;
+	uchar oid[Oidmax];
+	int oidlen;
+	ulong slot;
+
+	spawnforget();
+	d = newdisk();
+	if((s = mustopen(d, "adopt absent")) == nil){
+		devclose(d);
+		return;
+	}
+	storestat(s, &st0);
+	if(adopt(s, "ghost", 5, 3) < 0)
+		fail("objadopt of an absent id: %r");
+	if(ostat(s, "ghost", &oi) < 0){
+		fail("objstat after adopting an absent id: %r");
+		goto out;
+	}
+	eqv("an adopted tombstone is state tomb", oi.state, Stomb);
+	eqv("an adopted tombstone has len 0", oi.len, 0);
+	eqv("an adopted tombstone keeps the sender's ver", oi.ver, 5);
+	eqv("an adopted tombstone keeps the sender's wepoch", oi.wepoch, 3);
+	checks++;
+	if(memcmp(oi.csum, emptycsum, Csumlen) != 0)
+		fail("an adopted tombstone does not carry §1.4's "
+			"zero-length csum");
+	istrue("an adopted tombstone has a qid.path", oi.qidpath != 0);
+	eqv("an adopted tombstone holds no extent-map slot", oi.emapslot, 0);
+
+	/* visible through §8's slot cursor, which is what a scrub walks */
+	slot = oi.slot;
+	if(objslot(s, slot, oid, &oidlen, &oi2) != 1)
+		fail("objslot of an adopted tombstone's slot: %r");
+	else{
+		eqv("objslot answers the adopted oid's length", oidlen, 5);
+		checks++;
+		if(memcmp(oid, "ghost", 5) != 0)
+			fail("objslot answers another oid for the adopted slot");
+		eqv("objslot agrees on the state", oi2.state, Stomb);
+	}
+	storestat(s, &st1);
+	eqv("adopting an absent id takes one index slot",
+		st0.slotfree - st1.slotfree, 1);
+	eqv("adopting an absent id takes no grain", st0.grainfree,
+		st1.grainfree);
+	eqv("adopting an absent id makes a tombstone", st1.ntomb, 1);
+
+	if((s = restart(s, d, "adopt absent, replayed")) == nil){
+		devclose(d);
+		return;
+	}
+	if(ostat(s, "ghost", &oi2) < 0){
+		fail("objstat after a restart: %r");
+		goto out;
+	}
+	eqv("the adopted tombstone survives a restart", oi2.state, Stomb);
+	eqv("... at its len", oi2.len, 0);
+	eqv("... at its ver", oi2.ver, 5);
+	eqv("... at its wepoch", oi2.wepoch, 3);
+	eqv("... at its qid.path", oi2.qidpath, oi.qidpath);
+	checks++;
+	if(memcmp(oi2.csum, emptycsum, Csumlen) != 0)
+		fail("the adopted tombstone's csum does not survive a restart");
+out:
+	storeclose(s);
+	devclose(d);
+	killspawned();
+}
+
+/*
+ * T1.30 continued: a lower-keyed tombstone is re-keyed in place, a
+ * live copy is refused with an error carrying no §2.6 prefix, and a
+ * version of 0 is `bad ctl' because the key came from elsewhere.
+ */
+static void
+tadoptover(void)
+{
+	Dev *d;
+	Store *s;
+	Objinfo oi, tomb, live;
+	Storestat st0, st1;
+	uchar *buf;
+
+	spawnforget();
+	d = newdisk();
+	if((s = mustopen(d, "adopt over")) == nil){
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(2*Blk, 7);
+
+	/* a tombstone of this instance's own making, at (1, 2) */
+	mk(s, "old");
+	if(rmv(s, "old", 2) < 0)
+		fail("objremove: %r");
+	if(ostat(s, "old", &tomb) < 0)
+		fail("objstat of the tombstone: %r");
+
+	if(adopt(s, "old", 9, 4) < 0)
+		fail("objadopt over a tombstone: %r");
+	if(ostat(s, "old", &oi) < 0)
+		fail("objstat after re-keying: %r");
+	else{
+		eqv("a re-keyed tombstone is still a tombstone", oi.state, Stomb);
+		eqv("a re-keyed tombstone takes the new ver", oi.ver, 9);
+		eqv("a re-keyed tombstone takes the new wepoch", oi.wepoch, 4);
+		eqv("a re-keyed tombstone keeps its slot", oi.slot, tomb.slot);
+		eqv("a re-keyed tombstone keeps its qid.path", oi.qidpath,
+			tomb.qidpath);
+		eqv("a re-keyed tombstone keeps len 0", oi.len, 0);
+	}
+
+	/* a live copy: refused, and nothing about it moves */
+	mk(s, "alive");
+	if(wr(s, "alive", buf, 2*Blk, 0, 2) < 0)
+		fail("objwrite: %r");
+	if(ostat(s, "alive", &live) < 0)
+		fail("objstat of the live copy: %r");
+	storestat(s, &st0);
+	checks++;
+	if(adopt(s, "alive", 99, 9) >= 0)
+		fail("objadopt over a live copy was taken");
+	else
+		errnotwire("objadopt over a live copy");
+	if(ostat(s, "alive", &oi) < 0)
+		fail("objstat after the refused adopt: %r");
+	else{
+		eqv("the refused adopt leaves the copy live", oi.state, Slive);
+		eqv("... at its length", oi.len, live.len);
+		eqv("... at its ver", oi.ver, live.ver);
+	}
+	storestat(s, &st1);
+	eqv("the refused adopt frees no grain", st1.grainfree, st0.grainfree);
+
+	/* layer-a §1.3 forbids ver 0, and §3.7 makes this one `bad ctl' */
+	checks++;
+	if(adopt(s, "nought", 0, 1) >= 0)
+		fail("objadopt at version 0 was taken");
+	else
+		errsays("objadopt at version 0", "bad ctl");
+	checks++;
+	if(ostat(s, "nought", &oi) >= 0)
+		fail("the refused adopt published a record");
+
+	free(buf);
+	storeclose(s);
+	devclose(d);
+	killspawned();
 }
 
 /* ------------------------------------------------------------------ */
@@ -200,6 +372,9 @@ csumop(Store *s, int kind, uchar *buf, uchar *csum)
 		}
 		/* stagefinalcsum consumes the handle on every outcome */
 		return stagefinalcsum(g, 7, 2, csum, nil, 0);
+	case Cadopt:
+		oidof(o, "new");
+		return objadoptcsum(s, o, 3, 4, 2, csum, nil, 0);
 	}
 	return -1;
 }
@@ -324,7 +499,9 @@ main(int argc, char **argv)
 	USED(argc); USED(argv);
 	csumdigests(nil, 0, emptycsum);
 
-	for(i = Cwrite; i <= Cfull; i++)
+	tadoptabsent();
+	tadoptover();
+	for(i = Cwrite; i <= Cadopt; i++)
 		tcsum(i);
 
 	killspawned();

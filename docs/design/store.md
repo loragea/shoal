@@ -1637,7 +1637,7 @@ own `not primary: n5.0` is the pattern. Callers can act on these:
 | an oid outside layer-a §1.1's `1*128` bound | `bad object name` |
 | a write, truncate or stage past `objmax`, at either bound | `object too large` |
 | an `op=full` at a key the receiver's own key defends (§3.6) | `stale version` |
-| an `op=full` at a version the object model forbids, and a chunk outside its stage's declared length | `bad ctl` |
+| an `op=full` or an adopted `op=delete` at a version the object model forbids, and a chunk outside its stage's declared length | `bad ctl` |
 | a read, verify or update through an extent-map entry that failed its `csum128` (§5 step 9) — block repair excepted, below; a read, write or truncate of a copy whose `corrupt` flag is set (§8); a block repair whose bytes do not hash to the stored `dig[i]` | `checksum mismatch` |
 | a replicated operation whose resulting `csum` is not the one it named (layer-a §5.5, §3.8, D23) | `checksum mismatch` |
 | a discard whose record fails layer-a §1.5's receiver checks: not a tombstone, not at exactly the named key, or its `wepoch` not strictly below the given epoch | `not discardable` |
@@ -1651,7 +1651,8 @@ grain number outside `ngrains` read out of a map, a negative count, a
 version of 0 — or, over a tombstone, a version that is not the
 tombstone's plus one or a `wepoch` below the tombstone's — on a path
 whose version this instance chooses (create,
-write, truncate, delete), a
+write, truncate, delete), a tombstone adoption over a **live** copy
+(§3.8), a
 failed allocation, a chunk or `final=1` on a stage the idle sweep has
 expired (§3.6), a block repair asked for on an object whose digest
 array fails its `csum` or through an extent-map entry that failed its
@@ -1673,11 +1674,13 @@ is the server's decision and not this document's.
 Three consequences are worth stating, because the list does not make
 them obvious:
 
-- **A version of 0 is refused on every publishing path, and only
-  `op=full`'s refusal is a wire error.** The key is one layer-a §1.3
+- **A version of 0 is refused on every publishing path, and the
+  refusal is a wire error on exactly the two paths whose version came
+  from somewhere else.** The key is one layer-a §1.3
   forbids — `ver` starts at 1 and absence is not `(0, 0)` — and this
   is where that rule lives. On the stage path the version arrives in
-  an `op=full` header, so the refusal is `bad ctl`: layer-a §5.5's
+  an `op=full` header, and on the tombstone adoption of §3.8 in an
+  `op=delete` header, so both refusals are `bad ctl`: layer-a §5.5's
   common set, for an operation a conforming sender cannot send. On
   create, write, truncate and delete the version is this instance's
   own to choose (layer-a §5.4 step 3), so a 0 there is a caller bug
@@ -1722,6 +1725,40 @@ What layer-a's peer channels require of a receiver that the write
 path above does not reach — because each of these does something no
 client operation does — is described here; §3.7 carries the error
 strings and D23 the checksum rule.
+
+**Tombstone adoption — `op=delete` for an id the receiver holds no
+live record of.** layer-a §5.5 makes `op=delete` self-contained and
+applicable "or the receiver holds no copy", and §1.5 says the adopter
+"takes `state=tomb`, the key and `len=0` … and commits that as its
+record". The delete path above cannot do it: it opens an existing
+record and answers `no such object` for an absent id and
+`object deleted` for a tombstone, which are exactly the two records
+an adoption is for. So adoption is its own commit. For an absent id
+it reserves an index slot and a `qid.path` and publishes
+`state=tomb`, `len=0` and §1.4's zero-length `csum` in **one** record,
+for the reason §3.6 gives for the absent `op=full` receiver: a slot
+reserved by one commit and published by another is a window a crash
+lands in. For an id whose record is already a tombstone it re-keys
+that tombstone in place, keeping §2.3's stable `qid.path`.
+
+Over a **live** copy it refuses, and the refusal is §3.7's internal
+kind. A live copy holds content; replacing it with metadata is the
+delete path's work, and the server reaches that path having
+arbitrated under the object's queue. There is no safe two-call
+substitute for any of this: a create followed by a delete publishes a
+live object at a key the sender never sent, and a crash between the
+two leaves it live — layer-a §1.3's copy that wins arbitration and
+overwrites a good one, manufactured by the very call meant to
+converge.
+
+A flag on the record being re-keyed — §8's `corrupt` or §5 step 10's
+condemnation — does not stand in the way, for the reason a delete
+ignores both: a tombstone holds no content for either to describe,
+and a record stranded at a key the cluster has moved past would block
+§1.5's discard for ever. `mtime` is set to now. layer-a §1.5 allows
+that in as many words, at the price of delaying the tombstone's
+discard by `tombdays`, and `op=delete` carries no `mtime` on the wire
+to carry instead.
 
 **The resulting-`csum` check.** layer-a §5.5 requires the receiver of
 a replicated operation to compute the `csum` the object will have and
@@ -4081,7 +4118,7 @@ back at a higher key under it, and under concurrent churn with one
 churn proc parked on a tombstone of its own making, so that the
 walk's epoch condition is what holds it off and not its cutoff).
 
-Against the list below that is T1.1–T1.26 and T1.32. One case
+Against the list below that is T1.1–T1.26 and T1.30–T1.31. One case
 is not covered
 and waits on something this store does not have yet: **T1.27** waits
 on the server's `Reqqueue` pool (§7), which is what it is about — the
@@ -4337,8 +4374,20 @@ what would close it.
   instead of pushing through the object's `Reqqueue`. Not covered:
   the `Reqqueue` pool is the server's (§7) and is not built, so
   neither is the thing this test discriminates between.
+- **T1.30 tombstone adoption (§3.8).** Adopt over an id the store
+  holds no record of and assert a tombstone at the key that arrived,
+  `len` 0 and layer-a §1.4's zero-length `csum`, visible through
+  `objstat` and §8's slot cursor, with a fresh `qid.path`, surviving
+  a restart. Adopt over a lower-keyed tombstone and assert it is
+  re-keyed in its own slot at its own `qid.path`. Adopt over a live
+  copy and assert the refusal, that it carries no §2.6 prefix (§3.7)
+  and that the copy is untouched. Adopt at version 0 and assert
+  `bad ctl` and no record. *Mutations:* let the adoption take a live
+  copy, leaving its grains marked under a tombstone; publish the
+  tombstone at a `len` other than 0.
 - **T1.32 the resulting-`csum` check (§3.8, D23).** For each of
-  `objwrite`, `objtrunc`, `objremove`, `objcreate` and `op=full`: learn the `csum` the operation produces on one store,
+  `objwrite`, `objtrunc`, `objremove`, `objcreate`, the adoption and
+  `op=full`: learn the `csum` the operation produces on one store,
   then on an identical one offer a wrong `csum` and assert
   `checksum mismatch` and that **nothing is durable** — the log's
   `seqnext` and watermark have not moved, and a restart replays to
