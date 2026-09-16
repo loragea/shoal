@@ -710,6 +710,59 @@ the case undefined rather than decided. Also policy, and a known cost:
 `/status` path reporting both runs the HRW twice — measured against
 nothing yet, and cheap at §4.1's envelope.
 
+## D23 — The resulting-`csum` check, and a csum-taking variant per call (2026-09-16)
+
+**Decision:** layer-a §5.5's receiver check — "the receiver MUST
+compute its own and MUST fail with `checksum mismatch` if they
+differ" — is made inside the store's commit path, at the point where
+the new `csum` has been computed and no byte of the log record has
+been written, and it answers §2.6's `checksum mismatch`.
+`design/store.md` §3.8 states it and §3.7's table carries the row.
+The library exposes it as one extra argument on a parallel entry
+point per call a peer's key can reach — `objwritecsum`,
+`objtrunccsum`, `objremovecsum`, `objadoptcsum`, `stagefinalcsum` —
+where nil means no check and each plain call is its variant with nil.
+`objcreate` has no variant: `op=create`'s receiver is a zero-length
+stage that arbitrates in `stagefinal`, and a client create's key is
+the instance's own to choose, so nothing names a `csum` for it.
+For a multi-request `op=full` the check runs over the digests the
+transfer staged and a failure discards the stage, as §3.6 says every
+`final=1` outcome does. A zero-byte replicated write is the one
+exception to "inside the commit path": it commits nothing and adopts
+no key (layer-a §2.4 makes a count of 0 not an extend), and the check
+still runs, against the `csum` the object already carries.
+**Rationale:** The check's whole value is that it is a bar rather
+than a report. Made after `logcommit` it would refuse the operation
+and leave its record on the platter, so the next start would replay
+into precisely the divergent state layer-a §5.5 says the check exists
+to prevent — and the caller, holding an error, would have no way to
+know. The one place where the resulting `csum` exists and nothing is
+durable is inside the commit, which is also the only place that sees
+the `csum` of an `op=full`'s staged digests and of a tombstone alike,
+so one check covers six operations. Separate entry points were
+chosen over widening the existing ones because those have hundreds of
+call sites and the argument is meaningful on none of them: a client
+write has no sender to check against. They were chosen over a
+store-wide "expected csum" set before the call because §7 runs many
+committing procs over one `Store` and such a value would belong to
+none of them; and over returning the computed `csum` for the caller
+to compare because by the time the caller could compare, the record
+is durable, which is the failure this row exists to rule out.
+**Normative:** that the check is made, and that it answers
+`checksum mismatch` — the spelling is layer-a §2.6's and §3.7's
+carve-out makes the mapping normative. A receiver that answers
+something else does not conform.
+**Implementation policy:** *when* the check is made. layer-a §5.5
+fixes the check and the string and says nothing about the moment, so
+a receiver that commits and then reports conforms to §5.5 as written
+— badly, for the reason above, which is why this store makes the
+check before the record and why `design/store.md` §14(16) proposes
+that §5.5 require it. Also the API shape — a parallel call per
+operation, nil for no check, the plain call defined as the variant
+with nil — and the detail after the prefix. An implementation that
+passes the expected `csum` on one widened signature, or that carries
+it in a per-operation handle, conforms equally.
+
 ## D24 — The rebuild engine enforces the walk's coverage, bounds a fold's re-reads, and moves the free count by the swap's own difference (2026-09-16)
 
 **Decision:** The four calls' contract under D18's mechanism,

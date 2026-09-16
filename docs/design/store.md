@@ -1557,6 +1557,20 @@ time of the last chunk. It is owned by the fid.
   same call, because a repair that worked only for a slot condemned
   since the last restart is not a repair.
 
+  **`op=create` is this path with `len=0`.** layer-a §5.5 makes
+  `op=create` self-contained and arbitrated on `(wepoch, ver)` exactly
+  as `op=full` is, and a created object carries no content — so the
+  receiver's path for it is a stage of zero length whose `final=1`
+  follows no chunk, which lands in the first of the two receivers
+  above when the instance holds nothing and in the tombstone
+  paragraph when it holds a tombstone. `objcreate` is **not** that
+  path: it is layer-a §5.4's *client* create, which answers
+  `object exists` for a live id and chooses the new version itself
+  over a tombstone, where a replicated create must adopt the sender's
+  version verbatim and defend an existing key with `stale version`
+  (§3.7). The two agree on no refusal at all, which is why the
+  receiver takes the stage.
+
   A **count-0 write** is not one of these and is not an extend
   either: layer-a §2.4 extends at a write *at* an offset above `len`,
   meaning bytes landing there, and a count of zero lands none. It
@@ -1631,14 +1645,15 @@ own `not primary: n5.0` is the pattern. Callers can act on these:
 
 | Condition | Answer |
 |---|---|
-| an id this store does not hold, on any path | `no such object` |
-| a read, write, truncate or delete of a tombstoned id | `object deleted` |
+| an id this store does not hold, on any path; and a **drop** of a tombstoned id, which is a record and not a copy (§3.8) | `no such object` |
+| a read, write, truncate or delete of a tombstoned id — but **not** a drop, which answers `no such object` because a tombstone is a record and not a copy (§3.8) | `object deleted` |
 | a create of a live id | `object exists` |
 | an oid outside layer-a §1.1's `1*128` bound | `bad object name` |
 | a write, truncate or stage past `objmax`, at either bound | `object too large` |
-| an `op=full` at a key the receiver's own key defends (§3.6) | `stale version` |
-| an `op=full` at a version the object model forbids, and a chunk outside its stage's declared length | `bad ctl` |
+| an `op=full`, or the replicated `op=create` §3.6 serves as a zero-length stage, at a key the receiver's own key defends (§3.6); an adopted `op=delete` at a key its own tombstone defends (§3.8) | `stale version` |
+| an `op=full` or `op=create` through the stage, or an adopted `op=delete`, at a version the object model forbids, and a chunk outside its stage's declared length | `bad ctl` |
 | a read, verify or update through an extent-map entry that failed its `csum128` (§5 step 9) — block repair excepted, below; a read, write or truncate of a copy whose `corrupt` flag is set (§8); a block repair whose bytes do not hash to the stored `dig[i]` | `checksum mismatch` |
+| a replicated operation whose resulting `csum` is not the one it named (layer-a §5.5, §3.8, D23) | `checksum mismatch` |
 | a discard whose record fails layer-a §1.5's receiver checks: not a tombstone, not at exactly the named key, or its `wepoch` not strictly below the given epoch | `not discardable` |
 | no grain, index slot, extent-map slot, staged-grain budget, or log space after §6's bounded wait | `disk full` |
 | an enumeration-snapshot open past §9's `objsnapmax` | `disk full` |
@@ -1650,7 +1665,8 @@ grain number outside `ngrains` read out of a map, a negative count, a
 version of 0 — or, over a tombstone, a version that is not the
 tombstone's plus one or a `wepoch` below the tombstone's — on a path
 whose version this instance chooses (create,
-write, truncate, delete), a
+write, truncate, delete), a tombstone adoption over a **live** copy
+(§3.8), a
 failed allocation, a chunk or `final=1` on a stage the idle sweep has
 expired (§3.6), a block repair asked for on an object whose digest
 array fails its `csum` or through an extent-map entry that failed its
@@ -1672,21 +1688,30 @@ is the server's decision and not this document's.
 Three consequences are worth stating, because the list does not make
 them obvious:
 
-- **A version of 0 is refused on every publishing path, and only
-  `op=full`'s refusal is a wire error.** The key is one layer-a §1.3
-  forbids — `ver` starts at 1 and absence is not `(0, 0)` — and this
-  is where that rule lives. On the stage path the version arrives in
-  an `op=full` header, so the refusal is `bad ctl`: layer-a §5.5's
-  common set, for an operation a conforming sender cannot send. On
-  create, write, truncate and delete the version is this instance's
-  own to choose (layer-a §5.4 step 3), so a 0 there is a caller bug
-  and the refusal carries no §2.6 prefix. The tombstone rule rides
-  the same principle: a client create over a tombstone takes the
-  tombstone's version plus one at a `wepoch` no lower (§3.6), and
-  since choosing that key is the caller's job, any other key is the
-  same internal kind of refusal. Only `stagefinal`'s arbitration —
-  where the key genuinely arrives from elsewhere — answers a
-  tombstone's defence as §2.6's `stale version`.
+- **A version of 0 is refused on every publishing path, and which
+  kind of refusal it is follows from the call, not from where the
+  version came.** The key is one layer-a §1.3 forbids — `ver` starts
+  at 1 and absence is not `(0, 0)` — and this is where that rule
+  lives. `stagefinal` and `objadopt` answer `bad ctl`: their version
+  arrives in an `op=full`, `op=create` or `op=delete` header, so a
+  value §1.3 forbids is a malformed header — layer-a §5.5's common
+  set, for an operation a conforming sender cannot send.
+  `objcreate`, `objwrite`, `objtrunc` and `objremove` answer the
+  internal `… at version 0`, which carries no §2.6 prefix, and they
+  answer it whatever the version's origin: a server relaying a peer's
+  `op=write`, `op=trunc` or `op=delete` over a live copy reaches the
+  store through those same calls and gets the same internal refusal.
+  That is not a hole in the mapping. §3.8 makes it the server's
+  obligation to refuse a wire header carrying `ver=0` with `bad ctl`
+  before it calls the engine at all, so a 0 reaching a delta call is
+  a caller bug by construction — which is what the internal refusal
+  says. The tombstone rule rides the same principle: a client create
+  over a tombstone takes the tombstone's version plus one at a
+  `wepoch` no lower (§3.6), and since choosing that key is the
+  caller's job, any other key is the same internal kind of refusal.
+  The two calls that make layer-a §5.5's comparison themselves are
+  also the two that answer a defended key with §2.6's
+  `stale version`: `stagefinal` (§3.6) and `objadopt` (§3.8).
 - **`no such object` for a discard of an id this store does not
   hold.** layer-a §1.5's receiver checks judge a record; an id this
   store holds no record for has nothing for check (i) to judge, and
@@ -1711,6 +1736,172 @@ them obvious:
   is `op=full` — so they are spelled as one family of
   internal-invariant error, `block repair: slot N: …`, rather than
   splitting on which structure carried the damage.
+
+### 3.8 The peer-channel primitives
+
+*Policy for the mechanics; layer-a §1.5, §5.5, §5.6 and §7.4 own the
+rules.*
+
+What layer-a's peer channels require of a receiver that the write
+path above does not reach — because each of these does something no
+client operation does — is described here; §3.7 carries the error
+strings and D23 the checksum rule. Three of the four are below:
+tombstone adoption, drop and the resulting-`csum` check. The fourth,
+layer-a §5.6's `op=list`, is an enumeration, so it is described with
+the other enumerations in **§9**.
+
+**Tombstone adoption — `op=delete` for an id the receiver holds no
+live record of.** layer-a §5.5 makes `op=delete` self-contained and
+applicable "or the receiver holds no copy", and §1.5 says the adopter
+"takes `state=tomb`, the key and `len=0` … and commits that as its
+record". The delete path above cannot do it: it opens an existing
+record and answers `no such object` for an absent id and
+`object deleted` for a tombstone, which are exactly the two records
+an adoption is for. So adoption is its own commit. For an absent id
+it reserves an index slot and a `qid.path` and publishes
+`state=tomb`, `len=0` and §1.4's zero-length `csum` in **one** record,
+for the reason §3.6 gives for the absent `op=full` receiver: a slot
+reserved by one commit and published by another is a window a crash
+lands in. For an id whose record is already a tombstone it re-keys
+that tombstone in place, keeping §2.3's stable `qid.path`, and only
+at a key **strictly greater** than that tombstone's: layer-a §5.5's
+comparison is made here, under the hold that read the record, because
+the key arrived from elsewhere and a caller could make it only with a
+second read an `op=delete` can overtake. An equal key is refused with
+the lower ones — §1.3 makes equal keys equal content, a tombstone
+holds none, and there is no `force=1` on a path that carries none
+either — and the refusal is §3.7's `stale version`, as `stagefinal`'s
+is. An absent id has no key to defend and takes any key §1.3
+permits. Neither commit frees space: an adoption publishes
+`state=tomb` but releases no grain, no slot and no length, so it is
+not one of the space-freeing commits §6's reserved log tail is for.
+
+Over a **live** copy it refuses, and the refusal is §3.7's internal
+kind. A live copy holds content; replacing it with metadata is the
+delete path's work, and the server reaches that path having
+arbitrated under the object's queue. There is no safe two-call
+substitute for any of this: a create followed by a delete publishes a
+live object at a key the sender never sent, and a crash between the
+two leaves it live — layer-a §1.3's copy that wins arbitration and
+overwrites a good one, manufactured by the very call meant to
+converge.
+
+A flag on the record being re-keyed — §8's `corrupt` or §5 step 10's
+condemnation — does not stand in the way, for the reason a delete
+ignores both: a tombstone holds no content for either to describe,
+and a record stranded at a key the cluster has moved past would block
+§1.5's discard for ever. `mtime` is set to now. layer-a §1.5 does not
+permit that in as many words; it **prices** it, for the neighbouring
+case of a tombstone re-adopted after a missed discard — "(If the pull
+resets the record's `mtime`, condition 2 delays that second discard
+by `tombdays`; that costs space, not correctness.)" — and the price
+is the same one this pays. There is nothing to carry instead:
+`op=delete` has no `mtime` field on the wire.
+
+**Drop — `op=drop`, layer-a §5.6 and §7.4's drop guard.** A stray
+holder is told to delete its copy with **no** tombstone. A tombstone
+would be wrong: it arbitrates, so one published by a stray would
+travel back out and delete the copies the guard exists to protect.
+`objdiscard` cannot do it either — it refuses anything that is not a
+tombstone at exactly the named key.
+
+The whole of it is **one record**: an `Eobj` that releases the copy's
+grains and, by §2.7's `Oslot` rule, its extent-map slot, and an
+`Eslot` for the same index slot, in one item and therefore packed in
+that order into one record. §3.2's apply and §5's replay both apply an
+item's `Eobj` before its `Eslot`, so the tombstone the `Eobj` would
+otherwise publish is never visible: the state after the record is the
+state with no record, and the `qid.path` is gone. §3.5's deferred
+reuse covers all three releases exactly as it covers any commit's.
+Two commits would not do: the first publishes a tombstone this holder
+has no authority to create, and a crash between them leaves it
+durable. The drop needs no new record kind and no `Storevers` bump:
+the format carries both entries already, and an item carries both.
+
+A `corrupt`-flagged or condemned copy is droppable, for the reason a
+delete is: such a copy contributes no key (layer-a §1.3), so there is
+nothing here for the flag to defend, and a stray that could not be
+dropped would hold its grains for the life of the disk. The grains a
+condemned map named are not recovered by the drop — nothing knows
+which they were — and stay marked until a bitmap rebuild, which is
+what `applyrec` counts in `grainleak` (§6). A tombstoned id answers
+`no such object`, the same as an absent one (§3.7). It is the one
+place the store answers that for an id it does hold a record of, and
+the reason is that the record is not a copy: layer-a §5.6's `op=drop`
+table and §2.5's `drop` verb allow no `object deleted`, because a
+drop asks a stray *holder* to remove its copy and there is no copy
+here to remove. layer-a §1.5's discard, with its cluster-wide
+conditions, is the only thing that takes a tombstone away.
+
+**The resulting-`csum` check.** layer-a §5.5 requires the receiver of
+a replicated operation to compute the `csum` the object will have and
+fail `checksum mismatch` before the divergent state exists. The check
+is made inside the commit path, at the one point where the new `csum`
+has been computed and no byte of the record has been written, so a
+mismatch costs a discard (§3.3) and leaves the published state
+exactly as it was. For a multi-request `op=full` the check runs over
+the digests the transfer staged, and a failure discards the stage as
+§3.6 says every `final=1` outcome does. A zero-byte write is the one
+operation that runs the check outside the commit path: it commits
+nothing and adopts no key, so there is no commit to run it in, and
+the `csum` such a write results in is the one the object already
+carries — which is what the named `csum` is compared against. D23
+argues why the check sits where it does, and marks what is normative
+here and what is this library's shape.
+
+**What the server still owes.** The engine holds no map, so layer-a's
+epoch check, the delta ops' predecessor rule, §5.6's re-check that a
+dropping instance is not in `P(oid)` (`still placed`), and §1.5's
+cluster-wide discard conditions are all the caller's, made under the
+object's queue (§7) before it calls.
+
+Two more are the server's because the engine's surface is not the
+wire's:
+
+- **A wire header carrying `ver=0` MUST be refused `bad ctl` before
+  any engine call.** The engine answers a version of 0 by the call
+  reached rather than by where the version came from (§3.7), so the
+  delta calls answer it with an internal-invariant error even when
+  the server is relaying a peer's `op=write`, `op=trunc` or
+  `op=delete` over a live copy. Refusing the header first is what
+  makes that internal refusal a caller bug by construction, and it is
+  what puts layer-a §5.5's `bad ctl` on the wire for every operation
+  a conforming sender cannot send.
+- **A listing response is rendered by the server.** layer-a §5.6
+  makes the requested `n=` a maximum the server MUST clamp so that
+  the whole response fits the negotiated `msize` less `IOHDRSZ`, and
+  makes `lines=` a count of advert lines and `more=1` the answer both
+  to a clamp and to inventory that follows. The engine's `k` counts
+  entries rather than bytes and knows nothing of `msize`, and its
+  `more` out-parameter answers only the second of those two
+  conditions (§9).
+- **A zero-byte replicated write publishes nothing, so a sender MUST
+  NOT have bumped `ver` for one.** An `n=0` write commits no record
+  and adopts no key — it is the operation the `csum` check above runs
+  outside the commit path for — so a sender that bumped `ver` for an
+  `n=0` `op=write` and replicated it would leave every receiver a key
+  behind with nothing to catch up on. A conforming primary cannot
+  produce that: it reaches the store through the same `objwrite`,
+  which commits nothing for `n=0`, so it has no new key to send and
+  sends nothing. A receiver handed a foreign `n=0` write at a bumped
+  key answers `ok` — the operation applies, having written no byte —
+  and stays at its own key.
+
+**Arbitration is split by call**, and not by whether the key arrived
+from elsewhere:
+
+- `op=full`, and the replicated `op=create` §3.6 serves as a
+  zero-length stage, are **`stagefinal`'s**: it takes the object's
+  queue at `final=1`, re-reads the receiver's then-current key and
+  makes layer-a §5.5's comparison itself (§3.6).
+- An `op=delete` over an existing **tombstone** is **`objadopt`'s**,
+  made under the hold that read the record, above.
+- An `op=delete` over a **live** copy is the **caller's**: it is the
+  delete path's work, and that path compares nothing — it applies the
+  key it is given — while the adoption refuses a live copy outright.
+  So the server arbitrates it under the object's queue before it
+  calls, as it does for every delta op.
+
 
 ## 4. Read path, holes and re-hashing
 
@@ -2103,8 +2294,14 @@ against the entry's `mtime`, which is why the tombstone keeps one.
 
 **The log's reserved tail.** The last `logresv` sectors of free log
 space (policy, default one sixteenth of `logsecs`) are usable only by
-commits that free space: an `Eobj` that releases grains without
-allocating any — delete, truncate, tombstone — and an `Eslot`. An
+commits that free space: an `Eobj` that releases something and
+allocates nothing — delete, truncate, drop — and an `Eslot`. What
+counts as a release is grains freed, a live copy becoming a
+tombstone, a length shrink, or the extent-map slot §2.7's `Oslot`
+rule gives back; publishing `state=tomb` is not one by itself, so a
+re-keying tombstone adoption (§3.8) and a `corrupt` flag set over a
+record that is already a tombstone (§8) free nothing and may not draw
+on the reserve. An
 `Edirty` is not one of them in either direction: adding or removing a
 fine-grained dirty record frees no log space, so a remove may no more
 draw on the reserve than an add may. The
@@ -3083,6 +3280,89 @@ implementation policy. Dropping it instead would make the copy and
 `/status`'s own count disagree on precisely the damage `/lost`
 exists for.
 
+**The oid-ordered listing is not a snapshot.** layer-a §5.6's
+`op=list` pages an instance's whole inventory — live and tomb — in
+`oid` byte order, resuming after `after=`, and it is the peer
+enumeration path: a reconcile pass runs it against every instance.
+The snapshot above is the wrong shape for it three times over. It is
+slot-ordered, so resuming after an `oid` through one would mean
+sorting the whole index per page; it costs a vector of the whole
+index; and its count is bounded by `objsnapmax`, which is sized for
+the admin fids, so a reconcile paging through the inventory would
+spend that bound against `/obj` and `/tombs`.
+
+So `op=list` is served by a **k-smallest selection over a chunked
+scan** instead: one pass of the slot array per page, holding `k`
+entries of state, taking `qlstate` for `Listchunk` slots at a time
+(policy, 256) and releasing it between chunks. Each entry the
+selection keeps is copied — `oid` and `Objinfo` both — under the hold
+it was seen in, so no entry mixes two states of one object. What
+layer-a §5.6's "internally consistent" is read to require of a page,
+and what it is read not to require, is §14(17). The whole point of
+the chunking is that this walk, unlike the
+snapshot open, is taken by every peer's reconcile rather than by an
+operator's open, so it must not be the second place a state lock is
+held for the 23 ms a full index costs.
+
+**What a page costs** is measured for this scan rather than derived
+from the ~22 ns a slot above, which prices the snapshot walk's
+per-slot work and not this one's. A page is one pass of the slot
+array: **O(`nslots`) comparisons for the candidates the selection
+rejects — one each, whatever `k` is** — plus O(`k`) to place each
+candidate it accepts, so `k` shows in the price through the
+acceptances rather than through the pass. Rejecting in one comparison
+is a test the selection makes before its insertion scan, against the
+largest entry a full buffer holds; without it every slot past the
+first `k` runs the insertion scan to completion and the per-slot cost
+is O(`k`). Measured on the reference machine at `nslots` = 8192 over
+8184 objects, for a page from the start of the inventory:
+
+| `k` | per hold of 256 slots | per page | per hold without the test |
+|---|---|---|---|
+| 1 | ~35 µs | ~1.1 ms | ~37 µs |
+| 256 | ~160 µs | ~5.1 ms | ~4.4 ms |
+| 1024 | ~1.15 ms | ~37 ms | ~12.5 ms |
+
+(A per-hold figure is a page divided by its 32 holds.) 256 slots a
+hold keeps the hold under the 8.4 ms write §7 rule 2 measures holds
+against across that range, while a chunk small enough to matter for
+latency would pay a `qlock` round trip per handful of slots.
+
+`k` is the caller's and the **engine puts no bound on it**: it is
+bounded in practice by the server's clamp of layer-a §5.6's `n=` to
+the negotiated `msize`, below. A caller that asks for a `k` far above
+what a response can carry pays the table's right-hand column for a
+page it cannot send.
+
+What that costs is stated rather than hidden: an object created into
+a chunk the scan has already passed is missed by that page, and one
+created into a chunk ahead of it is included. layer-a §5.6 tolerates
+exactly that — "a reconcile pass MUST tolerate an object created or
+deleted between pages" — and the next pass or an `/advert` catches
+it. Paging by `after=` therefore neither repeats nor skips an object
+that stayed put across both pages, which is the contract §5.6 states.
+
+An oid can be seen **twice** by one page: its slot is released
+between two chunks and the id is re-created into a chunk the scan has
+not reached. It is answered once, at one of the two renders, because
+a page that answered it twice would not be ascending and would hand
+the caller an `after=` it had already paged past.
+
+**How the caller learns whether more follows** is an out-parameter
+(policy): the scan counts the candidates above `after` it saw, and
+answers `more` when that count exceeds what it returned. It is
+answered to the page's own tolerance, since it is the same scan, and
+within that tolerance it is one-sided: never falsely 0, because every
+candidate the page did not answer is counted, and so a caller told 0
+has the whole inventory above `after`. It can be a false 1, because
+an oid the scan saw twice counts twice and is answered once: a page
+that ends the inventory can still say `more`, and the cost is one
+further page that answers nothing rather than an object the caller
+stops short of. The
+`lines=` and `more=` of §5.6's response line are the server's to
+render, and so is clamping the requested `n=` to the negotiated
+`msize`: the engine's `k` counts entries, not bytes.
+
 §6's tombstone reclaim is the enumeration's first caller, and it is
 the caller's walk rather than the engine's: the engine holds no
 `tombdays` policy, because layer-a §3.1 makes `tombdays` a map-header
@@ -3960,8 +4240,9 @@ T1 formats a **small geometry** — a partition image of a few MiB with
 over one header sector, not over the whole store, and the cases that
 need `nslots = 2^20` are T2's.
 
-**What T1 covers today.** Twelve programs, all of them against the
-simulated disk except where a file-backed device is the point:
+**What T1 covers today.** Fifteen programs. All but `maptest`, which
+is pure text and reaches no device at all, run against the simulated
+disk except where a file-backed device is the point:
 `csumtest` (layer-a §1.4's block digests and object checksums against
 known-answer vectors), `structtest` (§2's byte layouts against
 known-answer vectors, a flipped byte caught in every structure,
@@ -4174,9 +4455,56 @@ whose own index entry is the damage, and §6's tombstone reclaim walk
 — single-proc, with the record replaced under it, with the record put
 back at a higher key under it, and under concurrent churn with one
 churn proc parked on a tombstone of its own making, so that the
-walk's epoch condition is what holds it off and not its cutoff).
+walk's epoch condition is what holds it off and not its cutoff),
+`maptest` (the cluster-map library of layer-a §3–§6 and §8.1, over
+map text alone: §3.2's header read back field by field, §3.1's rule
+that an unknown attribute and an unknown record — continuation lines
+and all — are ignored, §0's comments and blank lines, D21's required
+attributes, its defaults and its caps with each refusal read back by
+its own detail, §4.2 and §4.3's placement against known-answer
+vectors computed outside this codebase and the tie-break no vector
+can reach, an under-replicated `P` and the primary an `up` change
+promotes without moving a byte, §5.2's witness set with D22's
+clause-2 substitution, its skip rule against the map's stale ledger
+and `dead` excluded outright, §6.3's adoption decision with both
+refusals reported when both hold, §6.4's fence state on a synthetic
+clock, and §8.1's commit validation with §8.6's `forceepoch`
+exemption), `bmrebuildtest` (§8's online bitmap rebuild, T1.28 and
+T1.29: the walk over a serving store with a §5 step 10 condemned
+slot, whose rebuilt bitmap equals a full scan of the live maps and
+whose `grainleak` returns to zero with a stage's grains outstanding;
+the commit that lands in a folded slot and in one not yet reached;
+the write barrier and the per-slot generation stamp that validates an
+entry the fold re-read outside the state lock — a map moved at an
+unchanged four-tuple, a damaged map an `op=full` replaced, and a
+writer that drives the fold to its eight-re-read bound, each parked
+at §13's `bmfold` point; the swap dirtying only the page that
+differs and the checkpoint after it writing that one page, an end
+refused for a live slot the walk skipped, a leak recorded after its
+slot was folded surviving the swap, and the pass's lifetime — the
+abort that leaves the live bitmap byte for byte as it was, the abort
+that lands inside a swap and does nothing, and the `storeclose` that
+aborts a live pass and lets go of a fold parked in it) and
+`peeropstest` (§3.8's peer-channel primitives and §9's oid-ordered
+listing: the adoption over an absent id, over a lower-keyed tombstone
+and over a live copy, each refusal told apart by whether it carries a
+§2.6 prefix, the index slot and the `qid.path` it reserves, and the
+tombstone it publishes read back across a restart; the drop's one
+durable step asserted before the restart as well as after it, the
+same freed state after a crash at `postwrite`, the two ids a drop is
+not for, and a condemned copy dropped with its unrecoverable grains
+counted in `grainleak`; the resulting-`csum` check over each of the
+five calls a peer's key can reach, a wrong `csum` leaving the log's
+`seqnext` and watermark where they were and a restart replaying to
+the state before the call, and the zero-byte write that has no commit
+to carry the check; and the listing over layer-a §1.1's byte order
+with tombstones in the inventory, paged by `after` with `more`, its
+refusals, and its pages under a proc creating objects beside the walk
+and dropping and re-creating them behind itself, over a store
+formatted with more than `Listchunk` slots so that a page is more
+than one hold).
 
-Against the list below that is T1.1–T1.26, T1.28 and T1.29. One case
+Against the list below that is T1.1–T1.26 and T1.28–T1.33. One case
 is not covered and waits on something this store does not have yet:
 **T1.27** waits on the server's `Reqqueue` pool (§7), which is what it
 is about — the engine's own scrub and cursor take the same `qlstate`
@@ -4482,6 +4810,85 @@ what would close it.
   a live pass alone at `storeclose`; skip the coverage check; mark a
   slot covered for any apply; zero `grainleak` at the end whatever
   the pass folded; let an abort inside a swap drop the pass.
+- **T1.30 tombstone adoption (§3.8).** Adopt over an id the store
+  holds no record of and assert a tombstone at the key that arrived,
+  `len` 0 and layer-a §1.4's zero-length `csum`, visible through
+  `objstat` and §8's slot cursor, with a fresh `qid.path`, surviving
+  a restart. Adopt over a lower-keyed tombstone and assert it is
+  re-keyed in its own slot at its own `qid.path`. Adopt over a live
+  copy and assert the refusal, that it carries no §2.6 prefix (§3.7)
+  and that the copy is untouched. Adopt at version 0 and assert
+  `bad ctl` and no record. *Mutations:* let the adoption take a live
+  copy, leaving its grains marked under a tombstone; publish the
+  tombstone at a `len` other than 0.
+- **T1.31 drop (§3.8).** Drop a multi-block live copy and assert the
+  grains, the extent-map slot and the index slot are all free again
+  (`Storestat`), and that no record is left — **before** the restart
+  as well as after, because replay repairs an apply that ran the item
+  the wrong way round and a check made only after a restart cannot
+  see the live path's order at all. Then the crash-point discipline:
+  with the simulated device stopped at `postwrite` and the written
+  sector kept, so the record is durable and its post-flush never
+  returns, assert the call fails — the crash fired — restart and
+  assert the same freed state: one record, one outcome. Assert the
+  two ids a drop is not for, both `no such object` (§3.7), and that a
+  `corrupt`-flagged copy is droppable and leaves `/lost`.
+  *Mutations:* leave the copy's grains marked (compare `grainfree`);
+  commit the `Eobj` without the `Eslot`, leaving a tombstone behind;
+  apply an item's `Eslot` before its `Eobj`, which only the
+  before-restart assertions catch.
+- **T1.32 the resulting-`csum` check (§3.8, D23).** For each of
+  `objwrite`, `objtrunc`, `objremove`, the adoption and `op=full` —
+  the five calls a peer's key can reach — learn the `csum` the
+  operation produces on one store,
+  then on an identical one offer a wrong `csum` and assert
+  `checksum mismatch` and that **nothing is durable** — the log's
+  `seqnext` and watermark have not moved, and a restart replays to
+  the state before the call — and then offer the right one and assert
+  it commits the same four-tuple, all four of it. A zero-byte write
+  is its own case, since it has no commit to carry the check: a wrong
+  `csum` is `checksum mismatch`, the right one is `ok`, and neither
+  writes a record or moves the key. *Mutation:* make the check after
+  `logcommit` rather than before it, which leaves the refusal in
+  place and the record on the platter.
+- **T1.33 the oid-ordered listing (§9).** An inventory chosen for
+  layer-a §1.1's byte order over mixed lengths — an id that is a
+  prefix of four others, and `-`, `.`, `_` and letters straddling
+  each other — with two of its entries tombstones. Assert the whole
+  inventory in order with both kinds present and the `Objinfo`
+  matching `objstat`'s; three pages of three resumed by `after` with
+  no duplicate and no gap and `more` set only while inventory
+  follows; a page of exactly the inventory and one an entry short of
+  it; `k` of 0; `after` at the last oid; and the refusals — a
+  negative `k`, an `after` past §1.1's bound, an `after` length with
+  no `after`, and a store that has stopped serving.
+  Then a proc creating objects beside the walk — and dropping and
+  re-creating them behind itself, which is what can put one oid in a
+  page twice — under which every page must still be strictly
+  ascending and above its `after`.
+  The walk is repeated for as long as that proc is in the engine
+  rather than run once beside it, since one pass costs less than one
+  of the proc's commits; the properties are accumulated and asserted
+  once, so the count of checks does not depend on how the race fell,
+  and one assertion is that the walk saw an object the proc made —
+  without it a run in which the two never overlapped is
+  indistinguishable from one in which they did. The store it runs
+  against is formatted with more than `Listchunk` slots, because at
+  §13's small geometry a page is one hold of `qlstate` across the
+  whole index and nothing can move under it. *Mutations:* resume at
+  `>= after` rather than `> after`; skip tombstones. **Not covered,**
+  two things, and one reason for both: no `-X` point parks a listing
+  between chunks. §13's hook framework is there and `snaphold` is the
+  precedent for a point of exactly that shape, so what is missing is
+  the point and not an observable. Without it, that the scan releases
+  `qlstate` between chunks rather than holding it across the index is
+  indistinguishable from outside — a create that blocks on the lock
+  and a create that lands between chunks leave the same page. And the
+  case where an oid a page sees twice is answered once needs the
+  release and the re-creation to fall either side of a chunk boundary
+  with the new slot ahead of the scan, which nothing here can place:
+  a mutation removing the de-duplication runs green under this churn.
+  Both are read off the code rather than driven.
 
 T1 stays diskless and is `mk test` at the repo root, as `AGENTS.md`
 requires: the simulated disk is a T1 program's own memory.
@@ -4543,13 +4950,13 @@ would be a wire change.
 
 *Policy, but read it before implementing anything.*
 
-Fifteen places where layer-a is silent, self-defeating, or
+Seventeen places where layer-a is silent, self-defeating, or
 contradicted by the measurements. Each entry states the tension, its
 resolution, and where the argument for it lives; nothing here repeats
 an argument made in a section above. Items 1–5, 8, 9, 11, 12, 13 and
-14 are amendments **made** to `docs/design/layer-a.md`; items 6, 7
-and 15 are recorded here and not made there; item 10 is a **proposal**
-rather than an amendment, because it touches the wire.
+14 are amendments **made** to `docs/design/layer-a.md`; items 6, 7,
+15 and 17 are recorded here and not made there; items 10 and 16 are
+**proposals** rather than amendments, because they touch the wire.
 
 1. **`cur` cannot usefully be durable (layer-a §5.2).** Layer-a
    required currency recorded "durably as `cur=<epoch>`" and, two
@@ -4688,6 +5095,36 @@ rather than an amendment, because it touches the wire.
     deviation from a named field rather than an invented oid. Format
     beyond `oid=` and `kind=` is implementation policy there, so the
     omission is the smaller of the two departures.
+
+16. **layer-a §5.5 requires the resulting-`csum` check but not that
+    it precede the update.** §5.5 has the receiver "compute its own
+    and MUST fail with `checksum mismatch` if they differ" and fixes
+    no moment for it, so a receiver that commits the operation and
+    then reports the mismatch meets the letter while leaving exactly
+    the divergent state the check exists to prevent — durable, for
+    the next start to replay, with the caller holding an error and no
+    way to know. *Proposed, not made:* §5.5 would say the receiver
+    MUST fail **before the operation becomes durable**. It is a
+    proposal rather than an amendment because it strengthens a
+    receiver obligation on the wire. This store already meets it
+    (§3.8), and D23 marks the timing as this store's implementation
+    policy for as long as §5.5 does not carry it.
+
+17. **"A page MUST be internally consistent" is undefined for
+    `op=list` (layer-a §5.6).** §5.6 requires it of a page and does
+    not say what it means, and a chunked scan must read it one way or
+    the other. *Not made; recorded here as this store's reading:* a
+    page is consistent **per entry** — each entry is rendered whole
+    under one hold of the state lock, so no entry mixes two states of
+    one object — and it is duplicate-free, so it ascends strictly in
+    `oid`. It is **not** a snapshot of the instance at one instant:
+    an object created or deleted while the page is being built may or
+    may not appear in it. What §5.6 tolerates between pages — "a
+    reconcile pass MUST tolerate an object created or deleted between
+    pages" — this store may therefore also do within one. The other
+    reading would cost a hold of the state lock across the whole
+    index, which is the 23 ms §9 measures and the cost the chunking
+    exists to avoid. §9 describes what the scan does.
 
 ## 15. Alternatives considered
 

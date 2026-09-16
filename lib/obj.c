@@ -41,6 +41,8 @@ struct Upd
 	int	slotresv;		/* this update reserved an index slot */
 	int	emapresv;		/* ... and an extent-map slot */
 	int	keepcsum;		/* publish e.csum rather than recompute */
+	uchar	*expcsum;		/* layer-a §5.5's csum=, or nil */
+	int	dropslot;		/* ... and an Eslot for the same slot */
 };
 
 static void updclose(Upd*);
@@ -181,8 +183,8 @@ updabort(Upd *u)
 /*
  * Build the Eobj and commit it, then release the pins.  An item is
  * space-freeing — and so may draw on §6's reserved log tail — when it
- * releases grains and allocates none: a delete, a truncate, a
- * tombstone.
+ * releases something and allocates nothing: a delete, a truncate, a
+ * drop.
  */
 static int
 updcommit(Upd *u, int state, uvlong ver, uvlong wepoch, vlong mtime,
@@ -215,6 +217,25 @@ updcommit(Upd *u, int state, uvlong ver, uvlong wepoch, vlong mtime,
 		memmove(csum, u->e.csum, Csumlen);
 	else if(updcsum(u, &mold, csum) < 0){
 		updabort(u);
+		return -1;
+	}
+	/*
+	 * layer-a §5.5's resulting-csum check (D23).  A replicated
+	 * operation names the csum the object MUST have once it is
+	 * applied, and the receiver MUST compute its own and refuse
+	 * `checksum mismatch' if they differ: it is the check that
+	 * catches divergence at the moment it would be created.
+	 *
+	 * It is made HERE and nowhere else.  This is the one point at
+	 * which the csum this operation publishes exists and no byte of
+	 * its record has been written, so a refusal costs an updabort
+	 * and leaves the published state exactly as §3.3 leaves it after
+	 * any other discard.  D23 argues why it must precede the record.
+	 */
+	if(u->expcsum != nil && memcmp(csum, u->expcsum, Csumlen) != 0){
+		updabort(u);
+		werrstr("checksum mismatch: the resulting csum is not the "
+			"one the operation named");
 		return -1;
 	}
 	memset(&o, 0, sizeof o);
@@ -251,14 +272,54 @@ updcommit(Upd *u, int state, uvlong ver, uvlong wepoch, vlong mtime,
 			alloc = 1;
 	if(u->oslot && u->newslot != 0)
 		alloc = 1;
+	/*
+	 * An index slot is the third space this store allocates, and a
+	 * commit that takes one is ordinary traffic however little else
+	 * it does.  Tombstone adoption is what makes the distinction
+	 * bite: it publishes state=tomb over a slot it has just
+	 * reserved.
+	 */
+	if(u->slotresv)
+		alloc = 1;
 
 	memset(&it, 0, sizeof it);
 	it.obj = &o;
 	it.dirty = dr;
 	it.ndirty = ndr;
 	it.emap = u->cnew;
-	it.freeing = !alloc && (u->nfree > 0 || state == Stomb
-		|| u->newlen < u->e.len);
+	/*
+	 * §5.6's op=drop: the Eobj above releases the copy's grains and
+	 * its extent-map slot, and this Eslot releases the index entry
+	 * they hung from.  They ride in ONE item, so they are packed
+	 * into one record in this order and applied in it — by
+	 * applybatch on the live path and by applyents on replay — and
+	 * the record is one commit point (§3.2), so no crash can land
+	 * between them.  Two calls could not do this: a create-then-drop
+	 * would publish a live object at a key the sender never sent,
+	 * and a crash between a tombstone and its discard leaves a
+	 * tombstone layer-a §1.5's cluster-wide rule never authorised.
+	 */
+	if(u->dropslot){
+		it.eslot = u->slot;
+		it.haseslot = 1;
+	}
+	/*
+	 * Each disjunct below is something this commit gives back, or —
+	 * the live-to-tomb one — the delete §6's reserve exists to keep
+	 * possible however little a particular object holds: grains
+	 * named in `freed', a delete, bytes above a shrunk length, and
+	 * the extent-map slot §2.7's Oslot rule releases when an object
+	 * drops to a block or fewer.  Publishing state=tomb is not one
+	 * of them by itself.  Over a record that is a tombstone already
+	 * it releases nothing and is not a delete — which is how a
+	 * re-keying adoption came to be admitted to a batch drawing on
+	 * the reserve while freeing no space at all, and how objcorrupt
+	 * over a tombstone came to be.
+	 */
+	it.freeing = !alloc && (u->nfree > 0
+		|| (state == Stomb && u->e.state == Slive)
+		|| u->newlen < u->e.len
+		|| (u->oslot && u->newslot == 0 && u->e.emapslot != 0));
 	r = logcommit(s, &it);
 	if(r < 0){
 		updabort(u);
@@ -338,6 +399,8 @@ enum
 	Utomb	= 1,	/* a tombstone may be opened */
 	Ubad	= 2,	/* ... and so may a slot §5 step 10 condemned */
 	Ucorrupt = 4,	/* ... and one whose §8 corrupt flag is set */
+	Unolive	= 8,	/* ... but a LIVE entry is refused: objadopt */
+	Unotomb	= 16,	/* ... and a tombstone is `no such object': objdrop */
 };
 
 static int
@@ -365,9 +428,30 @@ updopen(Upd *u, Store *s, uchar *oid, int oidlen, uvlong newlen, int flags)
 		 * way to tell them apart without a second, racy objstat,
 		 * and a client that sees `no such object' for a tombstoned
 		 * id may re-create it.
+		 *
+		 * Unotomb is op=drop's exception, and it is not a folding
+		 * of the two: layer-a §5.6's op=drop table and §2.5's drop
+		 * verb do not list `object deleted' at all, because a drop
+		 * asks a stray holder to remove a COPY and a tombstone is a
+		 * record rather than a copy.  There is nothing there to
+		 * drop, which is what `no such object' says.
 		 */
-		werrstr(e->state == Stomb ? "object deleted"
-			: "no such object");
+		werrstr(e->state == Stomb && !(flags & Unotomb)
+			? "object deleted" : "no such object");
+		return -1;
+	}
+	/*
+	 * Tombstone adoption's refusal, made under the same hold that
+	 * classified the record so that no delete can slip in between:
+	 * a live copy holds content, and replacing it with metadata
+	 * belongs to objremove, which the server reaches having
+	 * arbitrated.  §3.7's internal kind, so no §2.6 prefix.
+	 */
+	if((flags & Unolive) && e->state == Slive){
+		qunlock(&s->qlstate);
+		werrstr("adopt a tombstone over the live copy at "
+			"(%llud, %llud): the delete path is objremove",
+			e->wepoch, e->ver);
 		return -1;
 	}
 	/*
@@ -814,6 +898,17 @@ objstat(Store *s, uchar *oid, int oidlen, Objinfo *oi)
 	return 0;
 }
 
+/*
+ * The four plain entry points below and stagefinal have
+ * csum-checking variants, which are them with an expected csum (D23):
+ * layer-a §5.5's `csum=' is the receiver's check and a client write
+ * has nobody to check against, so the argument is nil for every
+ * caller but the peer channels.  objcreate has no variant: no peer's
+ * key reaches it.  §5.5's op=create receiver is a zero-length stage
+ * and arbitrates in stagefinal (§3.6), and a client create's key is
+ * this instance's own to choose (layer-a §5.4 step 3), so there is
+ * nobody to name a csum for it.
+ */
 int
 objcreate(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 	Dirtyrec *dr, int ndr, Objinfo *oi)
@@ -841,8 +936,9 @@ objcreate(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 	 * (0, 0).  Unlike stagefinal's, this refusal is §3.7's internal
 	 * kind and carries no §2.6 prefix — a client create's version is
 	 * this instance's own to choose (layer-a §5.4 step 3), and the
-	 * op=create receiver arbitrates rather than calling here (§3.6) —
-	 * so a version of 0 on this path is a caller bug.
+	 * op=create receiver does not come through here at all: its path
+	 * is a zero-length stage, which arbitrates in stagefinal (§3.6).
+	 * So a version of 0 on this path is a caller bug.
 	 */
 	if(ver == 0){
 		werrstr("create at version 0");
@@ -884,10 +980,10 @@ objcreate(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 		 * create path (§3.6), on which the version is this
 		 * instance's own to choose (layer-a §5.4 step 3) — chosen
 		 * by the rule this branch enforces — so any other value is
-		 * a caller bug.  The op=create receiver arbitrates before
-		 * calling here (§3.6), and an op=full over a tombstone
-		 * arbitrates in stagefinal, where the refusal is §2.6's
-		 * `stale version'.
+		 * a caller bug.  A replicated op=create is a zero-length
+		 * stage and an op=full over a tombstone a stage of the
+		 * object's length; both arbitrate in stagefinal, where the
+		 * refusal is §2.6's `stale version'.
 		 */
 		if(ver != e->ver + 1 || wepoch < e->wepoch){
 			qunlock(&s->qlstate);
@@ -949,6 +1045,14 @@ int
 objwrite(Store *s, uchar *oid, int oidlen, void *a, long n, uvlong off,
 	uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 {
+	return objwritecsum(s, oid, oidlen, a, n, off, ver, wepoch, nil,
+		dr, ndr);
+}
+
+int
+objwritecsum(Store *s, uchar *oid, int oidlen, void *a, long n, uvlong off,
+	uvlong ver, uvlong wepoch, uchar *csum, Dirtyrec *dr, int ndr)
+{
 	Upd u;
 	Omap mold;
 	Objinfo oi;
@@ -1007,9 +1111,26 @@ objwrite(Store *s, uchar *oid, int oidlen, void *a, long n, uvlong off,
 	 * legal client call.  The existence and bounds tests above still
 	 * run, so a count-0 write to a tombstone or past objmax fails as
 	 * it should.
+	 *
+	 * §5.5's resulting-csum check still runs, and this is the one
+	 * place it is made outside updcommit (D23).  The csum a
+	 * replicated write names is the one the object MUST have once
+	 * the operation is applied, and for a count of 0 that is the
+	 * csum it already carries: a sender that named another has
+	 * diverged from this receiver already, and answering ok would
+	 * report agreement where there is none.  The check is made
+	 * against the stored csum, which the objstat above has in hand,
+	 * and changes nothing else about this exit — the write still
+	 * commits no record and still adopts no key, on either outcome.
 	 */
-	if(n == 0)
+	if(n == 0){
+		if(csum != nil && memcmp(csum, oi.csum, Csumlen) != 0){
+			werrstr("checksum mismatch: the resulting csum is not "
+				"the one the operation named");
+			return -1;
+		}
 		return 0;
+	}
 	newlen = oi.len;
 	if(off + n > newlen)
 		newlen = off + n;
@@ -1050,6 +1171,7 @@ objwrite(Store *s, uchar *oid, int oidlen, void *a, long n, uvlong off,
 		return -1;
 	}
 	free(buf);
+	u.expcsum = csum;
 	if(updcommit(&u, Slive, ver, wepoch, time(nil), 0, dr, ndr) < 0){
 		updclose(&u);
 		return -1;
@@ -1061,6 +1183,13 @@ objwrite(Store *s, uchar *oid, int oidlen, void *a, long n, uvlong off,
 int
 objtrunc(Store *s, uchar *oid, int oidlen, uvlong len, uvlong ver,
 	uvlong wepoch, Dirtyrec *dr, int ndr)
+{
+	return objtrunccsum(s, oid, oidlen, len, ver, wepoch, nil, dr, ndr);
+}
+
+int
+objtrunccsum(Store *s, uchar *oid, int oidlen, uvlong len, uvlong ver,
+	uvlong wepoch, uchar *csum, Dirtyrec *dr, int ndr)
 {
 	Upd u;
 	Omap mold;
@@ -1095,6 +1224,7 @@ objtrunc(Store *s, uchar *oid, int oidlen, uvlong len, uvlong ver,
 		return -1;
 	}
 	free(buf);
+	u.expcsum = csum;
 	if(updcommit(&u, Slive, ver, wepoch, time(nil), 0, dr, ndr) < 0){
 		updclose(&u);
 		return -1;
@@ -1111,6 +1241,13 @@ objtrunc(Store *s, uchar *oid, int oidlen, uvlong len, uvlong ver,
 int
 objremove(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 	Dirtyrec *dr, int ndr)
+{
+	return objremovecsum(s, oid, oidlen, ver, wepoch, nil, dr, ndr);
+}
+
+int
+objremovecsum(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
+	uchar *csum, Dirtyrec *dr, int ndr)
 {
 	Upd u;
 	Omap mold;
@@ -1162,7 +1299,204 @@ objremove(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 		updclose(&u);
 		return -1;
 	}
+	u.expcsum = csum;
 	if(updcommit(&u, Stomb, ver, wepoch, time(nil), 0, dr, ndr) < 0){
+		updclose(&u);
+		return -1;
+	}
+	updclose(&u);
+	return 0;
+}
+
+/* layer-a §1.3's arbitration key, compared lexicographically */
+static int
+keycmp(uvlong we, uvlong ver, uvlong we2, uvlong ver2)
+{
+	if(we != we2)
+		return we < we2 ? -1 : 1;
+	if(ver != ver2)
+		return ver < ver2 ? -1 : 1;
+	return 0;
+}
+
+/*
+ * layer-a §1.5's tombstone adoption, which §5.5's op=delete needs for
+ * the two records objremove cannot open: an id this instance holds no
+ * record of, and an id whose record is already a tombstone at another
+ * key.  §1.5 is explicit that the adopter "takes state=tomb, the key
+ * and len=0 ... and commits that as its record", and §5.5 that a
+ * self-contained op applies "or the receiver holds no copy" — so
+ * without this call a replicated delete for an object this instance
+ * missed the creation of can never be applied, the tombstone never
+ * arrives, and §1.5's discard waits on this instance for ever.  §3.8
+ * has the rest of the argument, including why no two existing calls
+ * substitute for this one.
+ *
+ * The csum is §1.4's for a zero-length object — the hash of an empty
+ * digest array — and it is not written here: updcsum computes it for
+ * nblk == 0 from the same rule it computes every other csum by, which
+ * is why an adopted tombstone and a deleted one carry the same value
+ * without either path stating it.
+ */
+int
+objadopt(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
+	Dirtyrec *dr, int ndr)
+{
+	return objadoptcsum(s, oid, oidlen, ver, wepoch, nil, dr, ndr);
+}
+
+int
+objadoptcsum(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
+	uchar *csum, Dirtyrec *dr, int ndr)
+{
+	Upd u;
+	long slot;
+	int absent;
+
+	if(!storeserving(s))
+		return -1;
+	/*
+	 * The oid arrives from a peer, so its bound is checked here as
+	 * objcreate and stageopen check theirs: layer-a §2.6's
+	 * `bad object name'.
+	 */
+	if(oidlen < 1 || oidlen > Oidmax){
+		werrstr("bad object name: oid length %d", oidlen);
+		return -1;
+	}
+	/*
+	 * §3.7's rule, and this path falls on stagefinal's side of it:
+	 * the version is the sender's and arrives in an op=delete
+	 * header, so a value layer-a §1.3 forbids is a malformed header
+	 * — §5.5's common set, `bad ctl' — and not the caller bug a 0 on
+	 * create, write, truncate or delete is.
+	 */
+	if(ver == 0){
+		werrstr("bad ctl: op=delete at version 0");
+		return -1;
+	}
+	qlock(&s->qlstate);
+	slot = ientfind(s, oid, oidlen);
+	absent = slot < 0 || s->idx[slot].state == Sfree;
+	qunlock(&s->qlstate);
+	/*
+	 * An absent id takes a fresh index slot and a fresh qid.path in
+	 * the one commit that publishes the tombstone, for updnew's
+	 * reason: a slot reserved by one commit and published by
+	 * another is a window a crash lands in.  An existing tombstone
+	 * is re-keyed in place, keeping §2.3's stable qid.path.
+	 *
+	 * Ubad and Ucorrupt are passed for objremove's reason, not as an
+	 * exception to it: a tombstone holds no content, so neither flag
+	 * describes anything this commit publishes, and refusing would
+	 * strand the record at a key the cluster has moved past.
+	 * Unolive is what keeps a live copy out — tested under the hold
+	 * that classified the record, so the answer cannot be stale.
+	 */
+	if(absent){
+		if(updnew(&u, s, oid, oidlen, 0) < 0)
+			return -1;
+	}else if(updopen(&u, s, oid, oidlen, 0,
+		Utomb|Ubad|Ucorrupt|Unolive) < 0)
+		return -1;
+	/*
+	 * layer-a §5.5's comparison against the record this adoption
+	 * would replace, made HERE and not left to the caller.  The key
+	 * arrives from elsewhere, as op=full's does, so this path falls
+	 * on stagefinal's side of §3.7's line — and it makes the
+	 * comparison the way stagefinal makes it, against the key the
+	 * updopen above classified under one hold of qlstate, so no
+	 * op=delete can replace the tombstone between the read and the
+	 * commit.  A caller could not: a separate objstat is that second
+	 * read.
+	 *
+	 * Strictly greater, so an equal key is `stale version' too.
+	 * layer-a §1.3's I3 makes equal keys equal content, a tombstone
+	 * has none, and re-keying at the key the record already holds
+	 * would write a record that moves nothing.  Unlike op=full there
+	 * is no force=1 here: §1.3's divergence repair carries content,
+	 * and op=delete carries none.
+	 *
+	 * An absent id has no key to defend, so every key §1.3 permits
+	 * — anything at or above (·, 1) — applies to it; that is the
+	 * arm above, which reaches no record to compare against.
+	 */
+	if(!absent && keycmp(wepoch, ver, u.e.wepoch, u.e.ver) <= 0){
+		updabort(&u);
+		updclose(&u);
+		werrstr("stale version: op=delete at (%llud, %llud) over the "
+			"tombstone at (%llud, %llud)", wepoch, ver,
+			u.e.wepoch, u.e.ver);
+		return -1;
+	}
+	u.expcsum = csum;
+	/*
+	 * mtime is now.  layer-a §1.5 prices a reset mtime rather than
+	 * forbidding one (§3.8), and there is nothing to carry instead:
+	 * op=delete has no mtime field on the wire.
+	 */
+	if(updcommit(&u, Stomb, ver, wepoch, time(nil), 0, dr, ndr) < 0){
+		updclose(&u);
+		return -1;
+	}
+	updclose(&u);
+	return 0;
+}
+
+/*
+ * layer-a §5.6's op=drop and §7.4's drop guard: remove a stray live
+ * copy leaving no record at all.  A tombstone would be wrong here —
+ * the object is alive elsewhere and a tombstone arbitrates, so one
+ * published for a stray would travel back out and delete the good
+ * copies (§3.8) — and objdiscard cannot do it, since it refuses
+ * anything that is not a tombstone at exactly the named key.
+ *
+ * **One durable step.**  The Eobj below is the same record objremove
+ * commits — len 0, the copy's grains in `freed', the extent-map slot
+ * released by §2.7's Oslot rule — and the Eslot updcommit adds beside
+ * it in the same item frees the index entry.  applybatch and
+ * applyents both apply an item's Eobj before its Eslot, so the
+ * tombstone this record would otherwise publish never becomes
+ * visible: the state after the record is the state with no record.
+ * The key and mtime are the copy's own, so nothing about the object
+ * is invented for a state that is never published.  Two commits
+ * would leave that tombstone durable across a crash between them.
+ */
+int
+objdrop(Store *s, uchar *oid, int oidlen)
+{
+	Upd u;
+	Omap mold;
+
+	if(!storeserving(s))
+		return -1;
+	/*
+	 * §8 and §5 step 10 pass for objremove's reason: a copy that
+	 * contributes no key (layer-a §1.3) has nothing here to defend
+	 * (§3.8).  The grains a condemned map named are not recovered by
+	 * this — nothing knows which they were — and stay marked until a
+	 * bitmap rebuild, exactly as for a delete; applyrec counts them.
+	 *
+	 * Unotomb is what makes updopen answer a tombstoned id
+	 * `no such object', the same as an absent one: a tombstone is a
+	 * record and not a copy, so a drop has nothing here to remove
+	 * (§3.7, §3.8).
+	 */
+	if(updopen(&u, s, oid, oidlen, 0, Ubad|Ucorrupt|Unotomb) < 0)
+		return -1;
+	mapopen(s, &mold, &u.e, u.cold);
+	if(freetail(&u, &mold) < 0){
+		updabort(&u);
+		updclose(&u);
+		return -1;
+	}
+	if(u.e.emapslot == 0 && u.e.grain0 != 0 && addfree(&u, u.e.grain0) < 0){
+		updabort(&u);
+		updclose(&u);
+		return -1;
+	}
+	u.dropslot = 1;
+	if(updcommit(&u, Stomb, u.e.ver, u.e.wepoch, u.e.mtime, 0, nil, 0) < 0){
 		updclose(&u);
 		return -1;
 	}
@@ -1547,6 +1881,190 @@ objslot(Store *s, ulong slot, uchar *oid, int *oidlen, Objinfo *oi)
 	ientinfo(s, slot, oi);
 	qunlock(&s->qlstate);
 	return 1;
+}
+
+/*
+ * layer-a §1.1 compares ids as byte strings, case-sensitively, and
+ * says nothing else: so two ids that agree over the shorter one's
+ * length are ordered by length, the shorter first.  Every byte an oid
+ * may hold is below 0x80 (§1.1's ALPHA / DIGIT / "." / "-" / "_"), so
+ * memcmp over uchar is that comparison and no sign question arises.
+ */
+static int
+oidcmp(uchar *a, int na, uchar *b, int nb)
+{
+	int n, c;
+
+	n = na < nb ? na : nb;
+	if(n > 0 && (c = memcmp(a, b, n)) != 0)
+		return c;
+	if(na == nb)
+		return 0;
+	return na < nb ? -1 : 1;
+}
+
+/*
+ * layer-a §5.6's op=list: the k smallest oids strictly greater than
+ * `after', live and tomb alike, in oid byte order.  §9 argues why
+ * this is a k-smallest selection over a chunked scan rather than an
+ * Objsnap, and carries what a page and a hold measure at.
+ *
+ * **The hold is per chunk, not per page.**  The lock is taken for
+ * Listchunk slots at a time and released between chunks, because
+ * this walk is taken by every peer's reconcile rather than by an
+ * operator's open and must not be a second place a state lock is
+ * held for the milliseconds a full index costs (§9).  Each entry the
+ * selection keeps is copied — oid and Objinfo both — under the hold
+ * it was seen in.
+ *
+ * What that costs is stated rather than hidden: an object created
+ * into a chunk this scan has passed is missed by this page, and one
+ * created into a chunk ahead of it is included.  §5.6 tolerates
+ * exactly that — "a reconcile pass MUST tolerate an object created or
+ * deleted between pages" — and the next pass or an /advert catches
+ * it.  *more counts the candidates this scan saw, to the same
+ * tolerance, and the count is one-sided: within that tolerance it is
+ * never falsely 0, because every candidate this page did not answer
+ * is counted, so a caller told 0 has the whole inventory above
+ * `after'.  It CAN be a false 1 — an oid this scan saw twice, folded
+ * into one entry by the duplicate arm below or skipped by the equal
+ * early-out beside it, counts twice and is answered once — and the
+ * price of that is one more page that answers nothing, never an
+ * object the caller stops short of (§9).  §14(17) is how §5.6's
+ * "internally consistent" is read here.
+ */
+int
+objlist(Store *s, uchar *after, int afterlen, Objent *e, int k, int *more)
+{
+	Ient *ent;
+	ulong slot, lim, nslots;
+	uvlong ncand;
+	int n, i, j, c;
+
+	if(more != nil)
+		*more = 0;
+	if(!storeserving(s))
+		return -1;
+	if(k < 0){
+		werrstr("list: negative count %d", k);
+		return -1;
+	}
+	if(afterlen < 0 || afterlen > Oidmax){
+		werrstr("bad object name: after length %d", afterlen);
+		return -1;
+	}
+	/*
+	 * A nil `after' means the start of the inventory and carries no
+	 * length; a length with no bytes behind it would be read out of
+	 * a nil pointer by the comparison below.  §3.7's internal kind,
+	 * like every other caller bug.
+	 */
+	if(after == nil && afterlen != 0){
+		werrstr("list: after length %d with no after oid", afterlen);
+		return -1;
+	}
+	n = 0;
+	ncand = 0;
+	c = 1;
+	nslots = s->sb.nslots;
+	for(slot = 0; slot < nslots; ){
+		lim = slot + Listchunk;
+		if(lim > nslots)
+			lim = nslots;
+		/*
+		 * §9's rule for a walk that releases the lock, objsnapent's:
+		 * every hold re-asks whether the store is still serving,
+		 * because a walk that started on a live store can run on
+		 * into one that has been condemned or closed under it and
+		 * answer out of memory the store no longer stands behind.
+		 * The closed test is the FIRST thing inside the hold, so it
+		 * wins over the entries below; storeserving comes before
+		 * the hold, as it does there, so `store condemned' wins
+		 * over `store closed' when both are true.
+		 */
+		if(!storeserving(s))
+			return -1;
+		qlock(&s->qlstate);
+		if(s->closed){
+			qunlock(&s->qlstate);
+			werrstr("store closed");
+			return -1;
+		}
+		for(; slot < lim; slot++){
+			ent = &s->idx[slot];
+			if(ent->state != Slive && ent->state != Stomb)
+				continue;
+			/*
+			 * Strictly greater: `after' is the last oid of the
+			 * previous page and has been answered already, so
+			 * accepting an equal id would repeat it for ever.
+			 * An afterlen of 0 is below every oid, since §1.1
+			 * makes an oid at least one byte, so an empty
+			 * `after' starts from the beginning with no case of
+			 * its own.
+			 */
+			if(oidcmp(ent->oid, ent->oidlen, after, afterlen) <= 0)
+				continue;
+			ncand++;
+			if(k == 0)
+				continue;
+			/*
+			 * One comparison answers the whole question for
+			 * every candidate a full buffer will not take: the
+			 * entries are ascending, so a candidate that is not
+			 * below the largest of k cannot displace any of
+			 * them.  Without it the insertion scan below runs
+			 * to completion for every slot past the first k,
+			 * which is what makes the per-slot cost O(k) and
+			 * the hold O(k * Listchunk).  With it a candidate
+			 * the buffer REJECTS costs one comparison whatever
+			 * k is; what still scales with k is placing the
+			 * ones it accepts.  §9's table prices a hold both
+			 * ways.
+			 *
+			 * An oid equal to the largest kept entry is skipped
+			 * rather than re-rendered here, which is the same
+			 * one-entry-per-oid outcome the duplicate arm below
+			 * reaches, differing only in which of the two
+			 * renders it keeps — a choice §5.6 tolerates.
+			 */
+			if(n == k && oidcmp(ent->oid, ent->oidlen,
+				e[n-1].oid, e[n-1].oidlen) >= 0)
+				continue;
+			for(j = 0; j < n; j++)
+				if((c = oidcmp(ent->oid, ent->oidlen,
+					e[j].oid, e[j].oidlen)) <= 0)
+					break;
+			/*
+			 * The same oid twice in one page.  A slot released
+			 * between two chunks and its oid re-created into a
+			 * chunk this scan has not reached yet is seen
+			 * twice, and answering it twice would break the
+			 * ascending order layer-a §5.6 requires of a page
+			 * and hand the caller an `after' it has already
+			 * paged past.  So the later render replaces the
+			 * earlier rather than joining it: both were taken
+			 * whole under the hold that saw them, and §5.6
+			 * tolerates either.  The oids are equal, so only
+			 * the Objinfo is re-rendered.
+			 */
+			if(j < n && c == 0){
+				ientinfo(s, slot, &e[j].oi);
+				continue;
+			}
+			if(n < k)
+				n++;
+			for(i = n - 1; i > j; i--)
+				e[i] = e[i-1];
+			e[j].oidlen = ent->oidlen;
+			memmove(e[j].oid, ent->oid, ent->oidlen);
+			ientinfo(s, slot, &e[j].oi);
+		}
+		qunlock(&s->qlstate);
+	}
+	if(more != nil)
+		*more = ncand > (uvlong)n;
+	return n;
 }
 
 /*
@@ -1998,17 +2516,6 @@ stagediscard(Stage *g)
  * commit's apply, so nothing about the transfer was ever durable
  * until this moment.
  */
-/* layer-a §1.3's arbitration key, compared lexicographically */
-static int
-keycmp(uvlong we, uvlong ver, uvlong we2, uvlong ver2)
-{
-	if(we != we2)
-		return we < we2 ? -1 : 1;
-	if(ver != ver2)
-		return ver < ver2 ? -1 : 1;
-	return 0;
-}
-
 /*
  * Every exit from stagefinal releases the stage, which is what §3.6
  * means by "the stage is discarded exactly as below": a comparison
@@ -2067,6 +2574,13 @@ stagehandoff(Stage *g, uvlong lim)
 int
 stagefinal(Stage *g, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 {
+	return stagefinalcsum(g, ver, wepoch, nil, dr, ndr);
+}
+
+int
+stagefinalcsum(Stage *g, uvlong ver, uvlong wepoch, uchar *csum,
+	Dirtyrec *dr, int ndr)
+{
 	Store *s;
 	Upd u;
 	Omap mold;
@@ -2110,12 +2624,16 @@ stagefinal(Stage *g, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 	 * comparison is skipped entirely for a receiver with no key to
 	 * defend, which is both of §3.6's cases, so an absent or corrupt
 	 * copy would take the push and be published at (wepoch, 0).  On
-	 * the wire the version comes out of the op=full header, so a
-	 * value the model forbids is a malformed header — layer-a §5.5's
-	 * common set, `bad ctl'.
+	 * the wire the version comes out of the op=full header, or out
+	 * of the op=create one this path serves as a zero-length stage
+	 * (§3.6), so a value the model forbids is a malformed header —
+	 * layer-a §5.5's common set, `bad ctl'.  The detail names the
+	 * path rather than one of the two ops: §2.6 makes the detail
+	 * this store's to choose, and naming op=full alone would be
+	 * wrong for half the callers that reach it.
 	 */
 	if(ver == 0){
-		werrstr("bad ctl: op=full at version 0");
+		werrstr("bad ctl: stage at version 0");
 		return stagefail(g);
 	}
 	qlock(&s->qlstate);
@@ -2190,6 +2708,15 @@ stagefinal(Stage *g, uvlong ver, uvlong wepoch, Dirtyrec *dr, int ndr)
 		}
 	}
 	stagehandoff(g, g->nblk);
+	/*
+	 * §3.6: the check runs over the digests the transfer staged,
+	 * inside the commit and before the record is written, so an
+	 * op=full whose bytes do not hash to the csum the sender named
+	 * publishes nothing.  The failure ends the transfer like every
+	 * other final=1 outcome, and stagefail's discard is what
+	 * releases whatever the handle still owns.
+	 */
+	u.expcsum = csum;
 	if(updcommit(&u, Slive, ver, wepoch, time(nil), 0, dr, ndr) < 0){
 		updclose(&u);
 		return stagefail(g);
