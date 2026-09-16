@@ -43,10 +43,14 @@ sawfree(void *a)
  * One opener for every store here: t1.h's, plus the free hook tclose
  * watches and a stage lifetime long enough that a walk cannot outlast
  * it — §3.6's sweep releasing a stage's grains under the pass would
- * be a different test from the one tonline is making.
+ * be a different test from the one tonline is making.  cap, when not
+ * zero, is §9's extent-map LRU bound: a store opened with one entry
+ * drops a map as soon as another is read, which is how tleak makes an
+ * eviction happen at a point of its choosing rather than waiting for
+ * one.
  */
 static Store*
-openbm(Dev *d, char *what)
+openbmcap(Dev *d, char *what, ulong cap)
 {
 	Storecfg c;
 	Store *s;
@@ -54,10 +58,17 @@ openbm(Dev *d, char *what)
 	nfreed = 0;
 	tcfg(&c);
 	c.stagems = 30000;
+	c.emapcache = cap;
 	c.freed = sawfree;
 	if((s = storeopen(d, &c)) == nil)
 		fail("%s: storeopen: %r", what);
 	return s;
+}
+
+static Store*
+openbm(Dev *d, char *what)
+{
+	return openbmcap(d, what, 0);
 }
 
 static void
@@ -298,6 +309,45 @@ scanok(Store *s, Dev *d, char *what)
 	free(got);
 }
 
+/*
+ * The bitmap after a swap that returned less than everything: `want'
+ * grains are marked that no live map names, §6's grainleak says so,
+ * and nothing a live map names is clear.
+ */
+static void
+leakok(Store *s, Dev *d, uvlong want, char *what)
+{
+	Storestat st;
+	Super sup;
+	uchar *named, *got;
+	uvlong g, extra, missing;
+
+	if(storecheckpoint(s) < 0){
+		fail("%s: storecheckpoint: %r", what);
+		return;
+	}
+	geom(d, &sup);
+	named = scanmaps(d, &sup);
+	got = diskbits(d, &sup);
+	extra = missing = 0;
+	for(g = 0; g < sup.ngrains; g++){
+		if(((got[g/8] >> (g%8)) & 1) != 0
+		&& ((named[g/8] >> (g%8)) & 1) == 0)
+			extra++;
+		if(((got[g/8] >> (g%8)) & 1) == 0
+		&& ((named[g/8] >> (g%8)) & 1) != 0)
+			missing++;
+	}
+	eqv("the grains the pass folded before the leak stay marked",
+		extra, want);
+	eqv("and no grain a live map names is clear", missing, 0);
+	storestat(s, &st);
+	eqv("and grainleak is what stands", st.grainleak, want);
+	free(named);
+	free(got);
+	USED(what);
+}
+
 /* fold every slot but one; ~0 skips nothing */
 static int
 foldall(Store *s, ulong skip, char *what)
@@ -349,26 +399,28 @@ foldstart(Store *s, ulong slot)
 }
 
 /*
- * A fold counts the slot it is folding under qlstate and parks inside
- * that same hold, so a storestat that comes back with the count moved
- * is a fold that is parked: there is no other way for it to have
- * released the lock.
+ * A fold counts itself in flight under qlstate once its map read is
+ * done and parks inside that same hold, so a storestat that comes
+ * back with a fold in flight is a fold that is parked: there is no
+ * other way for it to have released the lock.  nre is how many
+ * re-reads the fold must have behind it, which is what tells one
+ * parked round of a fold from the next.
  */
 static int
-waitpark(Store *s, uvlong n, char *what)
+waitpark(Store *s, uvlong nre, char *what)
 {
 	Storestat st;
 	int k;
 
-	st.bmfolded = 0;
+	memset(&st, 0, sizeof st);
 	for(k = 0; k < 2000; k++){
 		storestat(s, &st);
-		if(st.bmfolded >= n)
+		if(st.bmfolding >= 1 && st.bmreread >= nre)
 			break;
 		sleep(5);
 	}
-	istrue(what, st.bmfolded >= n);
-	return st.bmfolded >= n;
+	istrue(what, st.bmfolding >= 1 && st.bmreread >= nre);
+	return st.bmfolding >= 1 && st.bmreread >= nre;
 }
 
 static int
@@ -668,7 +720,7 @@ treread(void)
 		fail("bmpassbegin: %r");
 	storehook(s, "bmfold", 1);
 	foldstart(s, oi.slot);
-	if(waitpark(s, 1, "the fold parks with its map read and unvalidated")){
+	if(waitpark(s, 0, "the fold parks with its map read and unvalidated")){
 		checks++;
 		if(objrepair(s, oid, 1, 1, buf + Blk, Blk) < 0)
 			fail("objrepair under the fold: %r");
@@ -702,6 +754,179 @@ treread(void)
 	whole(s, "r", "a repair under the walk");
 	storeclose(s);
 	killspawned();
+	devclose(d);
+	free(buf);
+}
+
+/*
+ * §8's coverage interlock.  An end whose walk skipped a live slot
+ * would free the grains that slot's map names, so it is refused: it
+ * installs nothing, the pass stays live, and the end after the
+ * missing fold succeeds.  A slot created *under* the walk owes no
+ * fold — the create names nothing and every grain written into it
+ * afterwards reaches the shadow through the barrier.
+ */
+static void
+tcover(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Super sup;
+	Objinfo oi;
+	uchar *buf, *was, *now;
+	uvlong gf, np, bytes;
+
+	np = 0;
+	d = newdisk();
+	if((s = openbm(d, "the coverage interlock")) == nil){
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(3*Blk, 17);
+	mk(s, "kept");
+	mustwr(s, "kept", buf, 3*Blk, 0, 2);
+	mk(s, "skipped");
+	mustwr(s, "skipped", buf, 3*Blk, 0, 2);
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	geom(d, &sup);
+	if(ostat(s, "skipped", &oi) < 0)
+		fail("objstat skipped: %r");
+	bytes = nbmpage(&sup)*(bmbits(sup.blksz)/8);
+	was = diskbits(d, &sup);
+	storestat(s, &st);
+	gf = st.grainfree;
+
+	checks++;
+	if(bmpassbegin(s) < 0)
+		fail("bmpassbegin: %r");
+	if(foldall(s, oi.slot, "a walk that skips one live slot") == 0){
+		checks++;
+		if(bmpassend(s, &np) >= 0)
+			fail("an end with a live slot unfolded installed "
+				"the shadow");
+	}
+	storestat(s, &st);
+	eqv("a refused end leaves the pass live", st.bmpass, 1);
+	eqv("and installs nothing", st.grainfree, gf);
+	eqv("and no page", np, 0);
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint after the refusal: %r");
+	now = diskbits(d, &sup);
+	checks++;
+	if(memcmp(was, now, bytes) != 0)
+		fail("a refused end changed the live bitmap");
+	free(was);
+	free(now);
+
+	/*
+	 * An ordinary write does not cover the slot: the blocks it
+	 * leaves alone are still the old map's, and those grains reach
+	 * the shadow only through a fold.
+	 */
+	mustwr(s, "skipped", buf, Blk, Blk, 3);
+	checks++;
+	if(bmpassend(s, &np) >= 0)
+		fail("a write under the walk covered the slot it did not "
+			"fold");
+
+	mk(s, "fresh");			/* created under the walk */
+	mustwr(s, "fresh", buf, Blk, 0, 2);
+	checks++;
+	if(bmpassfold(s, oi.slot) < 0)
+		fail("bmpassfold of the slot the walk skipped: %r");
+	checks++;
+	if(bmpassend(s, &np) < 0)
+		fail("bmpassend once every live slot is folded: %r");
+	storestat(s, &st);
+	eqv("the pass ends", st.bmpass, 0);
+	scanok(s, d, "an end whose walk covered the store");
+	whole(s, "kept", "the coverage interlock");
+	whole(s, "skipped", "the coverage interlock");
+	whole(s, "fresh", "the coverage interlock");
+	storeclose(s);
+	devclose(d);
+	free(buf);
+}
+
+/*
+ * §6's leak, recorded after the fold that put those grains in the
+ * shadow.  The swap installs them marked and named by nothing, so the
+ * count stands rather than being discharged — tonline is the other
+ * case, where the leak precedes the fold and the swap returns the
+ * grains.  The engine's only path to a condemnation is the first read
+ * of a damaged map, so the map is damaged on the media after the fold
+ * has read it and driven out of §9's LRU before the read that finds
+ * the damage.
+ */
+static void
+tleak(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Super sup;
+	Objinfo oi;
+	uchar *buf, oid[Oidmax];
+	uvlong gf, np;
+
+	np = 0;
+	d = newdisk();
+	if((s = openbmcap(d, "a leak after the fold", 1)) == nil){
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(3*Blk, 113);
+	mk(s, "live");
+	mustwr(s, "live", buf, 3*Blk, 0, 2);
+	mk(s, "d");
+	mustwr(s, "d", buf, 3*Blk, 0, 2);
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	geom(d, &sup);
+	if(ostat(s, "d", &oi) < 0)
+		fail("objstat d: %r");
+	storestat(s, &st);
+	gf = st.grainfree;
+
+	checks++;
+	if(bmpassbegin(s) < 0)
+		fail("bmpassbegin: %r");
+	if(foldall(s, ~0UL, "the walk") < 0){
+		storeclose(s);
+		devclose(d);
+		free(buf);
+		return;
+	}
+	damageentry(d, &sup, oi.emapslot);
+	oidof(oid, "live");
+	checks++;
+	if(objread(s, oid, strlen("live"), buf, Blk, 0) < 0)
+		fail("objread live: %r");	/* and d's map leaves the LRU */
+	oidof(oid, "d");
+	checks++;
+	if(objread(s, oid, strlen("d"), buf, Blk, 0) >= 0)
+		fail("a damaged extent map was served");
+	storestat(s, &st);
+	eqv("the read condemns the slot the walk had folded", st.nlost, 1);
+	checks++;
+	if(objremove(s, oid, strlen("d"), 3, 1, nil, 0) < 0)
+		fail("objremove of a condemned slot: %r");
+	storestat(s, &st);
+	eqv("and the delete leaks the folded map's grains", st.grainleak, 3);
+
+	checks++;
+	if(bmpassend(s, &np) < 0)
+		fail("bmpassend: %r");
+	storestat(s, &st);
+	eqv("the pass ends", st.bmpass, 0);
+	eqv("a leak recorded after the fold is not discharged",
+		st.grainleak, 3);
+	eqv("and the swap returns none of those grains", st.grainfree, gf);
+	leakok(s, d, 3, "a leak recorded after the fold");
+	whole(s, "live", "a leak after the fold");
+	storeclose(s);
 	devclose(d);
 	free(buf);
 }
@@ -899,7 +1124,7 @@ tclose(void)
 		fail("bmpassbegin: %r");
 	storehook(s, "bmfold", 1);
 	foldstart(s, oi.slot);
-	if(waitpark(s, 1, "the fold parks under the live pass")){
+	if(waitpark(s, 0, "the fold parks under the live pass")){
 		storeclose(s);
 		eqv("a store closed under an open snapshot is not freed",
 			nfreed, 0);
@@ -930,6 +1155,8 @@ main(int argc, char **argv)
 	tlive();
 	tbarrier();
 	treread();
+	tcover();
+	tleak();
 	tswap();
 	tabort();
 	tclose();

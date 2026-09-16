@@ -730,6 +730,15 @@ settled in `lib/store.c` and `lib/alloc.c`:
   caller ends or aborts one first (D16), and a fold parked at §13's
   hold point is woken by the drop rather than left asleep in a pass
   that no longer exists.
+- **The engine enforces the walk's coverage rather than trusting the
+  driver.** A mark per index slot, set by the fold that completes a
+  slot and by an apply whose record rebuilds that slot's map whole,
+  and an end that refuses while a `live` slot is unmarked or a fold
+  is in flight. A refusal installs nothing and leaves the pass live.
+- **The swap leaves standing what it did not reclaim.** A leak
+  recorded in a slot the pass had already folded outlives the swap,
+  because the fold put those grains in the shadow; the end discharges
+  the rest of `grainleak` and keeps that much.
 
 **Rationale:** The recount is the only one of these with a cost
 argument behind it: at `ngrains` on a 4 TB disk it is ~2.6*10^8 bit
@@ -749,7 +758,15 @@ re-created under a walk is the freshest possible entry, and zeroing
 the stamp would make it look unchanged to precisely the reader the
 stamp exists for. And a pass that a close left armed would be a
 barrier writing into freed memory on the next commit, which is why
-the close drops it rather than trusting the caller.
+the close drops it rather than trusting the caller. The coverage
+interlock is the one rule here that guards against losing data rather
+than against a wrong number: everything else a broken walk can do
+costs a count, while a shadow the walk did not finish frees grains a
+live map still names — so the engine refuses rather than leaving that
+obligation with a driver that is not built yet. The leak the swap
+keeps follows from the same mark: the count means "marked and named
+by nothing", and a swap that installed such grains has not stopped
+them being that.
 **Normative:** none. Nothing here reaches a wire or an on-disk
 format; the stamp is memory only and no format field carries it.
 **Implementation policy:** all of it. A conforming implementation may

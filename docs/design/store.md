@@ -2036,9 +2036,10 @@ and §3.6's `op=full` over one, each add `blkcount(len)` to a
 **leaked-grain count** that `/status` reports as `grainleak=`: the
 index entry's `len` is intact — it is the extent-map entry that is
 damaged — so the count is an upper bound, and exact for an object
-with no holes. §8's swap zeroes it, because the swap is what returns
-the grains: the number is what is outstanding rather than what has
-ever leaked. It is memory only and starts at zero at every start,
+with no holes. §8's swap discharges it, because the swap is what returns
+the grains; what it leaves standing is what leaked in a slot the pass
+had already folded, which that swap installs rather than returns. The
+number is what is outstanding rather than what has ever leaked. It is memory only and starts at zero at every start,
 because it is one session's observation of what that session left
 marked and not a property of the disk: an ordinary restart does not
 rebuild the bitmap — §5 step 11 rebuilds only when step 5 set the
@@ -2625,9 +2626,36 @@ and the rebuilt map is what the entry names either way. A map whose
 entry fails its checksum is condemned by the fold that read it, as it
 is by every other reader of a map (§5 step 10). `/status` reports
 what a pass is doing — whether one is live, the slots folded, the
-re-reads the stamp forced and the pages the last swap installed — and
-§6's `grainleak=` is what says how much a pass would return, and so
-what says when the work is worth doing.
+folds in flight, the re-reads the stamp forced and the pages the last
+swap installed — and §6's `grainleak=` is what says how much a pass
+would return, and so what says when the work is worth doing.
+
+**The engine enforces the walk's coverage.** The swap frees every
+grain the shadow does not mark, so a shadow the walk did not finish
+frees grains a live map still names — the one way this mechanism can
+destroy data, and a rate-limited walk over a serving store is exactly
+where a slot gets missed. The pass therefore keeps a mark per index
+slot, and `bmpassend` refuses unless every `live` slot carries one
+and no fold is in flight. A fold sets the mark for the slot it
+completes. So does an apply whose record rebuilds the slot's map
+whole — an `Oslot` record (§2.7), a record into a slot that was free,
+or one that leaves the slot naming no block — because every grain
+such a record names goes through the barrier; an ordinary write does
+not, since the blocks it leaves alone are still the old map's. A
+tombstone needs no mark of its own: its `Eobj` carries `len=0`, an
+empty `nmap` and `emapslot=0`, so it names no grain, and neither does
+a free slot. A refused end installs nothing and leaves the pass live,
+so the driver folds the slots the refusal names and ends again; a
+fold that could not read a map says so, and that slot is the driver's
+to fold again rather than a reason to drop the pass.
+
+**What the swap leaves of `grainleak`.** A leak recorded while the
+pass was live, in a slot the pass had already folded, is one the swap
+does *not* return: the fold put those grains in the shadow before the
+condemnation, so the swap installs them marked and named by nothing.
+The end leaves that much of the count standing and discharges the
+rest, and the next pass — which folds the condemned slot to nothing —
+is what returns them.
 
 **A pass and `storeclose`.** Every call on a closed store is
 undefined (D16), so a pass MUST be ended or aborted before one. A

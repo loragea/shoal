@@ -307,11 +307,13 @@ applyrec(Store *s, Objrec *o, Emape *c)
 	Omap m;
 	uvlong nblk;
 	ulong i, lim;
+	int wasfree;
 	uchar dig[Blkdlen];
 
 	if(objrecok(&s->sb, o) < 0)
 		return -1;
 	e = &s->idx[o->slot];
+	wasfree = e->state == Sfree;
 
 	/* clause 1: the four-tuple and len, and nblk derived from that len */
 	ientunhash(s, o->slot);
@@ -373,8 +375,16 @@ applyrec(Store *s, Objrec *o, Emape *c)
 	 * unpack has no readable len at all: its entry is zero, so this
 	 * adds nothing and /lost is the only report of it.
 	 */
-	if(e->bad)
+	if(e->bad){
 		s->grainleak += blkcount(e->len, s->sb.blksz);
+		/*
+		 * §8: if a pass has already folded this slot, those grains
+		 * are in its shadow and the swap will not return them, so
+		 * the count outlives the pass rather than being discharged
+		 * by it.
+		 */
+		bmleaked(s, o->slot, blkcount(e->len, s->sb.blksz));
+	}
 	e->bad = 0;
 	e->qidpath = o->qidpath;
 	e->len = o->len;
@@ -404,6 +414,26 @@ applyrec(Store *s, Objrec *o, Emape *c)
 	slotmark(s, o->slot);
 	idxdirty(s, o->slot);
 	nblk = blkcount(o->len, s->sb.blksz);
+
+	/*
+	 * §8's coverage mark.  A record that leaves the slot naming only
+	 * grains this apply itself marks owes the walk no fold: every one
+	 * of them goes through grainmark below, and the barrier mirrors
+	 * each into the shadow.  Three records do that and no others.
+	 * An Oslot record names every block below nblk and clause 2
+	 * zeroes the target map first (§2.7), whichever way emapslot
+	 * moves — so §3.6's op=full, a repair into a fresh map slot and
+	 * either inline transition qualify.  A record into a slot that
+	 * was free names everything the slot will name, because a free
+	 * entry is zero: a create, and the first record over a slot
+	 * reused after applyslot.  And a record that leaves nblk at 0
+	 * names nothing at all: a create, and the tombstone a delete
+	 * publishes.  An ordinary write is none of the three — the
+	 * blocks it does not name are still the old map's, and those
+	 * grains reached the shadow only if a fold put them there.
+	 */
+	if((o->oflags & Oslot) != 0 || wasfree || nblk == 0)
+		bmcovered(s, o->slot);
 
 	/*
 	 * Clause 2: the extent-map slot rule.  A commit that changes

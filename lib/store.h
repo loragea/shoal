@@ -248,6 +248,25 @@ struct Store
 	 * is qlstate's, like the bitmap it shadows.
 	 */
 	uchar	*bmshadow;		/* nil unless a pass is live */
+	/*
+	 * The pass's coverage interlock.  bmfoldmark is a byte per index
+	 * slot, allocated with the shadow and freed with it: set for a
+	 * slot whose grains the shadow holds, whether a fold put them
+	 * there or the barrier did.  bmnflight counts the folds holding
+	 * a map read for this pass.  bmpassend installs nothing unless
+	 * every live slot is marked and no fold is in flight, so a walk
+	 * that skipped a slot cannot free the grains that slot names.
+	 */
+	uchar	*bmfoldmark;		/* nil unless a pass is live */
+	ulong	bmnflight;		/* folds holding a map read */
+	/*
+	 * §6's leak, as the swap leaves it: what an apply added to
+	 * grainleak AFTER this pass had already folded the slot is a
+	 * leak the swap does not reclaim — the fold put those grains in
+	 * the shadow — so it outlives the swap and is what grainleak
+	 * becomes when the pass ends.
+	 */
+	uvlong	bmleakafter;
 	uvlong	bmnfold;		/* slots the pass has folded */
 	uvlong	bmnreread;		/* folds the stamp sent round again */
 	uvlong	bmswapped;		/* pages the last swap installed */
@@ -440,4 +459,7 @@ int	storeproc(Store*, void (*)(void*), void*);
 void	storefree(Store*);	/* the Store's memory; §13's freed hook */
 void	storeprocdone(Store*);
 void	storecondemn(Store*, ulong slot);	/* §5 step 10, at run time */
+/* §8's pass, from the apply: caller holds qlstate */
+void	bmcovered(Store*, ulong slot);	/* a live pass has this slot's grains */
+void	bmleaked(Store*, ulong slot, uvlong n);	/* ... and n of them leaked */
 void	lostupdate(Store*, ulong slot);		/* /lost membership, §8 */

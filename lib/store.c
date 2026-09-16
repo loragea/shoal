@@ -933,12 +933,58 @@ shadowgrain(Store *s, ulong g)
 		bitset(s->bmshadow, g);
 }
 
+/*
+ * The coverage mark: this pass's shadow holds every grain the slot
+ * names.  A fold sets it when it completes; the apply sets it for a
+ * record that rebuilds the slot's map whole, because those grains
+ * reached the shadow through the barrier and no fold is owed.  Only
+ * Slive slots are ever asked for it (bmpassend), but every completed
+ * fold sets it, so a slot that was free when the walk passed it and
+ * is filled later is marked twice rather than not at all.
+ *
+ * Caller holds qlstate.  Inert with no pass live, which is what lets
+ * the apply call it unconditionally.
+ */
+static void
+foldmark(Store *s, ulong slot)
+{
+	if(s->bmfoldmark != nil)
+		s->bmfoldmark[slot] = 1;
+}
+
+void
+bmcovered(Store *s, ulong slot)
+{
+	if(slot < s->sb.nslots)
+		foldmark(s, slot);
+}
+
+/*
+ * §6's leak, recorded while a pass is live.  If the slot is already
+ * marked, the fold that marked it put the grains this apply is
+ * leaking into the shadow, so the swap installs them marked and named
+ * by nothing: the count outlives the swap.  If it is not marked, the
+ * fold that comes will not fold a condemned slot's map and the swap
+ * returns the grains, which is what discharges the count.
+ *
+ * Caller holds qlstate.
+ */
+void
+bmleaked(Store *s, ulong slot, uvlong n)
+{
+	if(s->bmfoldmark != nil && slot < s->sb.nslots
+	&& s->bmfoldmark[slot])
+		s->bmleakafter += n;
+}
+
 /* drop a live pass; caller holds qlstate */
 static void
 bmpassdrop(Store *s)
 {
 	free(s->bmshadow);
 	s->bmshadow = nil;
+	free(s->bmfoldmark);
+	s->bmfoldmark = nil;
 	/*
 	 * A fold parked at §13's hold point is woken whatever released
 	 * the pass, so an abort — or a storeclose — cannot be made to
@@ -952,7 +998,7 @@ bmpassdrop(Store *s)
 int
 bmpassbegin(Store *s)
 {
-	uchar *p;
+	uchar *p, *m;
 
 	if(!storeserving(s))
 		return -1;
@@ -960,17 +1006,25 @@ bmpassbegin(Store *s)
 		werrstr("out of memory");
 		return -1;
 	}
+	if((m = mallocz(s->sb.nslots, 1)) == nil){
+		free(p);
+		werrstr("out of memory");
+		return -1;
+	}
 	qlock(&s->qlstate);
 	if(s->bmshadow != nil){
 		qunlock(&s->qlstate);
 		free(p);
+		free(m);
 		werrstr("bitmap rebuild: a pass is already running");
 		return -1;
 	}
 	s->bmshadow = p;
+	s->bmfoldmark = m;
 	bitset(s->bmshadow, 0);		/* grain 0 is never allocatable */
 	s->bmnfold = 0;
 	s->bmnreread = 0;
+	s->bmleakafter = 0;
 	qunlock(&s->qlstate);
 	return 0;
 }
@@ -998,6 +1052,9 @@ enum
 	Bmfoldtries	= 8,
 };
 
+/* what one round of a fold decided */
+enum { Fdone, Fagain, Ffail };
+
 int
 bmpassfold(Store *s, ulong slot)
 {
@@ -1005,7 +1062,7 @@ bmpassfold(Store *s, ulong slot)
 	Emape *c;
 	ulong *g, gen, eslot, i, n, try;
 	uvlong nblk;
-	int r, counted;
+	int r, act, counted;
 
 	if(!storeserving(s))
 		return -1;
@@ -1040,6 +1097,7 @@ bmpassfold(Store *s, ulong slot)
 		 * what the entry names either way.
 		 */
 		if(e->state == Sfree || e->bad){
+			foldmark(s, slot);
 			qunlock(&s->qlstate);
 			r = 0;
 			break;
@@ -1055,14 +1113,23 @@ bmpassfold(Store *s, ulong slot)
 			if(n > 0)
 				shadowgrain(s, e->grain0);
 			s->bmnfold++;
+			foldmark(s, slot);
 			qunlock(&s->qlstate);
 			r = 0;
 			break;
 		}
 		qunlock(&s->qlstate);
 
-		if((c = emapget(s, eslot, 0)) == nil)
+		if((c = emapget(s, eslot, 0)) == nil){
+			/*
+			 * A device error or an exhausted cache, not a dead
+			 * pass: this slot is the caller's to fold again,
+			 * and the text is what tells the two apart.
+			 */
+			werrstr("bitmap rebuild: slot %lud: map read: %r",
+				slot);
 			break;
+		}
 		if(c->bad){
 			/*
 			 * The entry failed its csum128: media damage the log
@@ -1075,6 +1142,11 @@ bmpassfold(Store *s, ulong slot)
 			qlock(&s->qlstate);
 			if(e->gen == gen)
 				storecondemn(s, slot);
+			if(!counted){
+				s->bmnfold++;
+				counted = 1;
+			}
+			foldmark(s, slot);
 			qunlock(&s->qlstate);
 			r = 0;
 			break;
@@ -1083,6 +1155,14 @@ bmpassfold(Store *s, ulong slot)
 			g[i] = emapgrain(c->p, i);
 
 		qlock(&s->qlstate);
+		/*
+		 * In flight from here: this fold holds a map read for the
+		 * pass, and bmpassend installs nothing while one does.  A
+		 * fold that has not got this far has written nothing into
+		 * the shadow and finds the pass gone, which it reports as
+		 * a retryable refusal rather than as coverage.
+		 */
+		s->bmnflight++;
 		if(!counted){
 			s->bmnfold++;
 			counted = 1;
@@ -1099,45 +1179,47 @@ bmpassfold(Store *s, ulong slot)
 			while(!s->bmfoldgo)
 				rsleep(&s->bmrz);
 		}
+		act = Fdone;
 		if(s->bmshadow == nil){
-			qunlock(&s->qlstate);
-			emapunpin(s, c);
 			werrstr("bitmap rebuild: no pass is running");
-			break;
-		}
-		if(e->gen != gen && try < Bmfoldtries){
+			act = Ffail;
+		}else if(e->gen != gen && try < Bmfoldtries){
 			s->bmnreread++;
-			qunlock(&s->qlstate);
-			emapunpin(s, c);
-			continue;
-		}
-		if(e->gen != gen){
+			act = Fagain;
+		}else if(e->gen != gen
+		&& (e->state == Sfree || e->bad || e->emapslot != eslot)){
 			/*
-			 * The loop's bound, reached.  The pinned entry is
-			 * still this slot's map if the entry still names it,
-			 * and reading it here is a read under the lock the
-			 * apply mutates it under; anything else and the slot
-			 * goes round again with a fresh pin.
+			 * The loop's bound, reached, and the entry no longer
+			 * names the map this round pinned: round again with
+			 * a fresh pin.
 			 */
-			if(e->state == Sfree || e->bad || e->emapslot != eslot){
-				qunlock(&s->qlstate);
-				emapunpin(s, c);
-				try = 0;
-				continue;
+			try = 0;
+			act = Fagain;
+		}else{
+			/*
+			 * The bound's fallback, when the stamp moved: the
+			 * pinned entry is still this slot's map, and reading
+			 * it here is a read under the lock the apply mutates
+			 * it under.
+			 */
+			if(e->gen != gen){
+				nblk = blkcount(e->len, s->sb.blksz);
+				if(nblk > s->sb.nblkmax)
+					nblk = s->sb.nblkmax;
+				n = nblk;
+				for(i = 0; i < n; i++)
+					g[i] = emapgrain(c->p, i);
 			}
-			nblk = blkcount(e->len, s->sb.blksz);
-			if(nblk > s->sb.nblkmax)
-				nblk = s->sb.nblkmax;
-			n = nblk;
 			for(i = 0; i < n; i++)
-				g[i] = emapgrain(c->p, i);
+				shadowgrain(s, g[i]);
+			foldmark(s, slot);
+			r = 0;
 		}
-		for(i = 0; i < n; i++)
-			shadowgrain(s, g[i]);
+		s->bmnflight--;
 		qunlock(&s->qlstate);
 		emapunpin(s, c);
-		r = 0;
-		break;
+		if(act != Fagain)
+			break;
 	}
 	free(g);
 	return r;
@@ -1159,6 +1241,37 @@ pagefree(uchar *p, uvlong bytes)
 	return n;
 }
 
+/*
+ * §8's coverage interlock: the swap frees every grain the shadow does
+ * not mark, so a walk that skipped a live slot would free the grains
+ * that slot names.  A pass therefore ends only when every live slot
+ * is marked — by the fold that folded it, or by an apply that
+ * rebuilt its map whole under the barrier — and no fold is holding a
+ * map read.  A tomb slot needs no mark: the Eobj that made it one
+ * carries len=0, an empty nmap and emapslot=0 (§6), so it names no
+ * grain and folds to nothing; a free slot names nothing either.
+ *
+ * The refusal installs nothing and leaves the pass live, so the
+ * caller folds what it missed and ends again.  Caller holds qlstate.
+ */
+static int
+coverok(Store *s)
+{
+	ulong slot;
+
+	if(s->bmnflight != 0){
+		werrstr("bitmap rebuild: %lud folds in flight",
+			s->bmnflight);
+		return -1;
+	}
+	for(slot = 0; slot < s->sb.nslots; slot++)
+		if(s->idx[slot].state == Slive && !s->bmfoldmark[slot]){
+			werrstr("bitmap rebuild: slot %lud not folded", slot);
+			return -1;
+		}
+	return 0;
+}
+
 int
 bmpassend(Store *s, uvlong *npage)
 {
@@ -1169,6 +1282,17 @@ bmpassend(Store *s, uvlong *npage)
 	if(!storeserving(s))
 		return -1;
 	bytes = bmbits(s->sb.blksz)/8;
+	qlock(&s->qlstate);
+	if(s->bmshadow == nil){
+		qunlock(&s->qlstate);
+		werrstr("bitmap rebuild: no pass is running");
+		return -1;
+	}
+	if(coverok(s) < 0){
+		qunlock(&s->qlstate);
+		return -1;
+	}
+	qunlock(&s->qlstate);
 	n = 0;
 	for(i = 0; i < s->nbmpage; i++){
 		qlock(&s->qlstate);
@@ -1213,9 +1337,13 @@ bmpassend(Store *s, uvlong *npage)
 	/*
 	 * Every grain a live map names is marked and nothing else is, so
 	 * §6's count of what a condemned slot left behind is discharged:
-	 * this is the rebuild D18 says the grains come back at.
+	 * this is the rebuild D18 says the grains come back at.  What is
+	 * left is what leaked AFTER the pass had folded the slot — the
+	 * fold put those grains in the shadow, so the swap installs them
+	 * marked and named by nothing, and the count carries over to the
+	 * next pass, which is the one that returns them.
 	 */
-	s->grainleak = 0;
+	s->grainleak = s->bmleakafter;
 	s->bmswapped = n;
 	bmpassdrop(s);
 	qunlock(&s->qlstate);
@@ -1264,6 +1392,7 @@ storefree(Store *s)
 	free(s->bmap);
 	free(s->bmdirty);
 	free(s->bmshadow);		/* §8's shadow, if a pass was live */
+	free(s->bmfoldmark);
 	free(s->idxdirty);
 	free(s->dirtdirty);
 	free(s->stagebuck);
@@ -1620,6 +1749,7 @@ storestat(Store *s, Storestat *st)
 	st->grainleak = s->grainleak;
 	st->bmpass = s->bmshadow != nil;
 	st->bmfolded = s->bmnfold;
+	st->bmfolding = s->bmnflight;
 	st->bmreread = s->bmnreread;
 	st->bmswapped = s->bmswapped;
 	st->slotfree = s->slotfree;
