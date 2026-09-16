@@ -1289,6 +1289,14 @@ pagefree(uchar *p, uvlong nbit)
  * carries len=0, an empty nmap and emapslot=0 (§6), so it names no
  * grain and folds to nothing; a free slot names nothing either.
  *
+ * The map-read test is this check's, not the swap's: a fold that
+ * begins after it runs beside the swap and writes only into the
+ * shadow, so a bit it sets in a page already installed is dropped.
+ * That loses nothing: the check passed, so the slot was marked
+ * already — every grain it named then is in the shadow, and every
+ * grain it has named since went into the live bitmap through the
+ * barrier.
+ *
  * The refusal installs nothing and leaves the pass live, so the
  * caller folds what it missed and ends again.  Caller holds qlstate.
  */

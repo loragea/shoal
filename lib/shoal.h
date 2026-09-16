@@ -658,13 +658,15 @@ struct Storestat
 	 * the last one cost.  bmfolded and bmreread are the live pass's
 	 * while one runs and the last pass's once it has ended, so a
 	 * finished pass still says what it did.  bmfolded counts the
-	 * folds that COMPLETED for a `live` slot, so it is progress
-	 * against nlive and a free or tomb slot adds nothing to it;
-	 * bmreread counts the folds a slot that moved under the walk
-	 * sent round again, which is how much the pass is fighting
-	 * write traffic.  bmfolding is
-	 * the folds holding a map read right now, and it is the live
-	 * pass's alone: an end refuses while any is outstanding.
+	 * folds that COMPLETED for a `live` slot: it only rises within
+	 * a pass, so a slot folded twice counts twice and a slot
+	 * deleted after its fold keeps its count, and a free or tomb
+	 * slot adds nothing to it.  bmreread counts the folds a slot
+	 * that moved under the walk sent round again, which is how much
+	 * the pass is fighting write traffic.  bmfolding is the folds
+	 * holding a map read right now, and it is the live pass's
+	 * alone: an end refuses while any is outstanding at the moment
+	 * it looks, and accepts a fold that begins after that.
 	 * bmswapped is the bitmap pages the last completed swap
 	 * installed — of Storestat's nothing else, so a caller that
 	 * wants it as a fraction reads §2.5's page count from the
@@ -817,7 +819,13 @@ int	storefullsync(Store*, char *peer);
  * frees every grain the shadow does not mark, so a shadow the walk
  * did not finish would free grains a live map still names.  The pass
  * therefore carries a mark per index slot, and bmpassend refuses
- * unless every Slive slot carries one and no fold is in flight.  A
+ * unless every Slive slot carries one and no fold is in flight at
+ * the moment it looks.  A fold that begins after that check is
+ * accepted: it runs beside the swap and writes only into the
+ * shadow, so it contributes nothing to the pages already installed,
+ * and it loses no bit either — coverage passed, so every grain its
+ * slot named then is in the shadow, and every grain that slot has
+ * named since went into the live bitmap through the barrier.  A
  * fold sets the mark for the slot it completes; so does an apply
  * whose record rebuilds the slot's map whole — an Oslot record
  * (§2.7), a record into a slot that was free, or one that leaves the
@@ -838,10 +846,12 @@ int	storefullsync(Store*, char *peer);
  *
  * The three that answer do so with 0, or -1 with an error set: on a
  * condemned store (§3.2), on a slot out of range, on a fold or an end
- * with no pass running, on an end the walk did not cover, and on a
- * begin with one already running.  bmpassabort answers nothing: it
- * has nothing to refuse and nothing to fail at.  A fold that could
- * not read a map says so ("map read"), which is the caller's cue to
+ * with no pass running, on an end the walk did not cover, on a
+ * begin with one already running, and on a begin that cannot
+ * allocate the shadow ("out of memory").  bmpassabort answers
+ * nothing: it has nothing to refuse and nothing to fail at.  A fold
+ * that could not read a map says so ("map read"), which is the
+ * caller's cue to
  * fold that slot again rather than to give the pass up.  None of them
  * is a §2.6 wire condition, so none carries a §2.6 prefix (§3.7).
  * A fold that reached its ceiling says "the map will not hold still",

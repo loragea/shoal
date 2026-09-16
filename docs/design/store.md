@@ -2646,11 +2646,11 @@ object under a continuous write rate starves the walk on its slot for
 ever.
 
 `/status` reports what a pass is doing: `bmpass=` whether one is
-live, `bmfolded=` the live slots folded, `bmfolding=` the folds in
-flight, `bmreread=` the re-reads the stamp forced and `bmswapped=`
-the pages the last swap installed. §6's `grainleak=` is what says how
-much a pass would return, and so what says when the work is worth
-doing.
+live, `bmfolded=` the completed folds of live slots, `bmfolding=` the
+folds in flight, `bmreread=` the re-reads the stamp forced and
+`bmswapped=` the pages the last swap installed. §6's `grainleak=` is
+what says how much a pass would return, and so what says when the
+work is worth doing.
 
 **The engine enforces the walk's coverage.** The swap frees every
 grain the shadow does not mark, so a shadow the walk did not finish
@@ -2658,9 +2658,15 @@ frees grains a live map still names — the one way this mechanism can
 destroy data, and a rate-limited walk over a serving store is exactly
 where a slot gets missed. The pass therefore keeps a mark per index
 slot, and `bmpassend` refuses unless every `live` slot carries one
-and no fold is in flight. A fold sets the mark for the slot it
-completes. So does an apply whose record rebuilds the slot's map
-whole — an `Oslot` record (§2.7), a record into a slot that was free,
+and no fold is in flight at the moment it looks. A fold begun after
+that check is accepted: it runs beside the swap and writes only into
+the shadow, so it contributes nothing to the pages already installed,
+and it loses no bit either — coverage passed, so every grain its slot
+named then is in the shadow, and every grain that slot has named
+since went into the live bitmap through the barrier. A fold sets the
+mark for the slot it completes. So does an apply whose record
+rebuilds the slot's map whole — an `Oslot` record (§2.7), a record
+into a slot that was free,
 or one that leaves the slot naming no block — because every grain
 such a record names goes through the barrier; an ordinary write does
 not, since the blocks it leaves alone are still the old map's. A
@@ -2681,8 +2687,12 @@ is what returns them. A slot condemned after its fold and not yet
 deleted is the same shape without the count: its grains stay marked
 through the swap, because the fold put them in the shadow, and
 `grainleak` does not name them, because by D18 the leak is made by
-the delete — which then counts it whether it lands under the pass,
-where the rule above keeps it, or after the pass has ended.
+the delete — which then counts it under the pass, where the rule
+above keeps it, or after the pass has ended, where D18's upper bound
+is what the count is: a delete of a condemned slot whose grains a
+completed pass has already returned counts them once more, and the
+next pass — which folds that slot to nothing — is what takes the
+count back down.
 
 **A pass and `storeclose`.** Every call on a closed store is
 undefined (D16), so a pass MUST be ended or aborted before one. A
@@ -3906,11 +3916,14 @@ parked, so a test walks a fold round by round by re-arming with 1
 each time and drives it to its re-read bound), and `bmswap:n` (park
 the next *n* pages of a swap in the `qlstate` hold that installed
 them, which is the gap between two pages an abort or a `storeclose`
-would land in; armed and released exactly as `bmfold:n` is, and
-`/status`'s `bmswapped=` counts the pages as they land, which is what
-a test waits on), and `snapstale:n` with `snapshort:k` (arm the next *n*
-enumeration fill attempts to find the index *k* entries larger than
-the count did, so a test can drive §9's re-count — and the vector's
+would land in; armed and released exactly as `bmfold:n` is. The point
+parks on every page the swap walks, while `/status`'s `bmswapped=`
+counts only the pages the swap installed — the ones that differ — so
+a test that waits on that counter must arrange a differing page, not
+expect one count per parked page), and `snapstale:n` with
+`snapshort:k` (arm the next *n* enumeration fill attempts to find the
+index *k* entries larger than the count did, so a test can drive §9's
+re-count — and the vector's
 slack, which is what decides whether a given growth needs one —
 without racing for either; one arming is spent per fill attempt
 rather than per open, an open makes up to `Snaptries` of them, and
