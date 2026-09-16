@@ -901,21 +901,19 @@ objstat(Store *s, uchar *oid, int oidlen, Objinfo *oi)
 }
 
 /*
- * The five plain entry points below are their csum-checking variants
- * with no expected csum (D23): layer-a §5.5's `csum=' is the
- * receiver's check and a client write has nobody to check against, so
- * the argument is nil for every caller but the peer channels.
+ * The four plain entry points below and stagefinal have
+ * csum-checking variants, which are them with an expected csum (D23):
+ * layer-a §5.5's `csum=' is the receiver's check and a client write
+ * has nobody to check against, so the argument is nil for every
+ * caller but the peer channels.  objcreate has no variant: no peer's
+ * key reaches it.  §5.5's op=create receiver is a zero-length stage
+ * and arbitrates in stagefinal (§3.6), and a client create's key is
+ * this instance's own to choose (layer-a §5.4 step 3), so there is
+ * nobody to name a csum for it.
  */
 int
 objcreate(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 	Dirtyrec *dr, int ndr, Objinfo *oi)
-{
-	return objcreatecsum(s, oid, oidlen, ver, wepoch, nil, dr, ndr, oi);
-}
-
-int
-objcreatecsum(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
-	uchar *csum, Dirtyrec *dr, int ndr, Objinfo *oi)
 {
 	Upd u;
 	Ient *e;
@@ -1035,7 +1033,6 @@ objcreatecsum(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 	u.oldnblk = 0;
 	u.newslot = 0;
 	u.oslot = 0;
-	u.expcsum = csum;
 	if(updcommit(&u, Slive, ver, wepoch, time(nil), 0, dr, ndr) < 0){
 		updclose(&u);
 		return -1;

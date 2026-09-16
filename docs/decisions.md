@@ -708,9 +708,12 @@ the new `csum` has been computed and no byte of the log record has
 been written, and it answers §2.6's `checksum mismatch`.
 `design/store.md` §3.8 states it and §3.7's table carries the row.
 The library exposes it as one extra argument on a parallel entry
-point per mutating call — `objwritecsum`, `objtrunccsum`,
-`objremovecsum`, `objcreatecsum`, `objadoptcsum`, `stagefinalcsum` —
+point per call a peer's key can reach — `objwritecsum`,
+`objtrunccsum`, `objremovecsum`, `objadoptcsum`, `stagefinalcsum` —
 where nil means no check and each plain call is its variant with nil.
+`objcreate` has no variant: `op=create`'s receiver is a zero-length
+stage that arbitrates in `stagefinal`, and a client create's key is
+the instance's own to choose, so nothing names a `csum` for it.
 For a multi-request `op=full` the check runs over the digests the
 transfer staged and a failure discards the stage, as §3.6 says every
 `final=1` outcome does. A zero-byte replicated write is the one

@@ -1001,9 +1001,13 @@ int	objrepair(Store*, uchar *oid, int oidlen, ulong blk, void *a, long n);
  * **The resulting-csum check** (layer-a §5.5, D23).  A replicated
  * operation carries the `csum=' the object MUST have once it is
  * applied, and the receiver MUST compute its own and fail
- * `checksum mismatch' if they differ.  The six calls below are the
+ * `checksum mismatch' if they differ.  The five calls below are the
  * plain calls above with one argument added: `csum' is nil for no
- * check, or Csumlen bytes the commit's own csum must equal.  The
+ * check, or Csumlen bytes the commit's own csum must equal.  There is
+ * one per call a peer's key can reach, which is why objcreate has
+ * none: layer-a §5.5's op=create receiver is a zero-length stage and
+ * arbitrates in stagefinal (§3.6), and a client create's key is this
+ * instance's own to choose, so no sender names a csum for it.  The
  * check is made where that csum is computed, inside the commit path
  * and BEFORE the log record is written, so a mismatch leaves nothing
  * durable — which is the whole of what makes it a check and not a
@@ -1024,8 +1028,6 @@ int	objrepair(Store*, uchar *oid, int oidlen, ulong blk, void *a, long n);
  * server compares keys under the oid's queue (§7) and calls here only
  * once it has decided, exactly as for the plain forms.
  */
-int	objcreatecsum(Store*, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
-		uchar *csum, Dirtyrec *dr, int ndr, Objinfo*);
 int	objwritecsum(Store*, uchar *oid, int oidlen, void *a, long n, uvlong off,
 		uvlong ver, uvlong wepoch, uchar *csum, Dirtyrec *dr, int ndr);
 int	objtrunccsum(Store*, uchar *oid, int oidlen, uvlong len, uvlong ver,

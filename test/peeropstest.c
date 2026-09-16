@@ -607,14 +607,12 @@ enum
 	Cwrite	= 0,
 	Ctrunc,
 	Cdelete,
-	Ccreate,
 	Cfull,
 	Cadopt,
 };
 
 static char *cname[] = {
-	"objwrite", "objtrunc", "objremove", "objcreate", "op=full",
-	"objadopt",
+	"objwrite", "objtrunc", "objremove", "op=full", "objadopt",
 };
 
 /* everything the case needs in place before the operation under test */
@@ -629,7 +627,6 @@ csumsetup(Store *s, int kind, uchar *buf)
 		if(wr(s, "sub", buf, 2*Blk, 0, 2) < 0)
 			fail("%s: setup objwrite: %r", cname[kind]);
 		break;
-	case Ccreate:
 	case Cfull:
 	case Cadopt:
 		break;
@@ -654,9 +651,6 @@ csumop(Store *s, int kind, uchar *buf, uchar *csum)
 	case Cdelete:
 		oidof(o, "sub");
 		return objremovecsum(s, o, 3, 3, 1, csum, nil, 0);
-	case Ccreate:
-		oidof(o, "new");
-		return objcreatecsum(s, o, 3, 1, 1, csum, nil, 0, nil);
 	case Cfull:
 		oidof(o, "new");
 		if((g = stageopen(s, o, 3, 2*Blk, 0)) == nil){
@@ -751,7 +745,7 @@ tcsum(int kind)
 		free(buf);
 		return;
 	}
-	if(kind == Ccreate || kind == Cadopt || kind == Cfull){
+	if(kind == Cadopt || kind == Cfull){
 		checks++;
 		if(ostat(s, "new", &oi) >= 0)
 			fail("%s: the refused operation is durable", what);
