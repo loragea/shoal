@@ -353,6 +353,37 @@ tadoptover(void)
 	if(ostat(s, "nought", &oi) >= 0)
 		fail("the refused adopt published a record");
 
+	/*
+	 * §8's flag on the record being re-keyed does not stand in the
+	 * way, and the commit publishes it CLEAR: a tombstone holds no
+	 * content for the flag to describe, which is also what takes the
+	 * object out of /lost (§3.8).
+	 */
+	mk(s, "flagged");
+	if(rmv(s, "flagged", 2) < 0)
+		fail("objremove flagged: %r");
+	oidof(o, "flagged");
+	if(objcorrupt(s, o, 7, 1, nil, 0) < 0)
+		fail("objcorrupt of a tombstone: %r");
+	if(ostat(s, "flagged", &oi) < 0)
+		fail("objstat of the flagged tombstone: %r");
+	else
+		eqv("the flag is set on the tombstone", oi.corrupt, 1);
+	storestat(s, &st0);
+	eqv("a flagged tombstone is in /lost", st0.nlost, 1);
+	if(adopt(s, "flagged", 9, 4) < 0)
+		fail("objadopt over a corrupt-flagged tombstone: %r");
+	if(ostat(s, "flagged", &oi) < 0)
+		fail("objstat after re-keying the flagged tombstone: %r");
+	else{
+		eqv("re-keying a flagged tombstone publishes the flag clear",
+			oi.corrupt, 0);
+		eqv("... and takes the sender's ver", oi.ver, 9);
+		eqv("... and its wepoch", oi.wepoch, 4);
+	}
+	storestat(s, &st1);
+	eqv("... and takes it out of /lost", st1.nlost, 0);
+
 out:
 	free(buf);
 	storeclose(s);
@@ -608,6 +639,100 @@ tdropedges(void)
 		st1.grainfree, st0.grainfree);
 	eqv("... and its index slot", st1.slotfree, st0.slotfree);
 	eqv("... and takes it out of /lost", st1.nlost, st0.nlost);
+
+	free(buf);
+	storeclose(s);
+	devclose(d);
+	killspawned();
+}
+
+/*
+ * §3.8's drop of a copy §5 step 10 condemned.  It is droppable, for
+ * the reason a delete is: a copy that fails local verification
+ * contributes no key (layer-a §1.3), so there is nothing here for the
+ * condemnation to defend, and a stray that could not be dropped would
+ * hold its grains for the life of the disk.  The grains its damaged
+ * map named are NOT returned — nothing knows which they were —
+ * and applyrec counts them in grainleak, which §5 step 11's rebuild
+ * is what clears (§6).
+ */
+static void
+tdropcondemned(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st0, st1;
+	Objinfo oi;
+	Sbsel sel;
+	Super sb;
+	uchar *buf, o[Oidmax], junk[8];
+	uvlong gf;
+
+	spawnforget();
+	d = newdisk();
+	if((s = mustopen(d, "drop a condemned copy")) == nil){
+		devclose(d);
+		killspawned();
+		return;
+	}
+	buf = mkbuf(3*Blk, 89);
+	mk(s, "cond");
+	if(wr(s, "cond", buf, 3*Blk, 0, 2) < 0)
+		fail("objwrite cond: %r");
+	if(ostat(s, "cond", &oi) < 0){
+		fail("objstat cond: %r");
+		storeclose(s);
+		devclose(d);
+		free(buf);
+		killspawned();
+		return;
+	}
+	istrue("a three-block object holds an extent-map slot",
+		oi.emapslot != 0);
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	storeclose(s);
+	/*
+	 * Damage the extent-map entry without repairing its csum128, so
+	 * the entry itself fails and §5 step 10 condemns the slot on the
+	 * first read that goes through it — scrubtest builds it the same
+	 * way.
+	 */
+	if(superselect(d, &sel) < 0)
+		sysfatal("superselect: %r");
+	sb = sel.sb[sel.start];
+	memset(junk, 0xa5, sizeof junk);
+	simpoke(d, emapentoff(&sb, oi.emapslot) + sb.emapsz - sizeof junk,
+		junk, sizeof junk);
+	if((s = mustopen(d, "drop a condemned copy, replayed")) == nil){
+		devclose(d);
+		free(buf);
+		killspawned();
+		return;
+	}
+	oidof(o, "cond");
+	checks++;
+	if(objread(s, o, 4, buf, Blk, 0) >= 0)
+		fail("a damaged extent map was served");
+	storestat(s, &st0);
+	eqv("the first read condemns the slot", st0.nlost, 1);
+	eqv("and nothing has leaked yet", st0.grainleak, 0);
+	gf = st0.grainfree;
+
+	checks++;
+	if(objdrop(s, o, 4) < 0)
+		fail("objdrop of a condemned copy: %r");
+	checks++;
+	if(ostat(s, "cond", &oi) >= 0)
+		fail("the dropped condemned copy still has a record");
+	storestat(s, &st1);
+	eqv("the drop takes the slot out of /lost", st1.nlost, 0);
+	eqv("... and returns the index slot", st1.slotfree,
+		st0.slotfree + 1);
+	eqv("... and the extent-map slot", st1.emapfree, st0.emapfree + 1);
+	eqv("a drop over a condemned slot frees no grain", st1.grainfree,
+		gf);
+	eqv("and counts the grains it left marked", st1.grainleak, 3);
 
 	free(buf);
 	storeclose(s);
@@ -1333,6 +1458,7 @@ main(int argc, char **argv)
 	tdrop(0);
 	tdrop(1);
 	tdropedges();
+	tdropcondemned();
 	for(i = Cwrite; i <= Cadopt; i++)
 		tcsum(i);
 	tcsumzero();

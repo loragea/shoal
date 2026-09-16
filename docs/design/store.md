@@ -4542,8 +4542,9 @@ what would close it.
   apply an item's `Eslot` before its `Eobj`, which only the
   before-restart assertions catch.
 - **T1.32 the resulting-`csum` check (§3.8, D23).** For each of
-  `objwrite`, `objtrunc`, `objremove`, `objcreate`, the adoption and
-  `op=full`: learn the `csum` the operation produces on one store,
+  `objwrite`, `objtrunc`, `objremove`, the adoption and `op=full` —
+  the five calls a peer's key can reach — learn the `csum` the
+  operation produces on one store,
   then on an identical one offer a wrong `csum` and assert
   `checksum mismatch` and that **nothing is durable** — the log's
   `seqnext` and watermark have not moved, and a restart replays to
@@ -4561,7 +4562,10 @@ what would close it.
   inventory in order with both kinds present and the `Objinfo`
   matching `objstat`'s; three pages of three resumed by `after` with
   no duplicate and no gap and `more` set only while inventory
-  follows; `k` past the inventory; `k` of 0; `after` at the last oid.
+  follows; a page of exactly the inventory and one an entry short of
+  it; `k` of 0; `after` at the last oid; and the refusals — a
+  negative `k`, an `after` past §1.1's bound, an `after` length with
+  no `after`, and a store that has stopped serving.
   Then a proc creating objects beside the walk — and dropping and
   re-creating them behind itself, which is what can put one oid in a
   page twice — under which every page must still be strictly
