@@ -1223,8 +1223,9 @@ int	stagefinalcsum(Stage*, uvlong ver, uvlong wepoch, uchar *csum,
  * arrives from elsewhere as op=full's does (§3.7); `stale version'
  * as above; `disk full' when no index slot or log space is free
  * after §6's bounded wait; `checksum mismatch' from objadoptcsum's
- * check; and §3.7's internal kinds for a live copy, for a condemned
- * or closed store, and for a device error carried out of the commit.
+ * check; and §3.7's internal kinds for a live copy, for a failed
+ * allocation (`out of memory'), for a condemned or closed store, and
+ * for a device error carried out of the commit.
  *
  * Takes the Edirty records like every other mutating call.
  */
