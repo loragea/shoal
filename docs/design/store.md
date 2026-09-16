@@ -4527,15 +4527,20 @@ what would close it.
   tombstone at a `len` other than 0.
 - **T1.31 drop (§3.8).** Drop a multi-block live copy and assert the
   grains, the extent-map slot and the index slot are all free again
-  (`Storestat`), that no record is left, and that the state survives
-  a restart. Then the crash-point discipline: with the simulated
-  device stopped at `postwrite` and the written sector kept, so the
-  record is durable and its post-flush never returns, restart and
-  assert the same freed state — one record, one outcome. Assert the
-  two ids a drop is not for (`no such object`, `object deleted`) and
-  that a `corrupt`-flagged copy is droppable and leaves `/lost`.
+  (`Storestat`), and that no record is left — **before** the restart
+  as well as after, because replay repairs an apply that ran the item
+  the wrong way round and a check made only after a restart cannot
+  see the live path's order at all. Then the crash-point discipline:
+  with the simulated device stopped at `postwrite` and the written
+  sector kept, so the record is durable and its post-flush never
+  returns, assert the call fails — the crash fired — restart and
+  assert the same freed state: one record, one outcome. Assert the
+  two ids a drop is not for, both `no such object` (§3.7), and that a
+  `corrupt`-flagged copy is droppable and leaves `/lost`.
   *Mutations:* leave the copy's grains marked (compare `grainfree`);
-  commit the `Eobj` without the `Eslot`, leaving a tombstone behind.
+  commit the `Eobj` without the `Eslot`, leaving a tombstone behind;
+  apply an item's `Eslot` before its `Eobj`, which only the
+  before-restart assertions catch.
 - **T1.32 the resulting-`csum` check (§3.8, D23).** For each of
   `objwrite`, `objtrunc`, `objremove`, `objcreate`, the adoption and
   `op=full`: learn the `csum` the operation produces on one store,

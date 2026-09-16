@@ -314,6 +314,14 @@ packbatch(Store *s, Batch *b, uchar *p, long max, ulong *nent)
 	USED(s);
 	n = 0;
 	*nent = 0;
+	/*
+	 * An item's entries are packed in this order and applied in it,
+	 * so an item that carries both an Eobj and an Eslot for the same
+	 * slot — store.md §3.8's op=drop — frees the object before it
+	 * frees the index entry, and the tombstone the Eobj would
+	 * otherwise publish is never visible.  applybatch applies the
+	 * same order on the live path; applyents does on replay.
+	 */
 	for(it = b->items; it != nil; it = it->next){
 		if(it->obj != nil){
 			if((m = objrecpack(p + n, max - n, it->obj)) < 0)
@@ -443,6 +451,15 @@ applybatch(Store *s, Batch *b)
 	int i, r;
 
 	r = 0;
+	/*
+	 * Eobj before Eslot within an item, which is what store.md
+	 * §3.8's op=drop needs: the Eobj releases the copy's grains and
+	 * its extent-map slot and the Eslot releases the index entry
+	 * they hung from, and applying them the other way round would
+	 * free the slot and then publish a tombstone into it.  It is the
+	 * order packbatch packs them in and the order applyents replays
+	 * them in.
+	 */
 	for(it = b->items; it != nil; it = it->next){
 		if(it->obj != nil && applyrec(s, it->obj, it->emap) < 0)
 			r = -1;

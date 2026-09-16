@@ -461,7 +461,10 @@ tdrop(int crash)
 		simcrashdead(d, 1);
 		simcrashmode(d, Sckeep);
 		simarm(d, "postwrite", 0);
-		drop(s, "stray");	/* the flush after it cannot answer */
+		checks++;
+		if(drop(s, "stray") >= 0)
+			fail("%s: postwrite did not fire", what);
+		simarm(d, nil, 0);
 		storeclose(s);
 		simrevive(d);
 		if((s = mustopen(d, what)) == nil){
@@ -472,6 +475,27 @@ tdrop(int crash)
 	}else{
 		if(drop(s, "stray") < 0)
 			fail("%s: objdrop: %r", what);
+		/*
+		 * The live path's own state, asserted BEFORE the restart.
+		 * After one, replay repairs an apply that ran an item's
+		 * Eslot before its Eobj — the Eslot frees the slot and the
+		 * Eobj then publishes a tombstone into it, and replay of
+		 * the same record in the right order leaves the freed state
+		 * either way — so a check made only after a restart cannot
+		 * see the live path's order at all (§3.8).
+		 */
+		checks++;
+		if(ostat(s, "stray", &oi) >= 0)
+			fail("%s: a record is left on the live path", what);
+		else
+			errsays("objstat of a dropped id, before the restart",
+				"no such object");
+		storestat(s, &st1);
+		eqv("the live path returns every grain", st1.grainfree,
+			st0.grainfree);
+		eqv("... the index slot", st1.slotfree, st0.slotfree);
+		eqv("... the extent-map slot", st1.emapfree, st0.emapfree);
+		eqv("... and leaves no tombstone", st1.ntomb, st0.ntomb);
 		if((s = restart(s, d, what)) == nil){
 			devclose(d);
 			free(buf);
