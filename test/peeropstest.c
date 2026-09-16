@@ -233,7 +233,7 @@ tadoptover(void)
 	Store *s;
 	Objinfo oi, tomb, live;
 	Storestat st0, st1;
-	uchar *buf;
+	uchar o[Oidmax], *buf;
 
 	spawnforget();
 	d = newdisk();
@@ -263,6 +263,46 @@ tadoptover(void)
 			tomb.qidpath);
 		eqv("a re-keyed tombstone keeps len 0", oi.len, 0);
 	}
+
+	/*
+	 * layer-a §5.5's comparison, which this call makes itself over a
+	 * tombstone (§3.8): only a strictly greater key applies.  The
+	 * record is at (4, 9) now.
+	 */
+	checks++;
+	if(adopt(s, "old", 8, 4) >= 0)
+		fail("objadopt at a lower ver over a tombstone was taken");
+	else
+		errsays("objadopt at a lower ver", "stale version");
+	checks++;
+	if(adopt(s, "old", 99, 3) >= 0)
+		fail("objadopt at a lower wepoch over a tombstone was taken");
+	else
+		errsays("objadopt at a lower wepoch", "stale version");
+	checks++;
+	if(adopt(s, "old", 9, 4) >= 0)
+		fail("objadopt at the tombstone's own key was taken");
+	else
+		errsays("objadopt at an equal key", "stale version");
+	if(ostat(s, "old", &oi) < 0)
+		fail("objstat after the refused adoptions: %r");
+	else{
+		eqv("a refused adoption leaves the ver", oi.ver, 9);
+		eqv("... and the wepoch", oi.wepoch, 4);
+		eqv("... and the slot", oi.slot, tomb.slot);
+	}
+	/*
+	 * ... and the record the refusals left is still the one §1.5's
+	 * discard names, so a discard at the key the adoption published
+	 * works after them.
+	 */
+	oidof(o, "old");
+	checks++;
+	if(objdiscard(s, o, 3, 9, 4, 5) < 0)
+		fail("objdiscard at the re-keyed tombstone's own key: %r");
+	checks++;
+	if(ostat(s, "old", &oi) >= 0)
+		fail("the discarded tombstone still has a record");
 
 	/* a live copy: refused, and nothing about it moves */
 	mk(s, "alive");

@@ -1650,7 +1650,7 @@ own `not primary: n5.0` is the pattern. Callers can act on these:
 | a create of a live id | `object exists` |
 | an oid outside layer-a §1.1's `1*128` bound | `bad object name` |
 | a write, truncate or stage past `objmax`, at either bound | `object too large` |
-| an `op=full` at a key the receiver's own key defends (§3.6) | `stale version` |
+| an `op=full` at a key the receiver's own key defends (§3.6), or an adopted `op=delete` at a key its own tombstone defends (§3.8) | `stale version` |
 | an `op=full` or an adopted `op=delete` at a version the object model forbids, and a chunk outside its stage's declared length | `bad ctl` |
 | a read, verify or update through an extent-map entry that failed its `csum128` (§5 step 9) — block repair excepted, below; a read, write or truncate of a copy whose `corrupt` flag is set (§8); a block repair whose bytes do not hash to the stored `dig[i]` | `checksum mismatch` |
 | a replicated operation whose resulting `csum` is not the one it named (layer-a §5.5, §3.8, D23) | `checksum mismatch` |
@@ -1753,7 +1753,16 @@ it reserves an index slot and a `qid.path` and publishes
 for the reason §3.6 gives for the absent `op=full` receiver: a slot
 reserved by one commit and published by another is a window a crash
 lands in. For an id whose record is already a tombstone it re-keys
-that tombstone in place, keeping §2.3's stable `qid.path`.
+that tombstone in place, keeping §2.3's stable `qid.path`, and only
+at a key **strictly greater** than that tombstone's: layer-a §5.5's
+comparison is made here, under the hold that read the record, because
+the key arrived from elsewhere and a caller could make it only with a
+second read an `op=delete` can overtake. An equal key is refused with
+the lower ones — §1.3 makes equal keys equal content, a tombstone
+holds none, and there is no `force=1` on a path that carries none
+either — and the refusal is §3.7's `stale version`, as `stagefinal`'s
+is. An absent id has no key to defend and takes any key §1.3
+permits.
 
 Over a **live** copy it refuses, and the refusal is §3.7's internal
 kind. A live copy holds content; replacing it with metadata is the
@@ -1825,7 +1834,10 @@ states what is normative here and what is this library's shape.
 
 **What the server still owes.** The engine holds no map and
 arbitrates on no delta path, so layer-a's epoch check, the delta ops'
-predecessor rule, the self-contained ops' key comparison, §5.6's
+predecessor rule, `op=full`'s key comparison and `op=delete`'s
+against a **live** copy — which goes through the delete path, the
+adoption above having refused it; the comparison against a tombstone
+is the engine's, above — §5.6's
 re-check that a dropping instance is not in `P(oid)`
 (`still placed`), and §1.5's cluster-wide discard conditions are all
 the caller's, made under the object's queue (§7) before it calls.

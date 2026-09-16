@@ -1060,11 +1060,20 @@ int	stagefinalcsum(Stage*, uvlong ver, uvlong wepoch, uchar *csum,
  * one here would throw away content on a call whose contract is
  * metadata only.
  *
- * The key is adopted verbatim — the engine arbitrates on no delta
- * path — so the caller still owes §5.5's comparison (greater than the
- * local key, or no local copy) before it calls.  A version of 0 is
- * refused `bad ctl': the key arrives from elsewhere, as op=full's
- * does, so §3.7 makes it a malformed header rather than a caller bug.
+ * **The comparison over an existing tombstone is made here.**  The
+ * key arrives from elsewhere, so this call makes layer-a §5.5's
+ * comparison itself, exactly as stagefinal does and under the hold
+ * that read the record: an adoption over a tombstone applies only at
+ * a key strictly greater than the tombstone's, and answers
+ * `stale version' otherwise.  An equal key is refused with the
+ * lower ones — §1.3 makes equal keys equal content and a tombstone
+ * holds none — and there is no force=1 here, since op=delete carries
+ * no content to repair a divergence with.  An absent id has no key
+ * to defend, so any key §1.3 permits applies to it.  The comparison
+ * against a LIVE copy is still the caller's: that copy is objremove's
+ * to replace, and this call refuses it.  A version of 0 is refused
+ * `bad ctl': the key arrives from elsewhere, as op=full's does, so
+ * §3.7 makes it a malformed header rather than a caller bug.
  * mtime is set to now, which layer-a §1.5 allows for an adopted
  * tombstone at the price of delaying its discard by tombdays.
  *

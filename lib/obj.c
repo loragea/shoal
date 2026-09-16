@@ -1290,6 +1290,17 @@ objremovecsum(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 	return 0;
 }
 
+/* layer-a §1.3's arbitration key, compared lexicographically */
+static int
+keycmp(uvlong we, uvlong ver, uvlong we2, uvlong ver2)
+{
+	if(we != we2)
+		return we < we2 ? -1 : 1;
+	if(ver != ver2)
+		return ver < ver2 ? -1 : 1;
+	return 0;
+}
+
 /*
  * layer-a §1.5's tombstone adoption, which §5.5's op=delete needs for
  * the two records objremove cannot open: an id this instance holds no
@@ -1373,6 +1384,36 @@ objadoptcsum(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 	}else if(updopen(&u, s, oid, oidlen, 0,
 		Utomb|Ubad|Ucorrupt|Unolive) < 0)
 		return -1;
+	/*
+	 * layer-a §5.5's comparison against the record this adoption
+	 * would replace, made HERE and not left to the caller.  The key
+	 * arrives from elsewhere, as op=full's does, so this path falls
+	 * on stagefinal's side of §3.7's line — and it makes the
+	 * comparison the way stagefinal makes it, against the key the
+	 * updopen above classified under one hold of qlstate, so no
+	 * op=delete can replace the tombstone between the read and the
+	 * commit.  A caller could not: a separate objstat is that second
+	 * read.
+	 *
+	 * Strictly greater, so an equal key is `stale version' too.
+	 * layer-a §1.3's I3 makes equal keys equal content, a tombstone
+	 * has none, and re-keying at the key the record already holds
+	 * would write a record that moves nothing.  Unlike op=full there
+	 * is no force=1 here: §1.3's divergence repair carries content,
+	 * and op=delete carries none.
+	 *
+	 * An absent id has no key to defend, so every key §1.3 permits
+	 * — anything at or above (·, 1) — applies to it; that is the
+	 * arm above, which reaches no record to compare against.
+	 */
+	if(!absent && keycmp(wepoch, ver, u.e.wepoch, u.e.ver) <= 0){
+		updabort(&u);
+		updclose(&u);
+		werrstr("stale version: op=delete at (%llud, %llud) over the "
+			"tombstone at (%llud, %llud)", wepoch, ver,
+			u.e.wepoch, u.e.ver);
+		return -1;
+	}
 	u.expcsum = csum;
 	/*
 	 * mtime is now.  layer-a §1.5 allows it in as many words — "if
@@ -2440,17 +2481,6 @@ stagediscard(Stage *g)
  * commit's apply, so nothing about the transfer was ever durable
  * until this moment.
  */
-/* layer-a §1.3's arbitration key, compared lexicographically */
-static int
-keycmp(uvlong we, uvlong ver, uvlong we2, uvlong ver2)
-{
-	if(we != we2)
-		return we < we2 ? -1 : 1;
-	if(ver != ver2)
-		return ver < ver2 ? -1 : 1;
-	return 0;
-}
-
 /*
  * Every exit from stagefinal releases the stage, which is what §3.6
  * means by "the stage is discarded exactly as below": a comparison
