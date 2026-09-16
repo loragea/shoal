@@ -1130,27 +1130,6 @@ bmpassfold(Store *s, ulong slot)
 				slot);
 			break;
 		}
-		if(c->bad){
-			/*
-			 * The entry failed its csum128: media damage the log
-			 * cannot repair, exactly as rebuildbitmap finds it,
-			 * and every grain number in it is the damaged bytes'.
-			 * So this reader condemns the slot as every other
-			 * reader of a map does, and folds nothing.
-			 */
-			emapunpin(s, c);
-			qlock(&s->qlstate);
-			if(e->gen == gen)
-				storecondemn(s, slot);
-			if(!counted){
-				s->bmnfold++;
-				counted = 1;
-			}
-			foldmark(s, slot);
-			qunlock(&s->qlstate);
-			r = 0;
-			break;
-		}
 		for(i = 0; i < n; i++)
 			g[i] = emapgrain(c->p, i);
 
@@ -1169,7 +1148,8 @@ bmpassfold(Store *s, ulong slot)
 		}
 		/*
 		 * §13's bmfold point: park this fold between the map read
-		 * and the validation, so a test can land a commit in the
+		 * and every validation it makes — the stamp's and the
+		 * checksum's alike — so a test can land a commit in the
 		 * window the stamp exists for instead of racing for it.
 		 * rsleep drops qlstate, which is what lets that commit
 		 * apply; inert unless the hook armed it.
@@ -1195,6 +1175,25 @@ bmpassfold(Store *s, ulong slot)
 			 */
 			try = 0;
 			act = Fagain;
+		}else if(c->bad){
+			/*
+			 * The entry failed its csum128: media damage the log
+			 * cannot repair, exactly as rebuildbitmap finds it,
+			 * and every grain number in it is the damaged bytes'.
+			 * So this reader condemns the slot as every other
+			 * reader of a map does, and folds nothing.
+			 *
+			 * The stamp is checked first, above, and a mismatch
+			 * sends the fold round again rather than here: a
+			 * repair or §3.6's op=full may have published a
+			 * fresh, good map over the damage since the read,
+			 * and condemning on that would condemn the new map
+			 * while folding nothing would let the swap clear
+			 * the grains it names.
+			 */
+			storecondemn(s, slot);
+			foldmark(s, slot);
+			r = 0;
 		}else{
 			/*
 			 * The bound's fallback, when the stamp moved: the

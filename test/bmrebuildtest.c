@@ -931,6 +931,103 @@ tleak(void)
 	free(buf);
 }
 
+/*
+ * A fold that read a damaged map, parked, and woke to find a fresh
+ * good one in its place.  §3.6's op=full rebuilds a condemned copy's
+ * map whole in a new extent-map slot, which moves the stamp with the
+ * four-tuple unchanged, so the fold must go round again: condemning
+ * on what it read would condemn the repair, and folding nothing would
+ * let the swap clear the grains the new map names.
+ */
+static void
+tmoved(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Stage *stg;
+	Super sup;
+	Objinfo oi;
+	uchar *buf, *fresh, oid[Oidmax];
+	ulong emapslot;
+	uvlong np;
+
+	np = 0;
+	spawnforget();
+	d = newdisk();
+	if((s = openbm(d, "a map that moved under a damaged read")) == nil){
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(3*Blk, 149);
+	fresh = mkbuf(3*Blk, 151);
+	mk(s, "live");
+	mustwr(s, "live", buf, 3*Blk, 0, 2);
+	mk(s, "d");
+	mustwr(s, "d", buf, 3*Blk, 0, 2);
+	oidof(oid, "d");
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	geom(d, &sup);
+	if(ostat(s, "d", &oi) < 0)
+		fail("objstat d: %r");
+	emapslot = oi.emapslot;
+	storeclose(s);
+	damageentry(d, &sup, emapslot);
+
+	if((s = openbm(d, "a damaged map, reopened")) == nil){
+		devclose(d);
+		free(buf);
+		free(fresh);
+		return;
+	}
+	storestat(s, &st);
+	eqv("nothing has read the map, so nothing is condemned yet",
+		st.nlost, 0);
+	checks++;
+	if(bmpassbegin(s) < 0)
+		fail("bmpassbegin: %r");
+	storehook(s, "bmfold", 1);
+	foldstart(s, oi.slot);
+	if(waitpark(s, 0, "the fold parks with a damaged map read")){
+		/* §3.6's repair of the copy, in the window the fold sits in */
+		if((stg = stageopen(s, oid, 1, 3*Blk, 0)) == nil)
+			fail("stageopen over the damaged copy: %r");
+		else{
+			if(stagewrite(stg, fresh, 3*Blk, 0) < 0)
+				fail("stagewrite: %r");
+			checks++;
+			if(stagefinal(stg, 3, 1, nil, 0) < 0)
+				fail("an op=full over the damaged copy: %r");
+		}
+	}
+	storehook(s, "bmfold", 0);
+	if(waitfold("the parked fold finishes")){
+		checks++;
+		if(foldr < 0)
+			fail("the parked fold: %s", folderr);
+	}
+	storestat(s, &st);
+	eqv("the stamp sent the fold round again", st.bmreread, 1);
+	eqv("and the fold condemned nothing", st.nlost, 0);
+	if(foldall(s, oi.slot, "the rest of the walk") == 0){
+		checks++;
+		if(bmpassend(s, &np) < 0)
+			fail("bmpassend: %r");
+	}
+	storestat(s, &st);
+	eqv("the pass ends", st.bmpass, 0);
+	eqv("and returns what the repair left behind", st.grainleak, 0);
+	scanok(s, d, "a fresh map published under a damaged read");
+	whole(s, "d", "a repair under the walk");
+	whole(s, "live", "a repair under the walk");
+	storeclose(s);
+	killspawned();
+	devclose(d);
+	free(buf);
+	free(fresh);
+}
+
 /* the multi-page geometry: §2.5's swap is page by page, so it needs
  * more than one page to be a swap of anything but the whole */
 static Dev*
@@ -1157,6 +1254,7 @@ main(int argc, char **argv)
 	treread();
 	tcover();
 	tleak();
+	tmoved();
 	tswap();
 	tabort();
 	tclose();
