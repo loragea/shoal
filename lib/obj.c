@@ -230,9 +230,7 @@ updcommit(Upd *u, int state, uvlong ver, uvlong wepoch, vlong mtime,
 	 * which the csum this operation publishes exists and no byte of
 	 * its record has been written, so a refusal costs an updabort
 	 * and leaves the published state exactly as §3.3 leaves it after
-	 * any other discard.  Made after logcommit it would be a report
-	 * of a divergence rather than a bar to one, and the record would
-	 * already be on the platter for replay to believe.
+	 * any other discard.  D23 argues why it must precede the record.
 	 */
 	if(u->expcsum != nil && memcmp(csum, u->expcsum, Csumlen) != 0){
 		updabort(u);
@@ -1330,12 +1328,9 @@ keycmp(uvlong we, uvlong ver, uvlong we2, uvlong ver2)
  * self-contained op applies "or the receiver holds no copy" — so
  * without this call a replicated delete for an object this instance
  * missed the creation of can never be applied, the tombstone never
- * arrives, and §1.5's discard waits on this instance for ever.
- *
- * There is no safe two-call substitute.  objcreate followed by
- * objremove publishes a live object at a key the sender never sent,
- * and a crash between the two leaves it live: exactly the copy §1.3
- * describes as winning arbitration and overwriting a good one.
+ * arrives, and §1.5's discard waits on this instance for ever.  §3.8
+ * has the rest of the argument, including why no two existing calls
+ * substitute for this one.
  *
  * The csum is §1.4's for a zero-length object — the hash of an empty
  * digest array — and it is not written here: updcsum computes it for
@@ -1436,11 +1431,9 @@ objadoptcsum(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 	}
 	u.expcsum = csum;
 	/*
-	 * mtime is now.  layer-a §1.5 allows it in as many words — "if
-	 * the pull resets the record's mtime, condition 2 delays that
-	 * second discard by tombdays; that costs space, not correctness"
-	 * — and the alternative, carrying the sender's mtime, is a field
-	 * op=delete does not have on the wire.
+	 * mtime is now.  layer-a §1.5 prices a reset mtime rather than
+	 * forbidding one (§3.8), and there is nothing to carry instead:
+	 * op=delete has no mtime field on the wire.
 	 */
 	if(updcommit(&u, Stomb, ver, wepoch, time(nil), 0, dr, ndr) < 0){
 		updclose(&u);
@@ -1455,8 +1448,8 @@ objadoptcsum(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
  * copy leaving no record at all.  A tombstone would be wrong here —
  * the object is alive elsewhere and a tombstone arbitrates, so one
  * published for a stray would travel back out and delete the good
- * copies — and objdiscard cannot do it, since it refuses anything
- * that is not a tombstone at exactly the named key.
+ * copies (§3.8) — and objdiscard cannot do it, since it refuses
+ * anything that is not a tombstone at exactly the named key.
  *
  * **One durable step.**  The Eobj below is the same record objremove
  * commits — len 0, the copy's grains in `freed', the extent-map slot
@@ -1466,12 +1459,8 @@ objadoptcsum(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
  * tombstone this record would otherwise publish never becomes
  * visible: the state after the record is the state with no record.
  * The key and mtime are the copy's own, so nothing about the object
- * is invented for a state that is never published.
- *
- * Doing it in two commits would publish a tombstone this holder has
- * no authority to create, and a crash between them would leave it
- * durable — layer-a §1.5's resurrection hole opened by the very call
- * that exists to close a capacity leak.
+ * is invented for a state that is never published.  Two commits
+ * would leave that tombstone durable across a crash between them.
  */
 int
 objdrop(Store *s, uchar *oid, int oidlen)
@@ -1483,20 +1472,15 @@ objdrop(Store *s, uchar *oid, int oidlen)
 		return -1;
 	/*
 	 * §8 and §5 step 10 pass for objremove's reason: a copy that
-	 * contributes no key (layer-a §1.3) has nothing here to defend,
-	 * and a stray that could not be dropped because its content is
-	 * damaged would hold its grains for the life of the disk.  The
-	 * grains a condemned map named are not recovered by this
-	 * (nothing knows which they were) and stay marked until a bitmap
-	 * rebuild, exactly as for a delete; applyrec counts them.
+	 * contributes no key (layer-a §1.3) has nothing here to defend
+	 * (§3.8).  The grains a condemned map named are not recovered by
+	 * this — nothing knows which they were — and stay marked until a
+	 * bitmap rebuild, exactly as for a delete; applyrec counts them.
 	 *
-	 * A tombstoned id answers `no such object', the same as an
-	 * absent one, and Unotomb is what makes updopen say so.  A
-	 * tombstone is a record and not a copy, so a drop has nothing
-	 * here to remove — layer-a §5.6's op=drop table and §2.5's drop
-	 * verb list no `object deleted' — and layer-a §1.5's discard,
-	 * with its cluster-wide conditions, is the only thing that takes
-	 * a tombstone away.
+	 * Unotomb is what makes updopen answer a tombstoned id
+	 * `no such object', the same as an absent one: a tombstone is a
+	 * record and not a copy, so a drop has nothing here to remove
+	 * (§3.7, §3.8).
 	 */
 	if(updopen(&u, s, oid, oidlen, 0, Ubad|Ucorrupt|Unotomb) < 0)
 		return -1;
@@ -1921,24 +1905,17 @@ oidcmp(uchar *a, int na, uchar *b, int nb)
 
 /*
  * layer-a §5.6's op=list: the k smallest oids strictly greater than
- * `after', live and tomb alike, in oid byte order.
+ * `after', live and tomb alike, in oid byte order.  §9 argues why
+ * this is a k-smallest selection over a chunked scan rather than an
+ * Objsnap, and carries what a page and a hold measure at.
  *
- * **Not an Objsnap.**  §9's snapshot is slot-ordered, so resuming
- * after an oid through one would mean sorting the whole index per
- * page; it costs a vector of the whole index; and its count is
- * bounded by objsnapmax, which §9 sizes for the admin fids, so a
- * reconcile pass paging through the inventory would spend that bound.
- * A k-smallest selection needs none of it: it is one pass of the slot
- * array per page with k entries of state.
- *
- * **The hold is per chunk, not per page.**  §9 measures a walk of a
- * full index at 23 ms and calls it the one place a state lock is held
- * for milliseconds; this walk would be a second one, taken by every
- * peer's reconcile rather than by an operator's open.  So the lock is
- * taken for Listchunk slots at a time and released between chunks.
- * Each entry the selection keeps is copied — oid and Objinfo both —
- * under the hold it was seen in, so a page is internally consistent
- * in layer-a §5.6's sense however the index moves between chunks.
+ * **The hold is per chunk, not per page.**  The lock is taken for
+ * Listchunk slots at a time and released between chunks, because
+ * this walk is taken by every peer's reconcile rather than by an
+ * operator's open and must not be a second place a state lock is
+ * held for the milliseconds a full index costs (§9).  Each entry the
+ * selection keeps is copied — oid and Objinfo both — under the hold
+ * it was seen in.
  *
  * What that costs is stated rather than hidden: an object created
  * into a chunk this scan has passed is missed by this page, and one
@@ -1947,27 +1924,8 @@ oidcmp(uchar *a, int na, uchar *b, int nb)
  * deleted between pages" — and the next pass or an /advert catches
  * it.  *more counts the candidates this scan saw, to the same
  * tolerance, which is what lets a caller stop without a second page
- * that answers nothing.
- *
- * What a hold costs is measured for this scan rather than derived
- * from §9's ~22 ns a slot, which prices the snapshot walk's per-slot
- * work and not this one's.  At nslots = 8192 over 8184 objects, a
- * page from the start of the inventory costs (§9):
- *
- *	k	per hold of 256 slots	per page
- *	1	~35 us			~1.1 ms
- *	256	~160 us			~5.1 ms
- *	1024	~1.15 ms		~37 ms
- *
- * A candidate the buffer rejects costs one comparison whatever k is
- * — that is what the early-out below buys, and without it the same
- * page at k=256 costs ~4.4 ms a hold and ~141 ms — so the page is
- * O(nslots) in the rejections.  What still scales with k is placing
- * the candidates the buffer accepts, which is O(k) each.  256 slots
- * a hold keeps the hold under the 8.4 ms write §7 rule 2 measures
- * holds against across that range, while a chunk small enough to
- * matter for latency would pay a qlock round trip per handful of
- * slots.
+ * that answers nothing.  §14(17) is how §5.6's "internally
+ * consistent" is read here.
  */
 int
 objlist(Store *s, uchar *after, int afterlen, Objent *e, int k, int *more)
@@ -2055,8 +2013,8 @@ objlist(Store *s, uchar *after, int afterlen, Objent *e, int k, int *more)
 			 * the hold O(k * Listchunk).  With it a candidate
 			 * the buffer REJECTS costs one comparison whatever
 			 * k is; what still scales with k is placing the
-			 * ones it accepts, which is the split the figures
-			 * above are measured either side of.
+			 * ones it accepts.  §9's table prices a hold both
+			 * ways.
 			 *
 			 * An oid equal to the largest kept entry is skipped
 			 * rather than re-rendered here, which is the same

@@ -1001,21 +1001,21 @@ int	objrepair(Store*, uchar *oid, int oidlen, ulong blk, void *a, long n);
  * **The resulting-csum check** (layer-a §5.5, D23).  A replicated
  * operation carries the `csum=' the object MUST have once it is
  * applied, and the receiver MUST compute its own and fail
- * `checksum mismatch' if they differ.  The five calls below are the
- * plain calls above with one argument added: `csum' is nil for no
- * check, or Csumlen bytes the commit's own csum must equal.  There is
- * one per call a peer's key can reach, which is why objcreate has
- * none: layer-a §5.5's op=create receiver is a zero-length stage and
- * arbitrates in stagefinal (§3.6), and a client create's key is this
- * instance's own to choose, so no sender names a csum for it.  The
- * check is made where that csum is computed, inside the commit path
- * and BEFORE the log record is written, so a mismatch leaves nothing
- * durable — which is the whole of what makes it a check and not a
- * report.  Each plain call is exactly its variant with nil.
+ * `checksum mismatch' if they differ.  Every call a peer's key can
+ * reach has a variant that takes that value: the four below, and
+ * objadoptcsum beside objadopt further down.  `csum' is nil for no
+ * check, or Csumlen bytes the commit's own csum must equal, and each
+ * plain call is exactly its variant with nil.  objcreate has no
+ * variant: layer-a §5.5's op=create receiver is a zero-length stage
+ * and arbitrates in stagefinal (§3.6), and a client create's key is
+ * this instance's own to choose, so no sender names a csum for it.
  *
- * stagefinalcsum checks the csum the staged digests hash to, before
- * the stage commits; a failure discards the stage like every other
- * stagefinal outcome (§3.6).
+ * The check is made where that csum is computed, inside the commit
+ * path and BEFORE the log record is written, so a mismatch leaves
+ * nothing durable.  D23 argues that placement and marks what layer-a
+ * makes normative and what is this store's own.  stagefinalcsum
+ * checks the csum the staged digests hash to, and a failure discards
+ * the stage like every other stagefinal outcome (§3.6).
  *
  * One exception, in objwritecsum: a write of count 0 is not an
  * extend (layer-a §2.4), so it commits nothing and adopts no key.
@@ -1024,9 +1024,21 @@ int	objrepair(Store*, uchar *oid, int oidlen, ulong blk, void *a, long n);
  * compared against — and it is the only one made outside the commit
  * path.
  *
- * The arbitration these calls do NOT do is still the caller's: the
- * server compares keys under the oid's queue (§7) and calls here only
- * once it has decided, exactly as for the plain forms.
+ * **Arbitration differs by call, and taking a csum does not change
+ * it.**  objwritecsum, objtrunccsum and objremovecsum compare no
+ * keys at all: the caller decides under the oid's queue (§7) and
+ * they apply the key it hands them, exactly as the plain forms do.
+ * stagefinalcsum and objadoptcsum make layer-a §5.5's comparison
+ * themselves — against the receiver's then-current key (§3.6), and
+ * against the tombstone being re-keyed (objadopt, below) — and
+ * answer `stale version' when it fails.
+ *
+ * A wire header carrying ver=0 is the SERVER's to refuse with
+ * `bad ctl' before it calls any of these (§3.8): only stagefinal and
+ * objadopt answer a 0 that way, while objwrite, objtrunc and
+ * objremove answer §3.7's internal refusal whatever the version's
+ * origin — a peer's op=write, op=trunc or op=delete over a live copy
+ * included.
  */
 int	objwritecsum(Store*, uchar *oid, int oidlen, void *a, long n, uvlong off,
 		uvlong ver, uvlong wepoch, uchar *csum, Dirtyrec *dr, int ndr);
@@ -1044,7 +1056,8 @@ int	stagefinalcsum(Stage*, uvlong ver, uvlong wepoch, uchar *csum,
  * record", and §5.5 requires op=delete to apply when the receiver
  * holds no copy — neither of which objremove can do, since it opens
  * an existing record and answers `no such object' or `object deleted'
- * for exactly the two records this call is for.
+ * for exactly the two records this call is for.  §3.8 argues why no
+ * pair of existing calls substitutes for it.
  *
  * For an id this instance holds no record of, one commit allocates
  * the index slot and a fresh qid.path and publishes state=tomb,
@@ -1054,7 +1067,8 @@ int	stagefinalcsum(Stage*, uvlong ver, uvlong wepoch, uchar *csum,
  * and qid.path (§2.3).  A flag on such a record — §8's corrupt or §5
  * step 10's condemnation — does not stand in the way: a tombstone
  * holds no content for either to describe, and the commit publishes
- * the flag clear, exactly as objremove's does.
+ * the flag clear, exactly as objremove's does.  mtime is set to now,
+ * which layer-a §1.5 prices rather than forbids (§3.8).
  *
  * **Over a LIVE copy it refuses**, and the refusal carries no §2.6
  * prefix (§3.7): a live copy is what objremove is for, and the caller
@@ -1073,11 +1087,15 @@ int	stagefinalcsum(Stage*, uvlong ver, uvlong wepoch, uchar *csum,
  * no content to repair a divergence with.  An absent id has no key
  * to defend, so any key §1.3 permits applies to it.  The comparison
  * against a LIVE copy is still the caller's: that copy is objremove's
- * to replace, and this call refuses it.  A version of 0 is refused
- * `bad ctl': the key arrives from elsewhere, as op=full's does, so
- * §3.7 makes it a malformed header rather than a caller bug.
- * mtime is set to now, which layer-a §1.5 allows for an adopted
- * tombstone at the price of delaying its discard by tombdays.
+ * to replace, and this call refuses it.
+ *
+ * The refusals in full: `bad object name' for an oidlen outside
+ * layer-a §1.1's bound; `bad ctl' for a version of 0, since the key
+ * arrives from elsewhere as op=full's does (§3.7); `stale version'
+ * as above; `disk full' when no index slot or log space is free
+ * after §6's bounded wait; `checksum mismatch' from objadoptcsum's
+ * check; and §3.7's internal kinds for a live copy, for a condemned
+ * or closed store, and for a device error carried out of the commit.
  *
  * Takes the Edirty records like every other mutating call.
  */
@@ -1092,17 +1110,15 @@ int	objadoptcsum(Store*, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
  * no qid.path.  One durable step frees the copy's grains, its
  * extent-map slot and its index slot together, so no crash can leave
  * the object half-removed; §3.5's deferred reuse covers all three
- * releases as it does for any commit.
+ * releases as it does for any commit.  §3.8 argues why a tombstone
+ * would be wrong here and why two commits would not do.
  *
- * A corrupt-flagged or condemned copy is droppable, for the reason a
- * delete is: the copy contributes no key (layer-a §1.3), so there is
- * nothing here for the flag to defend, and refusing would leave a
- * stray unreclaimable.  A tombstoned id answers `no such object',
- * the same as an id this store holds no record of (§3.7): a
- * tombstone is a record and not a copy, so there is nothing for a
- * drop to remove — layer-a §5.6's op=drop table and §2.5's drop verb
- * allow no `object deleted' — and layer-a §1.5's discard is what
- * takes a tombstone away.
+ * A corrupt-flagged or condemned copy is droppable: it contributes
+ * no key (layer-a §1.3), so no flag has anything here to defend, and
+ * the grains a condemned map named stay marked until a bitmap
+ * rebuild (§3.8).  A tombstoned id answers `no such object', the
+ * same as an id this store holds no record of (§3.7): a tombstone is
+ * a record and not a copy, so a drop has nothing here to remove.
  *
  * It takes no Edirty records, for objdiscard's reason: a drop leaves
  * no peer behind to mark.  The holder is by construction not in
@@ -1121,14 +1137,19 @@ int	objdrop(Store*, uchar *oid, int oidlen);
  * **Oid-ordered listing**, layer-a §5.6's op=list: the k smallest
  * oids strictly greater than `after', live and tomb alike, in the
  * byte order §1.1 compares ids in.  An `after' of length 0 (the
- * argument may be nil) starts from the beginning; a nil `after' with
- * a length is a caller bug and is refused.  A store condemned or
- * closed under the walk is refused too, at the next chunk.  Answers how many
+ * argument may be nil) starts from the beginning.  Answers how many
  * entries were filled — at most k, fewer at the end of the inventory
  * — or -1.  *more, when the pointer is not nil, is 1 when the scan
  * saw at least one further oid above the last one answered, which is
  * how a caller learns whether to ask again; a page that answers fewer
  * than k entries with *more 0 is the end of the inventory.
+ *
+ * The refusals in full: `bad object name' for an afterlen outside
+ * layer-a §1.1's bound, and §3.7's internal kinds for a negative k,
+ * for a nil `after' carrying a non-zero length, and for a store
+ * condemned or closed.  The last is re-tested at every chunk, so a
+ * store closed under the walk is refused rather than answered out of
+ * state it no longer stands behind.
  *
  * This is NOT an Objsnap (§9).  A snapshot is slot-ordered, costs a
  * vector of the whole index, is bounded by objsnapmax and competes
@@ -1144,20 +1165,19 @@ int	objdrop(Store*, uchar *oid, int oidlen);
  * is what bounds it in practice.  A page costs one pass of the slot
  * array — O(nslots) comparisons for the candidates it rejects,
  * whatever k is — plus O(k) for each candidate it accepts, so k shows
- * in the price.  Measured at nslots = 8192 over 8184 objects: k=1
- * costs ~35 us a hold and ~1.1 ms a page, k=256 ~160 us and ~5.1 ms,
- * k=1024 ~1.15 ms and ~37 ms (§9).
+ * in the price through the acceptances; §9 carries what that measures
+ * at.
  *
  * The price is that a page is not a snapshot: an object created into
  * a chunk this scan has already passed is missed by this page, and
- * one created into a chunk it has not reached yet is included.
- * layer-a §5.6 requires only that a page be internally consistent —
- * which it is, since each entry is rendered whole under one hold —
- * and explicitly tolerates an object created or deleted between
- * pages.  An oid whose slot is released mid-scan and re-created into
- * a chunk ahead of it is seen twice and answered ONCE, at one of the
- * two renders, so a page stays strictly ascending.  *more is answered to the same tolerance: it counts the
- * candidates this scan saw.
+ * one created into a chunk it has not reached yet is included.  Each
+ * entry is rendered whole under one hold, so no entry mixes two
+ * states of one object, and an oid whose slot is released mid-scan
+ * and re-created into a chunk ahead of it is seen twice and answered
+ * ONCE, at one of the two renders, so a page stays strictly
+ * ascending.  *more is answered to the same tolerance: it counts the
+ * candidates this scan saw.  What layer-a §5.6's "internally
+ * consistent" is read to require of a page is §14(17).
  *
  * Paging with `after' set to the last oid of the previous page
  * therefore neither duplicates nor skips an object that stayed put
