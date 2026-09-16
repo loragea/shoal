@@ -2662,8 +2662,17 @@ undefined (D16), so a pass MUST be ended or aborted before one. A
 pass still live when `storeclose` runs is aborted by it — the shadow
 is the store's memory and goes with the rest — which is the engine
 tidying up after a caller rather than a way to leave a pass open: a
-fold in flight in another proc when the close runs is undefined
-exactly as any other call in flight is.
+call in flight in another proc when the close runs is undefined
+exactly as any other call in flight is, a swap among them, and what
+the bitmap holds afterwards is however many of its pages had landed.
+
+**An abort under a swap does nothing.** The swap drops `qlstate`
+between pages, so an abort landing in that gap would free the shadow
+out from under a half-installed bitmap and leave §6's free count
+moved by the pages that did land — the one state this mechanism has
+no name for. The end is about to drop the pass itself, so the abort
+has nothing left to do, which is what lets it stay a call that cannot
+fail.
 
 What the walk needs, and what the index entry now carries, is a
 **per-slot generation stamp**. The four-tuple is not a sufficient

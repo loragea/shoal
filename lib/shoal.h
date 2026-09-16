@@ -788,7 +788,10 @@ int	storefullsync(Store*, char *peer);
  * whole bitmap — and moves §6's free count by what each installed
  * page changed.  *npage, when not nil, is how many pages it
  * installed.  bmpassabort drops the shadow and disarms the barrier,
- * leaving the live bitmap exactly as it was.
+ * leaving the live bitmap exactly as it was.  An abort while an end
+ * is installing pages does nothing at all: the end is mid-swap, it
+ * drops the pass itself a moment later, and a half-installed bitmap
+ * is the one state this mechanism has no name for.
  *
  * **An end is refused unless the walk covered the store.**  The swap
  * frees every grain the shadow does not mark, so a shadow the walk
@@ -822,8 +825,10 @@ int	storefullsync(Store*, char *peer);
  * A pass still live when storeclose runs is aborted by it, because
  * the shadow is the store's memory and goes with the rest; that is
  * the engine tidying up after a caller, not a way to leave one open,
- * and a fold in flight in another proc when the close runs is
- * undefined exactly as any other call in flight is.
+ * and a call in flight in another proc when the close runs is
+ * undefined exactly as any other call in flight is — a bmpassend
+ * among them, which leaves the bitmap holding however many of its
+ * pages had landed.
  */
 int	bmpassbegin(Store*);
 int	bmpassfold(Store*, ulong slot);

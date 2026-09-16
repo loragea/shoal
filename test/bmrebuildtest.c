@@ -435,6 +435,70 @@ waitfold(char *what)
 }
 
 /*
+ * The swap a test parks at §13's bmswap point, in a proc of its own,
+ * for the same reason the fold above runs in one.
+ */
+static Store *endstore;
+static int enddone, endr;
+static uvlong endnp;
+static char enderr[ERRMAX];
+
+static void
+endprocf(void *a)
+{
+	USED(a);
+	enderr[0] = '\0';
+	endnp = 0;
+	if((endr = bmpassend(endstore, &endnp)) < 0)
+		rerrstr(enderr, sizeof enderr);
+	enddone = 1;
+}
+
+static void
+endstart(Store *s)
+{
+	endstore = s;
+	enddone = 0;
+	endr = 0;
+	if(spawnproc(endprocf, nil) < 0)
+		fail("spawn: %r");
+}
+
+/*
+ * A swap counts the page it installed under qlstate and parks inside
+ * that same hold, so a storestat that comes back with a page
+ * installed and the pass still live is a swap that is parked between
+ * two pages.
+ */
+static int
+waitswap(Store *s, char *what)
+{
+	Storestat st;
+	int k;
+
+	memset(&st, 0, sizeof st);
+	for(k = 0; k < 2000; k++){
+		storestat(s, &st);
+		if(st.bmswapped >= 1 && st.bmpass)
+			break;
+		sleep(5);
+	}
+	istrue(what, st.bmswapped >= 1 && st.bmpass);
+	return st.bmswapped >= 1 && st.bmpass;
+}
+
+static int
+waitend(char *what)
+{
+	int k;
+
+	for(k = 0; k < 2000 && !enddone; k++)
+		sleep(5);
+	istrue(what, enddone);
+	return enddone;
+}
+
+/*
  * Condemn one object's extent map, and delete it when del is set,
  * which is §6's leak: the delete's nfree names nothing, the grains
  * stay marked and named by nothing, and grainleak counts them.  With
@@ -1184,6 +1248,67 @@ tswap(void)
 }
 
 /*
+ * An abort that lands between two pages of a swap.  The swap drops
+ * qlstate between pages, so an abort in the gap would free the shadow
+ * under a half-installed bitmap; it is a no-op instead, and the swap
+ * runs to its end.  §13's bmswap point is what puts the abort in the
+ * gap rather than beside it.
+ */
+static void
+tswapabort(void)
+{
+	Dev *d;
+	Store *s;
+	Storestat st;
+	Super sup;
+	uvlong gf;
+
+	spawnforget();
+	d = bigdisk();
+	if((s = withleak(d, &sup, "d", Bigblk, 1, "an abort under the swap"))
+	== nil){
+		devclose(d);
+		return;
+	}
+	istrue("the store has more than one bitmap page", nbmpage(&sup) > 1);
+	if(storecheckpoint(s) < 0)
+		fail("storecheckpoint: %r");
+	storestat(s, &st);
+	gf = st.grainfree;
+
+	checks++;
+	if(bmpassbegin(s) < 0)
+		fail("bmpassbegin: %r");
+	if(foldall(s, ~0UL, "the walk") == 0){
+		storehook(s, "bmswap", 1);
+		endstart(s);
+		if(waitswap(s, "the swap parks with a page installed")){
+			bmpassabort(s);
+			storestat(s, &st);
+			eqv("an abort under a swap leaves the pass live",
+				st.bmpass, 1);
+		}
+		storehook(s, "bmswap", 0);
+		if(waitend("the swap finishes")){
+			checks++;
+			if(endr < 0)
+				fail("bmpassend under an abort: %s", enderr);
+		}
+	}
+	storestat(s, &st);
+	eqv("the pass ends", st.bmpass, 0);
+	eqv("the swap installed the one page that differs", endnp, 1);
+	eqv("and says so", st.bmswapped, endnp);
+	eqv("the condemned map's grains come back", st.grainfree, gf + 3);
+	eqv("and the leak is discharged", st.grainleak, 0);
+	scanok(s, d, "a swap an abort could not interrupt");
+	whole(s, "live", "a swap an abort could not interrupt");
+	storeclose(s);
+	killspawned();
+	devclose(d);
+}
+
+/*
  * T1.29's second half: an abort leaves the live bitmap exactly as it
  * was and the barrier disarmed, so an ordinary commit follows it and
  * a second pass may be begun.
@@ -1326,6 +1451,7 @@ main(int argc, char **argv)
 	tmoved();
 	tbound();
 	tswap();
+	tswapabort();
 	tabort();
 	tclose();
 	killspawned();

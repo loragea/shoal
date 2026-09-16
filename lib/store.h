@@ -270,9 +270,12 @@ struct Store
 	uvlong	bmnfold;		/* slots the pass has folded */
 	uvlong	bmnreread;		/* folds the stamp sent round again */
 	uvlong	bmswapped;		/* pages the last swap installed */
+	int	bmswapping;		/* bmpassend is installing pages */
 	ulong	bmfoldhold;		/* §13's bmfold point: rounds to park */
 	int	bmfoldgo;		/* ... until the hook lets one go */
-	Rendez	bmrz;			/* on qlstate: the fold parked there */
+	ulong	bmswaphold;		/* §13's bmswap point: pages to park */
+	int	bmswapgo;		/* ... until the hook lets one go */
+	Rendez	bmrz;			/* on qlstate: whoever parked there */
 	Sgrain	**stagebuck;		/* §6's hash of reserved grains */
 	Sgrain	*stagefree;		/* recycled nodes */
 	ulong	nstagebuck;

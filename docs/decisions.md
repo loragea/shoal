@@ -735,6 +735,10 @@ settled in `lib/store.c` and `lib/alloc.c`:
   slot and by an apply whose record rebuilds that slot's map whole,
   and an end that refuses while a `live` slot is unmarked or a fold
   is in flight. A refusal installs nothing and leaves the pass live.
+- **An abort under an in-flight swap is a no-op.**  A `bmswapping`
+  flag under `qlstate` says so; abort stays a call that cannot fail,
+  and a `storeclose` under an in-flight end is D16-undefined like any
+  other call in flight rather than a defined half-swap.
 - **The swap leaves standing what it did not reclaim.** A leak
   recorded in a slot the pass had already folded outlives the swap,
   because the fold put those grains in the shadow; the end discharges
@@ -766,7 +770,10 @@ live map still names — so the engine refuses rather than leaving that
 obligation with a driver that is not built yet. The leak the swap
 keeps follows from the same mark: the count means "marked and named
 by nothing", and a swap that installed such grains has not stopped
-them being that.
+them being that.  The abort rule is the same argument once more: the
+gap between two pages is a real window, and the only two things that
+can be in it are an abort, which the end makes redundant, and a close,
+which D16 already leaves undefined.
 **Normative:** none. Nothing here reaches a wire or an on-disk
 format; the stamp is memory only and no format field carries it.
 **Implementation policy:** all of it. A conforming implementation may

@@ -183,6 +183,20 @@ storehook(Store *s, char *name, uvlong n)
 		s->bmfoldgo = 1;
 		rwakeupall(&s->bmrz);
 		qunlock(&s->qlstate);
+	}else if(strcmp(name, "bmswap") == 0){
+		/*
+		 * §8's swap installs the shadow a page at a time and drops
+		 * qlstate between pages, and what may happen in that gap
+		 * is a rule of its own (D24).  This arms the next n pages
+		 * to park once installed, in the hold that installed them,
+		 * so a test drives the gap instead of racing for it.  It
+		 * is armed and released exactly as bmfold is.
+		 */
+		qlock(&s->qlstate);
+		s->bmswaphold = n;
+		s->bmswapgo = 1;
+		rwakeupall(&s->bmrz);
+		qunlock(&s->qlstate);
 	}else if(strcmp(name, "reclaim") == 0)
 		s->reclaimearly = n != 0;
 	else if(strcmp(name, "publish") == 0)
@@ -990,6 +1004,9 @@ bmpassdrop(Store *s)
 	 */
 	s->bmfoldhold = 0;
 	s->bmfoldgo = 1;
+	s->bmswaphold = 0;
+	s->bmswapgo = 1;
+	s->bmswapping = 0;
 	rwakeupall(&s->bmrz);
 }
 
@@ -1031,7 +1048,18 @@ void
 bmpassabort(Store *s)
 {
 	qlock(&s->qlstate);
-	bmpassdrop(s);
+	/*
+	 * An abort while bmpassend is installing pages does nothing.
+	 * The swap drops qlstate between pages, and an abort landing in
+	 * that gap would free the shadow out from under a half-installed
+	 * bitmap and leave §6's free count moved by the pages that did
+	 * land — the one state this mechanism has no name for.  The end
+	 * drops the pass itself a moment later, so there is nothing left
+	 * for the abort to do, which is what lets it stay a call that
+	 * cannot fail.
+	 */
+	if(!s->bmswapping)
+		bmpassdrop(s);
 	qunlock(&s->qlstate);
 }
 
@@ -1303,11 +1331,14 @@ bmpassend(Store *s, uvlong *npage)
 		qunlock(&s->qlstate);
 		return -1;
 	}
+	s->bmswapping = 1;
+	s->bmswapped = 0;
 	qunlock(&s->qlstate);
 	n = 0;
 	for(i = 0; i < s->nbmpage; i++){
 		qlock(&s->qlstate);
 		if(s->bmshadow == nil){
+			s->bmswapping = 0;
 			qunlock(&s->qlstate);
 			werrstr("bitmap rebuild: no pass is running");
 			return -1;
@@ -1337,10 +1368,23 @@ bmpassend(Store *s, uvlong *npage)
 			}
 			n++;
 		}
+		s->bmswapped = n;
+		/*
+		 * §13's bmswap point: park in the hold that installed this
+		 * page, which is the gap between two pages an abort or a
+		 * close would land in.  Inert unless the hook armed it.
+		 */
+		if(s->bmswaphold > 0){
+			s->bmswaphold--;
+			s->bmswapgo = 0;
+			while(!s->bmswapgo)
+				rsleep(&s->bmrz);
+		}
 		qunlock(&s->qlstate);
 	}
 	qlock(&s->qlstate);
 	if(s->bmshadow == nil){
+		s->bmswapping = 0;
 		qunlock(&s->qlstate);
 		werrstr("bitmap rebuild: no pass is running");
 		return -1;
@@ -1721,10 +1765,12 @@ storeclose(Store *s)
 	 * on a closed store undefined, so a pass MUST have been ended or
 	 * aborted before this call; dropping one here is what keeps the
 	 * shadow from outliving the Store's other memory, not a licence
-	 * to leave a pass open.  The live bitmap is left exactly as it
-	 * was, which is an abort and not half a swap: the swap installs
-	 * a page at a time under this same lock, so it is either past a
-	 * page or not.
+	 * to leave a pass open.  A pass with no call in flight is left
+	 * with its live bitmap exactly as it was, which is an abort.  A
+	 * bmpassend in flight in another proc is undefined exactly as
+	 * any other call in flight is: the swap installs a page at a
+	 * time under this same lock, so what the bitmap holds afterwards
+	 * is however many pages had landed.
 	 */
 	bmpassdrop(s);
 	rwakeupall(&s->snaprz);		/* §13's snaphold point, if one parked */
