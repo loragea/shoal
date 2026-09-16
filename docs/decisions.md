@@ -294,7 +294,7 @@ already listed it.
 no wording for there being none, while §5.6's table listed
 `no such object` for `op=discard` as it does for `op=drop` and
 `op=verify`; the store (`design/store.md` §3.7) followed the table
-from wave 1c-α and the contract text is reconciled to match.
+when it was built and the contract text is reconciled to match.
 Nothing distinguishes the two answers: §1.5's sender rule removes the
 primary's own record only after every holder answered `ok`, and
 treats any other answer as an incomplete discard to retry on a later
@@ -401,7 +401,7 @@ and an operator can tell a device that may heal from one that cannot.
 damaged extent map named: `op=delete` over it commits a tombstone
 whose `nfree` names nothing, and §3.6's `op=full` over it rebuilds
 the map in a fresh slot over fresh grains. The permanent reclaim is
-**online and scrub-driven** — wave 1d's scrubber already reads every
+**online and scrub-driven** — the storage server's scrubber already reads every
 live entry's map, so its pass accumulates a shadow bitmap and swaps
 it in page by page under `qlstate`, behind a write barrier on the
 two bitmap mutators — and it needs a per-slot generation stamp,

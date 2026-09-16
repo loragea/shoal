@@ -2474,8 +2474,8 @@ already there:
 **What the engine builds, and what the server still owes.** The
 engine holds the per-object primitives and the durable state; the
 pass that drives them — the proc, its rate limit, the queue it pushes
-through and the peer fetch — is the server's, and is not built yet
-(wave 1d). The primitives are:
+through and the peer fetch — is the server's, and is not built yet;
+it lands with the server's 9P export. The primitives are:
 
 - **verify** one object, as above, mutating nothing.
 - **scrub** one object: verify, then the one durable transition that
@@ -2558,7 +2558,7 @@ A corrupt copy loses arbitration against everything including absence
 (layer-a §1.3), which the server enforces by refusing to advertise
 it.
 
-**Scrub runs inside the queues.** *This is the half wave 1d builds.*
+**Scrub runs inside the queues.** *This is the half the server builds.*
 A background proc walks slots in order, but it does not read grains
 itself: for each object it pushes one verify request onto that
 object's `Reqqueue` and waits for the answer, exactly as a client
@@ -2580,7 +2580,7 @@ object's worth of work, serialised by the caller exactly as every
 other call in §7 is.
 
 **The pass is also where a condemned slot's grains come back.** *Not
-built: this is the other half wave 1d's scrubber carries, and until
+built: this is the other half the server's scrub pass carries, and until
 it exists the reclaim is the offline `shoalck -R` of §6 and §12.* The
 pass already reads every live entry's extent map, so a walk that
 accumulates those grains into a **shadow bitmap** and swaps it in
@@ -2913,7 +2913,7 @@ calls **before** it calls `storeclose`, and MUST make none after it.
 What is allowed after the close is exactly `objsnapent`,
 `objsnapcount` and `objsnapclose` on handles taken before it — the
 three that carry a claim of their own. The shutdown order of the
-server that will export this store (wave 1d, §8) follows from that
+server that will export this store (§8) follows from that
 rule and not from taste: it stops accepting requests and lets the
 ones in flight drain, and only then closes the store, its surviving
 `/obj` fids holding the snapshots that are the one thing the close
