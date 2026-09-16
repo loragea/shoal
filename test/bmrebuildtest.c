@@ -187,6 +187,14 @@ damageentry(Dev *d, Super *sup, ulong emapslot)
  * nothing.  A map whose entry fails its checksum is §5 step 10's
  * damage and names nothing a store may believe, which is exactly what
  * the pass reclaims.
+ *
+ * Independent of the REBUILD, not of the codecs it shares: this scan
+ * unpacks index entries, checks record checksums and reads grain
+ * numbers with the same idxunpack, reccsumok and emapgrain the fold
+ * does, so a bug in one of those moves both sides alike and this
+ * ground truth would not see it.  §13's structtest is what
+ * discriminates the codecs; what these checks discriminate is the
+ * walk, the barrier and the swap over them.
  */
 static uchar*
 scanmaps(Dev *d, Super *sup)

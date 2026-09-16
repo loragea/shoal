@@ -879,8 +879,7 @@ storecondemn(Store *s, ulong slot)
 	 * §8's stamp moves here too, although no map changed: what
 	 * changed is that this slot's map may no longer be READ, and a
 	 * walk that had already copied it would otherwise fold the
-	 * damaged bytes' grain numbers into its shadow.  The stamp is
-	 * "what this slot says has moved", not "the four-tuple has".
+	 * damaged bytes' grain numbers into its shadow (D24).
 	 */
 	s->idx[slot].gen++;
 	/*
@@ -930,8 +929,8 @@ condemn(Store *s)
  *     every other map read does (§7 rules 1 and 2), so the per-slot
  *     hold is an entry copy plus at most nblkmax bit-sets;
  *   - the entry a fold re-reads is validated by its generation stamp
- *     and not by its four-tuple, which block repair and the
- *     corrupt-flag commit leave unchanged while the map moves (§2.7);
+ *     and not by its four-tuple, which §8 says the map can move
+ *     under;
  *   - the barrier in alloc.c keeps the shadow current from the begin
  *     to the last page of the swap, which is what makes installing
  *     the pages one at a time safe.
@@ -1348,14 +1347,12 @@ bmpassend(Store *s, uvlong *npage)
 			/*
 			 * §6's free count moves by what this page changed
 			 * rather than being recomputed over the whole
-			 * bitmap at the end: the recount would be a qlstate
-			 * hold proportional to the disk — 2.6*10^8 bits on
-			 * a 4 TB one — which is the hold chunking the swap
-			 * exists to avoid.  The staged set needs no term of
-			 * its own here for the same reason it needs no
-			 * barrier: a staged grain carries no bit in either
-			 * copy (§6), so it contributes to neither count and
-			 * the difference passes it over.
+			 * bitmap at the end; D24 has the cost of the
+			 * recount that is not taken.  The staged set needs
+			 * no term of its own here for the same reason it
+			 * needs no barrier: a staged grain carries no bit
+			 * in either copy (§6), so it contributes to neither
+			 * count and the difference passes it over.
 			 */
 			nbit = bits;
 			if(i*bits >= s->sb.ngrains)

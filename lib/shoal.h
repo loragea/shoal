@@ -668,7 +668,9 @@ struct Storestat
 	 * bmswapped is the bitmap pages the last completed swap
 	 * installed — of Storestat's nothing else, so a caller that
 	 * wants it as a fraction reads §2.5's page count from the
-	 * superblock.
+	 * superblock.  §8 names the key= each is rendered under; the
+	 * rendering itself is the server's, as it is for every other
+	 * field here.
 	 */
 	int	bmpass;			/* a rebuild pass is live */
 	uvlong	bmfolded;		/* live slots folded, completed */
@@ -780,10 +782,25 @@ int	storefullsync(Store*, char *peer);
  * nothing, and so does a slot §5 step 10 condemned: its map is the
  * damage, and the grains it named are exactly what the pass reclaims.
  * A slot whose map fails its checksum is condemned here, as it is by
- * every other reader of a map.  Each call is one object's worth of
- * work, so a server may push it through that object's Reqqueue (§8);
- * the order slots are folded in is the caller's, and a slot folded
- * twice is folded twice to no ill effect.
+ * every other reader of a map, but only while the entry still names
+ * the map those bytes came from: a stamp that moved sends the fold
+ * round again instead, since §3.6's op=full may have published a
+ * repair over the damage in the window.  Each call is one object's
+ * worth of work, so a server may push it through that object's
+ * Reqqueue (§8); the order slots are folded in is the caller's, and a
+ * slot folded twice is folded twice to no ill effect.
+ *
+ * **The re-reads are bounded**, so that a slot under a continuous
+ * write rate cannot starve the walk on it.  Every round counts
+ * against the bound; past it the fold takes the grains off the pinned
+ * entry under the state lock itself, which is a memory read under the
+ * lock the apply mutates the map under rather than a device read.
+ * The one case those bytes cannot answer is an entry that has stopped
+ * naming the extent-map slot the round pinned, and that starts over
+ * like any other round, under a second and larger ceiling: a fold
+ * that reaches it folds nothing and answers "the map will not hold
+ * still", which is a refusal to retry on that slot and not a failed
+ * pass.  §8 has both numbers.
  *
  * bmpassend swaps the shadow in page by page under the state lock,
  * installing and dirtying only the pages that differ — §5 step 11's
@@ -802,12 +819,16 @@ int	storefullsync(Store*, char *peer);
  * therefore carries a mark per index slot, and bmpassend refuses
  * unless every Slive slot carries one and no fold is in flight.  A
  * fold sets the mark for the slot it completes; so does an apply
- * whose record rebuilds the slot's map whole, because those grains
- * reach the shadow through the barrier.  A free slot and a tombstone
- * need no mark: a tombstone's Eobj carries len=0, an empty nmap and
- * emapslot=0 (§6), so neither names a grain.  A refused end installs
- * nothing and leaves the pass live: the caller folds the slots the
- * error names and ends again.
+ * whose record rebuilds the slot's map whole — an Oslot record
+ * (§2.7), a record into a slot that was free, or one that leaves the
+ * slot naming no block — because those grains reach the shadow
+ * through the barrier.  An ordinary write marks nothing: the blocks
+ * it leaves alone are still the old map's, so that slot still owes
+ * the walk a fold.  A free slot and a tombstone need no mark: a
+ * tombstone's Eobj carries len=0, an empty nmap and emapslot=0 (§6),
+ * so neither names a grain.  A refused end installs nothing and
+ * leaves the pass live: the caller folds the slots the error names
+ * and ends again.
  *
  * **grainleak is what the swap did not reclaim, not zero.**  A leak
  * recorded while the pass was live and after it had folded that slot
@@ -823,6 +844,8 @@ int	storefullsync(Store*, char *peer);
  * not read a map says so ("map read"), which is the caller's cue to
  * fold that slot again rather than to give the pass up.  None of them
  * is a §2.6 wire condition, so none carries a §2.6 prefix (§3.7).
+ * A fold that reached its ceiling says "the map will not hold still",
+ * which is the same cue: fold that slot again.
  *
  * **A pass MUST be ended or aborted before storeclose** — every call
  * on a closed store is undefined (D16), so no pass can outlive one.
