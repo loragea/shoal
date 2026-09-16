@@ -1549,13 +1549,13 @@ time of the last chunk. It is owned by the fid.
   extent-map slot (§2.7's slot rule), in the index slot and at the
   `qid.path` the object already had, and the grains the damaged entry
   named are unrecoverable and stay marked used until a bitmap rebuild
-  (§2.5, `shoalck -R`): writing the slot again does not reclaim them,
-  because the rebuild is what recomputes the bitmap from the maps that
-  are left. The rebuild does not depend on some earlier read
-  having found the damage: a `final=1` that reads the map and finds
-  it damaged condemns the slot and rebuilds it in the same call,
-  because a repair that worked only for a slot condemned since the
-  last restart is not a repair.
+  (§8's online pass, §2.5, `shoalck -R`): writing the slot again does
+  not reclaim them, because the rebuild is what recomputes the bitmap
+  from the maps that are left. The rebuild does not depend on some
+  earlier read having found the damage: a `final=1` that reads the
+  map and finds it damaged condemns the slot and rebuilds it in the
+  same call, because a repair that worked only for a slot condemned
+  since the last restart is not a repair.
 
   A **count-0 write** is not one of these and is not an extend
   either: layer-a §2.4 extends at a write *at* an offset above `len`,
@@ -2022,17 +2022,24 @@ A slot §5 step 10 condemned is the exception, and it is the point of
 allowing the delete at all: the entry that named its grains is the
 damaged bytes, so the delete reads no map and its `nfree` names
 **nothing**. The extent-map slot is still released and the tombstone
-is still clean. Until the scrub-driven rebuild §8 describes exists,
-the grains come back at the next **bitmap rebuild** and not before —
-`shoalck -R` (§12), or §5 step 11 when step 5 set the flag — and the
-count below is what reports them meanwhile (§3.6, §8, §12).
+is still clean. The grains come back at §8's **online rebuild**, whose
+engine half the store has: a walk folds every live map into a shadow
+bitmap and the swap installs it behind a write barrier, on a store
+that never stops serving. The offline **bitmap rebuild** — `shoalck
+-R` (§12), or §5 step 11 when step 5 set the flag — is the same
+reclaim on a store that is not serving, and the count below is what
+says how much either would return (§3.6, §8, §12).
 
 The store counts what it left behind. A delete of a condemned slot,
 and §3.6's `op=full` over one, each add `blkcount(len)` to a
 **leaked-grain count** that `/status` reports as `grainleak=`: the
 index entry's `len` is intact — it is the extent-map entry that is
 damaged — so the count is an upper bound, and exact for an object
-with no holes. It is memory only and starts at zero at every start,
+with no holes. §8's swap discharges it, because the swap is what
+returns the grains; what it leaves standing is what leaked in a slot
+the pass had already folded, which that swap installs rather than
+returns. The number is what is outstanding rather than what has ever
+leaked. It is memory only and starts at zero at every start,
 because it is one session's observation of what that session left
 marked and not a property of the disk: an ordinary restart does not
 rebuild the bitmap — §5 step 11 rebuilds only when step 5 set the
@@ -2548,11 +2555,11 @@ only exit: `op=full` is a condemned copy's other repair, and an
 object being deleted cluster-wide has no live copy left to push one,
 so layer-a §1.5's tombstone discard would wait on this witness
 forever. The tombstone releases the extent-map slot, so the next
-bitmap rebuild returns the grains — `shoalck -R` (§2.5, §12), or §5
-step 11 when step 5 set the flag. Until one runs they are marked and
+rebuild returns the grains — the online pass below on a store that is
+serving, or `shoalck -R` (§2.5, §12) and §5 step 11 when step 5 set
+the flag on one that is not. Until one runs they are marked and
 referenced by nothing, and §6's `grainleak=` is the store's own count
-of them; ending the takedown that reclaim costs today is the open
-half of the scrub below.
+of them.
 
 A corrupt copy loses arbitration against everything including absence
 (layer-a §1.3), which the server enforces by refusing to advertise
@@ -2579,41 +2586,146 @@ make that discipline available rather than enforce it: each is one
 object's worth of work, serialised by the caller exactly as every
 other call in §7 is.
 
-**The pass is also where a condemned slot's grains come back.** *Not
-built: this is the other half the server's scrub pass carries, and until
-it exists the reclaim is the offline `shoalck -R` of §6 and §12.* The
-pass already reads every live entry's extent map, so a walk that
-accumulates those grains into a **shadow bitmap** and swaps it in
-costs almost no I/O beyond the pass itself, and it takes the takedown
-out of the answer. It breaks no §7 rule. The bitmap has exactly two
-mutators after start, the mark and the clear of §6's allocator, and
-both are already called under `qlstate` at apply time, so a **write
-barrier** that mirrors each into the shadow while a pass is live
-keeps the two copies current. The map reads happen outside the lock
-under `qlemap`'s pin, as every other map read does (§7 rules 1 and
-2), and the per-slot hold is an entry copy plus at most `nblkmax`
-bit-sets — tens of microseconds, far under §9's ~23 ms enumeration
-hold. The **swap goes page by page** under `qlstate`, installing and
-dirtying only the pages that differ: §5 step 11's rebuild dirties
-every page, which on a serving store is §2.5's 32 MiB and ~2036
-writes and would turn §6's `ckwaitms` wait into a spurious `disk
-full`. Chunking is safe because the barrier keeps both copies current
-until the last page lands. The staged set needs no barrier — a staged
-grain carries no bitmap bit (§6) — but the `grainfree` recount at the
-swap must subtract `nstaged` separately.
+**The pass is also where a condemned slot's grains come back.** *The
+engine's half is built — `bmpassbegin`, `bmpassfold`, `bmpassend` and
+`bmpassabort`; the pass that drives them is the server's, like the
+scrub above, and is not.* The pass already reads every live entry's
+extent map, so a walk that accumulates those grains into a **shadow
+bitmap** and swaps it in costs almost no I/O beyond the pass itself,
+and it takes the takedown out of the answer. It breaks no §7 rule.
+The bitmap has exactly two mutators after start, the mark and the
+clear of §6's allocator, and both are already called under `qlstate`
+at apply time, so a **write barrier** that mirrors each into the
+shadow while a pass is live keeps the two copies current. The map
+reads happen outside the lock under `qlemap`'s pin, as every other
+map read does (§7 rules 1 and 2), and the per-slot hold is an entry
+copy plus at most `nblkmax` bit-sets — tens of microseconds, far
+under §9's ~23 ms enumeration hold. The **swap goes page by page**
+under `qlstate`, installing and dirtying only the pages that differ:
+§5 step 11's rebuild dirties every page, which on a serving store is
+§2.5's 32 MiB and ~2036 writes and would turn §6's `ckwaitms` wait
+into a spurious `disk full`. Chunking is safe because the barrier
+keeps both copies current until the last page lands. The staged set
+needs no barrier — a staged grain carries no bitmap bit (§6) — and
+needs no term in the free count either: `grainfree` moves by what
+each installed page changed, and a staged grain is clear in the old
+page and in the new one, so the difference passes it over. Recounting
+the whole bitmap at the end instead would be one `qlstate` hold
+proportional to the disk, which is the hold chunking the swap exists
+to avoid; D24 has the cost.
 
-What the walk needs and the store does not have is a **per-slot
-generation stamp**. The four-tuple is not a sufficient validation of
-an entry re-read outside `qlstate`: the block repair above and the
-`corrupt`-flag commit both publish with the four-tuple unchanged
-while the map changes (§2.7), so a walk that compared keys would OR
-in a stale map's grains. §16a(11) names the same shape for §9's
-enumeration — a chunked scan under a generation counter bumped by
-every apply that moves a slot — and one counter in the index entry
-serves both; the alternative is to run each per-slot step inside the
-object's `Reqqueue`, which is what this scrub walks in anyway. §6's
-`grainleak=` is what says how much a pass would return, and so what
-says when the work is worth doing.
+**What a fold folds, and what it reclaims.** A free slot folds to
+nothing; so does a slot §5 step 10 condemned, and that is the whole
+reclaim — its map is the damage, so the grains it named are named by
+nothing the store may believe, and a swap that never marked them
+returns them. §3.6's `op=full` over a condemned slot leaks the old
+grains exactly as a delete does and clears the entry's condemnation,
+so the store stops remembering the slot was ever condemned; that
+costs the walk nothing, because it folds what the live maps say now
+and the rebuilt map is what the entry names either way. A map whose
+entry fails its checksum is condemned by the fold that read it, as it
+is by every other reader of a map (§5 step 10) — but only while the
+entry still names the map those bytes came from. A stamp that moved
+sends the fold round again instead, because §3.6's `op=full` may have
+published a fresh map over the damage while the fold held the old
+bytes, and condemning on those would condemn the repair.
+
+**A fold's re-reads are bounded.** A slot whose stamp moved under the
+fold is read again with a fresh pin, eight times (policy). Past that
+the fold takes the grains off the pinned entry under `qlstate`
+itself, which is a memory read under the lock the apply mutates the
+map under and not a device read; the one case those bytes cannot
+answer is an entry that has stopped naming the extent-map slot the
+round pinned — freed, condemned, or moved to another slot — and that
+starts over like any other round. Every round counts against the
+bound, the fallback's own included, under a second ceiling of sixteen
+rounds in all (policy): a fold that reaches it folds nothing and
+answers `the map will not hold still`, which the driver retries on
+that slot rather than reading as a failed pass. Without the bound one
+object under a continuous write rate starves the walk on its slot for
+ever.
+
+`/status` reports what a pass is doing: `bmpass=` whether one is
+live, `bmfolded=` the completed folds of live slots, `bmfolding=` the
+folds in flight, `bmreread=` the re-reads the stamp forced and
+`bmswapped=` the pages the last swap installed. §6's `grainleak=` is
+what says how much a pass would return, and so what says when the
+work is worth doing.
+
+**The engine enforces the walk's coverage.** The swap frees every
+grain the shadow does not mark, so a shadow the walk did not finish
+frees grains a live map still names — the one way this mechanism can
+destroy data, and a rate-limited walk over a serving store is exactly
+where a slot gets missed. The pass therefore keeps a mark per index
+slot, and `bmpassend` refuses unless every `live` slot carries one
+and no fold is in flight at the moment it looks. A fold begun after
+that check is accepted: it runs beside the swap and writes only into
+the shadow, so it contributes nothing to the pages already installed,
+and it loses no bit either — coverage passed, so every grain its slot
+named then is in the shadow, and every grain that slot has named
+since went into the live bitmap through the barrier. A fold sets the
+mark for the slot it completes. So does an apply whose record
+rebuilds the slot's map whole — an `Oslot` record (§2.7), a record
+into a slot that was free,
+or one that leaves the slot naming no block — because every grain
+such a record names goes through the barrier; an ordinary write does
+not, since the blocks it leaves alone are still the old map's. A
+tombstone needs no mark of its own: its `Eobj` carries `len=0`, an
+empty `nmap` and `emapslot=0`, so it names no grain, and neither does
+a free slot. A refused end installs nothing and leaves the pass live,
+so the driver folds the slots the refusal names and ends again; a
+fold that could not read a map says so, and that slot is the driver's
+to fold again rather than a reason to drop the pass.
+
+**What the swap leaves of `grainleak`.** A leak recorded while the
+pass was live, in a slot the pass had already folded, is one the swap
+does *not* return: the fold put those grains in the shadow before the
+condemnation, so the swap installs them marked and named by nothing.
+The end leaves that much of the count standing and discharges the
+rest, and the next pass — which folds the condemned slot to nothing —
+is what returns them. A slot condemned after its fold and not yet
+deleted is the same shape without the count: its grains stay marked
+through the swap, because the fold put them in the shadow, and
+`grainleak` does not name them, because by D18 the leak is made by
+the delete — which then counts it under the pass, where the rule
+above keeps it, or after the pass has ended, where D18's upper bound
+is what the count is: a delete of a condemned slot whose grains a
+completed pass has already returned counts them once more, and the
+next pass — which folds that slot to nothing — is what takes the
+count back down.
+
+**A pass and `storeclose`.** Every call on a closed store is
+undefined (D16), so a pass MUST be ended or aborted before one. A
+pass still live when `storeclose` runs is aborted by it — the shadow
+is the store's memory and goes with the rest — which is the engine
+tidying up after a caller rather than a way to leave a pass open: a
+call in flight in another proc when the close runs is undefined
+exactly as any other call in flight is, a swap among them, and what
+the bitmap holds afterwards is however many of its pages had landed.
+
+**An abort under a swap does nothing.** The swap drops `qlstate`
+between pages, so an abort landing in that gap would free the shadow
+out from under a half-installed bitmap and leave §6's free count
+moved by the pages that did land — the one state this mechanism has
+no name for. The end is about to drop the pass itself, so the abort
+has nothing left to do, which is what lets it stay a call that cannot
+fail.
+
+What the walk needs, and what the index entry carries, is a
+**per-slot generation stamp**. The four-tuple is not a sufficient
+validation of an entry re-read outside `qlstate`: the block repair
+above and the `corrupt`-flag commit both publish with the four-tuple
+unchanged while the map changes (§2.7), so a walk that compared keys
+would OR in a stale map's grains. The stamp is in memory only, is
+bumped by every apply that creates, frees or re-states a slot or
+changes its map, and by the condemnation that stops a slot's map
+being read at all, and it outlives a slot's release — a released slot
+is stamped one past what it held, so a slot freed and re-created
+under a walk cannot present the stamp the walk recorded. §16a(11)
+names the same counter for §9's enumeration, and this is that
+counter; what that enumeration would still owe is the chunked scan
+itself, which is not built. D24 records why the stamp rather than the
+alternative to it.
 
 **What a corrupt object answers to `op=meta`.** No available answer
 is right: reporting the key claims an arbitration position layer-a
@@ -2761,9 +2873,9 @@ lock is held for milliseconds. §7 rule 2's letter holds — no device
 call, flush wait or `Rendez` sleep is reachable under the hold, and
 the vector's 12 MB is allocated *outside* it — but its number, an
 8.4 ms write, is the thing this is comparable to rather than the
-thing it avoids. §16(a) carries the chunked scan under a generation
-counter that would bound the hold if T2 shows the 23 ms matters; it
-is not built.
+thing it avoids. §16(a) carries the chunked scan that would bound
+the hold if T2 shows the 23 ms matters; the generation counter it
+would scan under is built (§8), and the scan is not.
 
 **The second hold, and the one way the open can fail.** The open
 counts the index under `qlstate` — testing and taking the bound in
@@ -3515,8 +3627,9 @@ and both reports are the state of the disk rather than a second
 fault: its extent-map entry does not unpack, so the cross-check finds
 nothing referencing the grains it held and calls them marked and
 unreferenced. They stay that way — a tombstone over such a slot frees
-none of them either (§6) — until `-R` rebuilds the bitmap from the
-maps that do unpack. `-l` dumps the log records and their entries; a second
+none of them either (§6) — until a rebuild recomputes the bitmap from
+the maps that do unpack: `-R` here, or §8's online pass on a store
+that is serving. `-l` dumps the log records and their entries; a second
 `-l` dumps each `Eobj`'s block map. `-q` prints the problems and
 nothing else. `-o` dumps one object's index entry and extent map.
 
@@ -3775,7 +3888,7 @@ record is written and then a byte-wise mixture of its old and its new
 header bytes is placed on the platter, which is what a torn write
 leaves and what the sweep must be exhaustive over.
 
-Eight of §13's points are *mutations* or schedules rather than
+Ten of §13's points are *mutations* or schedules rather than
 crashes, and are built into the store as hooks that are inert unless
 a test asks for them: `reclaim` (reclaim log space before the checkpoint's
 superblock write returns), `publish` (force an `epochhigh` publish
@@ -3794,9 +3907,23 @@ while the committer is still inside the flush), and `fatal` (put the
 store into §3.2's condemned state, which the commit path itself
 reaches only from an apply that failed after its record was durable —
 a case §3.2 makes unreachable, so a test cannot arrive at it any
-other way), and `snapstale:n` with `snapshort:k` (arm the next *n*
-enumeration fill attempts to find the index *k* entries larger than
-the count did, so a test can drive §9's re-count — and the vector's
+other way), and `bmfold:n` (park the next *n* rounds of a §8 fold in
+the window between the map read and the validations the fold makes of
+it, so a test lands a commit where the stamp exists to catch it
+instead of racing for it — the sleep drops `qlstate`, which is what
+lets that commit apply, and arming also releases a round already
+parked, so a test walks a fold round by round by re-arming with 1
+each time and drives it to its re-read bound), and `bmswap:n` (park
+the next *n* pages of a swap in the `qlstate` hold that installed
+them, which is the gap between two pages an abort or a `storeclose`
+would land in; armed and released exactly as `bmfold:n` is. The point
+parks on every page the swap walks, while `/status`'s `bmswapped=`
+counts only the pages the swap installed — the ones that differ — so
+a test that waits on that counter must arrange a differing page, not
+expect one count per parked page), and `snapstale:n` with
+`snapshort:k` (arm the next *n* enumeration fill attempts to find the
+index *k* entries larger than the count did, so a test can drive §9's
+re-count — and the vector's
 slack, which is what decides whether a given growth needs one —
 without racing for either; one arming is spent per fill attempt
 rather than per open, an open makes up to `Snaptries` of them, and
@@ -4049,20 +4176,20 @@ back at a higher key under it, and under concurrent churn with one
 churn proc parked on a tombstone of its own making, so that the
 walk's epoch condition is what holds it off and not its cutoff).
 
-Against the list below that is T1.1–T1.26. One case is not covered
-and waits on something this store does not have yet: **T1.27** waits
-on the server's `Reqqueue` pool (§7), which is what it is about — the
-engine's own scrub and cursor take the same `qlstate` snapshot every
-other call takes and hold no lock across a verify, but *that a
-scrubber pushes through the object's queue rather than reading grains
-beside it* is a property of the server, and there is no server to
-hold it wrong yet. T1.21 is covered for the orderings and the fields,
-but drives the four publish triggers in sequence rather than from
-concurrent procs. **T1.15** is covered at T1's geometry and not at
-the scale its row names: `enumtest` walks a snapshot of 1500 entries
-over 4096 slots while four procs create, delete and discard beside
-it, and reads `/dirty` under the same churn, which is the shape of
-the case in about 0.3 s. The 2.6·10^5 entries the row asks for are
+Against the list below that is T1.1–T1.26, T1.28 and T1.29. One case
+is not covered and waits on something this store does not have yet:
+**T1.27** waits on the server's `Reqqueue` pool (§7), which is what it
+is about — the engine's own scrub and cursor take the same `qlstate`
+snapshot every other call takes and hold no lock across a verify, but
+*that a scrubber pushes through the object's queue rather than reading
+grains beside it* is a property of the server, and there is no server
+to hold it wrong yet. T1.21 is covered for the orderings and the
+fields, but drives the four publish triggers in sequence rather than
+from concurrent procs. **T1.15** is covered at T1's geometry and not
+at the scale its row names: `enumtest` walks a snapshot of 1500
+entries over 4096 slots while four procs create, delete and discard
+beside it, and reads `/dirty` under the same churn, which is the shape
+of the case in about 0.3 s. The 2.6·10^5 entries the row asks for are
 T2's, for the same reason §13's small geometry is: `mk test` stays
 within `AGENTS.md`'s seconds.
 
@@ -4304,6 +4431,57 @@ what would close it.
   instead of pushing through the object's `Reqqueue`. Not covered:
   the `Reqqueue` pool is the server's (§7) and is not built, so
   neither is the thing this test discriminates between.
+- **T1.28 the online rebuild walk (§8, D18).** A store with a slot §5
+  step 10 condemned, walked while it serves: the rebuilt bitmap
+  equals a full scan of the live maps read off the media, `grainleak`
+  returns to zero, and `grainfree` is right with a stage's grains
+  outstanding — before the condemned record is deleted and after.
+  Then a commit that lands *during* the walk, in a slot already
+  folded and in one not yet reached, is in the bitmap after the swap;
+  and a map that moves at an **unchanged four-tuple** — a block
+  repair, landed in the window between a fold's map read and its
+  validation, which §13's `bmfold` hold point parks the fold in —
+  forces the fold to read again. So does a **damaged** map that
+  §3.6's `op=full` replaced while the fold sat in that window: the
+  fold goes round again rather than condemn the repair, and the
+  grains the fresh map names are in the bitmap after the swap. And a
+  writer that moves the map inside *every* round drives the fold to
+  its re-read bound — eight re-reads, then a ninth round that folds
+  from the pinned entry and agrees with the full scan — which the
+  `bmfold` point makes deterministic by arming a round at a time.
+  *Mutations:* drop the write barrier; validate the re-read entry by
+  the four-tuple instead of the stamp; do not bump the stamp in the
+  apply; fold the grains a damaged map names; check the map's
+  checksum before the stamp; reset the round count at a re-read. The
+  fourth is all the fold's `bad`-entry fast path can be shown to do:
+  every condemned slot the engine makes is one whose extent-map entry
+  failed its checksum, so a mutation that dropped only that fast path
+  would fall into the checksum arm and answer the same.
+- **T1.29 the swap and the pass's lifetime (§8, D18).** Over a
+  geometry of several bitmap pages whose objects all sit in the
+  first: the swap installs and dirties the one page that differs, and
+  the checkpoint after it writes one bitmap page and not the whole
+  bitmap. An abort leaves the live bitmap byte for byte as it was and
+  the barrier disarmed, so an ordinary commit follows it and a second
+  pass returns the grains. A `storeclose` under a live pass aborts
+  it, and lets go of a fold parked in the pass it dropped — driven
+  under an open snapshot, which is what keeps the `Store`'s memory
+  alive across the close (§9). An end whose walk skipped one live
+  slot is **refused**: it installs nothing, the pass stays live, the
+  bitmap is byte for byte as it was, and the end after the missing
+  fold succeeds — while an ordinary write under the walk does not
+  stand in for that fold and a slot created under the walk needs
+  none. A leak recorded *after* the pass had folded the slot survives
+  the swap, which installs those grains marked and leaves `grainleak`
+  counting them; the map is damaged after its fold and read again
+  through a one-entry extent-map cache, which is what puts the
+  condemnation on the far side of the fold. And an abort that lands
+  between two pages of a swap, where §13's `bmswap` point puts it,
+  does nothing at all and the swap runs to its end. *Mutations:* swap
+  the whole bitmap at once; make the abort install the shadow; leave
+  a live pass alone at `storeclose`; skip the coverage check; mark a
+  slot covered for any apply; zero `grainleak` at the end whatever
+  the pass folded; let an abort inside a swap drop the pass.
 
 T1 stays diskless and is `mk test` at the repo root, as `AGENTS.md`
 requires: the simulated disk is a T1 program's own memory.
@@ -4706,11 +4884,12 @@ rather than an amendment, because it touches the wire.
     a slot shows the index moved under it. That keeps `objsnap=full`
     — a restart is not a partial vector — at the price of a scan
     that can be made to starve by a continuous create rate, which is
-    why it is not built on speculation. §8's scrub-driven bitmap
-    rebuild wants the same counter for a different reason —
-    validating an extent map it re-read outside `qlstate`, which the
-    four-tuple cannot do — so whichever is built first builds it for
-    both. T2.
+    why it is not built on speculation. **The counter itself is
+    there**: §8's online bitmap rebuild wants it for a different
+    reason — validating an extent map it re-reads outside `qlstate`,
+    which the four-tuple cannot do — and carries it as a per-slot
+    stamp in the index entry. So what is open here is the chunked
+    scan alone, and not the counter under it. T2.
 
 ### (b) Product calls
 

@@ -395,25 +395,32 @@ checkpointer any other way, or name a permanently failed one
 differently, so long as a store that cannot checkpoint does not spin
 and an operator can tell a device that may heal from one that cannot.
 
-## D18 — A condemned slot's grains are reclaimed online by the scrubber; `shoalck -R` is the interim (2026-09-15, Victor)
+## D18 — A condemned slot's grains are reclaimed online by the scrubber; the offline rebuild is the not-serving store's reclaim (2026-09-15, Victor)
 
 **Decision:** A slot §5 step 10 condemned leaks the grains its
 damaged extent map named: `op=delete` over it commits a tombstone
 whose `nfree` names nothing, and §3.6's `op=full` over it rebuilds
 the map in a fresh slot over fresh grains. The permanent reclaim is
-**online and scrub-driven** — the storage server's scrubber already reads every
-live entry's map, so its pass accumulates a shadow bitmap and swaps
-it in page by page under `qlstate`, behind a write barrier on the
-two bitmap mutators — and it needs a per-slot generation stamp,
-because the block repair and the `corrupt`-flag commit both publish
-with the four-tuple unchanged while the map changes. The scrubber
-does not exist yet, so what the store does today is *account*: each
-leaking exit adds `blkcount(len)` to a memory-only **leaked-grain
-count**, reported as `grainleak=` and starting at zero at every
-start, which is where a rebuild happens. The grains come back at
-that rebuild: `shoalck -R`, or §5 step 11 when start found a damaged
-bitmap page. `design/store.md` §6, §8 and §13 say so, with the
-scrub half marked as not built.
+**online and scrub-driven** — the storage server's scrubber already
+reads every live entry's map, so its pass accumulates a shadow
+bitmap and swaps it in page by page under `qlstate`, behind a write
+barrier on the two bitmap mutators — and it needs a per-slot
+generation stamp, because the block repair and the `corrupt`-flag
+commit both publish with the four-tuple unchanged while the map
+changes. The count stands beside it: each leaking exit adds
+`blkcount(len)` to a memory-only **leaked-grain count**, reported as
+`grainleak=`, starting at zero at every start and discharged by the
+swap that returns the grains. The offline reclaim is not an interim:
+`shoalck -R`, and §5 step 11 when start found a damaged bitmap page,
+stay as the same reclaim on a store that is not serving — the one
+state a scrubber cannot reach. `design/store.md` §6 and §8 hold the
+behaviour and say which half of it is built; §13 has the test plan.
+**The one rule.** A reclaim strategy may be any of these so long as
+it **never frees a grain a map it read named**. That is the one way
+this mechanism destroys data rather than a number, and everything
+under it — the barrier, the stamp, §8's coverage interlock, the
+offline rebuild's own full scan, and D24's engine contract — is in
+service of it.
 **Owner's direction (Victor):** "manual intervention needed? That
 sounds VERY bad … should be folded into scrub."
 **Rationale:** Keeping the offline rebuild as the *permanent* answer
@@ -432,19 +439,23 @@ and a reformat, and pays out as a surprise slow start months later;
 a `/ctl` verb spends a change to layer-a §2.5's normative grammar,
 on a file that does not exist yet; `-R` against a live store is two
 allocators and two superblock publishers over one partition, which
-§2.2 forbids outright. The counter lands now on its own merits: the
-leak was previously visible only through `shoalck`'s offline
-cross-check, so a serving store could not distinguish space in use
-from space marked and referenced by nothing, and that number is what
-says when a pass would be worth its I/O.
+§2.2 forbids outright. The counter earns its place on its own
+merits: without it the leak is visible only through `shoalck`'s
+offline cross-check, so a serving store cannot distinguish space in
+use from space marked and referenced by nothing, and that number is
+what says when a pass would be worth its I/O.
 **Normative:** none. Nothing here reaches a wire or an on-disk
 format; `/status`'s only normative field is `epoch=` (layer-a §2.2).
+The one rule above is not normative by that test either — it reaches
+no format — but it is not one of the choices this row leaves open:
+an implementation that frees a grain a map it read named does not
+implement this store, whatever else it does.
 **Implementation policy:** all of it — the count and its name, that
-it is memory-only and an upper bound, the interim reliance on a
-bitmap rebuild, and the scrub-driven shadow-bitmap mechanism with
-its generation stamp. A conforming implementation may reclaim the
-grains some other way, or not report them at all, so long as it
-never frees a grain no map it read named.
+it is memory-only and an upper bound, the offline rebuild's standing
+as the not-serving store's reclaim, and the scrub-driven
+shadow-bitmap mechanism with its generation stamp. A conforming
+implementation may reclaim the grains some other way, or not report
+them at all, within the one rule above.
 
 ## D19 — The monitor reads every map slot back; the object store does not (2026-09-15)
 
@@ -698,3 +709,85 @@ the case undefined rather than decided. Also policy, and a known cost:
 `mapprimary` and `mapunderrep` each recompute the whole placement, so a
 `/status` path reporting both runs the HRW twice — measured against
 nothing yet, and cheap at §4.1's envelope.
+
+## D24 — The rebuild engine enforces the walk's coverage, bounds a fold's re-reads, and moves the free count by the swap's own difference (2026-09-16)
+
+**Decision:** The four calls' contract under D18's mechanism,
+settled in `lib/store.c` and `lib/alloc.c`:
+
+- **The free count moves by the swap's own difference, not by a
+  recount.** Each installed page moves `grainfree` by the clear bits
+  it gained or lost; the whole-bitmap recount §5 step 11's offline
+  rebuild ends with is not taken here. A staged grain is clear in
+  both copies (§6), so it needs no term of its own either way.
+- **A fold validates by the stamp and re-reads a bounded number of
+  times.** Past that bound it takes the grains from the pinned entry
+  under `qlstate` itself — a memory read under the lock the apply
+  mutates the map under, not a device read — and a slot whose
+  extent-map slot has moved under it goes round again with a fresh
+  pin, under a second and larger ceiling past which the fold refuses
+  with an error the caller retries.
+- **The stamp outlives the slot.** `applyslot` bumps it rather than
+  zeroing it, and a condemnation bumps it although no map changed,
+  because what it records is "what this slot says has moved" and not
+  "the four-tuple has".
+- **`storeclose` aborts a live pass.** The contract is still that a
+  caller ends or aborts one first (D16), and a fold parked at §13's
+  hold point is woken by the drop rather than left asleep in a pass
+  that no longer exists.
+- **The engine enforces the walk's coverage rather than trusting the
+  driver.** A mark per index slot, set by the fold that completes a
+  slot and by an apply whose record rebuilds that slot's map whole,
+  and an end that refuses while a `live` slot is unmarked or a fold
+  is in flight. A refusal installs nothing and leaves the pass live.
+- **An abort under an in-flight swap is a no-op.**  A `bmswapping`
+  flag under `qlstate` says so; abort stays a call that cannot fail,
+  and a `storeclose` under an in-flight end is D16-undefined like any
+  other call in flight rather than a defined half-swap.
+- **The swap leaves standing what it did not reclaim.** A leak
+  recorded in a slot the pass had already folded outlives the swap,
+  because the fold put those grains in the shadow; the end discharges
+  the rest of `grainleak` and keeps that much.
+
+**Rationale:** The recount is the only one of these with a cost
+argument behind it: at `ngrains` on a 4 TB disk it is ~2.6*10^8 bit
+tests under `qlstate`, which is the hold that chunking the swap
+exists to avoid — §7 rule 2's `/status`, `/ctl` and `Tflush` are
+behind exactly that lock — so taking it at the end would give back
+what the page-by-page swap bought. The difference is exact rather
+than approximate: the barrier keeps both copies current, so a page's
+two counts are taken under one hold of the lock every mutation of
+either copy is made under. The re-read bound is a liveness
+obligation, not a correctness one: without it one object under a
+continuous write rate starves the walk on that slot for ever, and the
+fallback is safe because a pinned entry's bytes are readable under
+`qlstate` by construction (§7); the second ceiling is what a round
+the fallback itself cannot answer — the slot naming a different map —
+would otherwise loop without. The stamp's survival across a release
+is the case that would otherwise be silently wrong: a slot freed and
+re-created under a walk is the freshest possible entry, and zeroing
+the stamp would make it look unchanged to precisely the reader the
+stamp exists for. And a pass that a close left armed would be a
+barrier writing into freed memory on the next commit, which is why
+the close drops it rather than trusting the caller. The coverage
+interlock is the one rule here that guards against losing data rather
+than against a wrong number: everything else a broken walk can do
+costs a count, while a shadow the walk did not finish frees grains a
+live map still names — D18's one rule, broken — so the engine refuses
+rather than leaving that obligation with a driver that is not built
+yet. The leak the swap keeps follows from the same mark: the count
+means "marked and named by nothing", and a swap that installed such
+grains has not stopped them being that. The abort rule is the same
+argument once more: the gap between two pages is a real window, and
+the only two things that can be in it are an abort, which the end
+makes redundant, and a close, which D16 already leaves undefined.
+**Normative:** none. Nothing here reaches a wire or an on-disk
+format; the stamp is memory only and no format field carries it.
+**Implementation policy:** all of it. A conforming implementation may
+recount, may re-read without a bound or a ceiling or run the fold
+inside the object's queue instead, may leave the walk's coverage to
+its driver and refuse nothing, may discharge the whole leak count at
+the swap or recompute it, may refuse an abort under a swap or leave
+it undefined rather than ignoring it, may refuse a close under a live
+pass rather than aborting it, and may reclaim a condemned slot's
+grains some other way entirely — all within D18's one rule.

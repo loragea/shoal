@@ -49,6 +49,35 @@ bitclr(uchar *p, uvlong i)
 	p[i/8] &= ~(1 << (i%8));
 }
 
+/*
+ * §8's write barrier, and the whole of what a live rebuild pass costs
+ * the allocator.  The bitmap has exactly two mutators after start —
+ * the mark and the clear below — and both already run under qlstate,
+ * so mirroring each into the shadow keeps the two copies current
+ * while a pass walks the index.  That is what makes the swap safe to
+ * chunk: a page installed early is already current, and a page not
+ * yet installed will be.
+ *
+ * The mirror is unconditional where the bitmap's own count is not: a
+ * grain the bitmap already marks may be one the shadow has not folded
+ * yet, and a grain the bitmap does not mark may be one it has.  The
+ * staged set needs no barrier at all, because a staged grain carries
+ * no bitmap bit (§6) and so has none to mirror.
+ */
+static void
+shadowmark(Store *s, ulong g)
+{
+	if(s->bmshadow != nil)
+		bitset(s->bmshadow, g);
+}
+
+static void
+shadowclear(Store *s, ulong g)
+{
+	if(s->bmshadow != nil)
+		bitclr(s->bmshadow, g);
+}
+
 /* mark the bitmap page holding grain g for the next checkpoint */
 static void
 bmpagedirty(Store *s, ulong g)
@@ -199,6 +228,7 @@ grainmark(Store *s, ulong g)
 		bitset(s->bmap, g);
 		s->grainfree--;
 	}
+	shadowmark(s, g);
 	bmpagedirty(s, g);
 }
 
@@ -211,6 +241,7 @@ grainclear(Store *s, ulong g)
 		bitclr(s->bmap, g);
 		s->grainfree++;
 	}
+	shadowclear(s, g);
 	/*
 	 * The cursor lands on what was just released, so the next
 	 * allocation reuses it.  That is what §3.5's deferred-reuse rule
