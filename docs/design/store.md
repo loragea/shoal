@@ -1838,13 +1838,14 @@ states what is normative here and what is this library's shape.
 
 **What the server still owes.** The engine holds no map and
 arbitrates on no delta path, so layer-a's epoch check, the delta ops'
-predecessor rule, `op=full`'s key comparison and `op=delete`'s
-against a **live** copy — which goes through the delete path, the
-adoption above having refused it; the comparison against a tombstone
-is the engine's, above — §5.6's
+predecessor rule, `op=full`'s key comparison, §5.6's
 re-check that a dropping instance is not in `P(oid)`
 (`still placed`), and §1.5's cluster-wide discard conditions are all
 the caller's, made under the object's queue (§7) before it calls.
+`op=delete`'s comparison is the one that is split: against a **live**
+copy it is the caller's, since that copy goes through the delete path
+and the adoption refuses it; against a tombstone the adoption makes
+it itself, above.
 
 
 ## 4. Read path, holes and re-hashing
