@@ -1645,13 +1645,13 @@ own `not primary: n5.0` is the pattern. Callers can act on these:
 
 | Condition | Answer |
 |---|---|
-| an id this store does not hold, on any path | `no such object` |
+| an id this store does not hold, on any path; and a **drop** of a tombstoned id, which is a record and not a copy (§3.8) | `no such object` |
 | a read, write, truncate or delete of a tombstoned id — but **not** a drop, which answers `no such object` because a tombstone is a record and not a copy (§3.8) | `object deleted` |
 | a create of a live id | `object exists` |
 | an oid outside layer-a §1.1's `1*128` bound | `bad object name` |
 | a write, truncate or stage past `objmax`, at either bound | `object too large` |
-| an `op=full` at a key the receiver's own key defends (§3.6), or an adopted `op=delete` at a key its own tombstone defends (§3.8) | `stale version` |
-| an `op=full` or an adopted `op=delete` at a version the object model forbids, and a chunk outside its stage's declared length | `bad ctl` |
+| an `op=full`, or the replicated `op=create` §3.6 serves as a zero-length stage, at a key the receiver's own key defends (§3.6); an adopted `op=delete` at a key its own tombstone defends (§3.8) | `stale version` |
+| an `op=full` or `op=create` through the stage, or an adopted `op=delete`, at a version the object model forbids, and a chunk outside its stage's declared length | `bad ctl` |
 | a read, verify or update through an extent-map entry that failed its `csum128` (§5 step 9) — block repair excepted, below; a read, write or truncate of a copy whose `corrupt` flag is set (§8); a block repair whose bytes do not hash to the stored `dig[i]` | `checksum mismatch` |
 | a replicated operation whose resulting `csum` is not the one it named (layer-a §5.5, §3.8, D23) | `checksum mismatch` |
 | a discard whose record fails layer-a §1.5's receiver checks: not a tombstone, not at exactly the named key, or its `wepoch` not strictly below the given epoch | `not discardable` |
@@ -1688,23 +1688,30 @@ is the server's decision and not this document's.
 Three consequences are worth stating, because the list does not make
 them obvious:
 
-- **A version of 0 is refused on every publishing path, and the
-  refusal is a wire error on exactly the two paths whose version came
-  from somewhere else.** The key is one layer-a §1.3
-  forbids — `ver` starts at 1 and absence is not `(0, 0)` — and this
-  is where that rule lives. On the stage path the version arrives in
-  an `op=full` header, and on the tombstone adoption of §3.8 in an
-  `op=delete` header, so both refusals are `bad ctl`: layer-a §5.5's
-  common set, for an operation a conforming sender cannot send. On
-  create, write, truncate and delete the version is this instance's
-  own to choose (layer-a §5.4 step 3), so a 0 there is a caller bug
-  and the refusal carries no §2.6 prefix. The tombstone rule rides
-  the same principle: a client create over a tombstone takes the
-  tombstone's version plus one at a `wepoch` no lower (§3.6), and
-  since choosing that key is the caller's job, any other key is the
-  same internal kind of refusal. Only `stagefinal`'s arbitration —
-  where the key genuinely arrives from elsewhere — answers a
-  tombstone's defence as §2.6's `stale version`.
+- **A version of 0 is refused on every publishing path, and which
+  kind of refusal it is follows from the call, not from where the
+  version came.** The key is one layer-a §1.3 forbids — `ver` starts
+  at 1 and absence is not `(0, 0)` — and this is where that rule
+  lives. `stagefinal` and `objadopt` answer `bad ctl`: their version
+  arrives in an `op=full`, `op=create` or `op=delete` header, so a
+  value §1.3 forbids is a malformed header — layer-a §5.5's common
+  set, for an operation a conforming sender cannot send.
+  `objcreate`, `objwrite`, `objtrunc` and `objremove` answer the
+  internal `… at version 0`, which carries no §2.6 prefix, and they
+  answer it whatever the version's origin: a server relaying a peer's
+  `op=write`, `op=trunc` or `op=delete` over a live copy reaches the
+  store through those same calls and gets the same internal refusal.
+  That is not a hole in the mapping. §3.8 makes it the server's
+  obligation to refuse a wire header carrying `ver=0` with `bad ctl`
+  before it calls the engine at all, so a 0 reaching a delta call is
+  a caller bug by construction — which is what the internal refusal
+  says. The tombstone rule rides the same principle: a client create
+  over a tombstone takes the tombstone's version plus one at a
+  `wepoch` no lower (§3.6), and since choosing that key is the
+  caller's job, any other key is the same internal kind of refusal.
+  The two calls that make layer-a §5.5's comparison themselves are
+  also the two that answer a defended key with §2.6's
+  `stale version`: `stagefinal` (§3.6) and `objadopt` (§3.8).
 - **`no such object` for a discard of an id this store does not
   hold.** layer-a §1.5's receiver checks judge a record; an id this
   store holds no record for has nothing for check (i) to judge, and
@@ -1738,7 +1745,10 @@ rules.*
 What layer-a's peer channels require of a receiver that the write
 path above does not reach — because each of these does something no
 client operation does — is described here; §3.7 carries the error
-strings and D23 the checksum rule.
+strings and D23 the checksum rule. Three of the four are below:
+tombstone adoption, drop and the resulting-`csum` check. The fourth,
+layer-a §5.6's `op=list`, is an enumeration, so it is described with
+the other enumerations in **§9**.
 
 **Tombstone adoption — `op=delete` for an id the receiver holds no
 live record of.** layer-a §5.5 makes `op=delete` self-contained and
@@ -1778,10 +1788,13 @@ A flag on the record being re-keyed — §8's `corrupt` or §5 step 10's
 condemnation — does not stand in the way, for the reason a delete
 ignores both: a tombstone holds no content for either to describe,
 and a record stranded at a key the cluster has moved past would block
-§1.5's discard for ever. `mtime` is set to now. layer-a §1.5 allows
-that in as many words, at the price of delaying the tombstone's
-discard by `tombdays`, and `op=delete` carries no `mtime` on the wire
-to carry instead.
+§1.5's discard for ever. `mtime` is set to now. layer-a §1.5 does not
+permit that in as many words; it **prices** it, for the neighbouring
+case of a tombstone re-adopted after a missed discard — "(If the pull
+resets the record's `mtime`, condition 2 delays that second discard
+by `tombdays`; that costs space, not correctness.)" — and the price
+is the same one this pays. There is nothing to carry instead:
+`op=delete` has no `mtime` field on the wire.
 
 **Drop — `op=drop`, layer-a §5.6 and §7.4's drop guard.** A stray
 holder is told to delete its copy with **no** tombstone. A tombstone
@@ -1800,9 +1813,8 @@ state with no record, and the `qid.path` is gone. §3.5's deferred
 reuse covers all three releases exactly as it covers any commit's.
 Two commits would not do: the first publishes a tombstone this holder
 has no authority to create, and a crash between them leaves it
-durable. No new record kind and no `Storevers` bump were needed —
-the format already carries both entries, and an item already carries
-both.
+durable. The drop needs no new record kind and no `Storevers` bump:
+the format carries both entries already, and an item carries both.
 
 A `corrupt`-flagged or condemned copy is droppable, for the reason a
 delete is: such a copy contributes no key (layer-a §1.3), so there is
@@ -1825,27 +1837,57 @@ fail `checksum mismatch` before the divergent state exists. The check
 is made inside the commit path, at the one point where the new `csum`
 has been computed and no byte of the record has been written, so a
 mismatch costs a discard (§3.3) and leaves the published state
-exactly as it was. Made after the record, it would be a report of a
-divergence rather than a bar to one, and the next start would believe
-the record. For a multi-request `op=full` the check runs over the
-digests the transfer staged, and a failure discards the stage as §3.6
-says every `final=1` outcome does. A zero-byte write is the one
+exactly as it was. For a multi-request `op=full` the check runs over
+the digests the transfer staged, and a failure discards the stage as
+§3.6 says every `final=1` outcome does. A zero-byte write is the one
 operation that runs the check outside the commit path: it commits
 nothing and adopts no key, so there is no commit to run it in, and
 the `csum` such a write results in is the one the object already
 carries — which is what the named `csum` is compared against. D23
-states what is normative here and what is this library's shape.
+argues why the check sits where it does, and marks what is normative
+here and what is this library's shape.
 
-**What the server still owes.** The engine holds no map and
-arbitrates on no delta path, so layer-a's epoch check, the delta ops'
-predecessor rule, `op=full`'s key comparison, §5.6's
-re-check that a dropping instance is not in `P(oid)`
-(`still placed`), and §1.5's cluster-wide discard conditions are all
-the caller's, made under the object's queue (§7) before it calls.
-`op=delete`'s comparison is the one that is split: against a **live**
-copy it is the caller's, since that copy goes through the delete path
-and the adoption refuses it; against a tombstone the adoption makes
-it itself, above.
+**What the server still owes.** The engine holds no map, so layer-a's
+epoch check, the delta ops' predecessor rule, §5.6's re-check that a
+dropping instance is not in `P(oid)` (`still placed`), and §1.5's
+cluster-wide discard conditions are all the caller's, made under the
+object's queue (§7) before it calls.
+
+Two more are the server's because the engine's surface is not the
+wire's:
+
+- **A wire header carrying `ver=0` MUST be refused `bad ctl` before
+  any engine call.** The engine answers a version of 0 by the call
+  reached rather than by where the version came from (§3.7), so the
+  delta calls answer it with an internal-invariant error even when
+  the server is relaying a peer's `op=write`, `op=trunc` or
+  `op=delete` over a live copy. Refusing the header first is what
+  makes that internal refusal a caller bug by construction, and it is
+  what puts layer-a §5.5's `bad ctl` on the wire for every operation
+  a conforming sender cannot send.
+- **A listing response is rendered by the server.** layer-a §5.6
+  makes the requested `n=` a maximum the server MUST clamp so that
+  the whole response fits the negotiated `msize` less `IOHDRSZ`, and
+  makes `lines=` a count of advert lines and `more=1` the answer both
+  to a clamp and to inventory that follows. The engine's `k` counts
+  entries rather than bytes and knows nothing of `msize`, and its
+  `more` out-parameter answers only the second of those two
+  conditions (§9).
+
+**Arbitration is split by call**, and not by whether the key arrived
+from elsewhere:
+
+- `op=full`, and the replicated `op=create` §3.6 serves as a
+  zero-length stage, are **`stagefinal`'s**: it takes the object's
+  queue at `final=1`, re-reads the receiver's then-current key and
+  makes layer-a §5.5's comparison itself (§3.6).
+- An `op=delete` over an existing **tombstone** is **`objadopt`'s**,
+  made under the hold that read the record, above.
+- An `op=delete` over a **live** copy is the **caller's**: it is the
+  delete path's work, and that path compares nothing — it applies the
+  key it is given — while the adoption refuses a live copy outright.
+  So the server arbitrates it under the object's queue before it
+  calls, as it does for every delta op.
 
 
 ## 4. Read path, holes and re-hashing
