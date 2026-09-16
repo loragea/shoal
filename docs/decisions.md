@@ -413,8 +413,8 @@ changes. The count stands beside it: each leaking exit adds
 swap that returns the grains. The offline reclaim is not an interim:
 `shoalck -R`, and §5 step 11 when start found a damaged bitmap page,
 stay as the same reclaim on a store that is not serving — the one
-state a scrubber cannot reach. `design/store.md` §6, §8 and §13 hold
-the behaviour and say which half of it is built.
+state a scrubber cannot reach. `design/store.md` §6 and §8 hold the
+behaviour and say which half of it is built; §13 has the test plan.
 **The one rule.** A reclaim strategy may be any of these so long as
 it **never frees a grain a map it read named**. That is the one way
 this mechanism destroys data rather than a number, and everything
