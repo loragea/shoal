@@ -713,7 +713,10 @@ point per mutating call — `objwritecsum`, `objtrunccsum`,
 where nil means no check and each plain call is its variant with nil.
 For a multi-request `op=full` the check runs over the digests the
 transfer staged and a failure discards the stage, as §3.6 says every
-`final=1` outcome does.
+`final=1` outcome does. A zero-byte replicated write is the one
+exception to "inside the commit path": it commits nothing and adopts
+no key (layer-a §2.4 makes a count of 0 not an extend), and the check
+still runs, against the `csum` the object already carries.
 **Rationale:** The check's whole value is that it is a bar rather
 than a report. Made after `logcommit` it would refuse the operation
 and leave its record on the platter, so the next start would replay

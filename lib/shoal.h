@@ -1013,6 +1013,13 @@ int	objrepair(Store*, uchar *oid, int oidlen, ulong blk, void *a, long n);
  * the stage commits; a failure discards the stage like every other
  * stagefinal outcome (§3.6).
  *
+ * One exception, in objwritecsum: a write of count 0 is not an
+ * extend (layer-a §2.4), so it commits nothing and adopts no key.
+ * The check still runs — the csum such a write results in is the one
+ * the object already carries, so that is what the named csum is
+ * compared against — and it is the only one made outside the commit
+ * path.
+ *
  * The arbitration these calls do NOT do is still the caller's: the
  * server compares keys under the oid's queue (§7) and calls here only
  * once it has decided, exactly as for the plain forms.

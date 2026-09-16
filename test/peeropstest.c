@@ -641,6 +641,69 @@ tcsum(int kind)
 	killspawned();
 }
 
+/*
+ * T1.32's exception (D23, §3.8): a replicated write of count 0
+ * commits nothing and adopts no key, and the resulting-csum check
+ * still runs — against the csum the object already carries, since
+ * that is the csum such a write results in.
+ */
+static void
+tcsumzero(void)
+{
+	Dev *d;
+	Store *s;
+	Objinfo oi, oi2;
+	Storestat st0, st1;
+	uchar *buf, bad[Csumlen], o[Oidmax];
+
+	spawnforget();
+	d = newdisk();
+	if((s = mustopen(d, "count-0 csum")) == nil){
+		devclose(d);
+		killspawned();
+		return;
+	}
+	buf = mkbuf(2*Blk, 53);
+	mk(s, "z");
+	if(wr(s, "z", buf, 2*Blk, 0, 2) < 0)
+		fail("count-0 csum: setup objwrite: %r");
+	if(ostat(s, "z", &oi) < 0){
+		fail("count-0 csum: objstat: %r");
+		goto out;
+	}
+	oidof(o, "z");
+	storestat(s, &st0);
+
+	memset(bad, 0xa5, sizeof bad);
+	checks++;
+	if(objwritecsum(s, o, 1, buf, 0, 0, 9, 4, bad, nil, 0) >= 0)
+		fail("a count-0 write took a wrong expected csum");
+	else
+		errsays("a count-0 write at a wrong csum",
+			"checksum mismatch");
+	checks++;
+	if(objwritecsum(s, o, 1, buf, 0, 0, 9, 4, oi.csum, nil, 0) < 0)
+		fail("a count-0 write at the right csum was refused: %r");
+
+	/* neither of them wrote a record: §3.8's "commits nothing" */
+	storestat(s, &st1);
+	eqv("a count-0 write commits no log record", st1.seqnext,
+		st0.seqnext);
+	eqv("... and moves no watermark", st1.watermark, st0.watermark);
+	if(ostat(s, "z", &oi2) < 0)
+		fail("count-0 csum: objstat after: %r");
+	else{
+		eqv("a count-0 write adopts no ver", oi2.ver, oi.ver);
+		eqv("... and no wepoch", oi2.wepoch, oi.wepoch);
+		eqv("... and leaves the len alone", oi2.len, oi.len);
+	}
+out:
+	free(buf);
+	storeclose(s);
+	devclose(d);
+	killspawned();
+}
+
 /* ------------------------------------------------------------------ */
 
 /*
@@ -945,6 +1008,7 @@ main(int argc, char **argv)
 	tdropedges();
 	for(i = Cwrite; i <= Cadopt; i++)
 		tcsum(i);
+	tcsumzero();
 	tlist();
 	tlistpage();
 	tlistchurn();

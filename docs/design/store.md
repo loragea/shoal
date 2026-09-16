@@ -1816,8 +1816,12 @@ exactly as it was. Made after the record, it would be a report of a
 divergence rather than a bar to one, and the next start would believe
 the record. For a multi-request `op=full` the check runs over the
 digests the transfer staged, and a failure discards the stage as §3.6
-says every `final=1` outcome does. D23 states what is normative here
-and what is this library's shape.
+says every `final=1` outcome does. A zero-byte write is the one
+operation that runs the check outside the commit path: it commits
+nothing and adopts no key, so there is no commit to run it in, and
+the `csum` such a write results in is the one the object already
+carries — which is what the named `csum` is compared against. D23
+states what is normative here and what is this library's shape.
 
 **What the server still owes.** The engine holds no map and
 arbitrates on no delta path, so layer-a's epoch check, the delta ops'

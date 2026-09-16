@@ -1092,13 +1092,27 @@ objwritecsum(Store *s, uchar *oid, int oidlen, void *a, long n, uvlong off,
 	 * that did not, at the same key: layer-a §1.3's I3 through a
 	 * legal client call.  The existence and bounds tests above still
 	 * run, so a count-0 write to a tombstone or past objmax fails as
-	 * it should.  A csum named for one is not checked, and cannot
-	 * need to be: the check bars a divergent state from becoming
-	 * durable (§5.5), and a call that commits no record creates no
-	 * state to diverge.
+	 * it should.
+	 *
+	 * §5.5's resulting-csum check still runs, and this is the one
+	 * place it is made outside updcommit (D23).  The csum a
+	 * replicated write names is the one the object MUST have once
+	 * the operation is applied, and for a count of 0 that is the
+	 * csum it already carries: a sender that named another has
+	 * diverged from this receiver already, and answering ok would
+	 * report agreement where there is none.  The check is made
+	 * against the stored csum, which the objstat above has in hand,
+	 * and changes nothing else about this exit — the write still
+	 * commits no record and still adopts no key, on either outcome.
 	 */
-	if(n == 0)
+	if(n == 0){
+		if(csum != nil && memcmp(csum, oi.csum, Csumlen) != 0){
+			werrstr("checksum mismatch: the resulting csum is not "
+				"the one the operation named");
+			return -1;
+		}
 		return 0;
+	}
 	newlen = oi.len;
 	if(off + n > newlen)
 		newlen = off + n;
