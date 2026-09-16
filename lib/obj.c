@@ -1968,7 +1968,7 @@ objlist(Store *s, uchar *after, int afterlen, Objent *e, int k, int *more)
 	Ient *ent;
 	ulong slot, lim, nslots;
 	uvlong ncand;
-	int n, i, j;
+	int n, i, j, c;
 
 	if(more != nil)
 		*more = 0;
@@ -1984,6 +1984,7 @@ objlist(Store *s, uchar *after, int afterlen, Objent *e, int k, int *more)
 	}
 	n = 0;
 	ncand = 0;
+	c = 1;
 	nslots = s->sb.nslots;
 	for(slot = 0; slot < nslots; ){
 		lim = slot + Listchunk;
@@ -2021,17 +2022,35 @@ objlist(Store *s, uchar *after, int afterlen, Objent *e, int k, int *more)
 			 * full, which is what the figures above measure.
 			 *
 			 * An oid equal to the largest kept entry is skipped
-			 * rather than re-rendered, so a page still holds
-			 * one entry per oid; which of two renders of the
-			 * same oid it keeps is a choice §5.6 tolerates.
+			 * rather than re-rendered here, which is the same
+			 * one-entry-per-oid outcome the duplicate arm below
+			 * reaches, differing only in which of the two
+			 * renders it keeps — a choice §5.6 tolerates.
 			 */
 			if(n == k && oidcmp(ent->oid, ent->oidlen,
 				e[n-1].oid, e[n-1].oidlen) >= 0)
 				continue;
 			for(j = 0; j < n; j++)
-				if(oidcmp(ent->oid, ent->oidlen, e[j].oid,
-					e[j].oidlen) < 0)
+				if((c = oidcmp(ent->oid, ent->oidlen,
+					e[j].oid, e[j].oidlen)) <= 0)
 					break;
+			/*
+			 * The same oid twice in one page.  A slot released
+			 * between two chunks and its oid re-created into a
+			 * chunk this scan has not reached yet is seen
+			 * twice, and answering it twice would break the
+			 * ascending order layer-a §5.6 requires of a page
+			 * and hand the caller an `after' it has already
+			 * paged past.  So the later render replaces the
+			 * earlier rather than joining it: both were taken
+			 * whole under the hold that saw them, and §5.6
+			 * tolerates either.  The oids are equal, so only
+			 * the Objinfo is re-rendered.
+			 */
+			if(j < n && c == 0){
+				ientinfo(s, slot, &e[j].oi);
+				continue;
+			}
 			if(n < k)
 				n++;
 			for(i = n - 1; i > j; i--)

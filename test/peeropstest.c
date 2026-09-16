@@ -1007,13 +1007,55 @@ tlistpage(void)
  * engine offers no counter or -X hook that would expose it, so no
  * check here discriminates the two.  §13's T1.33 row says so.
  */
+/*
+ * A listing test that means to exercise the CHUNKED scan needs more
+ * than Listchunk slots: t1.h's geometry has 128, so a page over it is
+ * one hold of qlstate across the whole index and nothing can move
+ * under it.  This is that geometry with nslots turned up past
+ * Listchunk and the image and log grown to match.
+ */
+enum
+{
+	Cnsec	= 40960,		/* 20 MiB */
+	Cnslots	= 1024,			/* four chunks to a page */
+};
+
+static Dev*
+churndisk(void)
+{
+	Dev *d;
+	Super sb;
+	Fmtcfg c;
+
+	if((d = simopen(Tsecsz, Cnsec, Tseed)) == nil)
+		sysfatal("simopen: %r");
+	smallcfg(&c);
+	c.nslots = Cnslots;
+	c.logbytes = 256*1024;
+	if(geometry(&sb, &c, d->size) < 0)
+		sysfatal("geometry: %r");
+	if(fmtstore(d, &sb) < 0)
+		sysfatal("fmtstore: %r");
+	return d;
+}
+
 static struct
 {
 	Store	*s;
 	int	stop;
 	int	done;			/* the proc is out of the engine */
+	char	err[ERRMAX];		/* what stopped it early, if anything */
 } churn;
 
+/*
+ * Creates, and drops-and-re-creates behind itself.  The second is
+ * what can put one oid in a page twice — a slot released between two
+ * chunks and the id re-created into a chunk the scan has not reached
+ * — which the strictly-ascending check below is what catches.  Like
+ * everything else here it is opportunistic: nothing synchronises the
+ * drop with a chunk boundary, and the engine offers no hook that
+ * would (§13's T1.33 row).
+ */
 static void
 churnproc(void*)
 {
@@ -1025,7 +1067,20 @@ churnproc(void*)
 		snprint(name, sizeof name, "c%d", i);
 		oidof(o, name);
 		if(objcreate(churn.s, o, strlen(name), 1, 1, nil, 0, nil) < 0)
-			break;
+			goto stopped;
+		if(i > 0){
+			snprint(name, sizeof name, "c%d", i - 1);
+			oidof(o, name);
+			if(objdrop(churn.s, o, strlen(name)) < 0)
+				goto stopped;
+			if(objcreate(churn.s, o, strlen(name), 1, 1, nil, 0,
+				nil) < 0)
+				goto stopped;
+		}
+	}
+	if(0){
+stopped:
+		rerrstr(churn.err, sizeof churn.err);
 	}
 	churn.stop = 1;
 	churn.done = 1;
@@ -1037,56 +1092,87 @@ tlistchurn(void)
 	Dev *d;
 	Store *s;
 	Objent *e;
-	uchar after[Oidmax];
-	int afterlen, i, j, n, more, pages;
+	uchar after[Oidmax], fo[Oidmax];
+	char fname[16];
+	int afterlen, i, j, n, more, pages, pass;
+	int ascok, afterok, sawchurn;
 
 	spawnforget();
-	d = newdisk();
-	if((s = mustopen(d, "list under churn")) == nil){
+	d = churndisk();
+	if((s = openstoreck(d)) == nil){
+		fail("list under churn: storeopen: %r");
 		devclose(d);
+		killspawned();
 		return;
 	}
 	fillinv(s);
+	/*
+	 * Enough objects to spread the index across more than one chunk,
+	 * so that a slot released under the walk and the slot its oid
+	 * comes back in can fall either side of a chunk boundary.  With
+	 * only the inventory above they are both in the first chunk,
+	 * which one hold covers.
+	 */
+	for(i = 0; i < 300; i++){
+		snprint(fname, sizeof fname, "f%03d", i);
+		oidof(fo, fname);
+		if(objcreate(s, fo, strlen(fname), 1, 1, nil, 0, nil) < 0){
+			fail("filling the index: %r");
+			break;
+		}
+	}
 	e = newpage(4);
 	churn.s = s;
 	churn.stop = 0;
 	churn.done = 0;
+	churn.err[0] = 0;
 	if(spawnproc(churnproc, nil) < 0){
 		fail("spawnproc: %r");
 		churn.stop = 1;
 		churn.done = 1;
 	}
-	afterlen = 0;
+	/*
+	 * Page the whole inventory over and over for as long as the
+	 * churn proc is in the engine, rather than once beside it: one
+	 * pass costs under a millisecond and the proc's commits cost
+	 * more than that each, so a single pass overlaps almost nothing.
+	 * The properties are accumulated and asserted once at the end,
+	 * so the count of checks this program reports does not depend on
+	 * how the race fell.
+	 */
+	ascok = 1;
+	afterok = 1;
+	sawchurn = 0;
 	pages = 0;
-	for(i = 0; i < 40; i++){
-		n = objlist(s, afterlen > 0 ? after : nil, afterlen, e, 4,
-			&more);
-		if(n < 0){
-			fail("objlist under churn: %r");
-			break;
-		}
-		pages++;
-		for(j = 0; j < n; j++){
-			checks++;
-			if(afterlen > 0
-			&& oidcmptest(e[j].oid, e[j].oidlen, after, afterlen) <= 0)
-				fail("a page under churn repeats or precedes "
-					"`after'");
-			if(j > 0){
-				checks++;
-				if(oidcmptest(e[j].oid, e[j].oidlen,
-					e[j-1].oid, e[j-1].oidlen) <= 0)
-					fail("a page under churn is not "
-						"strictly ascending");
+	for(pass = 0; pass < 400 && (!churn.done || pass < 20); pass++){
+		afterlen = 0;
+		for(i = 0; i < 400; i++){
+			n = objlist(s, afterlen > 0 ? after : nil, afterlen,
+				e, 4, &more);
+			if(n < 0){
+				fail("objlist under churn: %r");
+				goto stop;
 			}
-		}
-		if(n > 0){
+			pages++;
+			for(j = 0; j < n; j++){
+				if(afterlen > 0
+				&& oidcmptest(e[j].oid, e[j].oidlen, after,
+					afterlen) <= 0)
+					afterok = 0;
+				if(j > 0
+				&& oidcmptest(e[j].oid, e[j].oidlen,
+					e[j-1].oid, e[j-1].oidlen) <= 0)
+					ascok = 0;
+				if(e[j].oidlen >= 2 && e[j].oid[0] == 'c')
+					sawchurn = 1;
+			}
+			if(n == 0)
+				break;
 			afterlen = e[n-1].oidlen;
 			memmove(after, e[n-1].oid, afterlen);
 		}
-		if(n == 0)
-			break;
 	}
+stop:
 	churn.stop = 1;
 	/*
 	 * shoal.h's quiesce rule (D16): no call taking the Store may be
@@ -1097,6 +1183,12 @@ tlistchurn(void)
 	 */
 	while(!churn.done)
 		sleep(1);
+	checks++;
+	if(churn.err[0] != 0)
+		fail("the churn proc stopped early: %s", churn.err);
+	istrue("every page under churn is above its `after'", afterok);
+	istrue("every page under churn is strictly ascending", ascok);
+	istrue("the walk under churn overlapped the proc", sawchurn);
 	istrue("the walk under churn made progress", pages > 1);
 	free(e);
 	storeclose(s);

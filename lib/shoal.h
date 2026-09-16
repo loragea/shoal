@@ -1148,7 +1148,9 @@ int	objdrop(Store*, uchar *oid, int oidlen);
  * layer-a §5.6 requires only that a page be internally consistent —
  * which it is, since each entry is rendered whole under one hold —
  * and explicitly tolerates an object created or deleted between
- * pages.  *more is answered to the same tolerance: it counts the
+ * pages.  An oid whose slot is released mid-scan and re-created into
+ * a chunk ahead of it is seen twice and answered ONCE, at one of the
+ * two renders, so a page stays strictly ascending.  *more is answered to the same tolerance: it counts the
  * candidates this scan saw.
  *
  * Paging with `after' set to the last oid of the previous page

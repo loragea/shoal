@@ -3162,6 +3162,12 @@ deleted between pages" — and the next pass or an `/advert` catches
 it. Paging by `after=` therefore neither repeats nor skips an object
 that stayed put across both pages, which is the contract §5.6 states.
 
+An oid can be seen **twice** by one page: its slot is released
+between two chunks and the id is re-created into a chunk the scan has
+not reached. It is answered once, at one of the two renders, because
+a page that answered it twice would not be ascending and would hand
+the caller an `after=` it had already paged past.
+
 **How the caller learns whether more follows** is an out-parameter
 (policy): the scan counts the candidates above `after` it saw, and
 answers `more` when that count exceeds what it returned. It is
@@ -4544,15 +4550,30 @@ what would close it.
   matching `objstat`'s; three pages of three resumed by `after` with
   no duplicate and no gap and `more` set only while inventory
   follows; `k` past the inventory; `k` of 0; `after` at the last oid.
-  Then a proc creating objects beside the walk, under which every
-  page must still be strictly ascending and above its `after`.
-  *Mutations:* resume at `>= after` rather than `> after`; skip
-  tombstones. **Not covered:** that the scan releases `qlstate`
-  between chunks rather than holding it across the index. The two are
-  indistinguishable from outside — a create that blocks on the lock
-  and a create that lands between chunks leave the same page — and
-  the engine exposes no counter or `-X` hook that would tell them
-  apart, so no check here discriminates them.
+  Then a proc creating objects beside the walk — and dropping and
+  re-creating them behind itself, which is what can put one oid in a
+  page twice — under which every page must still be strictly
+  ascending and above its `after`.
+  The walk is repeated for as long as that proc is in the engine
+  rather than run once beside it, since one pass costs less than one
+  of the proc's commits; the properties are accumulated and asserted
+  once, so the count of checks does not depend on how the race fell,
+  and one assertion is that the walk saw an object the proc made —
+  without it a run in which the two never overlapped is
+  indistinguishable from one in which they did. The store it runs
+  against is formatted with more than `Listchunk` slots, because at
+  §13's small geometry a page is one hold of `qlstate` across the
+  whole index and nothing can move under it. *Mutations:* resume at
+  `>= after` rather than `> after`; skip tombstones. **Not covered,**
+  two things. That the scan releases `qlstate` between chunks rather
+  than holding it across the index: the two are indistinguishable
+  from outside — a create that blocks on the lock and a create that
+  lands between chunks leave the same page — and the engine exposes
+  no counter or `-X` hook that would tell them apart. And that an oid
+  a page sees twice is answered once: reaching it needs the release
+  and the re-creation to fall either side of a chunk boundary with
+  the new slot ahead of the scan, which nothing here can place, and a
+  mutation removing the de-duplication runs green under this churn.
 
 T1 stays diskless and is `mk test` at the repo root, as `AGENTS.md`
 requires: the simulated disk is a T1 program's own memory.
