@@ -4089,7 +4089,8 @@ back at a higher key under it, and under concurrent churn with one
 churn proc parked on a tombstone of its own making, so that the
 walk's epoch condition is what holds it off and not its cutoff).
 
-Against the list below that is T1.1–T1.26. One case is not covered
+Against the list below that is T1.1–T1.26, T1.28 and T1.29. One case
+is not covered
 and waits on something this store does not have yet: **T1.27** waits
 on the server's `Reqqueue` pool (§7), which is what it is about — the
 engine's own scrub and cursor take the same `qlstate` snapshot every
@@ -4344,6 +4345,33 @@ what would close it.
   instead of pushing through the object's `Reqqueue`. Not covered:
   the `Reqqueue` pool is the server's (§7) and is not built, so
   neither is the thing this test discriminates between.
+- **T1.28 the online rebuild walk (§8, D18).** A store with a slot §5
+  step 10 condemned, walked while it serves: the rebuilt bitmap
+  equals a full scan of the live maps read off the media, `grainleak`
+  returns to zero, and `grainfree` is right with a stage's grains
+  outstanding — before the condemned record is deleted and after.
+  Then a commit that lands *during* the walk, in a slot already
+  folded and in one not yet reached, is in the bitmap after the swap;
+  and a map that moves at an **unchanged four-tuple** — a block
+  repair, landed in the window between a fold's map read and its
+  validation, which §13's `bmfold` hold point parks the fold in —
+  forces the fold to read again. *Mutations:* drop the write barrier;
+  validate the re-read entry by the four-tuple instead of the stamp;
+  do not bump the stamp in the apply; fold a condemned slot's map
+  like any other.
+- **T1.29 the swap and the pass's lifetime (§8, D18).** Over a
+  geometry of several bitmap pages whose objects all sit in the
+  first: the swap installs and dirties the one page that differs, and
+  the checkpoint after it writes one bitmap page and not the whole
+  bitmap. An abort leaves the live bitmap byte for byte as it was and
+  the barrier disarmed, so an ordinary commit follows it and a second
+  pass returns the grains. A `storeclose` under a live pass aborts
+  it, and lets go of a fold parked in the pass it dropped — driven
+  under an open snapshot, which is what keeps the `Store`'s memory
+  alive across the close (§9). *Mutations:* swap the whole bitmap at
+  once; make the abort install the shadow; leave a live pass alone at
+  `storeclose`.
+
 T1 stays diskless and is `mk test` at the repo root, as `AGENTS.md`
 requires: the simulated disk is a T1 program's own memory.
 
