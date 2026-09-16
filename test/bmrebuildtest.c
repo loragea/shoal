@@ -1003,7 +1003,7 @@ tleak(void)
 	oidof(oid, "live");
 	checks++;
 	if(objread(s, oid, strlen("live"), buf, Blk, 0) < 0)
-		fail("objread live: %r");	/* and d's map leaves the LRU */
+		fail("objread live: %r");	/* d's map leaves the LRU */
 	oidof(oid, "d");
 	checks++;
 	if(objread(s, oid, strlen("d"), buf, Blk, 0) >= 0)

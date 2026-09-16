@@ -706,7 +706,7 @@ nothing yet, and cheap at §4.1's envelope.
 
 ## D24 — The online rebuild's engine contract: what a fold validates, what the swap counts, what a close does (2026-09-16)
 
-**Decision:** Five calls' worth of contract under D18's mechanism,
+**Decision:** The four calls' contract under D18's mechanism,
 settled in `lib/store.c` and `lib/alloc.c`:
 
 - **The free count moves by the swap's own difference, not by a

@@ -271,9 +271,9 @@ struct Store
 	uvlong	bmnreread;		/* folds the stamp sent round again */
 	uvlong	bmswapped;		/* pages the last swap installed */
 	int	bmswapping;		/* bmpassend is installing pages */
-	ulong	bmfoldhold;		/* §13's bmfold point: rounds to park */
+	ulong	bmfoldhold;		/* §13's bmfold point: rounds parked */
 	int	bmfoldgo;		/* ... until the hook lets one go */
-	ulong	bmswaphold;		/* §13's bmswap point: pages to park */
+	ulong	bmswaphold;		/* §13's bmswap point: pages parked */
 	int	bmswapgo;		/* ... until the hook lets one go */
 	Rendez	bmrz;			/* on qlstate: whoever parked there */
 	Sgrain	**stagebuck;		/* §6's hash of reserved grains */
@@ -463,6 +463,6 @@ void	storefree(Store*);	/* the Store's memory; §13's freed hook */
 void	storeprocdone(Store*);
 void	storecondemn(Store*, ulong slot);	/* §5 step 10, at run time */
 /* §8's pass, from the apply: caller holds qlstate */
-void	bmcovered(Store*, ulong slot);	/* a live pass has this slot's grains */
+void	bmcovered(Store*, ulong slot);	/* a pass has this slot's grains */
 void	bmleaked(Store*, ulong slot, uvlong n);	/* ... and n of them leaked */
 void	lostupdate(Store*, ulong slot);		/* /lost membership, §8 */

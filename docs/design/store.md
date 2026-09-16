@@ -2036,10 +2036,11 @@ and §3.6's `op=full` over one, each add `blkcount(len)` to a
 **leaked-grain count** that `/status` reports as `grainleak=`: the
 index entry's `len` is intact — it is the extent-map entry that is
 damaged — so the count is an upper bound, and exact for an object
-with no holes. §8's swap discharges it, because the swap is what returns
-the grains; what it leaves standing is what leaked in a slot the pass
-had already folded, which that swap installs rather than returns. The
-number is what is outstanding rather than what has ever leaked. It is memory only and starts at zero at every start,
+with no holes. §8's swap discharges it, because the swap is what
+returns the grains; what it leaves standing is what leaked in a slot
+the pass had already folded, which that swap installs rather than
+returns. The number is what is outstanding rather than what has ever
+leaked. It is memory only and starts at zero at every start,
 because it is one session's observation of what that session left
 marked and not a property of the disk: an ordinary restart does not
 rebuild the bitmap — §5 step 11 rebuilds only when step 5 set the

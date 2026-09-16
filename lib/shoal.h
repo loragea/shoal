@@ -819,10 +819,10 @@ int	storefullsync(Store*, char *peer);
  * condemned store (§3.2), on a slot out of range, on a fold or an end
  * with no pass running, on an end the walk did not cover, and on a
  * begin with one already running.  bmpassabort answers nothing: it
- * has nothing to refuse and nothing to fail at.  A fold that could not read a map says so ("map
- * read"), which is the caller's cue to fold that slot again rather
- * than to give the pass up.  None of them is a §2.6 wire condition,
- * so none carries a §2.6 prefix (§3.7).
+ * has nothing to refuse and nothing to fail at.  A fold that could
+ * not read a map says so ("map read"), which is the caller's cue to
+ * fold that slot again rather than to give the pass up.  None of them
+ * is a §2.6 wire condition, so none carries a §2.6 prefix (§3.7).
  *
  * **A pass MUST be ended or aborted before storeclose** — every call
  * on a closed store is undefined (D16), so no pass can outlive one.
