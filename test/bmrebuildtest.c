@@ -205,6 +205,18 @@ scanmaps(Dev *d, Super *sup)
 		simpeek(d, idxentoff(sup, slot), p, Idxentsz);
 		if(idxunpack(&ie, p, sup->nemap) < 0 || ie.state == Sfree)
 			continue;
+		/*
+		 * §5 step 10's condemnation as the media carries it —
+		 * Icorrupt, layer-a §7.5 — stated here rather than left to
+		 * the checksum below, so that "a condemned slot names
+		 * nothing a store may believe" is a rule of its own and
+		 * not a restatement of "an unreadable map names nothing".
+		 * Nothing in this program sets the flag any other way; a
+		 * scrub's flag over a readable map would have to be told
+		 * apart from this one.
+		 */
+		if((ie.flags & Icorrupt) != 0)
+			continue;
 		nblk = blkcount(ie.len, sup->blksz);
 		if(nblk > sup->nblkmax)
 			nblk = sup->nblkmax;
@@ -567,7 +579,9 @@ tlive(void)
 	Dev *d;
 	Store *s;
 	Storestat st;
+	Stage *stg;
 	Super sup;
+	uchar *buf, sid[Oidmax];
 	uvlong gf, np;
 
 	np = 0;
@@ -577,7 +591,19 @@ tlive(void)
 		devclose(d);
 		return;
 	}
+	/*
+	 * A stage outstanding across the pass, as tonline has one over
+	 * the deleted half: the shadow must not mark a staged grain,
+	 * because a staged grain carries no bitmap bit (§6).
+	 */
+	buf = mkbuf(2*Blk, 71);
+	oidof(sid, "staged");
+	if((stg = stageopen(s, sid, 6, 2*Blk, 0)) == nil)
+		fail("stageopen: %r");
+	else if(stagewrite(stg, buf, 2*Blk, 0) < 0)
+		fail("stagewrite: %r");
 	storestat(s, &st);
+	eqv("the stage holds two grains", st.staged, 2);
 	gf = st.grainfree;
 	eqv("nothing has counted a leak yet", st.grainleak, 0);
 	checks++;
@@ -592,11 +618,20 @@ tlive(void)
 	eqv("the damaged map's grains come back without a delete",
 		st.grainfree, gf + 3);
 	eqv("and the copy is still in /lost", st.nlost, 1);
+	eqv("and the stage's grains are still the stage's", st.staged, 2);
 	scanok(s, d, "a pass over a live condemned slot");
 	whole(s, "live", "a pass over a live condemned slot");
 	whole(s, "one", "a pass over a live condemned slot");
+	checks++;
+	if(stagefinal(stg, 1, 1, nil, 0) < 0)
+		fail("stagefinal after a pass over a live condemned slot: %r");
+	storestat(s, &st);
+	eqv("the staged grains become the object's", st.staged, 0);
+	whole(s, "staged", "a pass over a live condemned slot");
+	scanok(s, d, "a stage committed after a pass over a condemned slot");
 	storeclose(s);
 	devclose(d);
+	free(buf);
 }
 
 /*
@@ -650,7 +685,8 @@ tonline(void)
 	eqv("the pass ends", st.bmpass, 0);
 	eqv("the walk folded every live slot", st.bmfolded, 2);
 	eqv("nothing moved under it", st.bmreread, 0);
-	istrue("and the swap installed a page", np >= 1 && st.bmswapped == np);
+	eqv("the swap installs the one page that differs", np, 1);
+	eqv("and says so", st.bmswapped, np);
 	eqv("the condemned map's grains come back", st.grainfree, gf + 3);
 	eqv("so the leak is discharged", st.grainleak, 0);
 	eqv("and the stage's grains are still the stage's", st.staged, 2);
@@ -1396,6 +1432,7 @@ tclose(void)
 	Objsnap *sn;
 	Objinfo oi;
 	uchar *buf;
+	int ok;
 
 	spawnforget();
 	d = newdisk();
@@ -1415,7 +1452,7 @@ tclose(void)
 		fail("bmpassbegin: %r");
 	storehook(s, "bmfold", 1);
 	foldstart(s, oi.slot);
-	if(waitpark(s, 0, "the fold parks under the live pass")){
+	if((ok = waitpark(s, 0, "the fold parks under the live pass")) != 0){
 		storeclose(s);
 		eqv("a store closed under an open snapshot is not freed",
 			nfreed, 0);
@@ -1424,15 +1461,29 @@ tclose(void)
 			if(foldr >= 0)
 				fail("a fold in a pass the close dropped "
 					"answered success");
-		}
+		}else
+			ok = 0;
 	}else{
 		storehook(s, "bmfold", 0);
-		waitfold("the fold finishes");
+		ok = waitfold("the fold finishes");
 		storeclose(s);
 	}
-	if(sn != nil)
-		objsnapclose(sn);
-	eqv("and the last snapshot frees the store", nfreed, 1);
+	/*
+	 * The last objsnapclose frees the Store (§9), so a proc still
+	 * asleep inside it would then be reading freed memory — and the
+	 * fault would take this program down before it printed its FAIL
+	 * lines or its summary.  Every wait above has come back by here
+	 * or it has not: a run that timed out leaves the snapshot open
+	 * on purpose, costs itself this one check, and lets killspawned
+	 * reap the proc.
+	 */
+	if(ok){
+		if(sn != nil)
+			objsnapclose(sn);
+		eqv("and the last snapshot frees the store", nfreed, 1);
+	}else
+		fail("a wait timed out: the snapshot is left open so the "
+			"run can still report");
 	killspawned();
 	devclose(d);
 	free(buf);

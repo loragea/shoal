@@ -4392,10 +4392,22 @@ what would close it.
   and a map that moves at an **unchanged four-tuple** — a block
   repair, landed in the window between a fold's map read and its
   validation, which §13's `bmfold` hold point parks the fold in —
-  forces the fold to read again. *Mutations:* drop the write barrier;
-  validate the re-read entry by the four-tuple instead of the stamp;
-  do not bump the stamp in the apply; fold a condemned slot's map
-  like any other.
+  forces the fold to read again. So does a **damaged** map that
+  §3.6's `op=full` replaced while the fold sat in that window: the
+  fold goes round again rather than condemn the repair, and the
+  grains the fresh map names are in the bitmap after the swap. And a
+  writer that moves the map inside *every* round drives the fold to
+  its re-read bound — eight re-reads, then a ninth round that folds
+  from the pinned entry and agrees with the full scan — which the
+  `bmfold` point makes deterministic by arming a round at a time.
+  *Mutations:* drop the write barrier; validate the re-read entry by
+  the four-tuple instead of the stamp; do not bump the stamp in the
+  apply; fold the grains a damaged map names; check the map's
+  checksum before the stamp; reset the round count at a re-read. The
+  fourth is all the fold's `bad`-entry fast path can be shown to do:
+  every condemned slot the engine makes is one whose extent-map entry
+  failed its checksum, so a mutation that dropped only that fast path
+  would fall into the checksum arm and answer the same.
 - **T1.29 the swap and the pass's lifetime (§8, D18).** Over a
   geometry of several bitmap pages whose objects all sit in the
   first: the swap installs and dirties the one page that differs, and
@@ -4405,9 +4417,22 @@ what would close it.
   pass returns the grains. A `storeclose` under a live pass aborts
   it, and lets go of a fold parked in the pass it dropped — driven
   under an open snapshot, which is what keeps the `Store`'s memory
-  alive across the close (§9). *Mutations:* swap the whole bitmap at
-  once; make the abort install the shadow; leave a live pass alone at
-  `storeclose`.
+  alive across the close (§9). An end whose walk skipped one live
+  slot is **refused**: it installs nothing, the pass stays live, the
+  bitmap is byte for byte as it was, and the end after the missing
+  fold succeeds — while an ordinary write under the walk does not
+  stand in for that fold and a slot created under the walk needs
+  none. A leak recorded *after* the pass had folded the slot survives
+  the swap, which installs those grains marked and leaves `grainleak`
+  counting them; the map is damaged after its fold and read again
+  through a one-entry extent-map cache, which is what puts the
+  condemnation on the far side of the fold. And an abort that lands
+  between two pages of a swap, where §13's `bmswap` point puts it,
+  does nothing at all and the swap runs to its end. *Mutations:* swap
+  the whole bitmap at once; make the abort install the shadow; leave
+  a live pass alone at `storeclose`; skip the coverage check; mark a
+  slot covered for any apply; zero `grainleak` at the end whatever
+  the pass folded; let an abort inside a swap drop the pass.
 
 T1 stays diskless and is `mk test` at the repo root, as `AGENTS.md`
 requires: the simulated disk is a T1 program's own memory.
