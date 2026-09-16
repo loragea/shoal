@@ -2052,9 +2052,11 @@ objlist(Store *s, uchar *after, int afterlen, Objent *e, int k, int *more)
 			 * them.  Without it the insertion scan below runs
 			 * to completion for every slot past the first k,
 			 * which is what makes the per-slot cost O(k) and
-			 * the hold O(k * Listchunk).  With it the per-slot
-			 * constant stops depending on k once the buffer is
-			 * full, which is what the figures above measure.
+			 * the hold O(k * Listchunk).  With it a candidate
+			 * the buffer REJECTS costs one comparison whatever
+			 * k is; what still scales with k is placing the
+			 * ones it accepts, which is the split the figures
+			 * above are measured either side of.
 			 *
 			 * An oid equal to the largest kept entry is skipped
 			 * rather than re-rendered here, which is the same
