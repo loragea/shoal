@@ -835,6 +835,7 @@ static struct
 {
 	Store	*s;
 	int	stop;
+	int	done;			/* the proc is out of the engine */
 } churn;
 
 static void
@@ -851,6 +852,7 @@ churnproc(void*)
 			break;
 	}
 	churn.stop = 1;
+	churn.done = 1;
 }
 
 static void
@@ -872,9 +874,11 @@ tlistchurn(void)
 	e = newpage(4);
 	churn.s = s;
 	churn.stop = 0;
+	churn.done = 0;
 	if(spawnproc(churnproc, nil) < 0){
 		fail("spawnproc: %r");
 		churn.stop = 1;
+		churn.done = 1;
 	}
 	afterlen = 0;
 	pages = 0;
@@ -908,6 +912,15 @@ tlistchurn(void)
 			break;
 	}
 	churn.stop = 1;
+	/*
+	 * shoal.h's quiesce rule (D16): no call taking the Store may be
+	 * in flight when storeclose runs, or it wakes inside freed
+	 * memory.  Stopping the churn proc is not the same as waiting
+	 * for it to leave the engine, and a kill at the end of the
+	 * program is later still.
+	 */
+	while(!churn.done)
+		sleep(1);
 	istrue("the walk under churn made progress", pages > 1);
 	free(e);
 	storeclose(s);
