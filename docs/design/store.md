@@ -4706,11 +4706,11 @@ rather than an amendment, because it touches the wire.
     a slot shows the index moved under it. That keeps `objsnap=full`
     — a restart is not a partial vector — at the price of a scan
     that can be made to starve by a continuous create rate, which is
-    why it is not built on speculation. §8's scrub-driven bitmap
-    rebuild wants the same counter for a different reason —
-    validating an extent map it re-read outside `qlstate`, which the
-    four-tuple cannot do — so whichever is built first builds it for
-    both. T2.
+    why it is not built on speculation. **That counter now exists**:
+    it is the per-slot stamp §8's walk validates an entry it re-read
+    outside `qlstate` by, which the four-tuple cannot do. So what is
+    open here is the chunked scan alone, and not the counter under
+    it. T2.
 
 ### (b) Product calls
 

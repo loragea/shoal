@@ -844,6 +844,14 @@ storecondemn(Store *s, ulong slot)
 	s->idx[slot].bad = 1;
 	s->idx[slot].flags |= Icorrupt;
 	/*
+	 * §8's stamp moves here too, although no map changed: what
+	 * changed is that this slot's map may no longer be READ, and a
+	 * walk that had already copied it would otherwise fold the
+	 * damaged bytes' grain numbers into its shadow.  The stamp is
+	 * "what this slot says has moved", not "the four-tuple has".
+	 */
+	s->idx[slot].gen++;
+	/*
 	 * Ient.bad is memory only; Icorrupt is the half §2.3 writes, and
 	 * the checkpoint writes an index page only when something
 	 * dirtied it.  Without this the condemnation reaches the disk

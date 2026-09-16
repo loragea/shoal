@@ -382,6 +382,18 @@ applyrec(Store *s, Objrec *o, Emape *c)
 	e->wepoch = o->wepoch;
 	e->mtime = o->mtime;
 	e->cur = 0;
+	/*
+	 * §8's per-slot generation stamp.  Every apply that publishes a
+	 * record over this slot bumps it, whether or not the four-tuple
+	 * moved: block repair and the corrupt-flag commit change the map
+	 * with the four-tuple unchanged (§2.7), and a walk that re-read
+	 * this entry outside qlstate has no other way to tell that the
+	 * map it copied is no longer the one this slot names.  It is not
+	 * a version and nothing durable carries it, so a wrap after 2^32
+	 * applies to one slot costs a walk one stale fold in the window
+	 * of one map read and nothing else.
+	 */
+	e->gen++;
 	memmove(e->csum, o->csum, Csumlen);
 	if(e->state == Slive)
 		s->nlive++;
@@ -711,6 +723,7 @@ int
 applyslot(Store *s, ulong slot)
 {
 	Ient *e;
+	ulong gen;
 
 	if(slot >= s->sb.nslots){
 		werrstr("Eslot: slot %lud, nslots %lud", slot, s->sb.nslots);
@@ -725,7 +738,16 @@ applyslot(Store *s, ulong slot)
 	else if(e->state == Stomb)
 		s->ntomb--;
 	free(e->oid);
+	/*
+	 * §8's stamp outlives the slot: it is bumped rather than zeroed,
+	 * so a slot released under a walk and re-created before the walk
+	 * validates cannot present the stamp the walk recorded.  Zeroing
+	 * it would make the freshest possible entry look unchanged to
+	 * exactly the reader the stamp exists for.
+	 */
+	gen = e->gen;
 	memset(e, 0, sizeof *e);
+	e->gen = gen + 1;
 	e->hashnext = ~0UL;
 	lostupdate(s, slot);		/* a released slot holds no copy */
 	slotclear(s, slot);

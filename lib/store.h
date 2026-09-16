@@ -51,6 +51,21 @@ struct Ient
 	ulong	emapslot;
 	ulong	grain0;			/* inline map: 0 = hole */
 	uvlong	cur;			/* R5: in memory only, never on disk */
+	/*
+	 * §8's per-slot generation stamp: bumped by every apply that
+	 * creates, frees or re-states this slot or changes its map, and
+	 * by the condemnation that stops its map being read at all.  It
+	 * is what validates an entry re-read outside qlstate — §8's
+	 * online bitmap rebuild, and §16a(11)'s chunked enumeration if
+	 * that is ever built — because the four-tuple cannot: block
+	 * repair and the corrupt-flag commit both publish with the
+	 * four-tuple unchanged while the map changes (§2.7).  In memory
+	 * only, never on disk, and it outlives the slot's release —
+	 * applyslot bumps it rather than zeroing it — so a slot freed
+	 * and reused under a walk never presents the stamp the walk
+	 * recorded.
+	 */
+	ulong	gen;
 	ulong	hashnext;
 	uchar	oidlen;
 	uchar	oidcap;			/* bytes oid holds; §3.2's pre-allocation */
