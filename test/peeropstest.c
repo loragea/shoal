@@ -1185,9 +1185,12 @@ tlistpage(void)
  * NOT covered: that the scan releases the state lock BETWEEN chunks
  * rather than holding it across the whole index.  The difference is
  * invisible from outside — a create that blocks on the lock and a
- * create that lands between two chunks leave the same page — and the
- * engine offers no counter or -X hook that would expose it, so no
- * check here discriminates the two.  §13's T1.33 row says so.
+ * create that lands between two chunks leave the same page — and no
+ * -X point parks a listing between chunks so that a test could place
+ * one deliberately.  storehook's framework is there and snaphold is
+ * the precedent for such a point; until one exists the per-chunk
+ * hold is read off the code rather than driven.  §13's T1.33 row
+ * says so.
  */
 /*
  * A listing test that means to exercise the CHUNKED scan needs more
@@ -1235,8 +1238,8 @@ static struct
  * chunks and the id re-created into a chunk the scan has not reached
  * — which the strictly-ascending check below is what catches.  Like
  * everything else here it is opportunistic: nothing synchronises the
- * drop with a chunk boundary, and the engine offers no hook that
- * would (§13's T1.33 row).
+ * drop with a chunk boundary, because no -X point parks a listing
+ * between chunks (§13's T1.33 row).
  */
 static void
 churnproc(void*)

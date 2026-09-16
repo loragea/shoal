@@ -3165,8 +3165,10 @@ scan** instead: one pass of the slot array per page, holding `k`
 entries of state, taking `qlstate` for `Listchunk` slots at a time
 (policy, 256) and releasing it between chunks. Each entry the
 selection keeps is copied — `oid` and `Objinfo` both — under the hold
-it was seen in, so a page is internally consistent in layer-a §5.6's
-sense. The whole point of the chunking is that this walk, unlike the
+it was seen in, so no entry mixes two states of one object. What
+layer-a §5.6's "internally consistent" is read to require of a page,
+and what it is read not to require, is §14(17). The whole point of
+the chunking is that this walk, unlike the
 snapshot open, is taken by every peer's reconcile rather than by an
 operator's open, so it must not be the second place a state lock is
 held for the 23 ms a full index costs.
@@ -4085,7 +4087,7 @@ T1 formats a **small geometry** — a partition image of a few MiB with
 over one header sector, not over the whole store, and the cases that
 need `nslots = 2^20` are T2's.
 
-**What T1 covers today.** Twelve programs, all of them against the
+**What T1 covers today.** Thirteen programs, all of them against the
 simulated disk except where a file-backed device is the point:
 `csumtest` (layer-a §1.4's block digests and object checksums against
 known-answer vectors), `structtest` (§2's byte layouts against
@@ -4299,7 +4301,25 @@ whose own index entry is the damage, and §6's tombstone reclaim walk
 — single-proc, with the record replaced under it, with the record put
 back at a higher key under it, and under concurrent churn with one
 churn proc parked on a tombstone of its own making, so that the
-walk's epoch condition is what holds it off and not its cutoff).
+walk's epoch condition is what holds it off and not its cutoff) and
+`peeropstest` (§3.8's peer-channel primitives and §9's oid-ordered
+listing: the adoption over an absent id, over a lower-keyed tombstone
+and over a live copy, each refusal told apart by whether it carries a
+§2.6 prefix, the index slot and the `qid.path` it reserves, and the
+tombstone it publishes read back across a restart; the drop's one
+durable step asserted before the restart as well as after it, the
+same freed state after a crash at `postwrite`, the two ids a drop is
+not for, and a condemned copy dropped with its unrecoverable grains
+counted in `grainleak`; the resulting-`csum` check over each of the
+five calls a peer's key can reach, a wrong `csum` leaving the log's
+`seqnext` and watermark where they were and a restart replaying to
+the state before the call, and the zero-byte write that has no commit
+to carry the check; and the listing over layer-a §1.1's byte order
+with tombstones in the inventory, paged by `after` with `more`, its
+refusals, and its pages under a proc creating objects beside the walk
+and dropping and re-creating them behind itself, over a store
+formatted with more than `Listchunk` slots so that a page is more
+than one hold).
 
 Against the list below that is T1.1–T1.26 and T1.30–T1.33. One case
 is not covered
@@ -4624,15 +4644,18 @@ what would close it.
   §13's small geometry a page is one hold of `qlstate` across the
   whole index and nothing can move under it. *Mutations:* resume at
   `>= after` rather than `> after`; skip tombstones. **Not covered,**
-  two things. That the scan releases `qlstate` between chunks rather
-  than holding it across the index: the two are indistinguishable
-  from outside — a create that blocks on the lock and a create that
-  lands between chunks leave the same page — and the engine exposes
-  no counter or `-X` hook that would tell them apart. And that an oid
-  a page sees twice is answered once: reaching it needs the release
-  and the re-creation to fall either side of a chunk boundary with
-  the new slot ahead of the scan, which nothing here can place, and a
-  mutation removing the de-duplication runs green under this churn.
+  two things, and one reason for both: no `-X` point parks a listing
+  between chunks. §13's hook framework is there and `snaphold` is the
+  precedent for a point of exactly that shape, so what is missing is
+  the point and not an observable. Without it, that the scan releases
+  `qlstate` between chunks rather than holding it across the index is
+  indistinguishable from outside — a create that blocks on the lock
+  and a create that lands between chunks leave the same page. And the
+  case where an oid a page sees twice is answered once needs the
+  release and the re-creation to fall either side of a chunk boundary
+  with the new slot ahead of the scan, which nothing here can place:
+  a mutation removing the de-duplication runs green under this churn.
+  Both are read off the code rather than driven.
 
 T1 stays diskless and is `mk test` at the repo root, as `AGENTS.md`
 requires: the simulated disk is a T1 program's own memory.
