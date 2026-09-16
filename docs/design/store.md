@@ -3340,7 +3340,14 @@ the caller an `after=` it had already paged past.
 **How the caller learns whether more follows** is an out-parameter
 (policy): the scan counts the candidates above `after` it saw, and
 answers `more` when that count exceeds what it returned. It is
-answered to the page's own tolerance, since it is the same scan. The
+answered to the page's own tolerance, since it is the same scan, and
+within that tolerance it is one-sided: never falsely 0, because every
+candidate the page did not answer is counted, and so a caller told 0
+has the whole inventory above `after`. It can be a false 1, because
+an oid the scan saw twice counts twice and is answered once: a page
+that ends the inventory can still say `more`, and the cost is one
+further page that answers nothing rather than an object the caller
+stops short of. The
 `lines=` and `more=` of §5.6's response line are the server's to
 render, and so is clamping the requested `n=` to the negotiated
 `msize`: the engine's `k` counts entries, not bytes.

@@ -1305,7 +1305,10 @@ int	objdrop(Store*, uchar *oid, int oidlen);
  * and re-created into a chunk ahead of it is seen twice and answered
  * ONCE, at one of the two renders, so a page stays strictly
  * ascending.  *more is answered to the same tolerance: it counts the
- * candidates this scan saw.  What layer-a §5.6's "internally
+ * candidates this scan saw, so it is never falsely 0, and a
+ * duplicate collapsed into one entry can make it a false 1 — one
+ * further page that answers nothing, never an object stopped short
+ * of (§9).  What layer-a §5.6's "internally
  * consistent" is read to require of a page is §14(17).
  *
  * Paging with `after' set to the last oid of the previous page

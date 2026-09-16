@@ -1923,9 +1923,15 @@ oidcmp(uchar *a, int na, uchar *b, int nb)
  * exactly that — "a reconcile pass MUST tolerate an object created or
  * deleted between pages" — and the next pass or an /advert catches
  * it.  *more counts the candidates this scan saw, to the same
- * tolerance, which is what lets a caller stop without a second page
- * that answers nothing.  §14(17) is how §5.6's "internally
- * consistent" is read here.
+ * tolerance, and the count is one-sided: within that tolerance it is
+ * never falsely 0, because every candidate this page did not answer
+ * is counted, so a caller told 0 has the whole inventory above
+ * `after'.  It CAN be a false 1 — an oid this scan saw twice, folded
+ * into one entry by the duplicate arm below or skipped by the equal
+ * early-out beside it, counts twice and is answered once — and the
+ * price of that is one more page that answers nothing, never an
+ * object the caller stops short of (§9).  §14(17) is how §5.6's
+ * "internally consistent" is read here.
  */
 int
 objlist(Store *s, uchar *after, int afterlen, Objent *e, int k, int *more)
