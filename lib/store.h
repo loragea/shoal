@@ -51,6 +51,19 @@ struct Ient
 	ulong	emapslot;
 	ulong	grain0;			/* inline map: 0 = hole */
 	uvlong	cur;			/* R5: in memory only, never on disk */
+	/*
+	 * §8's per-slot generation stamp: bumped by every apply that
+	 * creates, frees or re-states this slot or changes its map, and
+	 * by the condemnation that stops its map being read at all.  It
+	 * is what validates an entry re-read outside qlstate, which the
+	 * four-tuple cannot; §8 says why, and names §16a(11)'s chunked
+	 * enumeration as the other reader that would want it.  In memory
+	 * only, never on disk, and it outlives the slot's release —
+	 * applyslot bumps it rather than zeroing it — so a slot freed
+	 * and reused under a walk never presents the stamp the walk
+	 * recorded.
+	 */
+	ulong	gen;
 	ulong	hashnext;
 	uchar	oidlen;
 	uchar	oidcap;			/* bytes oid holds; §3.2's pre-allocation */
@@ -224,6 +237,43 @@ struct Store
 	 * a rebuild corrects — and qlstate's, like grainfree.
 	 */
 	uvlong	grainleak;
+	/*
+	 * §8's online rebuild pass (D18).  bmshadow is the shadow bitmap
+	 * and it is also the write barrier's arm: while it is not nil,
+	 * grainmark and grainclear mirror every set and clear into it,
+	 * so the two copies stay current until the last page of the swap
+	 * has landed and the swap can therefore be chunked.  All of it
+	 * is qlstate's, like the bitmap it shadows.
+	 */
+	uchar	*bmshadow;		/* nil unless a pass is live */
+	/*
+	 * The pass's coverage interlock.  bmfoldmark is a byte per index
+	 * slot, allocated with the shadow and freed with it: set for a
+	 * slot whose grains the shadow holds, whether a fold put them
+	 * there or the barrier did.  bmnflight counts the folds holding
+	 * a map read for this pass.  bmpassend installs nothing unless
+	 * every live slot is marked and no fold is in flight, so a walk
+	 * that skipped a slot cannot free the grains that slot names.
+	 */
+	uchar	*bmfoldmark;		/* nil unless a pass is live */
+	ulong	bmnflight;		/* folds holding a map read */
+	/*
+	 * §6's leak, as the swap leaves it: what an apply added to
+	 * grainleak AFTER this pass had already folded the slot is a
+	 * leak the swap does not reclaim — the fold put those grains in
+	 * the shadow — so it outlives the swap and is what grainleak
+	 * becomes when the pass ends.
+	 */
+	uvlong	bmleakafter;
+	uvlong	bmnfold;		/* slots the pass has folded */
+	uvlong	bmnreread;		/* folds the stamp sent round again */
+	uvlong	bmswapped;		/* pages the last swap installed */
+	int	bmswapping;		/* bmpassend is installing pages */
+	ulong	bmfoldhold;		/* §13's bmfold point: rounds parked */
+	int	bmfoldgo;		/* ... until the hook lets one go */
+	ulong	bmswaphold;		/* §13's bmswap point: pages parked */
+	int	bmswapgo;		/* ... until the hook lets one go */
+	Rendez	bmrz;			/* on qlstate: whoever parked there */
 	Sgrain	**stagebuck;		/* §6's hash of reserved grains */
 	Sgrain	*stagefree;		/* recycled nodes */
 	ulong	nstagebuck;
@@ -410,4 +460,7 @@ int	storeproc(Store*, void (*)(void*), void*);
 void	storefree(Store*);	/* the Store's memory; §13's freed hook */
 void	storeprocdone(Store*);
 void	storecondemn(Store*, ulong slot);	/* §5 step 10, at run time */
+/* §8's pass, from the apply: caller holds qlstate */
+void	bmcovered(Store*, ulong slot);	/* a pass has this slot's grains */
+void	bmleaked(Store*, ulong slot, uvlong n);	/* ... and n of them leaked */
 void	lostupdate(Store*, ulong slot);		/* /lost membership, §8 */

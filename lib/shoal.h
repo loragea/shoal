@@ -652,6 +652,33 @@ struct Storestat
 	int	monidset;
 	uvlong	grainfree, staged;
 	uvlong	grainleak;		/* §6: marked, named by nothing */
+	/*
+	 * §8's online bitmap rebuild (D18), as a /status renderer wants
+	 * it: whether a pass is running, how far it has got, and what
+	 * the last one cost.  bmfolded and bmreread are the live pass's
+	 * while one runs and the last pass's once it has ended, so a
+	 * finished pass still says what it did.  bmfolded counts the
+	 * folds that COMPLETED for a `live` slot: it only rises within
+	 * a pass, so a slot folded twice counts twice and a slot
+	 * deleted after its fold keeps its count, and a free or tomb
+	 * slot adds nothing to it.  bmreread counts the folds a slot
+	 * that moved under the walk sent round again, which is how much
+	 * the pass is fighting write traffic.  bmfolding is the folds
+	 * holding a map read right now, and it is the live pass's
+	 * alone: an end refuses while any is outstanding at the moment
+	 * it looks, and accepts a fold that begins after that.
+	 * bmswapped is the bitmap pages the last completed swap
+	 * installed — of Storestat's nothing else, so a caller that
+	 * wants it as a fraction reads §2.5's page count from the
+	 * superblock.  §8 names the key= each is rendered under; the
+	 * rendering itself is the server's, as it is for every other
+	 * field here.
+	 */
+	int	bmpass;			/* a rebuild pass is live */
+	uvlong	bmfolded;		/* live slots folded, completed */
+	uvlong	bmfolding;		/* folds holding a map read */
+	uvlong	bmreread;		/* folds sent round again by the stamp */
+	uvlong	bmswapped;		/* bitmap pages the last swap installed */
 	uvlong	slotfree, emapfree;
 	uvlong	logfree;		/* sectors */
 	uvlong	logwait;		/* commits in §6's wait for log space */
@@ -742,6 +769,108 @@ int	storefullsync(Store*, char *peer);
  * the bitmap-rebuild work and nowhere else in this header.
  */
 /* --- bitmap-rebuild: begin --- */
+/*
+ * The pass is driven by these four calls.  bmpassbegin allocates the
+ * shadow bitmap and arms the write barrier: from then until the pass
+ * ends, every grainmark and grainclear mirrors into the shadow, so
+ * the live bitmap and the shadow stay current together and the swap
+ * can be chunked.  One pass runs at a time; a second begin refuses.
+ *
+ * bmpassfold folds one slot.  It reads that slot's extent map outside
+ * the state lock under the map cache's pin, exactly as every other
+ * map read does, validates the entry it re-reads by its per-slot
+ * generation stamp — reading again if the slot moved under it — and
+ * ORs the grains the map names into the shadow.  A free slot folds to
+ * nothing, and so does a slot §5 step 10 condemned: its map is the
+ * damage, and the grains it named are exactly what the pass reclaims.
+ * A slot whose map fails its checksum is condemned here, as it is by
+ * every other reader of a map, but only while the entry still names
+ * the map those bytes came from: a stamp that moved sends the fold
+ * round again instead, since §3.6's op=full may have published a
+ * repair over the damage in the window.  Each call is one object's
+ * worth of work, so a server may push it through that object's
+ * Reqqueue (§8); the order slots are folded in is the caller's, and a
+ * slot folded twice is folded twice to no ill effect.
+ *
+ * **The re-reads are bounded**, so that a slot under a continuous
+ * write rate cannot starve the walk on it.  Every round counts
+ * against the bound; past it the fold takes the grains off the pinned
+ * entry under the state lock itself, which is a memory read under the
+ * lock the apply mutates the map under rather than a device read.
+ * The one case those bytes cannot answer is an entry that has stopped
+ * naming the extent-map slot the round pinned, and that starts over
+ * like any other round, under a second and larger ceiling: a fold
+ * that reaches it folds nothing and answers "the map will not hold
+ * still", which is a refusal to retry on that slot and not a failed
+ * pass.  §8 has both numbers.
+ *
+ * bmpassend swaps the shadow in page by page under the state lock,
+ * installing and dirtying only the pages that differ — §5 step 11's
+ * rebuild dirties every page, which on a serving store is §2.5's
+ * whole bitmap — and moves §6's free count by what each installed
+ * page changed.  *npage, when not nil, is how many pages it
+ * installed.  bmpassabort drops the shadow and disarms the barrier,
+ * leaving the live bitmap exactly as it was.  An abort while an end
+ * is installing pages does nothing at all: the end is mid-swap, it
+ * drops the pass itself a moment later, and a half-installed bitmap
+ * is the one state this mechanism has no name for.
+ *
+ * **An end is refused unless the walk covered the store.**  The swap
+ * frees every grain the shadow does not mark, so a shadow the walk
+ * did not finish would free grains a live map still names.  The pass
+ * therefore carries a mark per index slot, and bmpassend refuses
+ * unless every Slive slot carries one and no fold is in flight at
+ * the moment it looks.  A fold that begins after that check is
+ * accepted: it runs beside the swap and writes only into the
+ * shadow, so it contributes nothing to the pages already installed,
+ * and it loses no bit either — coverage passed, so every grain its
+ * slot named then is in the shadow, and every grain that slot has
+ * named since went into the live bitmap through the barrier.  A
+ * fold sets the mark for the slot it completes; so does an apply
+ * whose record rebuilds the slot's map whole — an Oslot record
+ * (§2.7), a record into a slot that was free, or one that leaves the
+ * slot naming no block — because those grains reach the shadow
+ * through the barrier.  An ordinary write marks nothing: the blocks
+ * it leaves alone are still the old map's, so that slot still owes
+ * the walk a fold.  A free slot and a tombstone need no mark: a
+ * tombstone's Eobj carries len=0, an empty nmap and emapslot=0 (§6),
+ * so neither names a grain.  A refused end installs nothing and
+ * leaves the pass live: the caller folds the slots the error names
+ * and ends again.
+ *
+ * **grainleak is what the swap did not reclaim, not zero.**  A leak
+ * recorded while the pass was live and after it had folded that slot
+ * is a leak the swap installs rather than returns — the fold had
+ * already put those grains in the shadow — so the end leaves that
+ * much standing and discharges the rest.
+ *
+ * The three that answer do so with 0, or -1 with an error set: on a
+ * condemned store (§3.2), on a slot out of range, on a fold or an end
+ * with no pass running, on an end the walk did not cover, on a
+ * begin with one already running, and on a begin that cannot
+ * allocate the shadow ("out of memory").  bmpassabort answers
+ * nothing: it has nothing to refuse and nothing to fail at.  A fold
+ * that could not read a map says so ("map read"), which is the
+ * caller's cue to
+ * fold that slot again rather than to give the pass up.  None of them
+ * is a §2.6 wire condition, so none carries a §2.6 prefix (§3.7).
+ * A fold that reached its ceiling says "the map will not hold still",
+ * which is the same cue: fold that slot again.
+ *
+ * **A pass MUST be ended or aborted before storeclose** — every call
+ * on a closed store is undefined (D16), so no pass can outlive one.
+ * A pass still live when storeclose runs is aborted by it, because
+ * the shadow is the store's memory and goes with the rest; that is
+ * the engine tidying up after a caller, not a way to leave one open,
+ * and a call in flight in another proc when the close runs is
+ * undefined exactly as any other call in flight is — a bmpassend
+ * among them, which leaves the bitmap holding however many of its
+ * pages had landed.
+ */
+int	bmpassbegin(Store*);
+int	bmpassfold(Store*, ulong slot);
+int	bmpassend(Store*, uvlong *npage);
+void	bmpassabort(Store*);
 /* --- bitmap-rebuild: end --- */
 
 /* §2.2's publisher: durable before the value is acted on */
