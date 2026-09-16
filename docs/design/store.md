@@ -4548,7 +4548,10 @@ what would close it.
   `checksum mismatch` and that **nothing is durable** — the log's
   `seqnext` and watermark have not moved, and a restart replays to
   the state before the call — and then offer the right one and assert
-  it commits the same four-tuple. *Mutation:* make the check after
+  it commits the same four-tuple, all four of it. A zero-byte write
+  is its own case, since it has no commit to carry the check: a wrong
+  `csum` is `checksum mismatch`, the right one is `ok`, and neither
+  writes a record or moves the key. *Mutation:* make the check after
   `logcommit` rather than before it, which leaves the refusal in
   place and the record on the platter.
 - **T1.33 the oid-ordered listing (§9).** An inventory chosen for

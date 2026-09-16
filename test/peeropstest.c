@@ -42,13 +42,23 @@ errsays(char *what, char *pfx)
 static void
 errnotwire(char *what)
 {
+	/*
+	 * All of it, in §2.6's own order.  A subset would let an
+	 * internal error that begins with one of the missing prefixes
+	 * through, and the property being tested is about the SET: it is
+	 * prefix-free, so a client parsing any member out of a bug reads
+	 * it as an ordinary refusal.
+	 */
 	static char *w[] = {
-		"no such object", "object deleted", "object exists",
-		"bad object name", "object too large", "stale version",
-		"bad ctl", "checksum mismatch", "not discardable",
-		"disk full", "not ready", "permission denied",
-		"still placed", "bad map", "stale epoch", "future epoch",
-		"fenced", nil,
+		"no such object", "object exists", "object deleted",
+		"object too large", "object lost", "object unavailable",
+		"not ready", "bad object name", "reserved name",
+		"bad create mode", "bad open mode", "no rename",
+		"permission denied", "stale epoch", "future epoch",
+		"not primary", "not discardable", "fenced", "down",
+		"degraded", "stale version", "out of sequence",
+		"checksum mismatch", "still placed", "disk full",
+		"bad ctl", "unknown ctl", "bad aname", "bad map", nil,
 	};
 	char e[ERRMAX];
 	int i;
@@ -161,6 +171,7 @@ tadoptabsent(void)
 	d = newdisk();
 	if((s = mustopen(d, "adopt absent")) == nil){
 		devclose(d);
+		killspawned();
 		return;
 	}
 	storestat(s, &st0);
@@ -201,6 +212,7 @@ tadoptabsent(void)
 
 	if((s = restart(s, d, "adopt absent, replayed")) == nil){
 		devclose(d);
+		killspawned();
 		return;
 	}
 	if(ostat(s, "ghost", &oi2) < 0){
@@ -239,6 +251,7 @@ tadoptover(void)
 	d = newdisk();
 	if((s = mustopen(d, "adopt over")) == nil){
 		devclose(d);
+		killspawned();
 		return;
 	}
 	buf = mkbuf(2*Blk, 7);
@@ -247,8 +260,10 @@ tadoptover(void)
 	mk(s, "old");
 	if(rmv(s, "old", 2) < 0)
 		fail("objremove: %r");
-	if(ostat(s, "old", &tomb) < 0)
+	if(ostat(s, "old", &tomb) < 0){
 		fail("objstat of the tombstone: %r");
+		goto out;
+	}
 
 	if(adopt(s, "old", 9, 4) < 0)
 		fail("objadopt over a tombstone: %r");
@@ -308,8 +323,10 @@ tadoptover(void)
 	mk(s, "alive");
 	if(wr(s, "alive", buf, 2*Blk, 0, 2) < 0)
 		fail("objwrite: %r");
-	if(ostat(s, "alive", &live) < 0)
+	if(ostat(s, "alive", &live) < 0){
 		fail("objstat of the live copy: %r");
+		goto out;
+	}
 	storestat(s, &st0);
 	checks++;
 	if(adopt(s, "alive", 99, 9) >= 0)
@@ -336,6 +353,7 @@ tadoptover(void)
 	if(ostat(s, "nought", &oi) >= 0)
 		fail("the refused adopt published a record");
 
+out:
 	free(buf);
 	storeclose(s);
 	devclose(d);
@@ -437,6 +455,7 @@ tdrop(int crash)
 	d = newdisk();
 	if((s = mustopen(d, what)) == nil){
 		devclose(d);
+		killspawned();
 		return;
 	}
 	buf = mkbuf(3*Blk, 23);
@@ -470,6 +489,7 @@ tdrop(int crash)
 		if((s = mustopen(d, what)) == nil){
 			devclose(d);
 			free(buf);
+			killspawned();
 			return;
 		}
 	}else{
@@ -499,6 +519,7 @@ tdrop(int crash)
 		if((s = restart(s, d, what)) == nil){
 			devclose(d);
 			free(buf);
+			killspawned();
 			return;
 		}
 	}
@@ -538,6 +559,7 @@ tdropedges(void)
 	d = newdisk();
 	if((s = mustopen(d, "drop edges")) == nil){
 		devclose(d);
+		killspawned();
 		return;
 	}
 	buf = mkbuf(Blk, 31);
@@ -696,6 +718,7 @@ tcsum(int kind)
 	d = newdisk();
 	if((s = mustopen(d, what)) == nil){
 		devclose(d);
+		killspawned();
 		return;
 	}
 	buf = mkbuf(2*Blk, 41 + kind);
@@ -705,6 +728,7 @@ tcsum(int kind)
 		storeclose(s);
 		devclose(d);
 		free(buf);
+		killspawned();
 		return;
 	}
 	if(ostat(s, csumobj(kind), &want) < 0)
@@ -718,11 +742,10 @@ tcsum(int kind)
 	if((s = mustopen(d, what)) == nil){
 		devclose(d);
 		free(buf);
+		killspawned();
 		return;
 	}
 	csumsetup(s, kind, buf);
-	if(ostat(s, csumobj(kind), &oi) < 0)
-		memset(&oi, 0, sizeof oi);
 	storestat(s, &st0);
 	memset(bad, 0xa5, sizeof bad);
 	checks++;
@@ -743,6 +766,7 @@ tcsum(int kind)
 	if((s = restart(s, d, what)) == nil){
 		devclose(d);
 		free(buf);
+		killspawned();
 		return;
 	}
 	if(kind == Cadopt || kind == Cfull){
@@ -766,6 +790,7 @@ tcsum(int kind)
 		eqv("a checked operation commits the same len", oi.len,
 			want.len);
 		eqv("... the same ver", oi.ver, want.ver);
+		eqv("... the same wepoch", oi.wepoch, want.wepoch);
 		eqv("... the same state", oi.state, want.state);
 		checks++;
 		if(memcmp(oi.csum, want.csum, Csumlen) != 0)
@@ -901,6 +926,7 @@ tlist(void)
 	d = newdisk();
 	if((s = mustopen(d, "list")) == nil){
 		devclose(d);
+		killspawned();
 		return;
 	}
 	fillinv(s);
@@ -939,10 +965,15 @@ tlist(void)
 					fail("op=list renders another csum");
 			}
 
-	/* k larger than the inventory is not more */
-	n = objlist(s, nil, 0, e, 32, &more);
-	eqv("k past the inventory answers all of it", n, Ninv);
-	eqv("... with more 0", more, 0);
+	/* a page of exactly the inventory is full, and nothing follows */
+	n = objlist(s, nil, 0, e, Ninv, &more);
+	eqv("a page of exactly the inventory is full", n, Ninv);
+	eqv("... and says nothing follows", more, 0);
+
+	/* one entry short of it is full too, and more is set */
+	n = objlist(s, nil, 0, e, Ninv - 1, &more);
+	eqv("a page one short of the inventory is full", n, Ninv - 1);
+	eqv("... and says more follows", more, 1);
 
 	/* after the last oid there is nothing */
 	n = objlist(s, (uchar*)"z", 1, e, 32, &more);
@@ -977,6 +1008,7 @@ tlistpage(void)
 	d = newdisk();
 	if((s = mustopen(d, "list paging")) == nil){
 		devclose(d);
+		killspawned();
 		return;
 	}
 	fillinv(s);
