@@ -1557,6 +1557,20 @@ time of the last chunk. It is owned by the fid.
   because a repair that worked only for a slot condemned since the
   last restart is not a repair.
 
+  **`op=create` is this path with `len=0`.** layer-a §5.5 makes
+  `op=create` self-contained and arbitrated on `(wepoch, ver)` exactly
+  as `op=full` is, and a created object carries no content — so the
+  receiver's path for it is a stage of zero length whose `final=1`
+  follows no chunk, which lands in the first of the two receivers
+  above when the instance holds nothing and in the tombstone
+  paragraph when it holds a tombstone. `objcreate` is **not** that
+  path: it is layer-a §5.4's *client* create, which answers
+  `object exists` for a live id and chooses the new version itself
+  over a tombstone, where a replicated create must adopt the sender's
+  version verbatim and defend an existing key with `stale version`
+  (§3.7). The two agree on no refusal at all, which is why the
+  receiver takes the stage.
+
   A **count-0 write** is not one of these and is not an extend
   either: layer-a §2.4 extends at a write *at* an offset above `len`,
   meaning bytes landing there, and a count of zero lands none. It

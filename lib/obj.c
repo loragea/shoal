@@ -917,8 +917,9 @@ objcreatecsum(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 	 * (0, 0).  Unlike stagefinal's, this refusal is §3.7's internal
 	 * kind and carries no §2.6 prefix — a client create's version is
 	 * this instance's own to choose (layer-a §5.4 step 3), and the
-	 * op=create receiver arbitrates rather than calling here (§3.6) —
-	 * so a version of 0 on this path is a caller bug.
+	 * op=create receiver does not come through here at all: its path
+	 * is a zero-length stage, which arbitrates in stagefinal (§3.6).
+	 * So a version of 0 on this path is a caller bug.
 	 */
 	if(ver == 0){
 		werrstr("create at version 0");
@@ -960,10 +961,10 @@ objcreatecsum(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 		 * create path (§3.6), on which the version is this
 		 * instance's own to choose (layer-a §5.4 step 3) — chosen
 		 * by the rule this branch enforces — so any other value is
-		 * a caller bug.  The op=create receiver arbitrates before
-		 * calling here (§3.6), and an op=full over a tombstone
-		 * arbitrates in stagefinal, where the refusal is §2.6's
-		 * `stale version'.
+		 * a caller bug.  A replicated op=create is a zero-length
+		 * stage and an op=full over a tombstone a stage of the
+		 * object's length; both arbitrate in stagefinal, where the
+		 * refusal is §2.6's `stale version'.
 		 */
 		if(ver != e->ver + 1 || wepoch < e->wepoch){
 			qunlock(&s->qlstate);
