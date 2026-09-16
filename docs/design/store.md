@@ -1772,7 +1772,9 @@ the lower ones — §1.3 makes equal keys equal content, a tombstone
 holds none, and there is no `force=1` on a path that carries none
 either — and the refusal is §3.7's `stale version`, as `stagefinal`'s
 is. An absent id has no key to defend and takes any key §1.3
-permits.
+permits. Neither commit frees space: an adoption publishes
+`state=tomb` but releases no grain, no slot and no length, so it is
+not one of the space-freeing commits §6's reserved log tail is for.
 
 Over a **live** copy it refuses, and the refusal is §3.7's internal
 kind. A live copy holds content; replacing it with metadata is the
@@ -2281,8 +2283,14 @@ against the entry's `mtime`, which is why the tombstone keeps one.
 
 **The log's reserved tail.** The last `logresv` sectors of free log
 space (policy, default one sixteenth of `logsecs`) are usable only by
-commits that free space: an `Eobj` that releases grains without
-allocating any — delete, truncate, tombstone — and an `Eslot`. An
+commits that free space: an `Eobj` that releases something and
+allocates nothing — delete, truncate, drop — and an `Eslot`. What
+counts as a release is grains freed, a live copy becoming a
+tombstone, a length shrink, or the extent-map slot §2.7's `Oslot`
+rule gives back; publishing `state=tomb` is not one by itself, so a
+re-keying tombstone adoption (§3.8) and a `corrupt` flag set over a
+record that is already a tombstone (§8) free nothing and may not draw
+on the reserve. An
 `Edirty` is not one of them in either direction: adding or removing a
 fine-grained dirty record frees no log space, so a remove may no more
 draw on the reserve than an add may. The
