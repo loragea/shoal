@@ -2624,12 +2624,16 @@ stagefinalcsum(Stage *g, uvlong ver, uvlong wepoch, uchar *csum,
 	 * comparison is skipped entirely for a receiver with no key to
 	 * defend, which is both of §3.6's cases, so an absent or corrupt
 	 * copy would take the push and be published at (wepoch, 0).  On
-	 * the wire the version comes out of the op=full header, so a
-	 * value the model forbids is a malformed header — layer-a §5.5's
-	 * common set, `bad ctl'.
+	 * the wire the version comes out of the op=full header, or out
+	 * of the op=create one this path serves as a zero-length stage
+	 * (§3.6), so a value the model forbids is a malformed header —
+	 * layer-a §5.5's common set, `bad ctl'.  The detail names the
+	 * path rather than one of the two ops: §2.6 makes the detail
+	 * this store's to choose, and naming op=full alone would be
+	 * wrong for half the callers that reach it.
 	 */
 	if(ver == 0){
-		werrstr("bad ctl: op=full at version 0");
+		werrstr("bad ctl: stage at version 0");
 		return stagefail(g);
 	}
 	qlock(&s->qlstate);
