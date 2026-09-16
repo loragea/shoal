@@ -737,6 +737,13 @@ void	storehook(Store*, char *name, uvlong n);	/* §13's -X hooks */
 ulong	storelost(Store*, ulong i);
 int	storefullsync(Store*, char *peer);
 
+/*
+ * §8's online bitmap rebuild (D18): declarations are added here by
+ * the bitmap-rebuild work and nowhere else in this header.
+ */
+/* --- bitmap-rebuild: begin --- */
+/* --- bitmap-rebuild: end --- */
+
 /* §2.2's publisher: durable before the value is acted on */
 uvlong	qidalloc(Store*);
 int	epochadopt(Store*, uvlong epoch);
@@ -982,6 +989,15 @@ int	fullsyncsnap(Store*, char ***pp, ulong *np);
  * flag is not cleared — objscrub clears it when every block matches.
  */
 int	objrepair(Store*, uchar *oid, int oidlen, ulong blk, void *a, long n);
+
+/*
+ * The engine calls layer-a §5.5/§5.6's peer channels need and the
+ * store did not have (tombstone adoption, drop, the resulting-csum
+ * check, oid-ordered listing): declarations are added here by the
+ * peer-engine-ops work and nowhere else in this header.
+ */
+/* --- peer-engine-ops: begin --- */
+/* --- peer-engine-ops: end --- */
 
 /* the dirty set, §2.6 and layer-a §7.1 */
 int	dirtyadd(Store*, uchar *oid, int oidlen, char *peer, uvlong epoch);
