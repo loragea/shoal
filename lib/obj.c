@@ -1822,6 +1822,128 @@ objslot(Store *s, ulong slot, uchar *oid, int *oidlen, Objinfo *oi)
 }
 
 /*
+ * layer-a §1.1 compares ids as byte strings, case-sensitively, and
+ * says nothing else: so two ids that agree over the shorter one's
+ * length are ordered by length, the shorter first.  Every byte an oid
+ * may hold is below 0x80 (§1.1's ALPHA / DIGIT / "." / "-" / "_"), so
+ * memcmp over uchar is that comparison and no sign question arises.
+ */
+static int
+oidcmp(uchar *a, int na, uchar *b, int nb)
+{
+	int n, c;
+
+	n = na < nb ? na : nb;
+	if(n > 0 && (c = memcmp(a, b, n)) != 0)
+		return c;
+	if(na == nb)
+		return 0;
+	return na < nb ? -1 : 1;
+}
+
+/*
+ * layer-a §5.6's op=list: the k smallest oids strictly greater than
+ * `after', live and tomb alike, in oid byte order.
+ *
+ * **Not an Objsnap.**  §9's snapshot is slot-ordered, so resuming
+ * after an oid through one would mean sorting the whole index per
+ * page; it costs a vector of the whole index; and its count is
+ * bounded by objsnapmax, which §9 sizes for the admin fids, so a
+ * reconcile pass paging through the inventory would spend that bound.
+ * A k-smallest selection needs none of it: it is one pass of the slot
+ * array per page with k entries of state.
+ *
+ * **The hold is per chunk, not per page.**  §9 measures a walk of a
+ * full index at 23 ms and calls it the one place a state lock is held
+ * for milliseconds; this walk would be a second one, taken by every
+ * peer's reconcile rather than by an operator's open.  So the lock is
+ * taken for Listchunk slots at a time and released between chunks.
+ * Each entry the selection keeps is copied — oid and Objinfo both —
+ * under the hold it was seen in, so a page is internally consistent
+ * in layer-a §5.6's sense however the index moves between chunks.
+ *
+ * What that costs is stated rather than hidden: an object created
+ * into a chunk this scan has passed is missed by this page, and one
+ * created into a chunk ahead of it is included.  §5.6 tolerates
+ * exactly that — "a reconcile pass MUST tolerate an object created or
+ * deleted between pages" — and the next pass or an /advert catches
+ * it.  *more counts the candidates this scan saw, to the same
+ * tolerance, which is what lets a caller stop without a second page
+ * that answers nothing.
+ *
+ * Listchunk is 256 because §9 prices a slot at ~22 ns: 256 slots is
+ * ~5.6 us under the lock, three orders below the 8.4 ms write §7 rule
+ * 2 measures holds against, while a chunk small enough to matter for
+ * latency would pay a qlock round trip per handful of slots.
+ */
+int
+objlist(Store *s, uchar *after, int afterlen, Objent *e, int k, int *more)
+{
+	Ient *ent;
+	ulong slot, lim, nslots;
+	uvlong ncand;
+	int n, i, j;
+
+	if(more != nil)
+		*more = 0;
+	if(!storeserving(s))
+		return -1;
+	if(k < 0){
+		werrstr("list: negative count %d", k);
+		return -1;
+	}
+	if(afterlen < 0 || afterlen > Oidmax){
+		werrstr("bad object name: after length %d", afterlen);
+		return -1;
+	}
+	n = 0;
+	ncand = 0;
+	nslots = s->sb.nslots;
+	for(slot = 0; slot < nslots; ){
+		lim = slot + Listchunk;
+		if(lim > nslots)
+			lim = nslots;
+		qlock(&s->qlstate);
+		for(; slot < lim; slot++){
+			ent = &s->idx[slot];
+			if(ent->state != Slive && ent->state != Stomb)
+				continue;
+			/*
+			 * Strictly greater: `after' is the last oid of the
+			 * previous page and has been answered already, so
+			 * accepting an equal id would repeat it for ever.
+			 * An afterlen of 0 is below every oid, since §1.1
+			 * makes an oid at least one byte, so an empty
+			 * `after' starts from the beginning with no case of
+			 * its own.
+			 */
+			if(oidcmp(ent->oid, ent->oidlen, after, afterlen) <= 0)
+				continue;
+			ncand++;
+			if(k == 0)
+				continue;
+			for(j = 0; j < n; j++)
+				if(oidcmp(ent->oid, ent->oidlen, e[j].oid,
+					e[j].oidlen) < 0)
+					break;
+			if(j == k)
+				continue;	/* not among the k smallest */
+			if(n < k)
+				n++;
+			for(i = n - 1; i > j; i--)
+				e[i] = e[i-1];
+			e[j].oidlen = ent->oidlen;
+			memmove(e[j].oid, ent->oid, ent->oidlen);
+			ientinfo(s, slot, &e[j].oi);
+		}
+		qunlock(&s->qlstate);
+	}
+	if(more != nil)
+		*more = ncand > (uvlong)n;
+	return n;
+}
+
+/*
  * §8's first bullet: block repair.  The caller has fetched block blk
  * from a holder of a copy at the same key (layer-a §5.6's op=get) and
  * hands the bytes here; this checks them and, if they are the block

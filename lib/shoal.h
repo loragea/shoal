@@ -1096,6 +1096,53 @@ int	objadoptcsum(Store*, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
  * the engine holds no map.
  */
 int	objdrop(Store*, uchar *oid, int oidlen);
+
+/*
+ * **Oid-ordered listing**, layer-a §5.6's op=list: the k smallest
+ * oids strictly greater than `after', live and tomb alike, in the
+ * byte order §1.1 compares ids in.  An `after' of length 0 (the
+ * argument may be nil) starts from the beginning.  Answers how many
+ * entries were filled — at most k, fewer at the end of the inventory
+ * — or -1.  *more, when the pointer is not nil, is 1 when the scan
+ * saw at least one further oid above the last one answered, which is
+ * how a caller learns whether to ask again; a page that answers fewer
+ * than k entries with *more 0 is the end of the inventory.
+ *
+ * This is NOT an Objsnap (§9).  A snapshot is slot-ordered, costs a
+ * vector of the whole index, is bounded by objsnapmax and competes
+ * with the admin fids for that bound; op=list needs none of that and
+ * pages by oid rather than by position.  The scan is chunked: it
+ * takes the state lock for Listchunk slots at a time, renders each
+ * entry it selects under the hold it saw it in, and releases the lock
+ * between chunks, so no caller waits behind a walk of the whole
+ * index (§9 measures that walk at 23 ms at nslots = 2^20).
+ *
+ * The price is that a page is not a snapshot: an object created into
+ * a chunk this scan has already passed is missed by this page, and
+ * one created into a chunk it has not reached yet is included.
+ * layer-a §5.6 requires only that a page be internally consistent —
+ * which it is, since each entry is rendered whole under one hold —
+ * and explicitly tolerates an object created or deleted between
+ * pages.  *more is answered to the same tolerance: it counts the
+ * candidates this scan saw.
+ *
+ * Paging with `after' set to the last oid of the previous page
+ * therefore neither duplicates nor skips an object that stayed put
+ * for both pages, which is layer-a §5.6's contract.
+ */
+typedef struct Objent Objent;
+struct Objent
+{
+	int	oidlen;
+	uchar	oid[Oidmax];
+	Objinfo	oi;
+};
+enum
+{
+	Listchunk	= 256,	/* slots per hold of the state lock; §9 */
+};
+int	objlist(Store*, uchar *after, int afterlen, Objent *e, int k,
+		int *more);
 /* --- peer-engine-ops: end --- */
 
 /* the dirty set, §2.6 and layer-a §7.1 */

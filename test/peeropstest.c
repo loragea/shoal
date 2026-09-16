@@ -643,6 +643,278 @@ tcsum(int kind)
 
 /* ------------------------------------------------------------------ */
 
+/*
+ * T1.33, op=list.  The inventory below is chosen for layer-a §1.1's
+ * byte order over mixed lengths: "a" is a prefix of four of the
+ * others and sorts before them, and '-' (0x2d), '.' (0x2e), '_'
+ * (0x5f) and the letters straddle each other in a way a comparison
+ * that ignored length or compared signed chars would get wrong.
+ */
+static char *inv[] = {
+	"a", "a-b", "a.b", "a_b", "aa", "ab", "b", "ba", "z",
+};
+enum { Ninv = 9 };
+
+static Objent*
+newpage(int k)
+{
+	Objent *e;
+
+	if((e = malloc(k*sizeof *e)) == nil)
+		sysfatal("malloc: %r");
+	return e;
+}
+
+static int
+sameoid(Objent *e, char *name)
+{
+	return e->oidlen == (int)strlen(name)
+		&& memcmp(e->oid, name, e->oidlen) == 0;
+}
+
+static void
+fillinv(Store *s)
+{
+	int i;
+
+	/* created out of order, so nothing about slot order helps */
+	for(i = Ninv - 1; i >= 0; i--)
+		mk(s, inv[i]);
+	/* two of them are tombstones: op=list pages live and tomb alike */
+	if(rmv(s, "ab", 2) < 0)
+		fail("objremove ab: %r");
+	if(rmv(s, "b", 2) < 0)
+		fail("objremove b: %r");
+}
+
+static void
+tlist(void)
+{
+	Dev *d;
+	Store *s;
+	Objent *e;
+	Objinfo oi;
+	int i, n, more;
+
+	spawnforget();
+	d = newdisk();
+	if((s = mustopen(d, "list")) == nil){
+		devclose(d);
+		return;
+	}
+	fillinv(s);
+	e = newpage(32);
+
+	/* the whole inventory, in order, live and tomb both present */
+	n = objlist(s, nil, 0, e, 32, &more);
+	eqv("op=list answers the whole inventory", n, Ninv);
+	eqv("... and says nothing follows", more, 0);
+	if(n == Ninv)
+		for(i = 0; i < Ninv; i++){
+			checks++;
+			if(!sameoid(&e[i], inv[i]))
+				fail("op=list entry %d is `%.*s', wanted `%s'",
+					i, e[i].oidlen, (char*)e[i].oid, inv[i]);
+		}
+	/* the two tombstones are in it, as tombstones */
+	for(i = 0; i < n; i++)
+		if(sameoid(&e[i], "ab") || sameoid(&e[i], "b"))
+			eqv("op=list renders a tombstone as tomb",
+				e[i].oi.state, Stomb);
+
+	/* the Objinfo is the live index's, not a guess */
+	if(ostat(s, "aa", &oi) < 0)
+		fail("objstat aa: %r");
+	else
+		for(i = 0; i < n; i++)
+			if(sameoid(&e[i], "aa")){
+				eqv("op=list renders the object's slot",
+					e[i].oi.slot, oi.slot);
+				eqv("... its qid.path", e[i].oi.qidpath,
+					oi.qidpath);
+				eqv("... its ver", e[i].oi.ver, oi.ver);
+				checks++;
+				if(memcmp(e[i].oi.csum, oi.csum, Csumlen) != 0)
+					fail("op=list renders another csum");
+			}
+
+	/* k larger than the inventory is not more */
+	n = objlist(s, nil, 0, e, 32, &more);
+	eqv("k past the inventory answers all of it", n, Ninv);
+	eqv("... with more 0", more, 0);
+
+	/* after the last oid there is nothing */
+	n = objlist(s, (uchar*)"z", 1, e, 32, &more);
+	eqv("after the last oid the page is empty", n, 0);
+	eqv("... and nothing follows", more, 0);
+
+	/* k of 0 is a question about whether anything is there */
+	n = objlist(s, nil, 0, e, 0, &more);
+	eqv("k of 0 answers no entries", n, 0);
+	eqv("... but says more follows", more, 1);
+
+	free(e);
+	storeclose(s);
+	devclose(d);
+	killspawned();
+}
+
+/*
+ * Three pages of three, resumed by `after': no duplicates, no gaps,
+ * and `more' 0 only on the last.
+ */
+static void
+tlistpage(void)
+{
+	Dev *d;
+	Store *s;
+	Objent *e;
+	uchar after[Oidmax];
+	int afterlen, i, j, n, more, got;
+
+	spawnforget();
+	d = newdisk();
+	if((s = mustopen(d, "list paging")) == nil){
+		devclose(d);
+		return;
+	}
+	fillinv(s);
+	e = newpage(3);
+	afterlen = 0;
+	got = 0;
+	for(i = 0; i < 3; i++){
+		n = objlist(s, afterlen > 0 ? after : nil, afterlen, e, 3,
+			&more);
+		if(n < 0){
+			fail("objlist page %d: %r", i);
+			break;
+		}
+		eqv("a full page answers k entries", n, 3);
+		eqv("more is set while inventory follows", more, i < 2);
+		for(j = 0; j < n; j++){
+			if(got >= Ninv){
+				fail("paging answered more than the inventory");
+				break;
+			}
+			got++;
+			checks++;
+			if(!sameoid(&e[j], inv[got-1]))
+				fail("page %d entry %d is `%.*s', wanted `%s'",
+					i, j, e[j].oidlen, (char*)e[j].oid,
+					inv[got-1]);
+		}
+		if(n > 0){
+			afterlen = e[n-1].oidlen;
+			memmove(after, e[n-1].oid, afterlen);
+		}
+	}
+	eqv("three pages of three cover the inventory once", got, Ninv);
+
+	free(e);
+	storeclose(s);
+	devclose(d);
+	killspawned();
+}
+
+/*
+ * A create during the scan.  layer-a §5.6 tolerates an object created
+ * between pages, and the chunked scan makes that true within a page
+ * too: an object created into a chunk the scan has passed is missed.
+ * What a page MUST still be is internally consistent, so that is what
+ * is asserted here — every entry above `after', strictly ascending,
+ * never repeated — under a proc creating objects beside the walk.
+ *
+ * NOT covered: that the scan releases the state lock BETWEEN chunks
+ * rather than holding it across the whole index.  The difference is
+ * invisible from outside — a create that blocks on the lock and a
+ * create that lands between two chunks leave the same page — and the
+ * engine offers no counter or -X hook that would expose it, so no
+ * check here discriminates the two.  §13's T1.33 row says so.
+ */
+static struct
+{
+	Store	*s;
+	int	stop;
+} churn;
+
+static void
+churnproc(void*)
+{
+	char name[16];
+	uchar o[Oidmax];
+	int i;
+
+	for(i = 0; !churn.stop && i < 40; i++){
+		snprint(name, sizeof name, "c%d", i);
+		oidof(o, name);
+		if(objcreate(churn.s, o, strlen(name), 1, 1, nil, 0, nil) < 0)
+			break;
+	}
+	churn.stop = 1;
+}
+
+static void
+tlistchurn(void)
+{
+	Dev *d;
+	Store *s;
+	Objent *e;
+	uchar after[Oidmax];
+	int afterlen, i, j, n, more, pages;
+
+	spawnforget();
+	d = newdisk();
+	if((s = mustopen(d, "list under churn")) == nil){
+		devclose(d);
+		return;
+	}
+	fillinv(s);
+	e = newpage(4);
+	churn.s = s;
+	churn.stop = 0;
+	if(spawnproc(churnproc, nil) < 0){
+		fail("spawnproc: %r");
+		churn.stop = 1;
+	}
+	afterlen = 0;
+	pages = 0;
+	for(i = 0; i < 40; i++){
+		n = objlist(s, afterlen > 0 ? after : nil, afterlen, e, 4,
+			&more);
+		if(n < 0){
+			fail("objlist under churn: %r");
+			break;
+		}
+		pages++;
+		for(j = 0; j < n; j++){
+			checks++;
+			if(afterlen > 0
+			&& oidcmptest(e[j].oid, e[j].oidlen, after, afterlen) <= 0)
+				fail("a page under churn repeats or precedes "
+					"`after'");
+			if(j > 0){
+				checks++;
+				if(oidcmptest(e[j].oid, e[j].oidlen,
+					e[j-1].oid, e[j-1].oidlen) <= 0)
+					fail("a page under churn is not "
+						"strictly ascending");
+			}
+		}
+		if(n > 0){
+			afterlen = e[n-1].oidlen;
+			memmove(after, e[n-1].oid, afterlen);
+		}
+		if(n == 0)
+			break;
+	}
+	churn.stop = 1;
+	istrue("the walk under churn made progress", pages > 1);
+	free(e);
+	storeclose(s);
+	devclose(d);
+	killspawned();
+}
+
 /* ------------------------------------------------------------------ */
 
 void
@@ -660,6 +932,9 @@ main(int argc, char **argv)
 	tdropedges();
 	for(i = Cwrite; i <= Cadopt; i++)
 		tcsum(i);
+	tlist();
+	tlistpage();
+	tlistchurn();
 
 	killspawned();
 	if(fails > 0){

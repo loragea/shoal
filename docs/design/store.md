@@ -3072,6 +3072,48 @@ implementation policy. Dropping it instead would make the copy and
 `/status`'s own count disagree on precisely the damage `/lost`
 exists for.
 
+**The oid-ordered listing is not a snapshot.** layer-a §5.6's
+`op=list` pages an instance's whole inventory — live and tomb — in
+`oid` byte order, resuming after `after=`, and it is the peer
+enumeration path: a reconcile pass runs it against every instance.
+The snapshot above is the wrong shape for it three times over. It is
+slot-ordered, so resuming after an `oid` through one would mean
+sorting the whole index per page; it costs a vector of the whole
+index; and its count is bounded by `objsnapmax`, which is sized for
+the admin fids, so a reconcile paging through the inventory would
+spend that bound against `/obj` and `/tombs`.
+
+So `op=list` is served by a **k-smallest selection over a chunked
+scan** instead: one pass of the slot array per page, holding `k`
+entries of state, taking `qlstate` for `Listchunk` slots at a time
+(policy, 256) and releasing it between chunks. Each entry the
+selection keeps is copied — `oid` and `Objinfo` both — under the hold
+it was seen in, so a page is internally consistent in layer-a §5.6's
+sense. 256 is chosen against the ~22 ns a slot measured above: a
+chunk is ~5.6 µs under the lock, three orders below the 8.4 ms write
+§7 rule 2 measures holds against, while a chunk small enough to
+matter for latency would pay a `qlock` round trip per handful of
+slots. The whole point of the chunking is that this walk, unlike the
+snapshot open, is taken by every peer's reconcile rather than by an
+operator's open, so it must not be the second place a state lock is
+held for the 23 ms a full index costs.
+
+What that costs is stated rather than hidden: an object created into
+a chunk the scan has already passed is missed by that page, and one
+created into a chunk ahead of it is included. layer-a §5.6 tolerates
+exactly that — "a reconcile pass MUST tolerate an object created or
+deleted between pages" — and the next pass or an `/advert` catches
+it. Paging by `after=` therefore neither repeats nor skips an object
+that stayed put across both pages, which is the contract §5.6 states.
+
+**How the caller learns whether more follows** is an out-parameter
+(policy): the scan counts the candidates above `after` it saw, and
+answers `more` when that count exceeds what it returned. It is
+answered to the page's own tolerance, since it is the same scan. The
+`lines=` and `more=` of §5.6's response line are the server's to
+render, and so is clamping the requested `n=` to the negotiated
+`msize`: the engine's `k` counts entries, not bytes.
+
 §6's tombstone reclaim is the enumeration's first caller, and it is
 the caller's walk rather than the engine's: the engine holds no
 `tombdays` policy, because layer-a §3.1 makes `tombdays` a map-header
@@ -4150,7 +4192,7 @@ back at a higher key under it, and under concurrent churn with one
 churn proc parked on a tombstone of its own making, so that the
 walk's epoch condition is what holds it off and not its cutoff).
 
-Against the list below that is T1.1–T1.26 and T1.30–T1.32. One case
+Against the list below that is T1.1–T1.26 and T1.30–T1.33. One case
 is not covered
 and waits on something this store does not have yet: **T1.27** waits
 on the server's `Reqqueue` pool (§7), which is what it is about — the
@@ -4438,6 +4480,23 @@ what would close it.
   it commits the same four-tuple. *Mutation:* make the check after
   `logcommit` rather than before it, which leaves the refusal in
   place and the record on the platter.
+- **T1.33 the oid-ordered listing (§9).** An inventory chosen for
+  layer-a §1.1's byte order over mixed lengths — an id that is a
+  prefix of four others, and `-`, `.`, `_` and letters straddling
+  each other — with two of its entries tombstones. Assert the whole
+  inventory in order with both kinds present and the `Objinfo`
+  matching `objstat`'s; three pages of three resumed by `after` with
+  no duplicate and no gap and `more` set only while inventory
+  follows; `k` past the inventory; `k` of 0; `after` at the last oid.
+  Then a proc creating objects beside the walk, under which every
+  page must still be strictly ascending and above its `after`.
+  *Mutations:* resume at `>= after` rather than `> after`; skip
+  tombstones. **Not covered:** that the scan releases `qlstate`
+  between chunks rather than holding it across the index. The two are
+  indistinguishable from outside — a create that blocks on the lock
+  and a create that lands between chunks leave the same page — and
+  the engine exposes no counter or `-X` hook that would tell them
+  apart, so no check here discriminates them.
 
 T1 stays diskless and is `mk test` at the repo root, as `AGENTS.md`
 requires: the simulated disk is a T1 program's own memory.
