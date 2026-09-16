@@ -1117,6 +1117,15 @@ int	objdrop(Store*, uchar *oid, int oidlen);
  * between chunks, so no caller waits behind a walk of the whole
  * index (§9 measures that walk at 23 ms at nslots = 2^20).
  *
+ * `k' is the caller's and the engine puts no bound on it; layer-a
+ * §5.6's `n=' is clamped to the negotiated msize by the server, which
+ * is what bounds it in practice.  A page costs one pass of the slot
+ * array — O(nslots) comparisons for the candidates it rejects,
+ * whatever k is — plus O(k) for each candidate it accepts, so k shows
+ * in the price.  Measured at nslots = 8192 over 8184 objects: k=1
+ * costs ~35 us a hold and ~1.1 ms a page, k=256 ~160 us and ~5.1 ms,
+ * k=1024 ~1.15 ms and ~37 ms (§9).
+ *
  * The price is that a page is not a snapshot: an object created into
  * a chunk this scan has already passed is missed by this page, and
  * one created into a chunk it has not reached yet is included.

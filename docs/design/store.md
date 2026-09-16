@@ -3103,14 +3103,40 @@ entries of state, taking `qlstate` for `Listchunk` slots at a time
 (policy, 256) and releasing it between chunks. Each entry the
 selection keeps is copied — `oid` and `Objinfo` both — under the hold
 it was seen in, so a page is internally consistent in layer-a §5.6's
-sense. 256 is chosen against the ~22 ns a slot measured above: a
-chunk is ~5.6 µs under the lock, three orders below the 8.4 ms write
-§7 rule 2 measures holds against, while a chunk small enough to
-matter for latency would pay a `qlock` round trip per handful of
-slots. The whole point of the chunking is that this walk, unlike the
+sense. The whole point of the chunking is that this walk, unlike the
 snapshot open, is taken by every peer's reconcile rather than by an
 operator's open, so it must not be the second place a state lock is
 held for the 23 ms a full index costs.
+
+**What a page costs** is measured for this scan rather than derived
+from the ~22 ns a slot above, which prices the snapshot walk's
+per-slot work and not this one's. A page is one pass of the slot
+array: **O(`nslots`) comparisons for the candidates the selection
+rejects — one each, whatever `k` is** — plus O(`k`) to place each
+candidate it accepts, so `k` shows in the price through the
+acceptances rather than through the pass. Rejecting in one comparison
+is a test the selection makes before its insertion scan, against the
+largest entry a full buffer holds; without it every slot past the
+first `k` runs the insertion scan to completion and the per-slot cost
+is O(`k`). Measured on the reference machine at `nslots` = 8192 over
+8184 objects, for a page from the start of the inventory:
+
+| `k` | per hold of 256 slots | per page | per hold without the test |
+|---|---|---|---|
+| 1 | ~35 µs | ~1.1 ms | ~37 µs |
+| 256 | ~160 µs | ~5.1 ms | ~4.4 ms |
+| 1024 | ~1.15 ms | ~37 ms | ~12.5 ms |
+
+(A per-hold figure is a page divided by its 32 holds.) 256 slots a
+hold keeps the hold under the 8.4 ms write §7 rule 2 measures holds
+against across that range, while a chunk small enough to matter for
+latency would pay a `qlock` round trip per handful of slots.
+
+`k` is the caller's and the **engine puts no bound on it**: it is
+bounded in practice by the server's clamp of layer-a §5.6's `n=` to
+the negotiated `msize`, below. A caller that asks for a `k` far above
+what a response can carry pays the table's right-hand column for a
+page it cannot send.
 
 What that costs is stated rather than hidden: an object created into
 a chunk the scan has already passed is missed by that page, and one

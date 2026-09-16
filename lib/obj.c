@@ -1872,10 +1872,25 @@ oidcmp(uchar *a, int na, uchar *b, int nb)
  * tolerance, which is what lets a caller stop without a second page
  * that answers nothing.
  *
- * Listchunk is 256 because §9 prices a slot at ~22 ns: 256 slots is
- * ~5.6 us under the lock, three orders below the 8.4 ms write §7 rule
- * 2 measures holds against, while a chunk small enough to matter for
- * latency would pay a qlock round trip per handful of slots.
+ * What a hold costs is measured for this scan rather than derived
+ * from §9's ~22 ns a slot, which prices the snapshot walk's per-slot
+ * work and not this one's.  At nslots = 8192 over 8184 objects, a
+ * page from the start of the inventory costs (§9):
+ *
+ *	k	per hold of 256 slots	per page
+ *	1	~35 us			~1.1 ms
+ *	256	~160 us			~5.1 ms
+ *	1024	~1.15 ms		~37 ms
+ *
+ * A candidate the buffer rejects costs one comparison whatever k is
+ * — that is what the early-out below buys, and without it the same
+ * page at k=256 costs ~4.4 ms a hold and ~141 ms — so the page is
+ * O(nslots) in the rejections.  What still scales with k is placing
+ * the candidates the buffer accepts, which is O(k) each.  256 slots
+ * a hold keeps the hold under the 8.4 ms write §7 rule 2 measures
+ * holds against across that range, while a chunk small enough to
+ * matter for latency would pay a qlock round trip per handful of
+ * slots.
  */
 int
 objlist(Store *s, uchar *after, int afterlen, Objent *e, int k, int *more)
@@ -1923,12 +1938,30 @@ objlist(Store *s, uchar *after, int afterlen, Objent *e, int k, int *more)
 			ncand++;
 			if(k == 0)
 				continue;
+			/*
+			 * One comparison answers the whole question for
+			 * every candidate a full buffer will not take: the
+			 * entries are ascending, so a candidate that is not
+			 * below the largest of k cannot displace any of
+			 * them.  Without it the insertion scan below runs
+			 * to completion for every slot past the first k,
+			 * which is what makes the per-slot cost O(k) and
+			 * the hold O(k * Listchunk).  With it the per-slot
+			 * constant stops depending on k once the buffer is
+			 * full, which is what the figures above measure.
+			 *
+			 * An oid equal to the largest kept entry is skipped
+			 * rather than re-rendered, so a page still holds
+			 * one entry per oid; which of two renders of the
+			 * same oid it keeps is a choice §5.6 tolerates.
+			 */
+			if(n == k && oidcmp(ent->oid, ent->oidlen,
+				e[n-1].oid, e[n-1].oidlen) >= 0)
+				continue;
 			for(j = 0; j < n; j++)
 				if(oidcmp(ent->oid, ent->oidlen, e[j].oid,
 					e[j].oidlen) < 0)
 					break;
-			if(j == k)
-				continue;	/* not among the k smallest */
 			if(n < k)
 				n++;
 			for(i = n - 1; i > j; i--)
