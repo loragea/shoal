@@ -4222,8 +4222,9 @@ T1 formats a **small geometry** — a partition image of a few MiB with
 over one header sector, not over the whole store, and the cases that
 need `nslots = 2^20` are T2's.
 
-**What T1 covers today.** Thirteen programs, all of them against the
-simulated disk except where a file-backed device is the point:
+**What T1 covers today.** Fifteen programs. All but `maptest`, which
+is pure text and reaches no device at all, run against the simulated
+disk except where a file-backed device is the point:
 `csumtest` (layer-a §1.4's block digests and object checksums against
 known-answer vectors), `structtest` (§2's byte layouts against
 known-answer vectors, a flipped byte caught in every structure,
@@ -4436,7 +4437,36 @@ whose own index entry is the damage, and §6's tombstone reclaim walk
 — single-proc, with the record replaced under it, with the record put
 back at a higher key under it, and under concurrent churn with one
 churn proc parked on a tombstone of its own making, so that the
-walk's epoch condition is what holds it off and not its cutoff) and
+walk's epoch condition is what holds it off and not its cutoff),
+`maptest` (the cluster-map library of layer-a §3–§6 and §8.1, over
+map text alone: §3.2's header read back field by field, §3.1's rule
+that an unknown attribute and an unknown record — continuation lines
+and all — are ignored, §0's comments and blank lines, D21's required
+attributes, its defaults and its caps with each refusal read back by
+its own detail, §4.2 and §4.3's placement against known-answer
+vectors computed outside this codebase and the tie-break no vector
+can reach, an under-replicated `P` and the primary an `up` change
+promotes without moving a byte, §5.2's witness set with D22's
+clause-2 substitution, its skip rule against the map's stale ledger
+and `dead` excluded outright, §6.3's adoption decision with both
+refusals reported when both hold, §6.4's fence state on a synthetic
+clock, and §8.1's commit validation with §8.6's `forceepoch`
+exemption), `bmrebuildtest` (§8's online bitmap rebuild, T1.28 and
+T1.29: the walk over a serving store with a §5 step 10 condemned
+slot, whose rebuilt bitmap equals a full scan of the live maps and
+whose `grainleak` returns to zero with a stage's grains outstanding;
+the commit that lands in a folded slot and in one not yet reached;
+the write barrier and the per-slot generation stamp that validates an
+entry the fold re-read outside the state lock — a map moved at an
+unchanged four-tuple, a damaged map an `op=full` replaced, and a
+writer that drives the fold to its eight-re-read bound, each parked
+at §13's `bmfold` point; the swap dirtying only the page that
+differs and the checkpoint after it writing that one page, an end
+refused for a live slot the walk skipped, a leak recorded after its
+slot was folded surviving the swap, and the pass's lifetime — the
+abort that leaves the live bitmap byte for byte as it was, the abort
+that lands inside a swap and does nothing, and the `storeclose` that
+aborts a live pass and lets go of a fold parked in it) and
 `peeropstest` (§3.8's peer-channel primitives and §9's oid-ordered
 listing: the adoption over an absent id, over a lower-keyed tombstone
 and over a live copy, each refusal told apart by whether it carries a
