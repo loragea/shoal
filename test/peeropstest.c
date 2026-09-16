@@ -1221,6 +1221,70 @@ stop:
 	killspawned();
 }
 
+/*
+ * op=list's refusals.  Three are §3.7's internal kind — a count the
+ * caller cannot have meant, an `after' length with no `after' behind
+ * it, and a store that has stopped serving — and one is layer-a
+ * §2.6's `bad object name', which is the answer for any oid past
+ * §1.1's bound on any path.
+ */
+static void
+tlisterr(void)
+{
+	Dev *d;
+	Store *s;
+	Objent *e;
+	char err[ERRMAX];
+	char *full;
+	int n, more;
+
+	spawnforget();
+	d = newdisk();
+	if((s = mustopen(d, "list refusals")) == nil){
+		devclose(d);
+		killspawned();
+		return;
+	}
+	fillinv(s);
+	e = newpage(4);
+
+	checks++;
+	if(objlist(s, nil, 0, e, -1, &more) >= 0)
+		fail("objlist at a negative k was taken");
+	else
+		errnotwire("objlist at a negative k");
+	checks++;
+	if(objlist(s, (uchar*)"a", Oidmax + 1, e, 4, &more) >= 0)
+		fail("objlist past §1.1's oid bound was taken");
+	else
+		errsays("objlist past §1.1's oid bound", "bad object name");
+	checks++;
+	if(objlist(s, nil, 3, e, 4, &more) >= 0)
+		fail("objlist with a nil after and a length was taken");
+	else
+		errnotwire("objlist with a nil after and a length");
+
+	/* and a store that has stopped serving answers nothing (§3.2) */
+	storehook(s, "fatal", 1);
+	full = "store condemned: in-memory state no longer matches the "
+		"log; open it again";
+	checks++;
+	if((n = objlist(s, nil, 0, e, 4, &more)) >= 0)
+		fail("objlist on a condemned store answered %d entries", n);
+	else{
+		rerrstr(err, sizeof err);
+		checks++;
+		if(strcmp(err, full) != 0)
+			fail("objlist on a condemned store: %s, want "
+				"serving()'s refusal", err);
+	}
+
+	free(e);
+	storeclose(s);
+	devclose(d);
+	killspawned();
+}
+
 /* ------------------------------------------------------------------ */
 
 void
@@ -1243,6 +1307,7 @@ main(int argc, char **argv)
 	tlist();
 	tlistpage();
 	tlistchurn();
+	tlisterr();
 
 	killspawned();
 	if(fails > 0){

@@ -1121,7 +1121,9 @@ int	objdrop(Store*, uchar *oid, int oidlen);
  * **Oid-ordered listing**, layer-a §5.6's op=list: the k smallest
  * oids strictly greater than `after', live and tomb alike, in the
  * byte order §1.1 compares ids in.  An `after' of length 0 (the
- * argument may be nil) starts from the beginning.  Answers how many
+ * argument may be nil) starts from the beginning; a nil `after' with
+ * a length is a caller bug and is refused.  A store condemned or
+ * closed under the walk is refused too, at the next chunk.  Answers how many
  * entries were filled — at most k, fewer at the end of the inventory
  * — or -1.  *more, when the pointer is not nil, is 1 when the scan
  * saw at least one further oid above the last one answered, which is

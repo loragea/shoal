@@ -1989,6 +1989,16 @@ objlist(Store *s, uchar *after, int afterlen, Objent *e, int k, int *more)
 		werrstr("bad object name: after length %d", afterlen);
 		return -1;
 	}
+	/*
+	 * A nil `after' means the start of the inventory and carries no
+	 * length; a length with no bytes behind it would be read out of
+	 * a nil pointer by the comparison below.  §3.7's internal kind,
+	 * like every other caller bug.
+	 */
+	if(after == nil && afterlen != 0){
+		werrstr("list: after length %d with no after oid", afterlen);
+		return -1;
+	}
 	n = 0;
 	ncand = 0;
 	c = 1;
@@ -1997,7 +2007,25 @@ objlist(Store *s, uchar *after, int afterlen, Objent *e, int k, int *more)
 		lim = slot + Listchunk;
 		if(lim > nslots)
 			lim = nslots;
+		/*
+		 * §9's rule for a walk that releases the lock, objsnapent's:
+		 * every hold re-asks whether the store is still serving,
+		 * because a walk that started on a live store can run on
+		 * into one that has been condemned or closed under it and
+		 * answer out of memory the store no longer stands behind.
+		 * The closed test is the FIRST thing inside the hold, so it
+		 * wins over the entries below; storeserving comes before
+		 * the hold, as it does there, so `store condemned' wins
+		 * over `store closed' when both are true.
+		 */
+		if(!storeserving(s))
+			return -1;
 		qlock(&s->qlstate);
+		if(s->closed){
+			qunlock(&s->qlstate);
+			werrstr("store closed");
+			return -1;
+		}
 		for(; slot < lim; slot++){
 			ent = &s->idx[slot];
 			if(ent->state != Slive && ent->state != Stomb)
