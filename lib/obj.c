@@ -42,6 +42,7 @@ struct Upd
 	int	emapresv;		/* ... and an extent-map slot */
 	int	keepcsum;		/* publish e.csum rather than recompute */
 	uchar	*expcsum;		/* layer-a §5.5's csum=, or nil */
+	int	dropslot;		/* ... and an Eslot for the same slot */
 };
 
 static void updclose(Upd*);
@@ -288,6 +289,22 @@ updcommit(Upd *u, int state, uvlong ver, uvlong wepoch, vlong mtime,
 	it.dirty = dr;
 	it.ndirty = ndr;
 	it.emap = u->cnew;
+	/*
+	 * §5.6's op=drop: the Eobj above releases the copy's grains and
+	 * its extent-map slot, and this Eslot releases the index entry
+	 * they hung from.  They ride in ONE item, so they are packed
+	 * into one record in this order and applied in it — by
+	 * applybatch on the live path and by applyents on replay — and
+	 * the record is one commit point (§3.2), so no crash can land
+	 * between them.  Two calls could not do this: a create-then-drop
+	 * would publish a live object at a key the sender never sent,
+	 * and a crash between a tombstone and its discard leaves a
+	 * tombstone layer-a §1.5's cluster-wide rule never authorised.
+	 */
+	if(u->dropslot){
+		it.eslot = u->slot;
+		it.haseslot = 1;
+	}
 	it.freeing = !alloc && (u->nfree > 0 || state == Stomb
 		|| u->newlen < u->e.len);
 	r = logcommit(s, &it);
@@ -1350,6 +1367,74 @@ objadoptcsum(Store *s, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 	 * op=delete does not have on the wire.
 	 */
 	if(updcommit(&u, Stomb, ver, wepoch, time(nil), 0, dr, ndr) < 0){
+		updclose(&u);
+		return -1;
+	}
+	updclose(&u);
+	return 0;
+}
+
+/*
+ * layer-a §5.6's op=drop and §7.4's drop guard: remove a stray live
+ * copy leaving no record at all.  A tombstone would be wrong here —
+ * the object is alive elsewhere and a tombstone arbitrates, so one
+ * published for a stray would travel back out and delete the good
+ * copies — and objdiscard cannot do it, since it refuses anything
+ * that is not a tombstone at exactly the named key.
+ *
+ * **One durable step.**  The Eobj below is the same record objremove
+ * commits — len 0, the copy's grains in `freed', the extent-map slot
+ * released by §2.7's Oslot rule — and the Eslot updcommit adds beside
+ * it in the same item frees the index entry.  applybatch and
+ * applyents both apply an item's Eobj before its Eslot, so the
+ * tombstone this record would otherwise publish never becomes
+ * visible: the state after the record is the state with no record.
+ * The key and mtime are the copy's own, so nothing about the object
+ * is invented for a state that is never published.
+ *
+ * Doing it in two commits would publish a tombstone this holder has
+ * no authority to create, and a crash between them would leave it
+ * durable — layer-a §1.5's resurrection hole opened by the very call
+ * that exists to close a capacity leak.
+ */
+int
+objdrop(Store *s, uchar *oid, int oidlen)
+{
+	Upd u;
+	Omap mold;
+
+	if(!storeserving(s))
+		return -1;
+	/*
+	 * §8 and §5 step 10 pass for objremove's reason: a copy that
+	 * contributes no key (layer-a §1.3) has nothing here to defend,
+	 * and a stray that could not be dropped because its content is
+	 * damaged would hold its grains for the life of the disk.  The
+	 * grains a condemned map named are not recovered by this
+	 * (nothing knows which they were) and stay marked until a bitmap
+	 * rebuild, exactly as for a delete; applyrec counts them.
+	 *
+	 * A tombstoned id answers `object deleted' and an absent one
+	 * `no such object', both from updopen and both §3.7's rows: a
+	 * tombstone is not a stray, and layer-a §1.5's discard — with
+	 * its cluster-wide conditions — is the only thing that removes
+	 * one.
+	 */
+	if(updopen(&u, s, oid, oidlen, 0, Ubad|Ucorrupt) < 0)
+		return -1;
+	mapopen(s, &mold, &u.e, u.cold);
+	if(freetail(&u, &mold) < 0){
+		updabort(&u);
+		updclose(&u);
+		return -1;
+	}
+	if(u.e.emapslot == 0 && u.e.grain0 != 0 && addfree(&u, u.e.grain0) < 0){
+		updabort(&u);
+		updclose(&u);
+		return -1;
+	}
+	u.dropslot = 1;
+	if(updcommit(&u, Stomb, u.e.ver, u.e.wepoch, u.e.mtime, 0, nil, 0) < 0){
 		updclose(&u);
 		return -1;
 	}

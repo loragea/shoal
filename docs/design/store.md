@@ -1632,7 +1632,7 @@ own `not primary: n5.0` is the pattern. Callers can act on these:
 | Condition | Answer |
 |---|---|
 | an id this store does not hold, on any path | `no such object` |
-| a read, write, truncate or delete of a tombstoned id | `object deleted` |
+| a read, write, truncate, delete or drop of a tombstoned id | `object deleted` |
 | a create of a live id | `object exists` |
 | an oid outside layer-a §1.1's `1*128` bound | `bad object name` |
 | a write, truncate or stage past `objmax`, at either bound | `object too large` |
@@ -1759,6 +1759,38 @@ and a record stranded at a key the cluster has moved past would block
 that in as many words, at the price of delaying the tombstone's
 discard by `tombdays`, and `op=delete` carries no `mtime` on the wire
 to carry instead.
+
+**Drop — `op=drop`, layer-a §5.6 and §7.4's drop guard.** A stray
+holder is told to delete its copy with **no** tombstone. A tombstone
+would be wrong: it arbitrates, so one published by a stray would
+travel back out and delete the copies the guard exists to protect.
+`objdiscard` cannot do it either — it refuses anything that is not a
+tombstone at exactly the named key.
+
+The whole of it is **one record**: an `Eobj` that releases the copy's
+grains and, by §2.7's `Oslot` rule, its extent-map slot, and an
+`Eslot` for the same index slot, in one item and therefore packed in
+that order into one record. §3.2's apply and §5's replay both apply an
+item's `Eobj` before its `Eslot`, so the tombstone the `Eobj` would
+otherwise publish is never visible: the state after the record is the
+state with no record, and the `qid.path` is gone. §3.5's deferred
+reuse covers all three releases exactly as it covers any commit's.
+Two commits would not do: the first publishes a tombstone this holder
+has no authority to create, and a crash between them leaves it
+durable. No new record kind and no `Storevers` bump were needed —
+the format already carries both entries, and an item already carries
+both.
+
+A `corrupt`-flagged or condemned copy is droppable, for the reason a
+delete is: such a copy contributes no key (layer-a §1.3), so there is
+nothing here for the flag to defend, and a stray that could not be
+dropped would hold its grains for the life of the disk. The grains a
+condemned map named are not recovered by the drop — nothing knows
+which they were — and stay marked until a bitmap rebuild, which is
+what `applyrec` counts in `grainleak` (§6). A tombstoned id answers
+`object deleted` and an absent id `no such object` (§3.7): a
+tombstone is not a stray, and layer-a §1.5's discard, with its
+cluster-wide conditions, is the only thing that removes one.
 
 **The resulting-`csum` check.** layer-a §5.5 requires the receiver of
 a replicated operation to compute the `csum` the object will have and
@@ -4118,7 +4150,7 @@ back at a higher key under it, and under concurrent churn with one
 churn proc parked on a tombstone of its own making, so that the
 walk's epoch condition is what holds it off and not its cutoff).
 
-Against the list below that is T1.1–T1.26 and T1.30–T1.31. One case
+Against the list below that is T1.1–T1.26 and T1.30–T1.32. One case
 is not covered
 and waits on something this store does not have yet: **T1.27** waits
 on the server's `Reqqueue` pool (§7), which is what it is about — the
@@ -4385,6 +4417,17 @@ what would close it.
   `bad ctl` and no record. *Mutations:* let the adoption take a live
   copy, leaving its grains marked under a tombstone; publish the
   tombstone at a `len` other than 0.
+- **T1.31 drop (§3.8).** Drop a multi-block live copy and assert the
+  grains, the extent-map slot and the index slot are all free again
+  (`Storestat`), that no record is left, and that the state survives
+  a restart. Then the crash-point discipline: with the simulated
+  device stopped at `postwrite` and the written sector kept, so the
+  record is durable and its post-flush never returns, restart and
+  assert the same freed state — one record, one outcome. Assert the
+  two ids a drop is not for (`no such object`, `object deleted`) and
+  that a `corrupt`-flagged copy is droppable and leaves `/lost`.
+  *Mutations:* leave the copy's grains marked (compare `grainfree`);
+  commit the `Eobj` without the `Eslot`, leaving a tombstone behind.
 - **T1.32 the resulting-`csum` check (§3.8, D23).** For each of
   `objwrite`, `objtrunc`, `objremove`, `objcreate`, the adoption and
   `op=full`: learn the `csum` the operation produces on one store,

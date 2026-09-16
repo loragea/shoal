@@ -123,6 +123,15 @@ adopt(Store *s, char *name, uvlong ver, uvlong we)
 	return objadopt(s, o, strlen(name), ver, we, nil, 0);
 }
 
+static int
+drop(Store *s, char *name)
+{
+	uchar o[Oidmax];
+
+	oidof(o, name);
+	return objdrop(s, o, strlen(name));
+}
+
 static Store*
 restart(Store *s, Dev *d, char *what)
 {
@@ -294,6 +303,151 @@ tadoptover(void)
 }
 
 /* ------------------------------------------------------------------ */
+
+/*
+ * T1.31, drop: grains, extent-map slot and index slot all come back
+ * in one durable step, no record is left, and a crash after that
+ * record is durable replays to the same freed state.
+ */
+static void
+tdrop(int crash)
+{
+	Dev *d;
+	Store *s;
+	Objinfo oi;
+	Storestat st0, st1;
+	uchar *buf;
+	char *what;
+
+	what = crash ? "drop, crashed after the record landed" : "drop";
+	spawnforget();
+	d = newdisk();
+	if((s = mustopen(d, what)) == nil){
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(3*Blk, 23);
+	storestat(s, &st0);
+
+	mk(s, "stray");
+	if(wr(s, "stray", buf, 3*Blk, 0, 2) < 0)
+		fail("%s: objwrite: %r", what);
+	if(ostat(s, "stray", &oi) < 0)
+		fail("%s: objstat: %r", what);
+	istrue("a three-block object holds an extent-map slot",
+		oi.emapslot != 0);
+	storestat(s, &st1);
+	istrue("the object took grains", st1.grainfree < st0.grainfree);
+
+	if(crash){
+		/*
+		 * §3.4's P4/P5: the header write has returned, so the
+		 * record is durable; the post-flush never does.  Sckeep is
+		 * what makes the sector that landed survive the crash.
+		 */
+		simcrashdead(d, 1);
+		simcrashmode(d, Sckeep);
+		simarm(d, "postwrite", 0);
+		drop(s, "stray");	/* the flush after it cannot answer */
+		storeclose(s);
+		simrevive(d);
+		if((s = mustopen(d, what)) == nil){
+			devclose(d);
+			free(buf);
+			return;
+		}
+	}else{
+		if(drop(s, "stray") < 0)
+			fail("%s: objdrop: %r", what);
+		if((s = restart(s, d, what)) == nil){
+			devclose(d);
+			free(buf);
+			return;
+		}
+	}
+
+	checks++;
+	if(ostat(s, "stray", &oi) >= 0)
+		fail("%s: the dropped object still has a record", what);
+	else
+		errsays("objstat of a dropped id", "no such object");
+	storestat(s, &st1);
+	eqv("a drop returns every grain", st1.grainfree, st0.grainfree);
+	eqv("a drop returns the index slot", st1.slotfree, st0.slotfree);
+	eqv("a drop returns the extent-map slot", st1.emapfree, st0.emapfree);
+	eqv("a drop leaves no live object", st1.nlive, st0.nlive);
+	eqv("a drop leaves no tombstone", st1.ntomb, st0.ntomb);
+	eqv("a drop leaks no grain", st1.grainleak, st0.grainleak);
+
+	free(buf);
+	storeclose(s);
+	devclose(d);
+	killspawned();
+}
+
+/*
+ * The two ids a drop is not for, and the one flag it ignores.
+ */
+static void
+tdropedges(void)
+{
+	Dev *d;
+	Store *s;
+	Objinfo oi;
+	Storestat st0, st1;
+	uchar o[Oidmax], *buf;
+
+	spawnforget();
+	d = newdisk();
+	if((s = mustopen(d, "drop edges")) == nil){
+		devclose(d);
+		return;
+	}
+	buf = mkbuf(Blk, 31);
+
+	checks++;
+	if(drop(s, "nothing") >= 0)
+		fail("objdrop of an absent id was taken");
+	else
+		errsays("objdrop of an absent id", "no such object");
+
+	mk(s, "gonesoon");
+	if(rmv(s, "gonesoon", 2) < 0)
+		fail("objremove: %r");
+	checks++;
+	if(drop(s, "gonesoon") >= 0)
+		fail("objdrop of a tombstoned id was taken");
+	else
+		errsays("objdrop of a tombstoned id", "object deleted");
+	if(ostat(s, "gonesoon", &oi) < 0)
+		fail("the refused drop removed the tombstone: %r");
+
+	/*
+	 * §8's flag does not defend a stray: the copy contributes no key
+	 * (layer-a §1.3), so there is nothing here for the flag to hold
+	 * on to, and a stray that could not be dropped would keep its
+	 * grains for the life of the disk.
+	 */
+	storestat(s, &st0);
+	mk(s, "flagged");
+	if(wr(s, "flagged", buf, Blk, 0, 2) < 0)
+		fail("objwrite: %r");
+	oidof(o, "flagged");
+	if(objcorrupt(s, o, 7, 1, nil, 0) < 0)
+		fail("objcorrupt: %r");
+	if(drop(s, "flagged") < 0)
+		fail("objdrop of a corrupt-flagged copy: %r");
+	storestat(s, &st1);
+	eqv("dropping a corrupt-flagged copy returns its grains",
+		st1.grainfree, st0.grainfree);
+	eqv("... and its index slot", st1.slotfree, st0.slotfree);
+	eqv("... and takes it out of /lost", st1.nlost, st0.nlost);
+
+	free(buf);
+	storeclose(s);
+	devclose(d);
+	killspawned();
+}
 
 /* ------------------------------------------------------------------ */
 
@@ -501,6 +655,9 @@ main(int argc, char **argv)
 
 	tadoptabsent();
 	tadoptover();
+	tdrop(0);
+	tdrop(1);
+	tdropedges();
 	for(i = Cwrite; i <= Cadopt; i++)
 		tcsum(i);
 

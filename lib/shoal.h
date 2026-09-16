@@ -1067,6 +1067,35 @@ int	objadopt(Store*, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 		Dirtyrec *dr, int ndr);
 int	objadoptcsum(Store*, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
 		uchar *csum, Dirtyrec *dr, int ndr);
+
+/*
+ * **Drop**, layer-a §5.6's op=drop and §7.4's drop guard: delete a
+ * live local copy leaving NO record — no tombstone, no index entry,
+ * no qid.path.  One durable step frees the copy's grains, its
+ * extent-map slot and its index slot together, so no crash can leave
+ * the object half-removed; §3.5's deferred reuse covers all three
+ * releases as it does for any commit.
+ *
+ * A corrupt-flagged or condemned copy is droppable, for the reason a
+ * delete is: the copy contributes no key (layer-a §1.3), so there is
+ * nothing here for the flag to defend, and refusing would leave a
+ * stray unreclaimable.  A tombstoned id answers `object deleted' and
+ * an id this store holds no record of `no such object' (§3.7); a
+ * tombstone is not a stray and layer-a §1.5's discard is what removes
+ * one.
+ *
+ * It takes no Edirty records, for objdiscard's reason: a drop leaves
+ * no peer behind to mark.  The holder is by construction not in
+ * P(oid) and is replicating this object to nobody.
+ *
+ * What the caller still owes is the whole of the guard: layer-a §7.4
+ * makes dropping the serving primary's decision, taken only once
+ * every member of P(oid) is confirmed to hold the current version,
+ * and §5.6 makes the receiver re-check against its OWN map that it is
+ * not in P(oid) — `still placed' if it is.  Neither check is in here:
+ * the engine holds no map.
+ */
+int	objdrop(Store*, uchar *oid, int oidlen);
 /* --- peer-engine-ops: end --- */
 
 /* the dirty set, §2.6 and layer-a §7.1 */
