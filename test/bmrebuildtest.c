@@ -91,6 +91,16 @@ mustwr(Store *s, char *name, void *a, long n, uvlong off, uvlong ver)
 		fail("objwrite %s %ld at %llud: %r", name, n, off);
 }
 
+static void
+musttrunc(Store *s, char *name, uvlong len, uvlong ver)
+{
+	uchar o[Oidmax];
+
+	oidof(o, name);
+	if(objtrunc(s, o, strlen(name), len, ver, 1, nil, 0) < 0)
+		fail("objtrunc %s to %llud: %r", name, len);
+}
+
 static int
 ostat(Store *s, char *name, Objinfo *oi)
 {
@@ -1144,6 +1154,14 @@ tmoved(void)
  * entry under qlstate, and what it folds is what a full scan of the
  * live maps says.  §13's bmfold point is armed a round at a time,
  * which is what puts each write inside a round rather than beside it.
+ *
+ * The ninth round here is the one case the fallback cannot answer:
+ * the truncation in it takes the object down to one block, so the
+ * entry stops naming the extent-map slot the round pinned and §2.3's
+ * inline map takes its place.  That round starts over with a fresh
+ * pin and counts against the bound like any other, which is what the
+ * re-read count discriminates — without that count the fold's nine
+ * rounds would report eight.
  */
 static void
 tbound(void)
@@ -1180,7 +1198,10 @@ tbound(void)
 		if(!waitpark(s, k, "the fold parks with the map moved "
 			"under it"))
 			break;
-		mustwr(s, "m", buf, Blk, 0, 3 + k);
+		if(k < 8)
+			mustwr(s, "m", buf, Blk, 0, 3 + k);
+		else
+			musttrunc(s, "m", Blk, 3 + k);
 		storehook(s, "bmfold", k < 8 ? 1 : 0);
 	}
 	storehook(s, "bmfold", 0);
@@ -1190,7 +1211,9 @@ tbound(void)
 			fail("the bounded fold: %s", folderr);
 	}
 	storestat(s, &st);
-	eqv("every round counts against the bound", st.bmreread, 8);
+	eqv("every round counts against the bound, the round a moved "
+		"extent-map slot sent over again included",
+		st.bmreread, 9);
 	eqv("and the slot counts once", st.bmfolded, 1);
 	if(foldall(s, oi.slot, "the rest of the walk") == 0){
 		checks++;

@@ -1198,6 +1198,7 @@ bmpassfold(Store *s, ulong slot)
 			 * names the map this round pinned: round again with
 			 * a fresh pin, and count this round like any other.
 			 */
+			s->bmnreread++;
 			act = Fagain;
 		}else if(c->bad){
 			/*
