@@ -1646,7 +1646,7 @@ own `not primary: n5.0` is the pattern. Callers can act on these:
 | Condition | Answer |
 |---|---|
 | an id this store does not hold, on any path | `no such object` |
-| a read, write, truncate, delete or drop of a tombstoned id | `object deleted` |
+| a read, write, truncate or delete of a tombstoned id — but **not** a drop, which answers `no such object` because a tombstone is a record and not a copy (§3.8) | `object deleted` |
 | a create of a live id | `object exists` |
 | an oid outside layer-a §1.1's `1*128` bound | `bad object name` |
 | a write, truncate or stage past `objmax`, at either bound | `object too large` |
@@ -1811,9 +1811,13 @@ dropped would hold its grains for the life of the disk. The grains a
 condemned map named are not recovered by the drop — nothing knows
 which they were — and stay marked until a bitmap rebuild, which is
 what `applyrec` counts in `grainleak` (§6). A tombstoned id answers
-`object deleted` and an absent id `no such object` (§3.7): a
-tombstone is not a stray, and layer-a §1.5's discard, with its
-cluster-wide conditions, is the only thing that removes one.
+`no such object`, the same as an absent one (§3.7). It is the one
+place the store answers that for an id it does hold a record of, and
+the reason is that the record is not a copy: layer-a §5.6's `op=drop`
+table and §2.5's `drop` verb allow no `object deleted`, because a
+drop asks a stray *holder* to remove its copy and there is no copy
+here to remove. layer-a §1.5's discard, with its cluster-wide
+conditions, is the only thing that takes a tombstone away.
 
 **The resulting-`csum` check.** layer-a §5.5 requires the receiver of
 a replicated operation to compute the `csum` the object will have and

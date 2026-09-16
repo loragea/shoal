@@ -1095,10 +1095,12 @@ int	objadoptcsum(Store*, uchar *oid, int oidlen, uvlong ver, uvlong wepoch,
  * A corrupt-flagged or condemned copy is droppable, for the reason a
  * delete is: the copy contributes no key (layer-a §1.3), so there is
  * nothing here for the flag to defend, and refusing would leave a
- * stray unreclaimable.  A tombstoned id answers `object deleted' and
- * an id this store holds no record of `no such object' (§3.7); a
- * tombstone is not a stray and layer-a §1.5's discard is what removes
- * one.
+ * stray unreclaimable.  A tombstoned id answers `no such object',
+ * the same as an id this store holds no record of (§3.7): a
+ * tombstone is a record and not a copy, so there is nothing for a
+ * drop to remove — layer-a §5.6's op=drop table and §2.5's drop verb
+ * allow no `object deleted' — and layer-a §1.5's discard is what
+ * takes a tombstone away.
  *
  * It takes no Edirty records, for objdiscard's reason: a drop leaves
  * no peer behind to mark.  The holder is by construction not in

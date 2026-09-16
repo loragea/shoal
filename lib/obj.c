@@ -402,6 +402,7 @@ enum
 	Ubad	= 2,	/* ... and so may a slot §5 step 10 condemned */
 	Ucorrupt = 4,	/* ... and one whose §8 corrupt flag is set */
 	Unolive	= 8,	/* ... but a LIVE entry is refused: objadopt */
+	Unotomb	= 16,	/* ... and a tombstone is `no such object': objdrop */
 };
 
 static int
@@ -429,9 +430,16 @@ updopen(Upd *u, Store *s, uchar *oid, int oidlen, uvlong newlen, int flags)
 		 * way to tell them apart without a second, racy objstat,
 		 * and a client that sees `no such object' for a tombstoned
 		 * id may re-create it.
+		 *
+		 * Unotomb is op=drop's exception, and it is not a folding
+		 * of the two: layer-a §5.6's op=drop table and §2.5's drop
+		 * verb do not list `object deleted' at all, because a drop
+		 * asks a stray holder to remove a COPY and a tombstone is a
+		 * record rather than a copy.  There is nothing there to
+		 * drop, which is what `no such object' says.
 		 */
-		werrstr(e->state == Stomb ? "object deleted"
-			: "no such object");
+		werrstr(e->state == Stomb && !(flags & Unotomb)
+			? "object deleted" : "no such object");
 		return -1;
 	}
 	/*
@@ -1485,13 +1493,15 @@ objdrop(Store *s, uchar *oid, int oidlen)
 	 * (nothing knows which they were) and stay marked until a bitmap
 	 * rebuild, exactly as for a delete; applyrec counts them.
 	 *
-	 * A tombstoned id answers `object deleted' and an absent one
-	 * `no such object', both from updopen and both §3.7's rows: a
-	 * tombstone is not a stray, and layer-a §1.5's discard — with
-	 * its cluster-wide conditions — is the only thing that removes
-	 * one.
+	 * A tombstoned id answers `no such object', the same as an
+	 * absent one, and Unotomb is what makes updopen say so.  A
+	 * tombstone is a record and not a copy, so a drop has nothing
+	 * here to remove — layer-a §5.6's op=drop table and §2.5's drop
+	 * verb list no `object deleted' — and layer-a §1.5's discard,
+	 * with its cluster-wide conditions, is the only thing that takes
+	 * a tombstone away.
 	 */
-	if(updopen(&u, s, oid, oidlen, 0, Ubad|Ucorrupt) < 0)
+	if(updopen(&u, s, oid, oidlen, 0, Ubad|Ucorrupt|Unotomb) < 0)
 		return -1;
 	mapopen(s, &mold, &u.e, u.cold);
 	if(freetail(&u, &mold) < 0){

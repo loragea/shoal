@@ -527,13 +527,20 @@ tdropedges(void)
 	mk(s, "gonesoon");
 	if(rmv(s, "gonesoon", 2) < 0)
 		fail("objremove: %r");
+	/*
+	 * layer-a §5.6's op=drop table and §2.5's drop verb allow no
+	 * `object deleted': a tombstone is a record and not a copy, so
+	 * there is nothing for a drop to remove (§3.7, §3.8).
+	 */
 	checks++;
 	if(drop(s, "gonesoon") >= 0)
 		fail("objdrop of a tombstoned id was taken");
 	else
-		errsays("objdrop of a tombstoned id", "object deleted");
+		errsays("objdrop of a tombstoned id", "no such object");
 	if(ostat(s, "gonesoon", &oi) < 0)
 		fail("the refused drop removed the tombstone: %r");
+	else
+		eqv("the refused drop leaves the tombstone", oi.state, Stomb);
 
 	/*
 	 * §8's flag does not defend a stray: the copy contributes no key
