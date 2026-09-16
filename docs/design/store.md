@@ -1875,6 +1875,17 @@ wire's:
   entries rather than bytes and knows nothing of `msize`, and its
   `more` out-parameter answers only the second of those two
   conditions (§9).
+- **A zero-byte replicated write publishes nothing, so a sender MUST
+  NOT have bumped `ver` for one.** An `n=0` write commits no record
+  and adopts no key — it is the operation the `csum` check above runs
+  outside the commit path for — so a sender that bumped `ver` for an
+  `n=0` `op=write` and replicated it would leave every receiver a key
+  behind with nothing to catch up on. A conforming primary cannot
+  produce that: it reaches the store through the same `objwrite`,
+  which commits nothing for `n=0`, so it has no new key to send and
+  sends nothing. A receiver handed a foreign `n=0` write at a bumped
+  key answers `ok` — the operation applies, having written no byte —
+  and stays at its own key.
 
 **Arbitration is split by call**, and not by whether the key arrived
 from elsewhere:
