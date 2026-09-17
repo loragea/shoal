@@ -27,6 +27,7 @@ void	srvqpush(Srvctx*, uchar *oid, int oidlen, Req*, void (*)(Req*));
 void	srvqflush(Req*);
 Qreq*	srvqreq(Req*);
 int	srvqcheck(Req*);
+void	srvqexit(Req*);
 void	srvqdone(Req*, char *err);
 void	srvqended(Qreq*);
 void	srvqdrain(Srvctx*);

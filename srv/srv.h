@@ -190,9 +190,15 @@ void	srvcount(Srvctx*, uvlong *pushed, uvlong *done);
  *
  *	objhold	n != 0 holds every queued object request at its check
  *		point, so a test can have a request that is running and
- *		one that is still queued at a known moment.  A held
- *		request leaves the hold when the point is cleared or
- *		when its queue's flush flag is set, whichever is first.
+ *		one that is still queued at a known moment.
+ *	objexit	n != 0 holds every queued object request at the other
+ *		end of its handler: after the engine call and before the
+ *		exit, so a test can flush a request whose work is done
+ *		and require it to leave through srvqdone all the same.
+ *
+ * A held request leaves either hold when the point is cleared or when
+ * its queue's flush flag is set, whichever is first; the shutdown
+ * clears every point, so a request left holding cannot hold it up.
  *
  * These points are reachable in-process only.  store.md §13's -X flag
  * names the points of the device under the store — it is what drives

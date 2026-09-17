@@ -1773,6 +1773,71 @@ tflush(void)
 	eqv("step 7 ran before the reply", srvauxlate(ctx), 0);
 	srvhook(ctx, "objhold", 0);
 
+	/*
+	 * A request flushed at the OTHER end of its handler: past the
+	 * engine call, with its answer in hand.  Both of the handler's
+	 * exits must still be the queue's one exit — the plain one, and
+	 * the error API's, which a handler reaches with %r set.
+	 */
+	srvhook(ctx, "objexit", 1);
+	memset(&t, 0, sizeof t);
+	t.type = Twrite;
+	t.tag = ta = cltag(&cl);
+	t.fid = Fctl;
+	t.offset = 0;
+	t.data = "verify alpha";
+	t.count = strlen(t.data);
+	clput(&cl, &t);
+	sleep(200);			/* it is now held at its exit */
+	memset(&t, 0, sizeof t);
+	t.type = Tflush;
+	t.tag = tf = cltag(&cl);
+	t.oldtag = ta;
+	clput(&cl, &t);
+	clget(&cl, &r);
+	checks++;
+	if(r.type != Rerror || r.tag != ta
+	|| strcmp(r.ename, "interrupted") != 0)
+		fail("a request flushed at its exit: type %d tag %ud %s",
+			r.type, r.tag, r.type == Rerror ? r.ename : "");
+	clget(&cl, &r);
+	checks++;
+	if(r.type != Rflush || r.tag != tf)
+		fail("the Rflush after the exit-flushed one: type %d tag %ud",
+			r.type, r.tag);
+	srvauxcount(ctx, &n7, nil, nil);
+	eqv("a request flushed at its exit runs step 7", n7, 2);
+
+	memset(&t, 0, sizeof t);
+	t.type = Twrite;
+	t.tag = ta = cltag(&cl);
+	t.fid = Fctl;
+	t.offset = 0;
+	t.data = "verify nosuch";		/* the error exit */
+	t.count = strlen(t.data);
+	clput(&cl, &t);
+	sleep(200);
+	memset(&t, 0, sizeof t);
+	t.type = Tflush;
+	t.tag = tf = cltag(&cl);
+	t.oldtag = ta;
+	clput(&cl, &t);
+	clget(&cl, &r);
+	checks++;
+	if(r.type != Rerror || r.tag != ta
+	|| strcmp(r.ename, "interrupted") != 0)
+		fail("a request flushed at its error exit: type %d tag %ud %s",
+			r.type, r.tag, r.type == Rerror ? r.ename : "");
+	clget(&cl, &r);
+	checks++;
+	if(r.type != Rflush || r.tag != tf)
+		fail("the Rflush after the error exit: type %d tag %ud",
+			r.type, r.tag);
+	srvauxcount(ctx, &n7, nil, nil);
+	eqv("a request flushed at its error exit runs step 7", n7, 3);
+	eqv("no step 7 ran after its reply", srvauxlate(ctx), 0);
+	srvhook(ctx, "objexit", 0);
+
 	/* a Tflush naming a request answered on the loop is still answered */
 	memset(&t, 0, sizeof t);
 	t.type = Tflush;

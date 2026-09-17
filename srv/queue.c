@@ -207,27 +207,54 @@ srvqflush(Req *r)
  * reaches a handler with the flag clear is an ordinary internal error
  * and is marked like one (err.c).
  *
- * The §13 hold is here because this is where a request already
- * running can be made to stay running.
+ * The §13 holds are here because this is where a request already
+ * running can be made to stay running.  A hold ends when its point is
+ * cleared or when this queue's flush flag is set, whichever is first,
+ * so a held request is still flushable and the shutdown that clears
+ * every point (srvholdclear) is not held up by one.
  */
-int
-srvqcheck(Req *r)
+static void
+qhold(Srvctx *c, Qreq *qr, uvlong *pt)
 {
-	Qreq *qr;
-	Srvctx *c;
-
-	qr = r->aux;
-	if(qr == nil)
-		return 0;
-	c = qr->ctx;
 	qlock(&c->holdlk);
-	while(c->hold != 0 && qr->q->flush == 0){
+	while(*pt != 0 && qr->q->flush == 0){
 		qunlock(&c->holdlk);
 		sleep(5);
 		qlock(&c->holdlk);
 	}
 	qunlock(&c->holdlk);
+}
+
+int
+srvqcheck(Req *r)
+{
+	Qreq *qr;
+
+	qr = r->aux;
+	if(qr == nil)
+		return 0;
+	qhold(qr->ctx, qr, &qr->ctx->hold);
 	return qr->q->flush != 0;
+}
+
+/*
+ * The second point, at the other end of a handler: after its engine
+ * call and before its exit, so a test can flush a request whose work
+ * is already done and watch it leave through srvqdone all the same.
+ * The error string the handler is carrying survives the hold, since
+ * the exit below it is the one that reads %r.
+ */
+void
+srvqexit(Req *r)
+{
+	char err[ERRMAX];
+	Qreq *qr;
+
+	if((qr = r->aux) == nil)
+		return;
+	rerrstr(err, sizeof err);
+	qhold(qr->ctx, qr, &qr->ctx->exithold);
+	errstr(err, sizeof err);
 }
 
 /*
@@ -357,9 +384,10 @@ srvcount(Srvctx *c, uvlong *pushed, uvlong *done)
 void
 srvhook(Srvctx *c, char *name, uvlong n)
 {
-	if(strcmp(name, "objhold") == 0){
-		qlock(&c->holdlk);
+	qlock(&c->holdlk);
+	if(strcmp(name, "objhold") == 0)
 		c->hold = n;
-		qunlock(&c->holdlk);
-	}
+	else if(strcmp(name, "objexit") == 0)
+		c->exithold = n;
+	qunlock(&c->holdlk);
 }

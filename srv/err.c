@@ -190,11 +190,25 @@ srverr(char *buf, int nbuf)
 	return buf;
 }
 
+/*
+ * A request that was pushed to a queue has ONE exit, srvqdone, which
+ * is where the flush flag is tested and step 7 performed (queue.c).
+ * This function is the error API's own exit and is exported, so it is
+ * reached from a queue proc as readily as from the service loop; it
+ * therefore delegates rather than responding, whenever the request is
+ * one the pool is carrying — r->aux is the Qreq srvqprep armed.  A
+ * handler that answered here directly would skip the flush test and
+ * step 7 and leave a flushed request answered `no such object'.
+ */
 void
 srvrerror(Req *r)
 {
 	char buf[ERRMAX], err[ERRMAX];
 
 	rerrstr(err, sizeof err);
+	if(r->aux != nil){
+		srvqdone(r, err);
+		return;
+	}
 	respond(r, srverrs(buf, sizeof buf, err));
 }

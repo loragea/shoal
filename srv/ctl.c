@@ -217,7 +217,6 @@ ctlfence(Srvctx *c, Sfid *f, int argc, char **argv)
 static void
 ctlverify(Req *r)
 {
-	char buf[ERRMAX];
 	Srvctx *c;
 	Qreq *qr;
 	Vfy v;
@@ -230,11 +229,13 @@ ctlverify(Req *r)
 	c = r->srv->aux;
 	qr = r->aux;
 	if(objverify(c->store, qr->oid, qr->oidlen, &v) < 0){
-		srvqdone(r, srverr(buf, sizeof buf));
+		srvqexit(r);
+		srvrerror(r);
 		return;
 	}
 	bad = v.arraybad || v.nbad > 0;
 	vfyfree(&v);
+	srvqexit(r);
 	if(bad){
 		srvqdone(r, Ecsum);
 		return;

@@ -290,6 +290,7 @@ struct Srvctx
 
 	QLock	holdlk;
 	uvlong	hold;		/* srvhook("objhold") */
+	uvlong	exithold;	/* srvhook("objexit") */
 
 	int	closed;		/* the shutdown sequence has run */
 };
