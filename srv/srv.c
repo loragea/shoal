@@ -188,6 +188,11 @@ srvnew(Srvcfg *cfg)
 	 * and a freshly formatted store carries neither — so a disk that
 	 * holds it is one no adoption decision can be made about, and it
 	 * is refused rather than served.
+	 *
+	 * A T1 image can hold it all the same, and not only where a test
+	 * calls epochadopt itself: lib/ckpt.c's `pubatpage' point adopts
+	 * an epoch from inside a checkpoint, and on a store whose monid
+	 * was never pinned that leaves exactly this pair.
 	 */
 	if(!ad.pinned && c->sb.epochhigh != 0){
 		werrstr("the disk has adopted epoch %llud with no pinned "
