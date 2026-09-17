@@ -70,6 +70,15 @@ eqs(char *what, char *got, char *want)
 		fail("%s: %#q, want %#q", what, got, want);
 }
 
+/* what a reply says went wrong, for a case that compares the string */
+static char*
+errof(Fcall *r)
+{
+	if(r->type == Rerror)
+		return r->ename;
+	return "ok";
+}
+
 #include "srv9p.h"
 
 enum
@@ -94,9 +103,14 @@ enum
 static char Tuuid[] = "0000000000000000000000000000000a";
 static char Tmonid[] = "00112233445566778899aabbccddeeff";
 
-/* the one instance whose store this program formats, plus two others */
+/*
+ * The one instance whose store this program formats, plus two others.
+ * status and up are this instance's own record's, which is what §6.4
+ * F3 reads; every case but F3's passes the serving pair.
+ */
 static char *
-mkmap(uvlong epoch, ulong blksz, uvlong objmax, char *csumalg, char *uuid)
+mkmapself(uvlong epoch, ulong blksz, uvlong objmax, char *csumalg, char *uuid,
+	char *status, char *up)
 {
 	char *p;
 
@@ -110,17 +124,23 @@ mkmap(uvlong epoch, ulong blksz, uvlong objmax, char *csumalg, char *uuid)
 		"\n"
 		"instance=n1.0 onnode=n1 addr=tcp!10.0.0.1!17011\n"
 		"\tuuid=%s\n"
-		"\tclass=ssd weight=100 status=in up=yes since=1 fenced=no\n"
+		"\tclass=ssd weight=100 status=%s up=%s since=1 fenced=no\n"
 		"instance=n1.1 onnode=n1 addr=tcp!10.0.0.1!17012\n"
 		"\tuuid=0000000000000000000000000000000b\n"
 		"\tclass=ssd weight=100 status=in up=yes since=1 fenced=no\n"
 		"instance=n2.0 onnode=n2 addr=tcp!10.0.0.2!17011\n"
 		"\tuuid=0000000000000000000000000000000c\n"
 		"\tclass=ssd weight=100 status=dead up=no since=1 fenced=no\n",
-		epoch, Tmonid, objmax, blksz, csumalg, uuid);
+		epoch, Tmonid, objmax, blksz, csumalg, uuid, status, up);
 	if(p == nil)
 		sysfatal("smprint: %r");
 	return p;
+}
+
+static char *
+mkmap(uvlong epoch, ulong blksz, uvlong objmax, char *csumalg, char *uuid)
+{
+	return mkmapself(epoch, blksz, objmax, csumalg, uuid, "in", "yes");
 }
 
 static void
@@ -211,6 +231,22 @@ startsrv(Dev *d, char *maptext, int nq)
 		fail("srvnew: %r");
 	freedctx = c;
 	return c;
+}
+
+/* §2.4's Tcreate, which every gate case issues on a directory fid */
+static int
+clcreate(Cl *c, ulong fid, char *name, int mode, Fcall *r)
+{
+	Fcall t;
+
+	memset(&t, 0, sizeof t);
+	t.type = Tcreate;
+	t.tag = cltag(c);
+	t.fid = fid;
+	t.name = name;
+	t.perm = 0666;
+	t.mode = mode;
+	return clrpc(c, &t, r);
 }
 
 /* create and fill an object through the engine, as §2.4's create is not built */
@@ -627,11 +663,16 @@ tmodes(void)
 		"role=repl,peer=n1.1",
 		"role=admin",
 	};
-	/* the write column of /obj and of /obj/<oid>: client and admin */
+	/*
+	 * The write column of /obj and /obj/<oid> admits client and
+	 * admin; §2.1's operator rule then refuses the admin half for
+	 * every id that is not a reserved one, which `newobj' and
+	 * `alpha' are not.
+	 */
 	static char *want[3] = {
 		"shoalsrv: not built",
 		"permission denied",
-		"shoalsrv: not built",
+		"permission denied",
 	};
 	uchar stat[STATMAX];
 	char *m;
@@ -1282,6 +1323,202 @@ Out:
 }
 
 /*
+ * The object rows' gate, layer-a §2.1 and §6.4: the operator rule and
+ * its reserved-id exemption, and the fence with the one read §2.1 lets
+ * through it.  Every answer below that is not a refusal is the local
+ * `not built', because §2.4's content is the object-I/O surface's.
+ */
+static void
+tobjgate(void)
+{
+	char *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall r;
+	char *w[2];
+
+	clstage = "objgate";
+	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4)) == nil)
+		return;
+	mkobj(srvstore(ctx), "alpha", nil, 0, 1);
+	mkobj(srvstore(ctx), "shoal.map.7", nil, 0, 1);
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
+		fail("attach admin: %s", errof(&r));
+		goto Out;
+	}
+
+	/* §2.1: role=admin's grant of /obj is read-only … */
+	if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk)
+		fail("walk /obj: %s", errof(&r));
+	clcreate(&cl, Ffile, "brandnew", OWRITE, &r);
+	eqs("admin create of an id that is not reserved", errof(&r),
+		"permission denied");
+	/* … except for §1.1's reserved ids, which it may create and write */
+	clcreate(&cl, Ffile, "shoal.map.8", OWRITE, &r);
+	eqs("admin create of a reserved id", errof(&r), "shoalsrv: not built");
+	clclunk(&cl, Ffile, &r);
+
+	w[0] = "obj";
+	w[1] = "alpha";
+	if(clwalk(&cl, Froot, Ffile, 2, w, &r) != Rwalk)
+		fail("walk /obj/alpha: %s", errof(&r));
+	clopen(&cl, Ffile, OWRITE, &r);
+	eqs("admin open of an unreserved object for writing", errof(&r),
+		"permission denied");
+	clopen(&cl, Ffile, OREAD, &r);
+	eqs("admin open of an unreserved object for reading", errof(&r),
+		"shoalsrv: not built");
+	clclunk(&cl, Ffile, &r);
+
+	w[1] = "shoal.map.7";
+	if(clwalk(&cl, Froot, Ffile, 2, w, &r) != Rwalk)
+		fail("walk /obj/shoal.map.7: %s", errof(&r));
+	clopen(&cl, Ffile, OWRITE, &r);
+	eqs("admin open of a reserved object for writing", errof(&r),
+		"shoalsrv: not built");
+	clclunk(&cl, Ffile, &r);
+
+	/* the fence, and §2.1's sole exemption from it */
+	w[0] = "ctl";
+	if(clopenpath(&cl, Froot, Fctl, 1, w, OWRITE, &r) != Ropen){
+		fail("open /ctl: %s", errof(&r));
+		goto Out;
+	}
+	if(clwrite(&cl, Fctl, 0, "fence on", &r) != Rwrite)
+		fail("fence on: %s", errof(&r));
+	w[0] = "obj";
+	w[1] = "shoal.map.7";
+	if(clwalk(&cl, Froot, Ffile, 2, w, &r) != Rwalk)
+		fail("walk /obj/shoal.map.7 while fenced: %s", errof(&r));
+	clopen(&cl, Ffile, OREAD, &r);
+	eqs("fenced admin read of a reserved id", errof(&r),
+		"shoalsrv: not built");
+	clopen(&cl, Ffile, OWRITE, &r);
+	eqs("fenced admin write of a reserved id", errof(&r), "fenced");
+	clclunk(&cl, Ffile, &r);
+	w[0] = "meta";
+	if(clwalk(&cl, Froot, Ffile, 2, w, &r) != Rwalk)
+		fail("walk /meta/shoal.map.7 while fenced: %s", errof(&r));
+	clopen(&cl, Ffile, OREAD, &r);
+	eqs("fenced admin read of a reserved id through /meta", errof(&r),
+		"shoalsrv: not built");
+	clclunk(&cl, Ffile, &r);
+	w[0] = "obj";
+	w[1] = "alpha";
+	if(clwalk(&cl, Froot, Ffile, 2, w, &r) != Rwalk)
+		fail("walk /obj/alpha while fenced: %s", errof(&r));
+	clopen(&cl, Ffile, OREAD, &r);
+	eqs("fenced admin read of an unreserved id", errof(&r), "fenced");
+	clclunk(&cl, Ffile, &r);
+	if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk)
+		fail("walk /obj while fenced: %s", errof(&r));
+	clcreate(&cl, Ffile, "shoal.map.9", OWRITE, &r);
+	eqs("fenced admin create of a reserved id", errof(&r), "fenced");
+	clclunk(&cl, Ffile, &r);
+	if(clwrite(&cl, Fctl, 0, "fence off", &r) != Rwrite)
+		fail("fence off: %s", errof(&r));
+	clclunk(&cl, Fctl, &r);
+	clclunk(&cl, Froot, &r);
+
+	/* a client is not the operator: its writes are §2.4's, not §2.1's */
+	if(clattach(&cl, Froot, "role=client,epoch=7", &r) != Rattach){
+		fail("attach client: %s", errof(&r));
+		goto Out;
+	}
+	if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk)
+		fail("walk /obj as client: %s", errof(&r));
+	clcreate(&cl, Ffile, "brandnew", OWRITE, &r);
+	eqs("client create of an id that is not reserved", errof(&r),
+		"shoalsrv: not built");
+	clclunk(&cl, Ffile, &r);
+	w[1] = "alpha";
+	if(clwalk(&cl, Froot, Ffile, 2, w, &r) != Rwalk)
+		fail("walk /obj/alpha as client: %s", errof(&r));
+	clopen(&cl, Ffile, OWRITE, &r);
+	eqs("client open of an object for writing", errof(&r),
+		"shoalsrv: not built");
+	clclunk(&cl, Ffile, &r);
+	clclunk(&cl, Froot, &r);
+Out:
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
+ * §6.4 F3: an instance whose own map record says up=no or status=out
+ * refuses role=client I/O with `down', and answers everything else as
+ * it otherwise would.  The map is the static one (store.md §14(18)),
+ * so this is the state the instance was started in.
+ */
+static void
+tdown(char *status, char *up)
+{
+	char *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall r;
+	char *w[2];
+
+	clstage = "down";
+	m = mkmapself(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid, status, up);
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4)) == nil)
+		return;
+	mkobj(srvstore(ctx), "alpha", nil, 0, 1);
+	clstart(&cl, ctx, Clmsize);
+
+	/* the attach is not gated: §2.1 names no `down' among its refusals */
+	if(clattach(&cl, Froot, "role=client,epoch=7", &r) != Rattach){
+		fail("attach client on a %s/%s instance: %s", status, up,
+			errof(&r));
+		goto Out;
+	}
+	w[0] = "obj";
+	w[1] = "alpha";
+	if(clwalk(&cl, Froot, Ffile, 2, w, &r) != Rwalk)
+		fail("walk /obj/alpha: %s", errof(&r));
+	clopen(&cl, Ffile, OREAD, &r);
+	eqs("a client read on an instance the map does not serve with",
+		errof(&r), "down");
+	clopen(&cl, Ffile, OWRITE, &r);
+	eqs("a client write on an instance the map does not serve with",
+		errof(&r), "down");
+	clclunk(&cl, Ffile, &r);
+	if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk)
+		fail("walk /obj: %s", errof(&r));
+	clcreate(&cl, Ffile, "brandnew", OWRITE, &r);
+	eqs("a client create on an instance the map does not serve with",
+		errof(&r), "down");
+	clclunk(&cl, Ffile, &r);
+	clclunk(&cl, Froot, &r);
+
+	/* F3 is about serving clients: an operator still reaches the disk */
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
+		fail("attach admin: %s", errof(&r));
+		goto Out;
+	}
+	if(clwalk(&cl, Froot, Ffile, 2, w, &r) != Rwalk)
+		fail("walk /obj/alpha as admin: %s", errof(&r));
+	clopen(&cl, Ffile, OREAD, &r);
+	eqs("an admin read on the same instance", errof(&r),
+		"shoalsrv: not built");
+	clclunk(&cl, Ffile, &r);
+	clclunk(&cl, Froot, &r);
+Out:
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * layer-a §5.4.1's Tflush, both halves: a request still queued is
  * removed and answered `interrupted', then the Rflush follows; a
  * request already running is interrupted, unwinds through step 7 and
@@ -1596,6 +1833,9 @@ threadmain(int argc, char **argv)
 	tstatus();
 	tctl();
 	tverify();
+	tobjgate();
+	tdown("in", "no");
+	tdown("out", "yes");
 	tflush();
 	terrors();
 	tshutdown();

@@ -43,22 +43,109 @@ static char*	ctlnotbuilt(Srvctx*, Sfid*, int, char**);
 static void	ctlverify(Req*);
 
 /*
- *	verb	    roles   fenced nargmin nargmax  fn		qfn
+ * One row per verb, one field per line: a verb is built by naming the
+ * cell it fills, and a row grows without its neighbours moving.  A
+ * field left out is zero — no role, outside the fenced set, no
+ * arguments, no body.
  */
 Sctl srvctls[] =
 {
-	{"refresh",	Aadmin,	0,	0, 0,	ctlnotbuilt,	nil},
-	{"register",	Aadmin,	0,	0, 0,	ctlnotbuilt,	nil},
-	{"pull",	Aadmin,	1,	2, 2,	ctlnotbuilt,	nil},
-	{"push",	Aadmin,	1,	2, 2,	ctlnotbuilt,	nil},
-	{"reconcile",	Aadmin,	1,	0, 1,	ctlnotbuilt,	nil},
-	{"advert",	Aadmin,	1,	0, 1,	ctlnotbuilt,	nil},
-	{"drop",	Aadmin,	1,	1, 1,	ctlnotbuilt,	nil},
-	{"verify",	Aadmin,	0,	1, 1,	nil,		ctlverify},
-	{"scrub",	Aadmin,	0,	0, 2,	ctlnotbuilt,	nil},
-	{"forget",	Aadmin,	1,	1, 1,	ctlnotbuilt,	nil},
-	{"fence",	Aadmin,	0,	1, 1,	ctlfence,	nil},
-	{"newmonid",	Aadmin,	0,	1, 1,	ctlnotbuilt,	nil},
+{
+	.verb	= "refresh",
+	.roles	= Aadmin,
+	.fenced	= 0,
+	.nargmin= 0,
+	.nargmax= 0,
+	.fn	= ctlnotbuilt,
+},
+{
+	.verb	= "register",
+	.roles	= Aadmin,
+	.fenced	= 0,
+	.nargmin= 0,
+	.nargmax= 0,
+	.fn	= ctlnotbuilt,
+},
+{
+	.verb	= "pull",
+	.roles	= Aadmin,
+	.fenced	= 1,
+	.nargmin= 2,
+	.nargmax= 2,
+	.fn	= ctlnotbuilt,
+},
+{
+	.verb	= "push",
+	.roles	= Aadmin,
+	.fenced	= 1,
+	.nargmin= 2,
+	.nargmax= 2,
+	.fn	= ctlnotbuilt,
+},
+{
+	.verb	= "reconcile",
+	.roles	= Aadmin,
+	.fenced	= 1,
+	.nargmin= 0,
+	.nargmax= 1,
+	.fn	= ctlnotbuilt,
+},
+{
+	.verb	= "advert",
+	.roles	= Aadmin,
+	.fenced	= 1,
+	.nargmin= 0,
+	.nargmax= 1,
+	.fn	= ctlnotbuilt,
+},
+{
+	.verb	= "drop",
+	.roles	= Aadmin,
+	.fenced	= 1,
+	.nargmin= 1,
+	.nargmax= 1,
+	.fn	= ctlnotbuilt,
+},
+{
+	.verb	= "verify",
+	.roles	= Aadmin,
+	.fenced	= 0,
+	.nargmin= 1,
+	.nargmax= 1,
+	.qfn	= ctlverify,
+},
+{
+	.verb	= "scrub",
+	.roles	= Aadmin,
+	.fenced	= 0,
+	.nargmin= 0,
+	.nargmax= 2,
+	.fn	= ctlnotbuilt,
+},
+{
+	.verb	= "forget",
+	.roles	= Aadmin,
+	.fenced	= 1,
+	.nargmin= 1,
+	.nargmax= 1,
+	.fn	= ctlnotbuilt,
+},
+{
+	.verb	= "fence",
+	.roles	= Aadmin,
+	.fenced	= 0,
+	.nargmin= 1,
+	.nargmax= 1,
+	.fn	= ctlfence,
+},
+{
+	.verb	= "newmonid",
+	.roles	= Aadmin,
+	.fenced	= 0,
+	.nargmin= 1,
+	.nargmax= 1,
+	.fn	= ctlnotbuilt,
+},
 };
 int nsrvctls = nelem(srvctls);
 

@@ -54,28 +54,67 @@ enum
 };
 
 /*
+ * What a row's gate is asked about.  The request carries the rest: the
+ * mode of an open or a create is r->ifcall.mode, and the name a create
+ * names is r->ifcall.name.
+ */
+enum
+{
+	Gopen	= 0,
+	Gcreate,
+	Gremove,
+	Gwstat,
+};
+
+/*
  * One file of §2.2.  walk/rd/wr are §2.1's role matrix: which roles
  * may walk to this file, open it for reading, and open it for writing.
  * §2.1 states the matrix by role rather than by file, and is silent
  * about several cells; store.md §14(24) records what those cells are
  * here and why.
  *
- * The three handler cells are what the rest of the surface fills in:
+ * The handler cells are what the rest of the surface fills in.  Each
+ * row of the table names one field per line, so a field added to this
+ * struct touches no existing row and two hands filling different cells
+ * of one row do not meet in the same line.
  *
+ *	gate	the row's own rules, run right after the role gate on
+ *		open, create, remove and wstat.  It answers nil, or the
+ *		error string the operation is refused with.  What the
+ *		object rows' gate asks, and in what order, is beside it
+ *		in tree.c and in store.md §14(24).
  *	render	the file is a render-at-open text file (§2.2's MUST):
  *		open composes its bytes once into the fid's Text and
  *		every read is served from them.  It answers nil, or an
  *		error string.
  *	read	a read that is not served from a snapshot — a channel
- *		(/repl, /rpc) or a directory read.  It responds.
+ *		(/repl, /rpc) or a directory read.  It responds.  A row
+ *		with a read cell gets every read, whether or not the fid
+ *		also holds a rendered Text, and may serve that Text
+ *		itself with textread(r, f->text); only a row with render
+ *		and no read takes the automatic text path.
  *	write	a write.  It responds.
  *	open	a file whose open takes checks of its own (the object
  *		rows' mode rules, layer-a §2.4).  It responds.
+ *	create	a Tcreate in this directory.  It responds.
+ *	remove	a Tremove of this file.  It responds.
+ *	wstat	a Twstat of this file.  It responds.
  *
- * A row with render, read, write and open all nil is a file whose
- * content is not built: after the role gate, its open answers the
- * local Enotbuilt.  That is deliberate, so the gate matrix is complete
- * and testable before the content is.
+ * A row with every handler cell nil is a file whose content is not
+ * built: after the role gate and the row's gate, the operation answers
+ * the local Enotbuilt.  That is deliberate, so the gate matrix is
+ * complete and testable before the content is.
+ *
+ * Which cells belong with which body of work.  The /obj directory
+ * row's open and read cells — and the aux a fid of that row carries
+ * while it is a directory fid, which is that read's snapshot — belong
+ * with the enumeration of that directory.  That row's create cell, and
+ * the /obj/<oid> and /meta/<oid> rows entire, belong with object I/O.
+ * The two meet in one place: a Tcreate turns the directory fid it is
+ * issued on into a fid for the created object, so the create cell is
+ * what gives the directory fid's aux back — auxclose, then auxfree —
+ * before it sets the fid's file, oid and qid, since one fid cannot
+ * hold an enumeration's snapshot and an object's state at once.
  */
 struct Sfile
 {
@@ -85,10 +124,14 @@ struct Sfile
 	int	walk;
 	int	rd;
 	int	wr;
+	char*	(*gate)(Srvctx*, Sfid*, Req*, int op);
 	char*	(*render)(Srvctx*, Sfid*, Text*);
 	void	(*read)(Req*);
 	void	(*write)(Req*);
 	void	(*open)(Req*);
+	void	(*create)(Req*);
+	void	(*remove)(Req*);
+	void	(*wstat)(Req*);
 };
 
 extern Sfile srvfiles[Nfile];

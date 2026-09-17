@@ -37,32 +37,211 @@ static char Enofile[] = "shoalsrv: no such file";
 static char Edeleted[] = "object deleted";
 
 static void rootread(Req*);
+static char* objgate(Srvctx*, Sfid*, Req*, int);
 
+/*
+ * One row per file, one field per line: a cell is filled by naming it,
+ * so a row grows without its neighbours moving and two cells of one row
+ * are two separate lines.  A field left out is zero, which for a
+ * handler cell is `not built' and for a role column is `no role'.
+ */
 Sfile srvfiles[Nfile] =
 {
-/*	 name	   dir  perm	  walk		    rd		  wr		  render	  read	   write   open */
-[Qroot]	{nil,	   1, DMDIR|0555, Aall,		    Aall,	  0,		  nil,		  rootread, nil, nil},
-[Qctl]	{"ctl",	   0, 0666,	  Aall,		    Aall,	  Aall,		  srvemptytext,	  nil, srvctlwrite, nil},
-[Qstatus]{"status",0, 0444,	  Aadmin,	    Aadmin,	  0,		  srvstatustext,  nil, nil, nil},
-[Qmap]	{"map",	   0, 0444,	  Aadmin,	    Aadmin,	  0,		  srvmaptext,	  nil, nil, nil},
-[Qobj]	{"obj",	   1, DMDIR|0555, Aall,		    Aadmin,	  Aclient|Aadmin, nil,		  nil, nil, nil},
-[Qmeta]	{"meta",   1, DMDIR|0555, Aall,		    Aadmin,	  0,		  nil,		  nil, nil, nil},
-[Qrepl]	{"repl",   0, 0600,	  Arepl,	    Arepl,	  Arepl,	  nil,		  nil, nil, nil},
-[Qrpc]	{"rpc",	   0, 0600,	  Arepl|Aadmin,	    Arepl|Aadmin, Arepl|Aadmin,	  nil,		  nil, nil, nil},
-[Qadvert]{"advert",0, 0400,	  Arepl,	    Arepl,	  0,		  nil,		  nil, nil, nil},
-[Qdirty]{"dirty",  0, 0444,	  Aadmin,	    Aadmin,	  0,		  nil,		  nil, nil, nil},
-[Qstale]{"stale",  0, 0444,	  Aadmin,	    Aadmin,	  0,		  nil,		  nil, nil, nil},
-[Qtombs]{"tombs",  0, 0444,	  Aadmin,	    Aadmin,	  0,		  nil,		  nil, nil, nil},
-[Qlost]	{"lost",   0, 0444,	  Aadmin,	    Aadmin,	  0,		  nil,		  nil, nil, nil},
-[Qjobs]	{"jobs",   0, 0444,	  Aadmin,	    Aadmin,	  0,		  nil,		  nil, nil, nil},
-[Qobjfile]{nil,	   0, 0666,	  Aall,		    Aall,	  Aclient|Aadmin, nil,		  nil, nil, nil},
-[Qmetafile]{nil,   0, 0444,	  Aall,		    Aall,	  0,		  nil,		  nil, nil, nil},
+[Qroot] = {
+	.name	= nil,
+	.isdir	= 1,
+	.perm	= DMDIR|0555,
+	.walk	= Aall,
+	.rd	= Aall,
+	.wr	= 0,
+	.read	= rootread,
+},
+[Qctl] = {
+	.name	= "ctl",
+	.perm	= 0666,
+	.walk	= Aall,
+	.rd	= Aall,
+	.wr	= Aall,
+	.render	= srvemptytext,
+	.write	= srvctlwrite,
+},
+[Qstatus] = {
+	.name	= "status",
+	.perm	= 0444,
+	.walk	= Aadmin,
+	.rd	= Aadmin,
+	.wr	= 0,
+	.render	= srvstatustext,
+},
+[Qmap] = {
+	.name	= "map",
+	.perm	= 0444,
+	.walk	= Aadmin,
+	.rd	= Aadmin,
+	.wr	= 0,
+	.render	= srvmaptext,
+},
+[Qobj] = {
+	.name	= "obj",
+	.isdir	= 1,
+	.perm	= DMDIR|0555,
+	.walk	= Aall,
+	.rd	= Aadmin,
+	.wr	= Aclient|Aadmin,
+	.gate	= objgate,
+},
+[Qmeta] = {
+	.name	= "meta",
+	.isdir	= 1,
+	.perm	= DMDIR|0555,
+	.walk	= Aall,
+	.rd	= Aadmin,
+	.wr	= 0,
+},
+[Qrepl] = {
+	.name	= "repl",
+	.perm	= 0600,
+	.walk	= Arepl,
+	.rd	= Arepl,
+	.wr	= Arepl,
+},
+[Qrpc] = {
+	.name	= "rpc",
+	.perm	= 0600,
+	.walk	= Arepl|Aadmin,
+	.rd	= Arepl|Aadmin,
+	.wr	= Arepl|Aadmin,
+},
+[Qadvert] = {
+	.name	= "advert",
+	.perm	= 0400,
+	.walk	= Arepl,
+	.rd	= Arepl,
+	.wr	= 0,
+},
+[Qdirty] = {
+	.name	= "dirty",
+	.perm	= 0444,
+	.walk	= Aadmin,
+	.rd	= Aadmin,
+	.wr	= 0,
+},
+[Qstale] = {
+	.name	= "stale",
+	.perm	= 0444,
+	.walk	= Aadmin,
+	.rd	= Aadmin,
+	.wr	= 0,
+},
+[Qtombs] = {
+	.name	= "tombs",
+	.perm	= 0444,
+	.walk	= Aadmin,
+	.rd	= Aadmin,
+	.wr	= 0,
+},
+[Qlost] = {
+	.name	= "lost",
+	.perm	= 0444,
+	.walk	= Aadmin,
+	.rd	= Aadmin,
+	.wr	= 0,
+},
+[Qjobs] = {
+	.name	= "jobs",
+	.perm	= 0444,
+	.walk	= Aadmin,
+	.rd	= Aadmin,
+	.wr	= 0,
+},
+[Qobjfile] = {
+	.name	= nil,
+	.perm	= 0666,
+	.walk	= Aall,
+	.rd	= Aall,
+	.wr	= Aclient|Aadmin,
+	.gate	= objgate,
+},
+[Qmetafile] = {
+	.name	= nil,
+	.perm	= 0444,
+	.walk	= Aall,
+	.rd	= Aall,
+	.wr	= 0,
+	.gate	= objgate,
+},
 };
 
 static int
 rolebit(int role)
 {
 	return 1<<role;
+}
+
+/* layer-a §1.1's reserved ids: the system's own, spelled `shoal.…' */
+static int
+reservedid(uchar *oid, int oidlen)
+{
+	return oidlen >= 6 && memcmp(oid, "shoal.", 6) == 0;
+}
+
+/*
+ * The object rows' gate, run right after the role gate on every open,
+ * create, remove and wstat that reaches an object or the directory one
+ * is created in.  It asks three things, in this order:
+ *
+ *	§2.1's operator rule.  role=admin's grant of /obj and /meta is
+ *	read-only, and a create, write, remove or wstat of an id that is
+ *	not a reserved `shoal.' one MUST fail `permission denied'.  It
+ *	goes first because it reads the fid and the name alone, and
+ *	neither can change while the fid lives: no later state can make
+ *	an operation §2.1 forbids permissible.
+ *
+ *	§6.4 F3's `down'.  An instance whose own map record says up=no
+ *	or status=out MUST refuse role=client I/O with `down'.  up=heal
+ *	is deliberately not in F3's list.  This is the instance's own
+ *	standing state — the map it serves is the one it was started
+ *	with (store.md §14(18)) — so it answers before the one gate an
+ *	operator can change while a fid is open.
+ *
+ *	§6.4 F1 and F4's fence, with §2.1's sole exemption: a role=admin
+ *	READ of a reserved `shoal.' id passes while fenced, which is
+ *	what makes §8.6's monitor rebuild executable.  §2.1 grants admin
+ *	writes of reserved ids only while unfenced, so the exemption is
+ *	the read alone; every other operation on an object is `fenced'.
+ *
+ * store.md §14(24) carries the same order for a reader outside srv/.
+ */
+static char*
+objgate(Srvctx *c, Sfid *f, Req *r, int op)
+{
+	uchar *oid;
+	int oidlen, wr, rsvd, m;
+
+	if(op == Gcreate){
+		oid = (uchar*)r->ifcall.name;
+		oidlen = strlen(r->ifcall.name);
+		wr = 1;
+	}else{
+		oid = f->oid;
+		oidlen = f->oidlen;
+		m = r->ifcall.mode;
+		wr = op != Gopen
+			|| (m&OMASK) == OWRITE || (m&OMASK) == ORDWR
+			|| (m&OTRUNC) != 0;
+	}
+	rsvd = reservedid(oid, oidlen);
+	if(wr && f->role == Radmin && !rsvd)
+		return Eperm;
+	if(f->role == Rclient
+	&& (c->self->up == Uno || c->self->status == Sout))
+		return Edown;
+	if(srvfencekind(c) != Fencenone){
+		if(!wr && rsvd && f->role == Radmin)
+			return nil;
+		return Efenced;
+	}
+	return nil;
 }
 
 void
@@ -385,13 +564,11 @@ srvwalk(Req *r)
 }
 
 /*
- * Open.  §2.1's role gate first; then, for the two object rows, §6.4's
- * fence, because F1 fences every role=client read and write and every
- * role=repl or role=admin read of an object through /obj or /meta;
- * then the row's own hook, or its render-at-open snapshot, or the
- * local `not built'.  layer-a §2.4's mode rules — ORCLOSE and a write
- * on an OREAD fid — belong to the object rows' open hook, which is the
- * object-I/O surface's.
+ * Open.  §2.1's role gate first, then the row's own gate, then the
+ * row's open hook, or its render-at-open snapshot, or the local `not
+ * built'.  layer-a §2.4's mode rules — ORCLOSE and a write on an OREAD
+ * fid — belong to the object rows' open hook, which is the object-I/O
+ * surface's.
  */
 void
 srvopen(Req *r)
@@ -425,11 +602,9 @@ srvopen(Req *r)
 		respond(r, Eperm);
 		return;
 	}
-	if(f->file == Qobjfile || f->file == Qmetafile){
-		if(srvfencekind(c) != Fencenone){
-			respond(r, Efenced);
-			return;
-		}
+	if(file->gate != nil && (e = file->gate(c, f, r, Gopen)) != nil){
+		respond(r, e);
+		return;
 	}
 	if(file->open != nil){
 		file->open(r);
@@ -462,6 +637,12 @@ srvopen(Req *r)
 	respond(r, Enotbuilt);
 }
 
+/*
+ * Read.  A row with a read cell gets every read on it, whether or not
+ * the fid also holds a rendered Text — a row that renders bytes at
+ * open AND wants the read itself serves them with textread — and only
+ * a row with render and no read takes the automatic path (dat.h).
+ */
 void
 srvread(Req *r)
 {
@@ -470,12 +651,12 @@ srvread(Req *r)
 
 	f = r->fid->aux;
 	file = &srvfiles[f->file];
-	if(f->text != nil){
-		textread(r, f->text);
-		return;
-	}
 	if(file->read != nil){
 		file->read(r);
+		return;
+	}
+	if(f->text != nil){
+		textread(r, f->text);
 		return;
 	}
 	respond(r, Enotbuilt);
@@ -544,17 +725,45 @@ srvstat(Req *r)
 	respond(r, nil);
 }
 
+/*
+ * Create, remove and wstat, in the write column: §2.1's role gate,
+ * then the row's gate, then the row's own cell, which for a row whose
+ * content is not built is nil and answers the local `not built'.  The
+ * three are one shape, so a row is built by filling one cell.
+ */
+static void
+wrop(Req *r, int op, void (*cell)(Req*))
+{
+	char *e;
+	Srvctx *c;
+	Sfid *f;
+	Sfile *file;
+
+	c = r->srv->aux;
+	f = r->fid->aux;
+	file = &srvfiles[f->file];
+	if((file->wr & rolebit(f->role)) == 0){
+		respond(r, Eperm);
+		return;
+	}
+	if(file->gate != nil && (e = file->gate(c, f, r, op)) != nil){
+		respond(r, e);
+		return;
+	}
+	if(cell != nil){
+		cell(r);
+		return;
+	}
+	respond(r, Enotbuilt);
+}
+
 void
 srvcreate(Req *r)
 {
 	Sfid *f;
 
 	f = r->fid->aux;
-	if((srvfiles[f->file].wr & rolebit(f->role)) == 0){
-		respond(r, Eperm);
-		return;
-	}
-	respond(r, Enotbuilt);
+	wrop(r, Gcreate, srvfiles[f->file].create);
 }
 
 void
@@ -563,11 +772,7 @@ srvremove(Req *r)
 	Sfid *f;
 
 	f = r->fid->aux;
-	if((srvfiles[f->file].wr & rolebit(f->role)) == 0){
-		respond(r, Eperm);
-		return;
-	}
-	respond(r, Enotbuilt);
+	wrop(r, Gremove, srvfiles[f->file].remove);
 }
 
 void
@@ -576,11 +781,7 @@ srvwstat(Req *r)
 	Sfid *f;
 
 	f = r->fid->aux;
-	if((srvfiles[f->file].wr & rolebit(f->role)) == 0){
-		respond(r, Eperm);
-		return;
-	}
-	respond(r, Enotbuilt);
+	wrop(r, Gwstat, srvfiles[f->file].wstat);
 }
 
 /*
