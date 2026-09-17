@@ -380,10 +380,11 @@ tattach(void)
 			}
 		}else{
 			checks++;
-			if(r.type != Rerror)
+			if(r.type != Rerror){
 				fail("attach %#q: no error, want %s",
 					cases[i].aname, cases[i].err);
-			else
+				clclunk(&cl, Froot, &r);
+			}else
 				eqs("attach error", r.ename, cases[i].err);
 		}
 	}
@@ -567,6 +568,104 @@ tmatrix(void)
 			}
 			eqv("root entries for this role", nent, nwalkable[role]);
 		}
+		clclunk(&cl, Froot, &r);
+	}
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
+ * The same matrix over the three operations that are not walk and
+ * open: §2.4's create in /obj, remove of /obj/<oid> and wstat of one.
+ * Each is gated on the row's write column and then answers the local
+ * `not built', because §2.4's content is the object-I/O surface's.
+ */
+static void
+tmodes(void)
+{
+	static char *anames[3] = {
+		"role=client,epoch=7",
+		"role=repl,peer=n1.1",
+		"role=admin",
+	};
+	/* the write column of /obj and of /obj/<oid>: client and admin */
+	static char *want[3] = {
+		"shoalsrv: not built",
+		"permission denied",
+		"shoalsrv: not built",
+	};
+	uchar stat[STATMAX];
+	char *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall t, r;
+	Dir dir;
+	int role, n;
+
+	clstage = "modes";
+	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4)) == nil)
+		return;
+	mkobj(srvstore(ctx), "alpha", nil, 0, 1);
+	clstart(&cl, ctx, Clmsize);
+	for(role = 0; role < 3; role++){
+		if(clattach(&cl, Froot, anames[role], &r) != Rattach){
+			fail("attach %s: %s", anames[role],
+				r.type == Rerror ? r.ename : "?");
+			continue;
+		}
+		/* Tcreate in /obj */
+		if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk)
+			fail("walk /obj: %s", r.type == Rerror ? r.ename : "?");
+		memset(&t, 0, sizeof t);
+		t.type = Tcreate;
+		t.tag = cltag(&cl);
+		t.fid = Ffile;
+		t.name = "newobj";
+		t.perm = 0666;
+		t.mode = OWRITE;
+		clrpc(&cl, &t, &r);
+		checks++;
+		if(r.type != Rerror || strcmp(r.ename, want[role]) != 0)
+			fail("create in /obj as %s: %s, want %s", anames[role],
+				r.type == Rerror ? r.ename : "ok", want[role]);
+		clclunk(&cl, Ffile, &r);
+
+		/* Twstat and Tremove on /obj/<oid> */
+		if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk
+		|| clwalk1(&cl, Ffile, Ffile2, "alpha", &r) != Rwalk)
+			fail("walk /obj/alpha: %s",
+				r.type == Rerror ? r.ename : "?");
+		nulldir(&dir);
+		dir.length = 4096;
+		n = convD2M(&dir, stat, sizeof stat);
+		memset(&t, 0, sizeof t);
+		t.type = Twstat;
+		t.tag = cltag(&cl);
+		t.fid = Ffile2;
+		t.stat = stat;
+		t.nstat = n;
+		clrpc(&cl, &t, &r);
+		checks++;
+		if(r.type != Rerror || strcmp(r.ename, want[role]) != 0)
+			fail("wstat /obj/alpha as %s: %s, want %s",
+				anames[role], r.type == Rerror ? r.ename : "ok",
+				want[role]);
+		memset(&t, 0, sizeof t);
+		t.type = Tremove;
+		t.tag = cltag(&cl);
+		t.fid = Ffile2;
+		clrpc(&cl, &t, &r);
+		checks++;
+		if(r.type != Rerror || strcmp(r.ename, want[role]) != 0)
+			fail("remove /obj/alpha as %s: %s, want %s",
+				anames[role], r.type == Rerror ? r.ename : "ok",
+				want[role]);
+		clclunk(&cl, Ffile, &r);
 		clclunk(&cl, Froot, &r);
 	}
 	clstop(&cl);
@@ -1391,12 +1490,14 @@ threadmain(int argc, char **argv)
 {
 	USED(argc);
 	USED(argv);
+	quotefmtinstall();		/* the FAIL lines quote what they got */
 	clwatchon();
 
 	tstartup();
 	tattach();
 	tmsize();
 	tmatrix();
+	tmodes();
 	tobjects();
 	tstatus();
 	tctl();
