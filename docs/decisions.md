@@ -851,23 +851,23 @@ grains some other way entirely — all within D18's one rule.
 to a lease-derived fence, and this row is the argument for that
 amendment; the rule itself is read there, not here.
 `design/store.md` §14(26) records the amendment.
-**Rationale:** §2.5 lists `fence off` among the verbs that MUST fail
+**Rationale:** §2.5 listed `fence off` among the verbs that MUST fail
 `fenced` while the instance is fenced, and §6.4 F4 makes `fence off`
 the only thing that clears an operator fence — "a separate flag with
 the same effect as F1's; `fence off` clears only that flag". Read
-literally the two make an operator fence permanent: the operator sets
-it, and the verb that would clear it is thereafter refused because it
-is in force, so the instance serves nothing until it is restarted.
-That cannot be what either sentence means, since F4 exists to be used
-and §6.4 describes it as a flag an operator sets and clears. What
-§2.5's rule is protecting is named in its own paragraph: "a deposed
-instance could be driven to overwrite, delete, discard replication
-state, or unfence itself" — and the fence a deposed instance carries
-is F1's lease fence, which `fence off` MUST NOT clear anyway. Scoping
-the refusal to the lease fence keeps every word of that protection
-and costs nothing: an instance that has lost its map still cannot
-unfence itself, and one an operator fenced can still be unfenced by
-the operator.
+literally the two made an operator fence permanent: the operator set
+it, and the verb that would clear it was thereafter refused because
+it was in force, so the instance served nothing until it was
+restarted. That cannot have been what either sentence meant, since F4
+exists to be used and §6.4 describes it as a flag an operator sets
+and clears. What §2.5's rule protects is named in its own paragraph:
+"a deposed instance could be driven to overwrite, delete, discard
+replication state, or unfence itself" — and the fence a deposed
+instance carries is F1's lease fence, which `fence off` MUST NOT
+clear anyway. Scoping the refusal to the lease fence keeps every word
+of that protection and costs nothing: an instance that has lost its
+map still cannot unfence itself, and one an operator fenced can still
+be unfenced by the operator.
 **Considered and rejected:** refusing `fence off` under any fence,
 which is the literal reading and makes F4 one-way — an operator
 fence would then be cleared only by restarting the instance, and
@@ -877,8 +877,12 @@ would let a lease-fenced instance answer it `ok` while clearing
 nothing, telling the operator the fence is gone when it is not.
 **Normative:** the amended §2.5 sentence and §6.4 F4, which carry the
 rule; a reimplementation matches those, not this row.
-**Implementation policy:** that an operator-fenced-only instance
-accepts `fence off` rather than refusing it. An implementation that
-refuses it conforms to §2.5's letter; it is then an implementation in
-which an operator fence can only be cleared by a restart, and it must
-say so.
+**Implementation policy:** what a `fence off` refused under a `both`
+fence does to the operator half. A lease fence and an operator fence
+can be in force at once, and such a `fence off` owes §2.5's refusal
+and F4's clearing at the same time; this server refuses and changes
+nothing, so the operator flag is still set when the lease returns and
+the operator's next `fence off` is what clears it. An implementation
+that clears the operator half and answers `fenced` all the same
+conforms too: the fence still in force is the lease one either way,
+and neither reading lets a deposed instance unfence itself.
