@@ -43,17 +43,43 @@
  * records the marking and the single `not built' string beside it.
  */
 char Enotbuilt[]	= "shoalsrv: not built";
-char Ebadaname[]	= "bad aname";
+
+/*
+ * layer-a §2.6's set, whole and in §2.6's order — the strings no
+ * handler is built for yet included, so that a unit adding one of
+ * those handlers names a string that is already here rather than
+ * appending to this block.  e26 below is the same set, read as data
+ * for the classifier, so the two cannot drift apart.
+ */
+char Enoobj[]		= "no such object";
+char Eexists[]		= "object exists";
+char Edeleted[]		= "object deleted";
+char Etoobig[]		= "object too large";
+char Elost[]		= "object lost";
+char Eunavail[]		= "object unavailable";
+char Enotready[]	= "not ready";
+char Ebadname[]		= "bad object name";
+char Ereserved[]	= "reserved name";
+char Ebadcreate[]	= "bad create mode";
+char Ebadopen[]		= "bad open mode";
+char Enorename[]	= "no rename";
+char Eperm[]		= "permission denied";
 char Estaleepoch[]	= "stale epoch";
 char Efutureepoch[]	= "future epoch";
-char Eperm[]		= "permission denied";
+char Enotprimary[]	= "not primary";
+char Enotdisc[]		= "not discardable";
 char Efenced[]		= "fenced";
+char Edown[]		= "down";
+char Edegraded[]	= "degraded";
+char Estalever[]	= "stale version";
+char Eoutofseq[]	= "out of sequence";
+char Ecsum[]		= "checksum mismatch";
+char Estillplaced[]	= "still placed";
+char Ediskfull[]	= "disk full";
 char Ebadctl[]		= "bad ctl";
 char Eunknownctl[]	= "unknown ctl";
-char Ebadname[]		= "bad object name";
-char Edown[]		= "down";
-char Enoobj[]		= "no such object";
-char Ecsum[]		= "checksum mismatch";
+char Ebadaname[]	= "bad aname";
+char Ebadmap[]		= "bad map";
 
 /*
  * Not a §2.6 string: what lib9p's reqqueueflush answers a request it
@@ -96,38 +122,38 @@ srvintr(char *e)
 	return strcmp(p, Einterrupted) == 0;
 }
 
-/* layer-a §2.6, exactly.  The set is prefix-free; this is the check. */
+/* layer-a §2.6, exactly: the block above, read as data.  Prefix-free. */
 static char *e26[] =
 {
-	"no such object",
-	"object exists",
-	"object deleted",
-	"object too large",
-	"object lost",
-	"object unavailable",
-	"not ready",
-	"bad object name",
-	"reserved name",
-	"bad create mode",
-	"bad open mode",
-	"no rename",
-	"permission denied",
-	"stale epoch",
-	"future epoch",
-	"not primary",
-	"not discardable",
-	"fenced",
-	"down",
-	"degraded",
-	"stale version",
-	"out of sequence",
-	"checksum mismatch",
-	"still placed",
-	"disk full",
-	"bad ctl",
-	"unknown ctl",
-	"bad aname",
-	"bad map",
+	Enoobj,
+	Eexists,
+	Edeleted,
+	Etoobig,
+	Elost,
+	Eunavail,
+	Enotready,
+	Ebadname,
+	Ereserved,
+	Ebadcreate,
+	Ebadopen,
+	Enorename,
+	Eperm,
+	Estaleepoch,
+	Efutureepoch,
+	Enotprimary,
+	Enotdisc,
+	Efenced,
+	Edown,
+	Edegraded,
+	Estalever,
+	Eoutofseq,
+	Ecsum,
+	Estillplaced,
+	Ediskfull,
+	Ebadctl,
+	Eunknownctl,
+	Ebadaname,
+	Ebadmap,
 };
 
 /*

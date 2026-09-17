@@ -1,17 +1,43 @@
 /* private to srv/ */
 
-/* err.c — store.md §3.7's mapping rule, in one place (srv.h has the API) */
-extern char Ebadaname[];
+/*
+ * err.c — store.md §3.7's mapping rule, in one place (srv.h has the
+ * API).  layer-a §2.6's set is declared whole, in §2.6's order, the
+ * conditions no handler answers yet included: a unit that builds one
+ * of those handlers finds its string here instead of adding a line to
+ * this block.
+ */
+extern char Enoobj[];
+extern char Eexists[];
+extern char Edeleted[];
+extern char Etoobig[];
+extern char Elost[];
+extern char Eunavail[];
+extern char Enotready[];
+extern char Ebadname[];
+extern char Ereserved[];
+extern char Ebadcreate[];
+extern char Ebadopen[];
+extern char Enorename[];
+extern char Eperm[];
 extern char Estaleepoch[];
 extern char Efutureepoch[];
-extern char Eperm[];
+extern char Enotprimary[];
+extern char Enotdisc[];
 extern char Efenced[];
+extern char Edown[];
+extern char Edegraded[];
+extern char Estalever[];
+extern char Eoutofseq[];
+extern char Ecsum[];
+extern char Estillplaced[];
+extern char Ediskfull[];
 extern char Ebadctl[];
 extern char Eunknownctl[];
-extern char Ebadname[];
-extern char Edown[];
-extern char Enoobj[];
-extern char Ecsum[];
+extern char Ebadaname[];
+extern char Ebadmap[];
+
+/* not §2.6's: the two `interrupted' causes (err.c) */
 extern char Einterrupted[];
 extern char Edevintr[];
 int	srvintr(char*);

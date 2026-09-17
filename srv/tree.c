@@ -34,7 +34,6 @@
  * said the other way round, since every row of §2.5 is admin.
  */
 static char Enofile[] = "shoalsrv: no such file";
-static char Edeleted[] = "object deleted";
 
 static void rootread(Req*);
 static char* objgate(Srvctx*, Sfid*, Req*, int);
