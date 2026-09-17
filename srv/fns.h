@@ -36,6 +36,7 @@ void	srvqdrain(Srvctx*);
 void	srvqfree(Srvctx*);
 void	srvstep7(Req*);
 uvlong	srvpoint(Srvctx*, char*);
+void	srvholdclear(Srvctx*);
 
 /* tree.c */
 void	srvfidnew(Srvctx*, Sfid*);

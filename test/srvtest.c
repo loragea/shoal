@@ -2357,12 +2357,18 @@ tshutdown(void)
 	clput(&cl, &t);
 	sleep(200);			/* running, and held */
 
-	clhangup(&cl);			/* the loop ends with it in flight */
-	sleep(200);
-	istrue("the store is not closed while a request is in flight",
-		freedseen == 0);
-	srvhook(ctx, "objhold", 0);
-	istrue("the service loop ends", clwaitend(&cl, 10000));
+	/*
+	 * The loop ends with the request in flight, and nothing releases
+	 * the hold: the shutdown clears the points itself, because the
+	 * program that set one is not necessarily still watching when a
+	 * connection drops and a held request would otherwise hold the
+	 * drain -- and the store's close -- for as long as it lived.
+	 * Whether anything was still in flight at the close is what the
+	 * engine's freed callback recorded, below.
+	 */
+	clhangup(&cl);
+	istrue("the service loop ends with a held request in flight",
+		clwaitend(&cl, 10000));
 	clget(&cl, &r);
 	checks++;
 	if(r.type != Rwrite || r.tag != ta)

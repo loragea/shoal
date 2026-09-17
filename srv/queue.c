@@ -483,6 +483,24 @@ srvhook(Srvctx *c, char *name, uvlong n)
 	qunlock(&c->holdlk);
 }
 
+/*
+ * Clear every point that can hold a request, which the shutdown does
+ * before it drains: a point is a T1 thing and the program that set it
+ * is not necessarily watching when the connection drops, and a
+ * request left holding would hold the drain — and with it the store's
+ * close — for as long as the program lived.
+ */
+void
+srvholdclear(Srvctx *c)
+{
+	qlock(&c->holdlk);
+	c->hold = 0;
+	c->exithold = 0;
+	c->flushhold = 0;
+	c->mapopen = 0;
+	qunlock(&c->holdlk);
+}
+
 /* what a point is set to, for the one place that acts on the value */
 uvlong
 srvpoint(Srvctx *c, char *name)

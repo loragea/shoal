@@ -363,6 +363,10 @@ jobwait(Srvctx *c)
  * because such a call blocks on the state lock holding nothing that
  * keeps the Store alive.
  *
+ * Nothing new is taken on from here — the loop has ended and
+ * srvjobstart refuses — and the §13 points that can hold a request are
+ * cleared first, so a request left holding cannot hold the drain up.
+ *
  * The fids outlive this, but what they are holding may not: a fid open
  * when the connection dropped can be holding a stage, and §9 allows
  * nothing but the Objsnap calls once the store has closed.  So every
@@ -390,6 +394,7 @@ srvshutdown(Srvctx *c)
 	lock(&c->joblk);
 	c->stopping = 1;
 	unlock(&c->joblk);
+	srvholdclear(c);
 	srvqdrain(c);
 	jobwait(c);
 	srvfidsclose(c);
