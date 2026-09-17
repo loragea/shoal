@@ -218,6 +218,11 @@ reservedid(uchar *oid, int oidlen)
  *	what makes §8.6's monitor rebuild executable.  §2.1 grants admin
  *	writes of reserved ids only while unfenced, so the exemption is
  *	the read alone; every other operation on an object is `fenced'.
+ *	A read of the /obj or /meta DIRECTORY is not an operation on an
+ *	object: F1 fences "read of an object through /obj or /meta", and
+ *	a listing is neither — /tombs, which is the same operator
+ *	inspection path (§2.2), is not fenced at all.  store.md §14(24)
+ *	records the ruling.
  *
  * store.md §14(24) carries the same order for a reader outside srv/.
  */
@@ -267,6 +272,8 @@ objgate(Srvctx *c, Sfid *f, Req *r, int op)
 	&& (c->self->up == Uno || c->self->status == Sout))
 		return Edown;
 	if(srvfencekind(c) != Fencenone){
+		if(!wr && (f->file == Qobj || f->file == Qmeta))
+			return nil;
 		if(!wr && rsvd && f->role == Radmin)
 			return nil;
 		return Efenced;

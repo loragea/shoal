@@ -1535,6 +1535,10 @@ tobjgate(void)
 	clclunk(&cl, Ffile, &r);
 	if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk)
 		fail("walk /obj while fenced: %s", errof(&r));
+	/* a listing is not a read of an object, so F1 does not fence it */
+	clopen(&cl, Ffile, OREAD, &r);
+	eqs("fenced admin open of the /obj directory", errof(&r),
+		"shoalsrv: not built");
 	clcreate(&cl, Ffile, "shoal.map.9", OWRITE, &r);
 	eqs("fenced admin create of a reserved id", errof(&r), "fenced");
 	/*

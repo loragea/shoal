@@ -5303,6 +5303,16 @@ name a half that is not built; each says which.
        executable. §2.1 grants admin *writes* of reserved ids only
        while unfenced, so the exemption is the read alone.
 
+       A read of the `/obj` or `/meta` **directory** is not fenced
+       either, and that is a ruling rather than a quotation: F1
+       fences "every `role=repl` and `role=admin` read of an object
+       through `/obj` or `/meta`", and a listing is not a read of an
+       object. `/tombs` is the same operator inspection path (§2.2)
+       and F1 does not name it at all, so fencing the listing and not
+       the tombstones would be a distinction with nothing behind it.
+       Every row that names an object stays fenced, which is what F1
+       is for: a deposed primary must not serve an object's bytes.
+
     Only the first of those three positions is derivable. Rule 1 is:
     §2.1's operator rule reads the fid's role and the name alone, and
     neither changes while the fid lives, so no later state can make an
