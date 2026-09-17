@@ -69,7 +69,6 @@ void	srvholdclear(Srvctx*);
 void	srvfidnew(Srvctx*, Sfid*);
 void	srvfidgive(Sfid*);
 void	srvfidsclose(Srvctx*);
-void	srvattachqid(Sfid*, Qid*);
 void	srvfileqid(int file, Qid*);
 void	srvobjqid(Sfid*, Objinfo*, Qid*);
 void	srvdir(Srvctx*, Sfid*, Dir*);
