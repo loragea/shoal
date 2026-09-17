@@ -1867,7 +1867,7 @@ Out:
 static void
 tanyq(void)
 {
-	char buf[8192], *m;
+	char buf[8192], val[64], *m;
 	uchar data[1024];
 	Srvctx *ctx;
 	Dev *d;
@@ -1980,6 +1980,36 @@ tanyq(void)
 	sleep(100);
 	srvcount(ctx, &np, &nd);
 	eqv("the pool is empty again", np - nd, 0);
+
+	/*
+	 * A caller that prepares a request for a queue and then answers
+	 * it on the loop after all: the pool must count that request the
+	 * same way, since the completion is counted from the Req being
+	 * armed.  A depth that went below zero here would print as
+	 * 2^64-1 and the shutdown's drain would never converge.
+	 */
+	srvhook(ctx, "mapopen", 2);
+	if(clwalk1(&cl, Froot, Ffile, "map", &r) != Rwalk)
+		fail("walk /map a third time: %s", errof(&r));
+	clopen(&cl, Ffile, OREAD, &r);
+	checks++;
+	if(r.type != Ropen)
+		fail("an open prepared for a queue and answered on the loop: "
+			"%s", errof(&r));
+	clclunk(&cl, Ffile, &r);
+	srvhook(ctx, "mapopen", 0);
+	sleep(100);
+	srvcount(ctx, &np, &nd);
+	eqv("a preparation without a push leaves the pool empty", np - nd, 0);
+	w[0] = "status";
+	if(clopenpath(&cl, Froot, Ffile2, 1, w, OREAD, &r) != Ropen)
+		fail("open /status: %s", errof(&r));
+	else{
+		clslurp(&cl, Ffile2, buf, sizeof buf);
+		eqs("/status qdepth= after it",
+			clfield(buf, "qdepth", val, sizeof val), "0");
+		clclunk(&cl, Ffile2, &r);
+	}
 Out:
 	srvhook(ctx, "mapopen", 0);
 	clstop(&cl);

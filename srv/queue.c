@@ -29,7 +29,10 @@
  * different queues.  The pool size is a ceiling on concurrent object
  * operations rather than a collision parameter (§7), and /status
  * reports the depth so that saturation is visible: Reqqueue exposes no
- * count of its own, so this file counts the pushes and the completions.
+ * count of its own, so this file counts the requests the pool takes on
+ * — at the preparation, which is where the Req is armed and therefore
+ * where its completion is counted from — and srvdestroyreq counts them
+ * off again.
  */
 
 static void	qhold(Srvctx*, Qreq*, uvlong*);
@@ -144,6 +147,18 @@ qprep(Srvctx *c, Reqqueue *q, uchar *oid, int oidlen, Req *r,
 		memmove(qr->oid, oid, oidlen);
 		qr->oidlen = oidlen;
 	}
+	/*
+	 * Counted here rather than at the push, because this is the line
+	 * the completion is counted against: srvdestroyreq counts every
+	 * Req that carries a Qreq, whether it was pushed or answered on
+	 * the service loop after all.  Counting at the push would let a
+	 * caller that prepares a request and then answers it here take
+	 * the pool's depth below zero — where it is unsigned, so /status
+	 * prints 2^64-1 and the drain never converges.
+	 */
+	lock(&c->cntlk);
+	c->npush++;
+	unlock(&c->cntlk);
 	r->aux = qr;
 	return qr;
 }
@@ -192,10 +207,8 @@ srvqgo(Srvctx *c, Req *r)
 {
 	Qreq *qr;
 
+	USED(c);
 	qr = r->aux;
-	lock(&c->cntlk);
-	c->npush++;
-	unlock(&c->cntlk);
 	reqqueuepush(qr->q, r, qrun);
 }
 
