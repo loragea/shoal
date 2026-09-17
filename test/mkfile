@@ -19,8 +19,10 @@ TESTS=\
 	maptest\
 	bmrebuildtest\
 	peeropstest\
+	srvtest\
 
 LIB=../lib/libshoal.a$O
+SRVLIB=../srv/libshoalsrv.a$O
 HFILES=../lib/shoal.h ../lib/store.h t1.h
 LDFLAGS=
 
@@ -32,6 +34,14 @@ all:V:	$PROGS
 
 $O.%:	%.$O $LIB
 	$LD $LDFLAGS -o $target $prereq
+
+# srvtest drives the 9P surface, so it links the server library too and
+# is a libthread program; every other test's link line is unchanged.
+$O.srvtest:	srvtest.$O $SRVLIB $LIB
+	$LD $LDFLAGS -o $target $prereq
+
+srvtest.$O:	srvtest.c srv9p.h ../srv/srv.h $HFILES
+	$CC $CFLAGS srvtest.c
 
 %.$O:	%.c $HFILES
 	$CC $CFLAGS $stem.c
