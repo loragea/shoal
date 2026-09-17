@@ -1856,6 +1856,86 @@ Out:
 }
 
 /*
+ * A Tflush that loses the race to the request it names.  lib9p's
+ * reqqueueflush answers a request it does not find running — whether
+ * or not it found it queued either — and lib9p's respond asserts that
+ * a request has not answered before, so a flush arriving after the
+ * queue proc finished the request would abort the whole server.  The
+ * window is forced rather than raced for: the point parks the service
+ * loop between the lookup and the flush, and the held request is
+ * released inside it.
+ */
+static void
+tflushrace(void)
+{
+	char *m;
+	uchar data[1024];
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall t, r;
+	char *w[1];
+	ushort ta, tf;
+
+	clstage = "flushrace";
+	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
+	d = newdisk();
+	if((ctx = startsrv(d, m, 1)) == nil)
+		return;
+	memset(data, 0x44, sizeof data);
+	mkobj(srvstore(ctx), "alpha", data, sizeof data, 1);
+
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach)
+		fail("attach: %s", errof(&r));
+	w[0] = "ctl";
+	if(clopenpath(&cl, Froot, Fctl, 1, w, OWRITE, &r) != Ropen){
+		fail("open /ctl: %s", errof(&r));
+		goto Out;
+	}
+	srvhook(ctx, "objhold", 1);
+	memset(&t, 0, sizeof t);
+	t.type = Twrite;
+	t.tag = ta = cltag(&cl);
+	t.fid = Fctl;
+	t.offset = 0;
+	t.data = "verify alpha";
+	t.count = strlen(t.data);
+	clput(&cl, &t);
+	sleep(200);			/* running, and held */
+	memset(&t, 0, sizeof t);
+	t.type = Tflush;
+	t.tag = tf = cltag(&cl);
+	t.oldtag = ta;
+	srvhook(ctx, "flushhold", 1);
+	clput(&cl, &t);
+	sleep(200);			/* the loop holds the flush it looked up */
+	srvhook(ctx, "objhold", 0);	/* ... and now the request answers */
+	clget(&cl, &r);
+	checks++;
+	if(r.type != Rwrite || r.tag != ta)
+		fail("the request the flush lost to: type %d tag %ud %s",
+			r.type, r.tag, r.type == Rerror ? r.ename : "");
+	sleep(200);			/* its queue proc is past it now */
+	srvhook(ctx, "flushhold", 0);
+	clget(&cl, &r);
+	checks++;
+	if(r.type != Rflush || r.tag != tf)
+		fail("the Rflush for a request that had answered: type %d "
+			"tag %ud", r.type, r.tag);
+	/* and the server is still serving */
+	clwrite(&cl, Fctl, 0, "verify alpha", &r);
+	checks++;
+	if(r.type != Rwrite)
+		fail("verify after the lost flush: %s", errof(&r));
+Out:
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * store.md §3.7's mapping rule.  The two halves are checked where each
  * lives: the classifier, over the strings the engine actually
  * produces, and the wire, over an internal error driven through a
@@ -2046,6 +2126,7 @@ threadmain(int argc, char **argv)
 	tdown("out", "yes");
 	tfidstate();
 	tflush();
+	tflushrace();
 	terrors();
 	tshutdown();
 

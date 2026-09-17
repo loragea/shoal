@@ -195,6 +195,12 @@ void	srvcount(Srvctx*, uvlong *pushed, uvlong *done);
  *		end of its handler: after the engine call and before the
  *		exit, so a test can flush a request whose work is done
  *		and require it to leave through srvqdone all the same.
+ *	flushhold
+ *		n != 0 holds a Tflush of a pooled request between the
+ *		lookup that found it and the flush itself, which is the
+ *		window a completion racing a flush lives in.  This one
+ *		holds the SERVICE LOOP, not a queue proc, so a test that
+ *		leaves it set answers nothing else either.
  *
  * A held request leaves either hold when the point is cleared or when
  * its queue's flush flag is set, whichever is first; the shutdown

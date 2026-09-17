@@ -32,6 +32,8 @@
  * count of its own, so this file counts the pushes and the completions.
  */
 
+static void	qhold(Srvctx*, Qreq*, uvlong*);
+
 /*
  * The hash is this server's, not layer-a §4.2's: nothing on the wire
  * depends on which queue an oid lands in, so it is an FNV-1a over the
@@ -183,6 +185,20 @@ srvqpush(Srvctx *c, uchar *oid, int oidlen, Req *r, void (*f)(Req*))
  * finds no Qreq: the loop answers before it reads the next message, so
  * such a request has already responded and lib9p is only waiting to be
  * told to send the Rflush.
+ *
+ * What reqqueueflush must not be shown is a request that has already
+ * answered.  Its second branch — the one for a request it does not
+ * find running — responds `interrupted' whether or not it found the
+ * request queued either, and lib9p's respond asserts that a request
+ * has not responded before, so a second answer aborts the server
+ * rather than being ignored.  The window is real: sflush looks the
+ * request up (and holds a reference to it, which is why the Qreq is
+ * still here) before this runs, and the queue proc can finish it in
+ * between.  The Qreq's `done' closes it — set by srvqdone under the
+ * lock this holds across reqqueueflush, so either the flush reaches
+ * lib9p before the request answers or it is not made at all.  Either
+ * way the Rflush follows, which is all 9P asks of a flush whose
+ * request has already been answered.
  */
 void
 srvqflush(Req *r)
@@ -193,19 +209,23 @@ srvqflush(Req *r)
 		respond(r, nil);
 		return;
 	}
-	reqqueueflush(qr->q, r->oldreq);
+	qhold(qr->ctx, nil, &qr->ctx->flushhold);
+	qlock(&qr->lk);
+	if(!qr->done)
+		reqqueueflush(qr->q, r->oldreq);
+	qunlock(&qr->lk);
 	respond(r, nil);
 }
 
 /*
- * The check point a queued handler tests, and the only thing in this
- * server that reads the queue's flush flag.  store.md §7: the check
- * point is a test of that flag and an `interrupted' return from a
- * device call — and the two strings are the same, which is the hazard
- * this function exists to contain.  The flag says a request was
- * flushed; an error string never does.  A device `interrupted' that
- * reaches a handler with the flag clear is an ordinary internal error
- * and is marked like one (err.c).
+ * The check point a queued handler tests.  store.md §7: the check
+ * point is a test of the queue's flush flag and an `interrupted'
+ * return from a device call — and the two strings are the same, which
+ * is the hazard this file exists to contain.  The flag says a request
+ * was flushed; an error string never does.  This function reports the
+ * flag to a handler that wants to stop before doing the work; srvqdone
+ * is what tests it on the way out, classifies the error beside it and
+ * answers the two causes apart (err.c).
  *
  * The §13 holds are here because this is where a request already
  * running can be made to stay running.  A hold ends when its point is
@@ -217,7 +237,7 @@ static void
 qhold(Srvctx *c, Qreq *qr, uvlong *pt)
 {
 	qlock(&c->holdlk);
-	while(*pt != 0 && qr->q->flush == 0){
+	while(*pt != 0 && (qr == nil || qr->q->flush == 0)){
 		qunlock(&c->holdlk);
 		sleep(5);
 		qlock(&c->holdlk);
@@ -327,12 +347,24 @@ srvqdone(Req *r, char *err)
 {
 	char buf[ERRMAX];
 	Qreq *qr;
+	int flushed;
 
-	qr = r->aux;
-	if(qr != nil && (qr->q->flush != 0 || srvintr(err))){
-		srvstep7(r);
-		respond(r, qr->q->flush != 0 ? Einterrupted : Edevintr);
-		return;
+	if((qr = r->aux) != nil){
+		/*
+		 * Marked answered before it answers, and the flag read
+		 * under the same lock: a Tflush that arrives after this
+		 * takes the Rflush alone (srvqflush), and one that got in
+		 * first is seen here.
+		 */
+		qlock(&qr->lk);
+		qr->done = 1;
+		flushed = qr->q->flush != 0;
+		qunlock(&qr->lk);
+		if(flushed || srvintr(err)){
+			srvstep7(r);
+			respond(r, flushed ? Einterrupted : Edevintr);
+			return;
+		}
 	}
 	if(err != nil)
 		err = srverrs(buf, sizeof buf, err);
@@ -389,5 +421,7 @@ srvhook(Srvctx *c, char *name, uvlong n)
 		c->hold = n;
 	else if(strcmp(name, "objexit") == 0)
 		c->exithold = n;
+	else if(strcmp(name, "flushhold") == 0)
+		c->flushhold = n;
 	qunlock(&c->holdlk);
 }

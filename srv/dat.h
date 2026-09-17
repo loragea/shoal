@@ -201,11 +201,21 @@ struct Sfid
  * queue.  It is freed by Srv.destroyreq, which lib9p runs when the Req
  * itself goes — after any parked Rflush has been answered, so a Tflush
  * that finds the request through the pool always finds this too.
+ *
+ * `done' and the lock over it are what keep a Tflush and the request's
+ * own completion apart: lib9p's reqqueueflush answers a request it
+ * does not find running, whether or not it found it queued either, so
+ * a flush that reached it after it had answered would answer it twice.
+ * srvqdone marks the request under this lock before it responds and
+ * srvqflush holds the lock across reqqueueflush, so exactly one of the
+ * two runs (queue.c).
  */
 struct Qreq
 {
 	Srvctx	*ctx;
 	Reqqueue *q;
+	QLock	lk;		/* over done, against srvqflush */
+	int	done;		/* srvqdone has taken this request's exit */
 	void	(*f)(Req*);
 	Sctl	*ctl;		/* the verb row, for a queued ctl write */
 	Cmdbuf	*cb;		/* its parsed line */
@@ -291,6 +301,7 @@ struct Srvctx
 	QLock	holdlk;
 	uvlong	hold;		/* srvhook("objhold") */
 	uvlong	exithold;	/* srvhook("objexit") */
+	uvlong	flushhold;	/* srvhook("flushhold") */
 
 	int	closed;		/* the shutdown sequence has run */
 };
