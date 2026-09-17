@@ -177,6 +177,21 @@ srvnew(Srvcfg *cfg)
 	ad.pinned = c->sb.monidset != 0;
 	hexof(ad.monid, c->sb.monid, 16);
 	ad.epoch = c->sb.epochhigh;
+	/*
+	 * An unpinned instance has no epoch to regress from, so
+	 * mapadoptable passes every map it is shown; a disk that carries
+	 * an adopted epoch and no pinned monid would therefore adopt a
+	 * map below that epoch without a word.  This server never writes
+	 * that pair — the pin below is made durable before the epoch is,
+	 * and a freshly formatted store carries neither — so a disk that
+	 * holds it is one no adoption decision can be made about, and it
+	 * is refused rather than served.
+	 */
+	if(!ad.pinned && c->sb.epochhigh != 0){
+		werrstr("the disk has adopted epoch %llud with no pinned "
+			"monitor identity", c->sb.epochhigh);
+		goto Fail;
+	}
 	if((fl = mapadoptable(&ad, c->map)) != Mapok){
 		werrstr("map may not be adopted: %s%s%s",
 			(fl&Mapregress) ? adoptwhy(Mapregress) : "",
@@ -194,6 +209,14 @@ srvnew(Srvcfg *cfg)
 	 * §6.3: both facts must survive a restart, and the epoch MUST be
 	 * durable before the instance acts under it.  Nothing is served
 	 * until these have returned.
+	 *
+	 * The order of the two is load-bearing, not cosmetic: mapadoptable
+	 * answers Mapok for an unpinned instance whatever the map's epoch,
+	 * so the pin must be durable before the epoch it was decided
+	 * against is.  A crash between them leaves the pin with no epoch,
+	 * which is a state that adopts nothing it should not; the reverse
+	 * order would leave an epoch with no pin, which is the state
+	 * refused above.
 	 */
 	if(!ad.pinned){
 		if(unhex(monid, c->map->monid, 16) < 0){

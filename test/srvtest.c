@@ -311,6 +311,27 @@ tstartup(void)
 		srvnew(&cfg) == nil);
 	devclose(d);
 
+	/*
+	 * An epoch adopted with no monid pinned is a pair this server
+	 * never writes — it makes the pin durable first — and one no
+	 * adoption decision can be made about, since an unpinned instance
+	 * has no epoch to regress from and adopts whatever it is shown.
+	 * The map here is above that epoch, so nothing else refuses it.
+	 */
+	d = newdisk();
+	srvcfg(&cfg, d, good, 4);
+	if((st = storeopen(d, &cfg.store)) == nil)
+		fail("storeopen: %r");
+	else{
+		if(epochadopt(st, 5) < 0)
+			fail("epochadopt: %r");
+		storeclose(st);
+	}
+	srvcfg(&cfg, d, good, 4);
+	istrue("a disk carrying an adopted epoch and no pinned monid is "
+		"refused", srvnew(&cfg) == nil);
+	devclose(d);
+
 	/* and the same map on a fresh disk is served */
 	d = newdisk();
 	c = startsrv(d, good, 4);
