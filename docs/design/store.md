@@ -2369,6 +2369,18 @@ sitting in its queue instead. Short, non-object work — `/status`,
 `/map`, `/ctl` reads — is answered on the service loop itself and
 never queued.
 
+Work that names no object but is **not** short has nowhere to go in
+that scheme: a render or a directory read that takes `qlstate` would
+block the loop, and the loop is what answers `Tflush`. So the pool
+carries one **reserved queue** beside the hashed ones and outside the
+hash, for exactly such a request — a queue of its own, so that
+offloading one neither waits behind an object's operations nor
+reorders them against each other. It is otherwise an ordinary push:
+counted in the depth, flushable, and unwound through the same single
+exit. Nothing on the served surface uses it yet — the renders and the
+`/obj` directory read that will need it are not built — so today it
+carries only what the server's own test point puts there.
+
 **The pool size is a ceiling, not just a collision parameter.** A
 queue proc runs one pushed request at a time, and a client write
 occupies its queue from layer-a §5.4 step 2 to step 6 or 7 — across
@@ -2624,8 +2636,9 @@ one lock over all of it. This is also what settles the question of
 whether an `Ioproc` belongs in the vtable: it does not, and the
 vtable stays four calls and a geometry.
 
-**How many procs, and how big.** The service loop, 64 queue procs,
-the checkpointer and the scrubber: about 67, which is unremarkable on
+**How many procs, and how big.** The service loop, 64 queue procs
+and the reserved one, the checkpointer and the scrubber: about 68,
+which is unremarkable on
 9front but is a number worth having written down, since the queue
 count is a tunable and each queue is a proc. In the server every one
 of them is created by `proccreate` — `reqqueuecreate` included — so
@@ -3223,10 +3236,14 @@ What is allowed after the close is exactly `objsnapent`,
 `objsnapcount` and `objsnapclose` on handles taken before it — the
 three that carry a claim of their own. The shutdown order of the
 server that will export this store (§8) follows from that
-rule and not from taste: it stops accepting requests and lets the
-ones in flight drain, and only then closes the store, its surviving
-`/obj` fids holding the snapshots that are the one thing the close
-leaves valid.
+rule and not from taste: it stops accepting requests, lets the ones
+in flight drain, waits for the work inside the engine that is not a
+request at all — a pass proc a `ctl` verb started, which no request
+count can see — and gives every fid still open the chance to hand
+back what it is holding, which is where a stage has to be discarded,
+a stage being none of the three. Only then does it close the store,
+its surviving `/obj` fids holding the snapshots that are the one
+thing the close leaves valid.
 
 What this buys over simply deleting the fatal is more than the
 refusal. A freed `Store` address can be handed straight back to the
@@ -5352,6 +5369,16 @@ name a half that is not built; each says which.
     `role=admin` create or write of an id that is not reserved never
     reaches it, because §2.1 makes that `permission denied`
     (§14(24)), and neither does anything F3 or the fence refuses.
+
+    The same marking is what keeps §5.4.1's `interrupted` apart from
+    the device's. A flushed request is answered `interrupted`, the
+    word `reqqueueflush` gives a request it removed from a queue; a
+    device call aborted by a note with no `Tflush` behind it is an
+    error this server did not anticipate like any other, so it is
+    answered `shoalsrv: interrupted`. §7 unwinds both into the whole
+    of step 7 — what the request had staged is discarded either way —
+    but only the queue's flush flag says a request was flushed, and
+    the two answers keep that distinction where a client can see it.
 
 ## 15. Alternatives considered
 
