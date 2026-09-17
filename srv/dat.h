@@ -142,6 +142,29 @@ enum
  * srvfidgive (fns.h) is that give-back: it runs the two hooks in
  * order under the registry lock, which is where the shutdown's own
  * sweep runs them, so the two cannot both close one state.
+ *
+ * The rows this file leaves unnamed above, by the same rule.  The
+ * /meta directory row's read cell is the enumeration's too: it lists
+ * the same objects under a second name.  The five status files —
+ * /dirty, /stale, /tombs, /lost and /jobs — are render-at-open text
+ * like /status and /map, and each belongs with the state it reports:
+ * /dirty and /stale with the dirty set and the stale marks (layer-a
+ * §7.1), /tombs with the enumeration, since it is that listing over
+ * tombstones (§7.2), /lost with scrub and repair (§7.5), /jobs with
+ * whatever starts background passes.  /repl and /rpc are the peer
+ * channels: their read and write cells, and the per-fid state a
+ * multi-request op stages, belong with the replication surface
+ * (§5.5, §5.6), and /advert is that surface's bulk advertisement.
+ * Their gate is already filled, because the fence is this file's
+ * (tree.c's chgate).
+ *
+ * The srvctls table below says the same for the verbs: a verb is
+ * built by filling its row's fn or qfn, and the body of work that
+ * verb names owns that cell — `pull', `push', `reconcile', `advert',
+ * `drop' and `forget' with replication, `verify' with object I/O,
+ * `scrub' with the scrub pass, and `refresh', `register' and
+ * `newmonid' with the monitor client.  `fence' is this file's and is
+ * built.
  */
 struct Sfile
 {
