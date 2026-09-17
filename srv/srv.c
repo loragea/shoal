@@ -289,14 +289,79 @@ srvpost(Srvctx *c, char *name)
 }
 
 /*
+ * A background job: work inside the engine that is not a Req and so is
+ * invisible to the drain below.  A pass that walks the store — the
+ * scrub of layer-a §2.5 is the first — runs in a proc of its own,
+ * outside every queue, and store.md §9 forbids storeclose while
+ * anything is still inside the engine.  So such a proc takes a job for
+ * its whole run and the shutdown waits for the count to fall to zero,
+ * exactly as it waits for the requests in flight.
+ *
+ * srvjobstart answers -1 once the shutdown has begun, which is what a
+ * verb that would start a pass asks before starting one; srvstopping
+ * is the same fact for a pass already running, which SHOULD test it
+ * between units of work and return rather than leave the shutdown
+ * waiting for it.
+ */
+int
+srvjobstart(Srvctx *c)
+{
+	lock(&c->joblk);
+	if(c->stopping){
+		unlock(&c->joblk);
+		werrstr("shoalsrv: shutting down");
+		return -1;
+	}
+	c->njob++;
+	unlock(&c->joblk);
+	return 0;
+}
+
+void
+srvjobend(Srvctx *c)
+{
+	lock(&c->joblk);
+	if(c->njob > 0)
+		c->njob--;
+	unlock(&c->joblk);
+}
+
+int
+srvstopping(Srvctx *c)
+{
+	int n;
+
+	lock(&c->joblk);
+	n = c->stopping;
+	unlock(&c->joblk);
+	return n;
+}
+
+static void
+jobwait(Srvctx *c)
+{
+	int n;
+
+	for(;;){
+		lock(&c->joblk);
+		n = c->njob;
+		unlock(&c->joblk);
+		if(n == 0)
+			return;
+		sleep(5);
+	}
+}
+
+/*
  * D16's order, which store.md §9 derives from the close contract
  * rather than from taste: stop accepting requests, let the ones in
- * flight drain, stop the 9P loop, and only then close the store.  The
- * loop is what stops first here — this runs from Srv.end, which lib9p
- * calls once the connection has gone — and the drain is what makes the
- * engine's "quiesce, then close" true: no call taking the Store* may
- * still be in flight when storeclose runs, because such a call blocks
- * on the state lock holding nothing that keeps the Store alive.
+ * flight drain, wait for the background jobs, and only then close the
+ * store.  The loop is what stops first here — this runs from Srv.end,
+ * which lib9p calls once the connection has gone — and the two waits
+ * are what make the engine's "quiesce, then close" true: no call
+ * taking the Store* may still be in flight when storeclose runs,
+ * because such a call blocks on the state lock holding nothing that
+ * keeps the Store alive.
  *
  * The fids outlive this.  lib9p frees the fid pool after Srv.end, so
  * srvdestroyfid runs with the store already closed — which is exactly
@@ -306,10 +371,14 @@ srvpost(Srvctx *c, char *name)
 void
 srvshutdown(Srvctx *c)
 {
-	if(c->closed)
+	if(srvstopping(c))
 		return;
+	lock(&c->joblk);
+	c->stopping = 1;
+	unlock(&c->joblk);
 	c->closed = 1;
 	srvqdrain(c);
+	jobwait(c);
 	srvqfree(c);
 	if(c->store != nil){
 		storeclose(c->store);

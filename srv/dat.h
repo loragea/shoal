@@ -321,5 +321,14 @@ struct Srvctx
 	uvlong	flushhold;	/* srvhook("flushhold") */
 	uvlong	mapopen;	/* srvhook("mapopen") */
 
-	int	closed;		/* the shutdown sequence has run */
+	/*
+	 * The background jobs of §9's quiesce: work that is inside the
+	 * engine and is not a Req, so the drain above cannot see it.
+	 * A pass proc takes one of these for its whole run.
+	 */
+	Lock	joblk;
+	int	njob;
+	int	stopping;	/* the shutdown has begun: no new jobs */
+
+	int	closed;		/* the store has been closed */
 };

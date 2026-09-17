@@ -180,6 +180,23 @@ void	srvfree(Srvctx*);
  */
 void	srvshutdown(Srvctx*);
 
+/*
+ * A background job: work inside the engine that is not a Req, which is
+ * what a ctl verb that starts a pass proc runs.  The shutdown drains
+ * the requests in flight and then waits for these, because store.md §9
+ * forbids closing the store while anything is still inside the engine
+ * and the drain cannot see a proc that is not a request.
+ *
+ * A proc takes a job for its whole run: srvjobstart before it touches
+ * the engine, srvjobend when it is done, and it answers -1 once the
+ * shutdown has begun, which is the answer a verb turns into its
+ * refusal.  A pass already running SHOULD test srvstopping between
+ * units of work and give up rather than leave the shutdown waiting.
+ */
+int	srvjobstart(Srvctx*);
+void	srvjobend(Srvctx*);
+int	srvstopping(Srvctx*);
+
 /* what a caller and the tests read back */
 Store*	srvstore(Srvctx*);
 Cmap*	srvmap(Srvctx*);

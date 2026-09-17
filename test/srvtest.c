@@ -2229,6 +2229,74 @@ terrors(void)
 }
 
 /*
+ * A background job, which is what a pass proc started by a ctl verb
+ * will be: inside the engine, and not a Req, so the drain cannot see
+ * it.  store.md §9 forbids closing the store under one, so the
+ * shutdown waits for it — and what the job records is whether the
+ * store had been closed while it was still running.
+ */
+static Srvctx *jobctx;
+static int jobstarted, jobended, jobrefused, jobfreed;
+
+static void
+jobproc(void*)
+{
+	if(srvjobstart(jobctx) < 0){
+		jobrefused = 1;
+		jobstarted = 1;
+		return;
+	}
+	jobstarted = 1;
+	sleep(600);			/* the shutdown must wait this out */
+	jobfreed = freedseen;		/* ... so this is what it saw */
+	jobended = 1;
+	srvjobend(jobctx);
+}
+
+static void
+tjobs(void)
+{
+	char *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall r;
+	int i;
+
+	clstage = "jobs";
+	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
+	d = newdisk();
+	freedseen = 0;
+	if((ctx = startsrv(d, m, 4)) == nil)
+		return;
+	jobctx = ctx;
+	jobstarted = jobended = jobrefused = 0;
+	jobfreed = -1;
+
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach)
+		fail("attach: %s", errof(&r));
+	if(tspawn(jobproc, nil) < 0)
+		fail("tspawn: %r");
+	for(i = 0; i < 200 && !jobstarted; i++)
+		sleep(20);
+	istrue("a background job starts while the instance is serving",
+		jobstarted && !jobrefused);
+
+	clstop(&cl);			/* the loop ends; the shutdown runs */
+	istrue("the job had ended when the shutdown went on", jobended);
+	eqv("the store was closed once", freedseen, 1);
+	eqv("the store was still open while the job ran", jobfreed, 0);
+	istrue("a job is refused once the shutdown has begun",
+		srvjobstart(ctx) < 0);
+	istrue("and a job already running is told to stop",
+		srvstopping(ctx) != 0);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * D16's shutdown order: stop accepting, drain what is in flight, stop
  * the loop, then close the store.  The engine's `freed' callback is
  * the only observable of the close, and what it is asked here is
@@ -2326,6 +2394,7 @@ threadmain(int argc, char **argv)
 	tanyq();
 	tflushrace();
 	terrors();
+	tjobs();
 	tshutdown();
 
 	clwatchoff();
