@@ -1487,6 +1487,10 @@ tobjgate(void)
 	clopen(&cl, Ffile, OREAD, &r);
 	eqs("admin open of an unreserved object for reading", errof(&r),
 		"shoalsrv: not built");
+	/* ORCLOSE is the remove §2.1 refuses, one message earlier */
+	clopen(&cl, Ffile, OREAD|ORCLOSE, &r);
+	eqs("admin open of an unreserved object for reading with ORCLOSE",
+		errof(&r), "permission denied");
 	clclunk(&cl, Ffile, &r);
 
 	w[1] = "shoal.map.7";

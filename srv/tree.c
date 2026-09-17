@@ -242,9 +242,19 @@ objgate(Srvctx *c, Sfid *f, Req *r, int op)
 		wr = 1;
 		break;
 	case Gopen:
-		m = r->ifcall.mode;		/* the mode says which column */
+		/*
+		 * The mode says which column an open is in, and ORCLOSE is
+		 * in the write one: §2.4 makes it a remove at the clunk, and
+		 * §2.1 refuses role=admin the remove of an id that is not
+		 * reserved, so an OREAD|ORCLOSE open admitted as a read would
+		 * be that remove arranged one message ahead.  (§2.4 refuses
+		 * ORCLOSE on an object outright, with `bad open mode'; that
+		 * belongs to the rows' open cell, which is not built, and
+		 * this rule does not wait for it.)
+		 */
+		m = r->ifcall.mode;
 		wr = (m&OMASK) == OWRITE || (m&OMASK) == ORDWR
-			|| (m&OTRUNC) != 0;
+			|| (m&OTRUNC) != 0 || (m&ORCLOSE) != 0;
 		break;
 	default:			/* Gremove, Gwstat */
 		wr = 1;
