@@ -139,6 +139,9 @@ enum
  * what gives the directory fid's aux back — auxclose, then auxfree —
  * before it sets the fid's file, oid and qid, since one fid cannot
  * hold an enumeration's snapshot and an object's state at once.
+ * srvfidgive (fns.h) is that give-back: it runs the two hooks in
+ * order under the registry lock, which is where the shutdown's own
+ * sweep runs them, so the two cannot both close one state.
  */
 struct Sfile
 {

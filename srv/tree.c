@@ -461,6 +461,20 @@ fidgive(Sfid *f, int gone)
 	f->text = nil;
 }
 
+/*
+ * The same, for a fid that lives on: what a handler calls when the
+ * fid it is running on is about to hold something else, which is the
+ * /obj create cell turning a directory fid into the created object's
+ * (dat.h).  It is exported because the alternative another file has
+ * is to set auxclosed itself and call the hooks unlocked, which races
+ * the shutdown's sweep into a second auxclose on the same state.
+ */
+void
+srvfidgive(Sfid *f)
+{
+	fidgive(f, 0);
+}
+
 void
 srvauxpoint(Srvctx *c, int on)
 {
@@ -540,6 +554,10 @@ srvauxlate(Srvctx *c)
  *			answers an Rwrite counting the bytes, so a write
  *			the fence refuses is distinguishable from one no
  *			cell would have taken anyway.
+ *	[Qobj].create	gives the directory fid's state back with
+ *			srvfidgive, which is what a create cell owes that
+ *			fid before it retargets it (dat.h), and answers
+ *			`not built' since the retargeting is §2.4's.
  *
  * The cells are the table's and the table is the program's, so this
  * point is global rather than per-context: a T1 program sets it,
@@ -561,12 +579,20 @@ cellwrite(Req *r)
 	respond(r, nil);
 }
 
+static void
+cellcreate(Req *r)
+{
+	srvfidgive(r->fid->aux);
+	respond(r, Enotbuilt);
+}
+
 void
 srvcellpoint(Srvctx *c, int on)
 {
 	USED(c);
 	srvfiles[Qctl].read = on ? cellread : nil;
 	srvfiles[Qobjfile].write = on ? cellwrite : nil;
+	srvfiles[Qobj].create = on ? cellcreate : nil;
 }
 
 void

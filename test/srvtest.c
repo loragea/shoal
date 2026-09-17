@@ -1802,6 +1802,64 @@ Out:
 }
 
 /*
+ * The give-back a create owes the directory fid it is issued on.  A
+ * Tcreate turns that fid into the created object's, and one fid
+ * cannot hold an enumeration's snapshot and an object's state at once
+ * (dat.h), so a create cell gives the old state back -- the close
+ * hook, then the free hook -- before it retargets the fid.  The cell
+ * point's create cell does exactly that and nothing else, and the
+ * fid-state point counts the two hooks; what the case asks is that
+ * both ran, once, and that the clunk behind them finds nothing left.
+ */
+static void
+tcreategive(void)
+{
+	char *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall r;
+	uvlong nc, nf;
+
+	clstage = "creategive";
+	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4)) == nil)
+		return;
+	srvauxpoint(ctx, 1);
+	srvcellpoint(ctx, 1);
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
+		fail("attach: %s", errof(&r));
+		goto Out;
+	}
+	if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk){
+		fail("walk /obj: %s", errof(&r));
+		goto Out;
+	}
+	srvauxcount(ctx, nil, &nc, &nf);
+	eqv("the directory fid is still holding its state", nc + nf, 0);
+
+	clcreate(&cl, Ffile, "shoal.map.9", OWRITE, &r);
+	eqs("the create cell answered", errof(&r), "shoalsrv: not built");
+	srvauxcount(ctx, nil, &nc, &nf);
+	eqv("a create closes the directory fid's state", nc, 1);
+	eqv("a create frees the directory fid's state", nf, 1);
+
+	clclunk(&cl, Ffile, &r);
+	srvauxcount(ctx, nil, &nc, &nf);
+	eqv("the clunk behind it had nothing left to close", nc, 1);
+	eqv("the clunk behind it had nothing left to free", nf, 1);
+	clclunk(&cl, Froot, &r);
+Out:
+	srvcellpoint(ctx, 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * The fid registry under a walk that moves a fid.  A walk that names
  * an object runs on that object's queue while attaches and clones run
  * on the service loop, and both reach the same list: the walk gives
@@ -2638,6 +2696,7 @@ threadmain(int argc, char **argv)
 	tdown("in", "no");
 	tdown("out", "yes");
 	tfidstate();
+	tcreategive();
 	tfidwalk();
 	tflush();
 	tanyq();
