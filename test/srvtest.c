@@ -649,7 +649,7 @@ tobjects(void)
 	 * reach the client: 9P suppresses the error of a walk that got
 	 * past its first element, and lib9p's rwalk does exactly that,
 	 * so a two-element /obj/<oid> walk answers a partial Rwalk
-	 * instead (store.md §14(23)).  Both are checked.
+	 * instead (store.md §14(28)).  Both are checked.
 	 */
 	w[0] = "obj";
 	if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk)

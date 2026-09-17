@@ -21,7 +21,7 @@
  * `not built' second.
  *
  * The role matrix.  §2.1 states its grants by role and is silent about
- * several cells; store.md §14(19) records what is chosen here and why.
+ * several cells; store.md §14(24) records what is chosen here and why.
  * The columns are walk, open-for-read and open-for-write, because 9P
  * separates them: a client must reach /obj/<oid> through /obj without
  * being able to list /obj, which §2.1 grants to role=admin alone.

@@ -3762,11 +3762,20 @@ a T1 test to be a C program in `test/` linking `libshoal`. So the
 store engine — the device vtable (§0), the on-disk structures, the
 write path, the log and its apply function, replay, the index, the
 allocator and the enumeration snapshot — lives in `lib/libshoal.a`
-behind `lib/shoal.h`. What is left in `cmd/shoalsrv` is argument
-parsing, the `Srv` glue, the queue pool and the procs of §7; the
-three tools below are thin front ends over the same library. This is
-a real constraint on the code layout rather than a preference, and it
-is expensive to undo once the engine has grown roots in a command.
+behind `lib/shoal.h`. The same argument carries one step further: the
+9P surface layer-a §2 defines — attach, the file tree, the `Reqqueue`
+pool and the procs of §7, `Tflush`, the ctl framework, start-up and
+shutdown — is itself what T1 has to drive, so it lives in
+`srv/libshoalsrv.a` behind `srv/srv.h`, with `srv/dat.h` and
+`srv/fns.h` private to it. What is left in `cmd/shoalsrv` is argument
+parsing, opening the device and reading the map file, posting the
+service, and the trigger of the shutdown sequence; the three tools
+below are thin front ends over `lib/` alone. `lib/libshoal.a` depends
+on neither lib9p nor libthread, and must not come to: that
+independence is what lets one engine run under a plain-libc T1
+program and under the libthread server (§7). This is a real
+constraint on the code layout rather than a preference, and it is
+expensive to undo once the engine has grown roots in a command.
 
 **A path is an sd(3) partition when the directory holding it is an
 sd unit's, and a plain file otherwise.** What is asked is whether
@@ -4071,13 +4080,15 @@ layer-a's subject, not this document's, but two of `shoalsrv`'s flags
 carry behaviour this document defines, so it gets a synopsis here:
 
     shoalsrv [-w] [-X point[,n]] [-q queues] [-s srvname]
-             /dev/sdXX/name
+             -m mapfile /dev/sdXX/name
 
 `-w` is §3.2's operator assertion that the unit is write-through and
 is reported in `/status`; `-X` is §13's fault-injection point,
 present in every build and inert without the flag; `-q` sets the
-queue-pool size, whose sizing rule is §7's. The monitor is
-`cmd/shoalmon`.
+queue-pool size, whose sizing rule is §7's; `-s` names the posted
+service. `-m` is the cluster map, as a file: this build has no
+monitor client, so the map is read once at start and never refreshed
+(§14(18)). The monitor is `cmd/shoalmon`.
 
 ## 13. Test plan
 
@@ -4950,13 +4961,18 @@ would be a wire change.
 
 *Policy, but read it before implementing anything.*
 
-Seventeen places where layer-a is silent, self-defeating, or
-contradicted by the measurements. Each entry states the tension, its
-resolution, and where the argument for it lives; nothing here repeats
-an argument made in a section above. Items 1–5, 8, 9, 11, 12, 13 and
-14 are amendments **made** to `docs/design/layer-a.md`; items 6, 7,
-15 and 17 are recorded here and not made there; items 10 and 16 are
-**proposals** rather than amendments, because they touch the wire.
+Twenty-nine places where layer-a is silent, self-defeating, or
+contradicted by the measurements or by the platform. Each entry
+states the tension, its resolution, and where the argument for it
+lives; nothing here repeats an argument made in a section above.
+Items 1–5, 8, 9, 11, 12, 13 and 14 are amendments **made** to
+`docs/design/layer-a.md`; items 6, 7, 15, 17 and 18–29 are recorded
+here and not made there; items 10 and 16 are **proposals** rather
+than amendments, because they touch the wire.
+
+Items 18 to 29 are the object server's, and they describe what
+`srv/libshoalsrv.a` and `cmd/shoalsrv` **do today**. Several of them
+name a half that is not built; each says which.
 
 1. **`cur` cannot usefully be durable (layer-a §5.2).** Layer-a
    required currency recorded "durably as `cur=<epoch>`" and, two
@@ -5125,6 +5141,173 @@ an argument made in a section above. Items 1–5, 8, 9, 11, 12, 13 and
     reading would cost a hold of the state lock across the whole
     index, which is the 23 ms §9 measures and the cost the chunking
     exists to avoid. §9 describes what the scan does.
+
+18. **The object server has no network (layer-a §6.3, §5.5, §5.6).**
+    layer-a has every party poll the monitor's `/map` every `pollms`,
+    and has a primary reach its peers over `/repl` and `/rpc`. This
+    build has neither client. The cluster map is a file named by
+    `-m`, parsed with `mapparse`, adopted once at start-up and never
+    refreshed; there are no peers, so nothing is replicated, no
+    currency check is made and no stale mark is registered. *Not
+    made:* layer-a is unchanged and this is a build that does not yet
+    conform to it. Items 19 to 23 are the consequences that are
+    visible on the wire, and `/repl`, `/rpc` and `/advert` are files
+    that exist, gate by role, and refuse with `shoalsrv: not built`
+    (§14(29)).
+
+19. **§6.4 F1's lease fence is inert while the map is static.** F1
+    fences an instance that has not refreshed its map within
+    `leasems`. With no monitor client there is no refresh, so a live
+    lease clock would fence the instance one `leasems` after start
+    and nothing could ever clear it. *Not made:* the server evaluates
+    `fencekind` against the time of its last successful refresh —
+    the start-up adoption — rather than against the monotonic clock,
+    so the lease half can never elapse and `fence=` in `/status`
+    never reads `lease`. F4, the operator fence of `fence on|off`, is
+    live and is what the fenced-verb gate and the object-open gate
+    are tested against. A refresh loop restores F1 by passing the
+    real clock at that one call site.
+
+20. **The msize floor is enforced at `Tattach`, not at `Tversion`.**
+    layer-a §5.5 sizes the forwarded-write payload off the negotiated
+    `msize` and §2.2 reports it in `/status`; the floor this server
+    requires is 8192 + `IOHDRSZ`. `lib9p` answers `Tversion` itself
+    and `Srv` carries no hook for it (9p(2)), so the first point at
+    which a server sees the negotiated size is a request that carries
+    a `Srv*` — `Tattach`. *Not made:* a connection below the floor
+    completes its version negotiation and is refused at attach. The
+    refusal is not a layer-a §2.6 condition, so it carries this
+    server's own prefix (§14(29)). The value is read from
+    `Srv.msize`, which 9p(2) marks implementation-specific; there is
+    no other reader of it.
+
+21. **`future epoch` triggers no map fetch.** §2.1 has an attach at
+    an epoch above the instance's fail `future epoch` and SHOULD
+    trigger an immediate map fetch. *Not made:* the refusal is the
+    whole of what happens, because the map is static (§14(18)). The
+    instance stays at the epoch of the map it was started with, and
+    an operator who wants it higher restarts it with a newer map
+    file.
+
+22. **A map this instance may not adopt is refused at start.** §6.3
+    has an instance reject a map whose epoch regresses or whose
+    `monid` differs from its pin, and report the condition in
+    `/status` as `epochregress=yes` or `monidmismatch=yes`. That
+    reporting assumes a later refresh can still deliver a good map.
+    Here there is no later map. *Not made:* `srvnew` refuses to start
+    on a map `mapadoptable` rejects, naming the flags it set, so the
+    instance never serves under a map it has refused — and
+    `/status`'s two flags therefore always read `no` while the server
+    is running. The identity comes from the same place: layer-a §3.4
+    has the disk carry the identity, so the instance is the map
+    record whose `uuid=` is the superblock's, and a map with no such
+    record is refused too. §14(8)'s geometry check runs over the
+    superblock `superselect` reads before the store is opened.
+
+23. **Four `/status` fields are omitted.** §2.2 makes `epoch=`
+    normative and the rest SHOULD-present. `chunk=` is the smallest
+    peer `msize` less headers; `underrep=`, `strays=` and `marks=`
+    count local objects against the placement, against the peers that
+    hold them and against the stale ledger's marks on this instance.
+    None of the four can be computed without the peers and the
+    reconcile pass §14(18) says are not built, and a zero would be a
+    measurement this instance has not made. *Not made:* they are
+    absent from the file rather than present and wrong. Two fields
+    beyond §2.2's list are present because nothing else reports them:
+    `objsnapopen=`, which §9 makes the server's half of `objsnap=`,
+    and the queue pool's `queues=`, `qdepth=`, `qpushed=` and
+    `qdone=`, which §7 asks `/status` to report and which `Reqqueue`
+    does not count for itself.
+
+24. **§2.1's role matrix has cells §2.1 does not state.** §2.1 grants
+    `/repl`, `/rpc`, `/advert` and object reads to `role=repl`, and
+    `/ctl`, `/rpc`, the status files and read-only `/obj`, `/meta`
+    and `/tombs` to `role=admin`; it says nothing about which roles
+    may reach the rest. *Not made; recorded here as this server's
+    matrix*, which is one table in `srv/tree.c` with a column each
+    for walk, open-for-read and open-for-write:
+
+    - The status files — `/status`, `/map`, `/dirty`, `/stale`,
+      `/tombs`, `/lost`, `/jobs` — are `role=admin` alone, walk
+      included, because that is the only role §2.1 grants them to. A
+      client learns the epoch from the monitor (§6.3), not from here.
+    - `/obj` and `/meta` may be **walked** by every role and **read**
+      — the directory read, which is the enumeration — by
+      `role=admin` alone, which is §2.1's read-only grant said
+      exactly. A client that could not walk through `/obj` could not
+      reach an object at all.
+    - `/ctl` may be walked, opened and written by **every** role, and
+      the gate that refuses is §2.5's per-verb one. §2.5 requires
+      that "a verb issued on a fid whose role does not permit it MUST
+      fail with `permission denied`", which has meaning only if a
+      non-admin fid can hold `/ctl` open and write to it; §2.1's
+      grant of `/ctl` to `role=admin` is that same gate said the
+      other way round, since every row of §2.5's table is `admin`.
+
+25. **An attach specifier missing a required attribute answers `bad
+    aname`.** §2.1 makes `epoch` REQUIRED for `role=client` and
+    `peer=` REQUIRED for `role=repl`, and gives the attach no error
+    for their absence; the only attach error it names for the
+    specifier is `bad aname`, for one that is unparseable. *Not
+    made:* an absent required attribute, a repeated attribute, an
+    unknown attribute, an unknown role spelling and a malformed
+    `epoch` are all `bad aname`. The grammar is closed, so an unknown
+    attribute is not ignored the way an unknown map attribute is
+    (§3.1). A `peer=` on a role that does not need it parses and is
+    ignored, because the grammar permits it on any attr list. The
+    order of the attach's refusals is: the specifier, then the msize
+    floor, then the epoch compare, then the `role=repl` membership
+    check.
+
+26. **`fence off` is refused only under a lease fence.** §2.5 lists
+    `fence off` among the verbs that MUST fail `fenced` while the
+    instance is fenced, and §6.4 F4 makes `fence off` the only way to
+    clear an operator fence. Read together they make an operator
+    fence permanent: the verb that clears it is refused because it is
+    in force. *Not made:* `fence off` is refused `fenced` when the
+    **lease** fence is in force and clears the operator flag
+    otherwise, which is what §2.5's rule is protecting — a deposed
+    instance must not unfence itself — without making F4 one-way.
+    `decisions.md` D25 carries the argument.
+
+27. **A ctl verb naming a malformed oid answers `bad object
+    name`.** §2.5 answers a known verb with bad arguments `bad ctl`;
+    §2.6 makes `bad object name` the answer to "any operation naming
+    an oid that violates §1.1". *Not made:* the more specific string
+    wins, so `verify` and every later verb that names an object
+    answer `bad object name` for an id §1.1 forbids and `bad ctl` for
+    every other argument fault, including the wrong number of them.
+
+28. **A multi-element walk cannot carry a §2.6 error.** §2.6 makes
+    `no such object` the answer to a walk of an id nothing holds, and
+    `object deleted` the answer to a walk of a tombstone. 9P answers
+    a walk that failed after its first element with a **partial**
+    `Rwalk` and no error at all, and `lib9p` implements exactly that.
+    *Not made:* a one-element walk from an `/obj` or `/meta` fid —
+    which is what a client library holding such a fid issues, and
+    what an operator's `ls` resolves to — answers §2.6's string; a
+    two-element walk from the root answers a partial `Rwalk`, and the
+    client learns only that the name did not resolve. The rule is
+    9P's and no server can hold both halves at once.
+
+29. **Two local error strings, and what marks them.** §3.7 makes the
+    mapping rule normative — a §2.6 condition answered with §2.6's
+    prefix and nothing else, an internal or device error never
+    beginning with one — and leaves what the server does with an
+    internal string to the server. *Not made; recorded here as this
+    server's policy:* every error that is not a §2.6 condition goes
+    on the wire under the prefix `shoalsrv: `, which shares no prefix
+    with any §2.6 entry, so the marked set stays prefix-free against
+    §2.6's and the rule is visible to a client rather than merely
+    intended. `store closed`, `store condemned: …`, `i/o error`,
+    `stage expired` and the `Eobj:` family are that case. A file or a
+    ctl verb whose content is not built answers the single local
+    string `shoalsrv: not built`, **after** its role and fence gates,
+    so the gates are complete and testable before the content is;
+    `/obj` and `/meta` directory reads, `/repl`, `/rpc`, `/advert`,
+    `/dirty`, `/stale`, `/tombs`, `/lost`, `/jobs`, the object rows'
+    open, read, write, create, remove and wstat, and every ctl verb
+    but `fence` and `verify` answer it today.
 
 ## 15. Alternatives considered
 

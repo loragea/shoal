@@ -844,3 +844,44 @@ the swap or recompute it, may refuse an abort under a swap or leave
 it undefined rather than ignoring it, may refuse a close under a live
 pass rather than aborting it, and may reclaim a condemned slot's
 grains some other way entirely — all within D18's one rule.
+
+## D25 — `fence off` is refused only under a lease fence (2026-09-17)
+
+**Decision:** `/ctl`'s `fence off` verb is refused with `fenced` when
+the **lease** fence of `design/layer-a.md` §6.4 F1 is in force, and
+clears the operator flag otherwise. Every other verb of §2.5's fenced
+set — `pull`, `push`, `drop`, `forget`, `reconcile`, `advert` — is
+refused while **either** fence is in force, as §2.5 says.
+`design/store.md` §14(26) records the deviation.
+**Rationale:** §2.5 lists `fence off` among the verbs that MUST fail
+`fenced` while the instance is fenced, and §6.4 F4 makes `fence off`
+the only thing that clears an operator fence — "a separate flag with
+the same effect as F1's; `fence off` clears only that flag". Read
+literally the two make an operator fence permanent: the operator sets
+it, and the verb that would clear it is thereafter refused because it
+is in force, so the instance serves nothing until it is restarted.
+That cannot be what either sentence means, since F4 exists to be used
+and §6.4 describes it as a flag an operator sets and clears. What
+§2.5's rule is protecting is named in its own paragraph: "a deposed
+instance could be driven to overwrite, delete, discard replication
+state, or unfence itself" — and the fence a deposed instance carries
+is F1's lease fence, which `fence off` MUST NOT clear anyway. Scoping
+the refusal to the lease fence keeps every word of that protection
+and costs nothing: an instance that has lost its map still cannot
+unfence itself, and one an operator fenced can still be unfenced by
+the operator.
+**Considered and rejected:** refusing `fence off` under any fence,
+which is the literal reading and makes F4 one-way — an operator
+fence would then be cleared only by restarting the instance, and
+§6.4's "separate flag" would be a one-shot kill switch. Also
+rejected: dropping `fence off` from the fenced set entirely, which
+would let a lease-fenced instance answer it `ok` while clearing
+nothing, telling the operator the fence is gone when it is not.
+**Normative:** that a lease-fenced instance MUST refuse `fence off`
+with `fenced`, and that `fence off` MUST NOT clear a lease-derived
+fence (§6.4 F4 already). A reimplementation must match both.
+**Implementation policy:** that an operator-fenced-only instance
+accepts `fence off` rather than refusing it. An implementation that
+refuses it conforms to §2.5's letter; it is then an implementation in
+which an operator fence can only be cleared by a restart, and it must
+say so.

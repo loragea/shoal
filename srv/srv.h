@@ -50,7 +50,7 @@ enum
 	 * The msize floor.  lib9p answers Tversion itself and offers no
 	 * hook (9p(2): Srv has none), so the only place a server can see
 	 * the negotiated size is the first request that carries a Srv*,
-	 * which is Tattach.  store.md §14(18) records that.
+	 * which is Tattach.  store.md §14(20) records that.
 	 */
 	Msizemin	= 8192+IOHDRSZ,
 

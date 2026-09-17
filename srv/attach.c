@@ -28,7 +28,7 @@
  * attribute that is absent is answered the same way: §2.1 gives the
  * attach no other error for a specifier it cannot use, and the two
  * cases are one to a caller — it sent an aname this server cannot act
- * on.  store.md §14(20) records that reading.  peer= on a role that
+ * on.  store.md §14(25) records that reading.  peer= on a role that
  * does not need it parses and is ignored, because the grammar permits
  * it on any attr list.
  */
@@ -116,7 +116,7 @@ srvattach(Req *r)
 	 * this server at Tattach, through the Srv the request carries.
 	 * layer-a §5.5's forwarded-write payload is sized off it and
 	 * /status reports it, so a connection below the floor is refused
-	 * here rather than half-served later.  store.md §14(18) records
+	 * here rather than half-served later.  store.md §14(20) records
 	 * the deviation: the refusal is late and it is not a §2.6
 	 * condition, so it carries this server's own prefix.
 	 */
@@ -134,7 +134,7 @@ srvattach(Req *r)
 	 * immediate map fetch — there is no monitor client in this wave,
 	 * so the refusal is the whole of what happens and the instance
 	 * stays at the epoch of the map it was started with (store.md
-	 * §14(16)).
+	 * §14(21)).
 	 */
 	if(f->hasepoch){
 		if(f->epoch < c->map->epoch){

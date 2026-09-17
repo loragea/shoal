@@ -20,7 +20,7 @@
  * The map is a file rather than a monitor connection: this build has
  * no network client, so the epoch, the placement and the stale ledger
  * are whatever -m carries, and F1's lease fence is inert
- * (docs/design/store.md §14(15), §14(16)).
+ * (docs/design/store.md §14(18), §14(19)).
  */
 
 enum

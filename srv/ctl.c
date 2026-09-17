@@ -30,7 +30,7 @@
  * in force.  What §2.5 is protecting is a deposed instance unfencing
  * itself, which is the lease fence F1 raises, so `fence off' here is
  * refused while a LEASE fence is in force and clears the operator flag
- * otherwise.  store.md §14(21) and decisions.md D25 record it.
+ * otherwise.  store.md §14(26) and decisions.md D25 record it.
  */
 
 enum
@@ -76,7 +76,7 @@ srvfencekind(Srvctx *c)
 	 * successful refresh itself, which is the start-up adoption, and
 	 * the lease can never elapse.  F4, the operator fence, is live.
 	 * A refresh loop replaces this argument with the monotonic clock
-	 * and nothing else here changes.  store.md §14(15) records it.
+	 * and nothing else here changes.  store.md §14(19) records it.
 	 */
 	k = fencekind(&c->fence, c->fence.last);
 	qunlock(&c->fencelk);
@@ -245,7 +245,7 @@ srvctlwrite(Req *r)
 		 * makes `bad object name' the answer to "any operation
 		 * naming an oid that violates §1.1"; §2.5's rows answer bad
 		 * arguments `bad ctl'.  The more specific string wins here
-		 * (store.md §14(22)).
+		 * (store.md §14(27)).
 		 */
 		oidlen = strlen(cb->f[1]);
 		if(oidlen > Oidmax)

@@ -24,7 +24,7 @@
  * peer client and no monitor client, so there is no peer msize to take
  * the smallest of and no reconcile pass to have counted the rest; a
  * zero would be a measurement this instance has not made.  store.md
- * §14(17) records the omission.  Two fields beyond §2.2's list are
+ * §14(23) records the omission.  Two fields beyond §2.2's list are
  * rendered because something here has no other place to report them:
  * the open enumeration-snapshot count, which store.md §9 makes the
  * server's half of `objsnap=', and the queue pool's depth, which §7

@@ -39,7 +39,8 @@
  * client.  `shoalsrv' shares no prefix with any §2.6 entry, so the
  * marked set stays prefix-free against §2.6's.  The one thing this
  * function will not do under any input is manufacture a §2.6 prefix
- * for a string that did not already carry one.
+ * for a string that did not already carry one.  store.md §14(29)
+ * records the marking and the single `not built' string beside it.
  */
 char Enotbuilt[]	= "shoalsrv: not built";
 char Ebadaname[]	= "bad aname";

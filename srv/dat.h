@@ -57,7 +57,7 @@ enum
  * One file of §2.2.  walk/rd/wr are §2.1's role matrix: which roles
  * may walk to this file, open it for reading, and open it for writing.
  * §2.1 states the matrix by role rather than by file, and is silent
- * about several cells; store.md §14(19) records what those cells are
+ * about several cells; store.md §14(24) records what those cells are
  * here and why.
  *
  * The three handler cells are what the rest of the surface fills in:

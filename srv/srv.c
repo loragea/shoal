@@ -171,7 +171,7 @@ srvnew(Srvcfg *cfg)
 	 * instance that served under a map it had refused would be the
 	 * split brain the rule exists to prevent.  /status's
 	 * epochregress= and monidmismatch= therefore always read `no'
-	 * while this server is running (store.md §14(16)).
+	 * while this server is running (store.md §14(22)).
 	 */
 	memset(&ad, 0, sizeof ad);
 	ad.pinned = c->sb.monidset != 0;
