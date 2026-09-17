@@ -251,11 +251,14 @@ walk1(Srvctx *c, Sfid *f, char *name, Qid *q, char *buf, int nbuf)
 }
 
 /*
- * The walk itself.  A partial walk leaves newfid untouched, which is
- * what 9P asks and what lib9p's own walkandclone does not do; the fid
- * is advanced only when every element resolved, except that a walk of
- * a fid onto itself commits what it managed, because lib9p's rwalk
- * moves that Fid's qid whatever this answers.
+ * The walk itself.  A walk that does not resolve every element leaves
+ * both fids exactly where they were — which is what 9P asks and what
+ * lib9p's own walkandclone does not do — and that holds for a walk of
+ * a fid onto itself too: lib9p's rwalk leaves the Fid's qid untouched
+ * whenever it answers fewer qids than were named, so a server that
+ * advanced its own state there would leave the two disagreeing about
+ * where the client's fid points.  The Sfid is therefore committed only
+ * when every element resolved.
  */
 static void
 dowalk(Req *r)
@@ -283,10 +286,10 @@ dowalk(Req *r)
 		srvqdone(r, e);
 		return;
 	}
-	if(i == r->ifcall.nwname || r->fid == r->newfid){
+	if(i == r->ifcall.nwname){
 		if(r->fid == r->newfid)
 			*f = g;
-		else if(i == r->ifcall.nwname){
+		else{
 			if((nf = mallocz(sizeof *nf, 1)) == nil){
 				srvqdone(r, "shoalsrv: out of memory");
 				return;

@@ -858,6 +858,30 @@ tobjects(void)
 			r.wqid[1].path, path2);
 	clclunk(&cl, Ffile, &r);
 
+	/*
+	 * A walk that does not resolve every element leaves the fid where
+	 * it was, and a walk of a fid onto itself is no exception: lib9p
+	 * answers a partial Rwalk without touching the Fid's qid, so the
+	 * client still holds the root and the next walk from it must
+	 * behave like one from the root.
+	 */
+	if(clattach(&cl, Froot2, "role=admin", &r) != Rattach)
+		fail("attach: %s", r.type == Rerror ? r.ename : "?");
+	w[0] = "obj";
+	w[1] = "nosuch";
+	clwalk(&cl, Froot2, Froot2, 2, w, &r);
+	checks++;
+	if(r.type != Rwalk || r.nwqid != 1)
+		fail("a partial walk of a fid onto itself: %s",
+			r.type == Rerror ? r.ename : "not a partial walk");
+	clwalk1(&cl, Froot2, Ffile, "ctl", &r);
+	checks++;
+	if(r.type != Rwalk || r.nwqid != 1)
+		fail("walk to /ctl after a partial self-walk: %s",
+			r.type == Rerror ? r.ename : "short");
+	clclunk(&cl, Ffile, &r);
+	clclunk(&cl, Froot2, &r);
+
 Out:
 	clstop(&cl);
 	srvfree(ctx);
