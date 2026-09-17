@@ -420,6 +420,8 @@ tattach(void)
 		{"epoch=18446744073709551616",	"bad aname"},
 		{"epoch=99999999999999999999",	"bad aname"},
 		{"epoch=184467440737095516150",	"bad aname"},
+		/* leading zeros are part of the number: this is epoch 7 */
+		{"epoch=007",			nil},
 		{"epoch=18446744073709551615",	"future epoch"},
 		{"epoch=6",			"stale epoch"},
 		{"epoch=8",			"future epoch"},

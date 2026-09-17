@@ -36,6 +36,12 @@
  * grammar admits u64 and nothing else, so it is `bad aname' and not an
  * epoch compare against a saturated value, which would answer `future
  * epoch' for a specifier that never named an epoch at all.
+ *
+ * Leading zeros are read as part of the number: `epoch=007' names
+ * epoch 7.  §2.1 writes the field as a u64 and fixes no lexical form
+ * for it, and a run of decimal digits is the number it spells in every
+ * other reading of the map and the wire, so refusing 007 would refuse
+ * a specifier no rule forbids.
  */
 static int
 u64(char *s, uvlong *vp)
