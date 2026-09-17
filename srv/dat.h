@@ -105,6 +105,22 @@ enum
  * the local Enotbuilt.  That is deliberate, so the gate matrix is
  * complete and testable before the content is.
  *
+ * A render, read or open cell MAY leave the service loop.  Anything
+ * that takes an engine snapshot or a lock the engine holds has to —
+ * lib9p's loop is single-threaded, so a cell that blocks there blocks
+ * the Tflush layer-a §5.4.1 requires to be answerable — and the way
+ * to do it is srvqpushany (fns.h), which puts the request on a queue
+ * of its own outside the pool the oids hash into, so that nothing an
+ * offload does can reorder one object's operations against another's.
+ * A row opts in by filling the cell that gets the request first: the
+ * open cell for an open (a row with only a render cell is answered on
+ * the loop, which is what the fixed status files want), the read cell
+ * for a read.  Such a cell pushes and returns; what runs on the queue
+ * obeys the pool's rules entire — it tests srvqcheck if it has work
+ * worth skipping, and it MUST leave through srvqdone, which is where
+ * the flush is answered and step 7 performed.  srvopentext is the
+ * standard render-at-open body for a row that wants it on a queue.
+ *
  * Which cells belong with which body of work.  The /obj directory
  * row's open and read cells — and the aux a fid of that row carries
  * while it is a directory fid, which is that read's snapshot — belong
@@ -293,6 +309,7 @@ struct Srvctx
 
 	Reqqueue **q;
 	int	nq;
+	Reqqueue *anyq;		/* srvqpushany's, outside the oid pool */
 
 	Lock	cntlk;
 	uvlong	npush;
@@ -302,6 +319,7 @@ struct Srvctx
 	uvlong	hold;		/* srvhook("objhold") */
 	uvlong	exithold;	/* srvhook("objexit") */
 	uvlong	flushhold;	/* srvhook("flushhold") */
+	uvlong	mapopen;	/* srvhook("mapopen") */
 
 	int	closed;		/* the shutdown sequence has run */
 };

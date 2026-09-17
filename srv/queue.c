@@ -71,6 +71,10 @@ srvqinit(Srvctx *c, int nq)
 		}
 		c->nq = i+1;
 	}
+	if((c->anyq = reqqueuecreate()) == nil){
+		werrstr("reqqueuecreate: %r");
+		return -1;
+	}
 	return 0;
 }
 
@@ -123,8 +127,9 @@ srvqended(Qreq *qr)
  * answered, so a Tflush that finds the request in the pool always
  * finds this beside it.
  */
-Qreq*
-srvqprep(Srvctx *c, uchar *oid, int oidlen, Req *r, void (*f)(Req*))
+static Qreq*
+qprep(Srvctx *c, Reqqueue *q, uchar *oid, int oidlen, Req *r,
+	void (*f)(Req*))
 {
 	Qreq *qr;
 
@@ -134,13 +139,46 @@ srvqprep(Srvctx *c, uchar *oid, int oidlen, Req *r, void (*f)(Req*))
 	}
 	qr->ctx = c;
 	qr->f = f;
-	qr->q = c->q[oidhash(oid, oidlen) % c->nq];
+	qr->q = q;
 	if(oidlen > 0 && oidlen <= Oidmax){
 		memmove(qr->oid, oid, oidlen);
 		qr->oidlen = oidlen;
 	}
 	r->aux = qr;
 	return qr;
+}
+
+Qreq*
+srvqprep(Srvctx *c, uchar *oid, int oidlen, Req *r, void (*f)(Req*))
+{
+	return qprep(c, c->q[oidhash(oid, oidlen) % c->nq], oid, oidlen, r, f);
+}
+
+/*
+ * The same for an operation that names no object: a status render, a
+ * directory read, anything that takes an engine snapshot and so must
+ * not be run on the service loop.  It goes to a queue of its own,
+ * outside the pool the oids hash into, so that offloading it neither
+ * waits behind an object's operations nor delays them — the pool is
+ * the objects' ordering point (§5.4 step 2) and nothing else may
+ * change what is ordered against what.  One queue, because there is
+ * nothing to order here and a second would only add a proc.
+ *
+ * Everything else about such a request is an ordinary pushed one: it
+ * is counted by the pool's depth, it is flushable, and it MUST leave
+ * through srvqdone.
+ */
+Qreq*
+srvqprepany(Srvctx *c, Req *r, void (*f)(Req*))
+{
+	return qprep(c, c->anyq, nil, 0, r, f);
+}
+
+void
+srvqpushany(Srvctx *c, Req *r, void (*f)(Req*))
+{
+	if(srvqprepany(c, r, f) != nil)
+		srvqgo(c, r);
 }
 
 /*
@@ -402,6 +440,10 @@ srvqfree(Srvctx *c)
 	free(c->q);
 	c->q = nil;
 	c->nq = 0;
+	if(c->anyq != nil){
+		reqqueuefree(c->anyq);
+		c->anyq = nil;
+	}
 }
 
 void
@@ -423,5 +465,21 @@ srvhook(Srvctx *c, char *name, uvlong n)
 		c->exithold = n;
 	else if(strcmp(name, "flushhold") == 0)
 		c->flushhold = n;
+	else if(strcmp(name, "mapopen") == 0)
+		c->mapopen = n;
 	qunlock(&c->holdlk);
+}
+
+/* what a point is set to, for the one place that acts on the value */
+uvlong
+srvpoint(Srvctx *c, char *name)
+{
+	uvlong n;
+
+	n = 0;
+	qlock(&c->holdlk);
+	if(strcmp(name, "mapopen") == 0)
+		n = c->mapopen;
+	qunlock(&c->holdlk);
+	return n;
 }

@@ -38,6 +38,7 @@ static char Edeleted[] = "object deleted";
 
 static void rootread(Req*);
 static char* objgate(Srvctx*, Sfid*, Req*, int);
+static void mapopenq(Req*);
 
 /*
  * One row per file, one field per line: a cell is filled by naming it,
@@ -775,7 +776,7 @@ srvwalk(Req *r)
 void
 srvopen(Req *r)
 {
-	char buf[ERRMAX], *e;
+	char *e;
 	Srvctx *c;
 	Sfid *f;
 	Sfile *file;
@@ -813,30 +814,93 @@ srvopen(Req *r)
 		return;
 	}
 	if(file->render != nil){
-		if((f->text = textnew()) == nil){
-			respond(r, "shoalsrv: out of memory");
+		switch(f->file == Qmap ? srvpoint(c, "mapopen") : 0){
+		case 1:
+			srvqpushany(c, r, mapopenq);
 			return;
+		case 2:
+			if(srvqprepany(c, r, mapopenq) == nil)
+				return;
+			break;
 		}
-		if((e = file->render(c, f, f->text)) != nil){
-			textfree(f->text);
-			f->text = nil;
-			respond(r, srverrs(buf, sizeof buf, e));
-			return;
-		}
-		if(f->text->err){
-			textfree(f->text);
-			f->text = nil;
-			respond(r, "shoalsrv: out of memory");
-			return;
-		}
-		respond(r, nil);
+		srvopentext(r);
 		return;
 	}
 	if(file->read != nil || file->write != nil){
-		respond(r, nil);
+		srvqdone(r, nil);
 		return;
 	}
-	respond(r, Enotbuilt);
+	srvqdone(r, Enotbuilt);
+}
+
+/*
+ * The render-at-open body, on its own so that a row whose open was
+ * offloaded runs the same one: it is reached from the service loop and
+ * from a queue proc, and it answers through the pool's one exit either
+ * way (srvqdone answers directly for a request that was never pushed).
+ */
+void
+srvopentext(Req *r)
+{
+	char *e;
+	Srvctx *c;
+	Sfid *f;
+	Sfile *file;
+
+	c = r->srv->aux;
+	f = r->fid->aux;
+	file = &srvfiles[f->file];
+	if((f->text = textnew()) == nil){
+		srvqdone(r, "shoalsrv: out of memory");
+		return;
+	}
+	if((e = file->render(c, f, f->text)) != nil){
+		textfree(f->text);
+		f->text = nil;
+		srvqdone(r, e);
+		return;
+	}
+	if(f->text->err){
+		textfree(f->text);
+		f->text = nil;
+		srvqdone(r, "shoalsrv: out of memory");
+		return;
+	}
+	srvqdone(r, nil);
+}
+
+/*
+ * The T1 offload point.  A row MAY answer an open, a read or a render
+ * on a queue rather than on the service loop (dat.h), and this is that
+ * path driven from a test: with the point at 1 a Topen of /map is
+ * pushed to the reserved queue and held there, so a case can hold one
+ * request that names no object while it asks the loop for another and
+ * while the object queues go on running; with it at 2 the open is
+ * prepared for a queue and then answered on the loop after all, which
+ * is the caller the pool's counting has to survive.
+ *
+ * /map is the row that takes it because its render reads nothing an
+ * offload would change; the rows that will really need one — the /obj
+ * directory's read and the status files whose renders take an engine
+ * snapshot — are not built.
+ */
+static void
+mapopenq(Req *r)
+{
+	Srvctx *c;
+
+	c = r->srv->aux;
+	if(srvqcheck(r)){
+		srvqdone(r, nil);
+		return;
+	}
+	while(srvpoint(c, "mapopen") == 1 && !srvqcheck(r))
+		sleep(5);
+	if(srvqcheck(r)){
+		srvqdone(r, nil);
+		return;
+	}
+	srvopentext(r);
 }
 
 /*
@@ -861,7 +925,7 @@ srvread(Req *r)
 		textread(r, f->text);
 		return;
 	}
-	respond(r, Enotbuilt);
+	srvqdone(r, Enotbuilt);
 }
 
 void
@@ -876,7 +940,7 @@ srvwrite(Req *r)
 		file->write(r);
 		return;
 	}
-	respond(r, Enotbuilt);
+	srvqdone(r, Enotbuilt);
 }
 
 static void

@@ -1856,6 +1856,139 @@ Out:
 }
 
 /*
+ * An operation that names no object, run off the service loop.  The
+ * status renders and the /obj directory read that are to come take
+ * engine snapshots, and lib9p's loop is single-threaded, so they need
+ * an offload that the pool's oid hash cannot give them.  The reserved
+ * queue is that offload, and what this asks of it is that it is a
+ * queue of its own: the pool here is ONE queue, so an object's verb
+ * would wait behind the held request if the two shared one.
+ */
+static void
+tanyq(void)
+{
+	char buf[8192], *m;
+	uchar data[1024];
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall t, r;
+	char *w[1];
+	uvlong np, nd;
+	ushort ta, tf;
+	long n;
+
+	clstage = "anyq";
+	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
+	d = newdisk();
+	if((ctx = startsrv(d, m, 1)) == nil)
+		return;
+	memset(data, 0x33, sizeof data);
+	mkobj(srvstore(ctx), "alpha", data, sizeof data, 1);
+
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach)
+		fail("attach: %s", errof(&r));
+	w[0] = "ctl";
+	if(clopenpath(&cl, Froot, Fctl, 1, w, OWRITE, &r) != Ropen){
+		fail("open /ctl: %s", errof(&r));
+		goto Out;
+	}
+	if(clwalk1(&cl, Froot, Ffile, "map", &r) != Rwalk){
+		fail("walk /map: %s", errof(&r));
+		goto Out;
+	}
+	srvhook(ctx, "mapopen", 1);
+	memset(&t, 0, sizeof t);
+	t.type = Topen;
+	t.tag = ta = cltag(&cl);
+	t.fid = Ffile;
+	t.mode = OREAD;
+	clput(&cl, &t);
+	sleep(200);			/* pushed, and held on the reserved queue */
+	srvcount(ctx, &np, &nd);
+	eqv("a request that names no object is counted by the pool",
+		np - nd, 1);
+
+	/* the service loop is free, and so is the one queue the oids share */
+	w[0] = "status";
+	if(clopenpath(&cl, Froot, Ffile2, 1, w, OREAD, &r) != Ropen)
+		fail("open /status while a request is held off the loop: %s",
+			errof(&r));
+	else{
+		n = clslurp(&cl, Ffile2, buf, sizeof buf);
+		istrue("/status renders while a request is held off the loop",
+			n > 0);
+		clclunk(&cl, Ffile2, &r);
+	}
+	clwrite(&cl, Fctl, 0, "verify alpha", &r);
+	checks++;
+	if(r.type != Rwrite)
+		fail("an object's verb while a request is held off the loop: "
+			"%s", errof(&r));
+	memset(&t, 0, sizeof t);
+	t.type = Tflush;
+	t.tag = tf = cltag(&cl);
+	t.oldtag = 31337;
+	clput(&cl, &t);
+	clget(&cl, &r);
+	checks++;
+	if(r.type != Rflush || r.tag != tf)
+		fail("an unrelated Tflush while a request is held off the "
+			"loop: type %d tag %ud", r.type, r.tag);
+
+	/* and it is flushable, like every other pushed request */
+	memset(&t, 0, sizeof t);
+	t.type = Tflush;
+	t.tag = tf = cltag(&cl);
+	t.oldtag = ta;
+	clput(&cl, &t);
+	clget(&cl, &r);
+	checks++;
+	if(r.type != Rerror || r.tag != ta
+	|| strcmp(r.ename, "interrupted") != 0)
+		fail("a flushed request on the reserved queue: type %d tag "
+			"%ud %s", r.type, r.tag, r.type == Rerror ? r.ename : "");
+	clget(&cl, &r);
+	checks++;
+	if(r.type != Rflush || r.tag != tf)
+		fail("the Rflush after it: type %d tag %ud", r.type, r.tag);
+	clclunk(&cl, Ffile, &r);
+
+	/* released rather than flushed, it answers what the loop would have */
+	if(clwalk1(&cl, Froot, Ffile, "map", &r) != Rwalk)
+		fail("walk /map again: %s", errof(&r));
+	memset(&t, 0, sizeof t);
+	t.type = Topen;
+	t.tag = ta = cltag(&cl);
+	t.fid = Ffile;
+	t.mode = OREAD;
+	clput(&cl, &t);
+	sleep(200);
+	srvhook(ctx, "mapopen", 0);
+	clget(&cl, &r);
+	checks++;
+	if(r.type != Ropen || r.tag != ta)
+		fail("an open answered off the loop: type %d tag %ud %s",
+			r.type, r.tag, r.type == Rerror ? r.ename : "");
+	else{
+		n = clslurp(&cl, Ffile, buf, sizeof buf);
+		eqv("it rendered the same bytes", n, strlen(m));
+		istrue("which are the map text", strcmp(buf, m) == 0);
+	}
+	clclunk(&cl, Ffile, &r);
+	sleep(100);
+	srvcount(ctx, &np, &nd);
+	eqv("the pool is empty again", np - nd, 0);
+Out:
+	srvhook(ctx, "mapopen", 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * A Tflush that loses the race to the request it names.  lib9p's
  * reqqueueflush answers a request it does not find running — whether
  * or not it found it queued either — and lib9p's respond asserts that
@@ -2126,6 +2259,7 @@ threadmain(int argc, char **argv)
 	tdown("out", "yes");
 	tfidstate();
 	tflush();
+	tanyq();
 	tflushrace();
 	terrors();
 	tshutdown();

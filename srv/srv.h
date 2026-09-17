@@ -106,7 +106,9 @@ int	textwrite(Text*, void*, long);
  *			server's own `shoalsrv: ' prefix.  buf is
  *			written only in the second case.
  *	srverr		srverrs over the current %r.
- *	srvrerror	respond(r, srverr(...)).
+ *	srvrerror	the answer to the current %r.  A request the queue
+ *			pool is carrying leaves through srvqdone instead,
+ *			so this is safe to call from a queue proc.
  *
  * Enotbuilt is the local refusal a file or a ctl verb whose body is
  * not built answers after its gates.  It is deliberately not a §2.6
@@ -186,7 +188,7 @@ void	srvcount(Srvctx*, uvlong *pushed, uvlong *done);
 
 /*
  * store.md §13's -X shape, for this library's own points: inert until
- * set, present in every build.  One point today:
+ * set, present in every build.
  *
  *	objhold	n != 0 holds every queued object request at its check
  *		point, so a test can have a request that is running and
@@ -195,6 +197,12 @@ void	srvcount(Srvctx*, uvlong *pushed, uvlong *done);
  *		end of its handler: after the engine call and before the
  *		exit, so a test can flush a request whose work is done
  *		and require it to leave through srvqdone all the same.
+ *	mapopen	1 offloads a Topen of /map to the reserved queue
+ *		srvqpushany uses and holds it there until the point is
+ *		cleared; 2 prepares that open for a queue and then
+ *		answers it on the service loop after all.  It is how a
+ *		test drives the offload path before a row of the tree
+ *		really needs one.
  *	flushhold
  *		n != 0 holds a Tflush of a pooled request between the
  *		lookup that found it and the flush itself, which is the

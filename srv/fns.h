@@ -24,6 +24,8 @@ int	srvqinit(Srvctx*, int nq);
 Qreq*	srvqprep(Srvctx*, uchar *oid, int oidlen, Req*, void (*)(Req*));
 void	srvqgo(Srvctx*, Req*);
 void	srvqpush(Srvctx*, uchar *oid, int oidlen, Req*, void (*)(Req*));
+Qreq*	srvqprepany(Srvctx*, Req*, void (*)(Req*));
+void	srvqpushany(Srvctx*, Req*, void (*)(Req*));
 void	srvqflush(Req*);
 Qreq*	srvqreq(Req*);
 int	srvqcheck(Req*);
@@ -33,6 +35,7 @@ void	srvqended(Qreq*);
 void	srvqdrain(Srvctx*);
 void	srvqfree(Srvctx*);
 void	srvstep7(Req*);
+uvlong	srvpoint(Srvctx*, char*);
 
 /* tree.c */
 void	srvfidnew(Srvctx*, Sfid*);
@@ -52,6 +55,7 @@ void	srvremove(Req*);
 void	srvwstat(Req*);
 void	srvdestroyfid(Fid*);
 void	srvdestroyreq(Req*);
+void	srvopentext(Req*);
 
 /* attach.c */
 void	srvattach(Req*);
