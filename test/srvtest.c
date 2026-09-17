@@ -1663,14 +1663,14 @@ Out:
 static void
 tflush(void)
 {
-	char *m;
+	char buf[8192], val[64], *m;
 	uchar data[1024];
 	Srvctx *ctx;
 	Dev *d;
 	Cl cl;
 	Fcall t, r;
 	char *w[1];
-	uvlong n7;
+	uvlong n7, np, nd;
 	ushort ta, tb, tf;
 
 	clstage = "flush";
@@ -1697,6 +1697,16 @@ tflush(void)
 		goto Out;
 	}
 
+	/*
+	 * One request that has been through the pool already, so that the
+	 * depth below and the number of pushes are different numbers.
+	 */
+	clwrite(&cl, Fctl, 0, "verify alpha", &r);
+	checks++;
+	if(r.type != Rwrite)
+		fail("verify before the hold: %s", errof(&r));
+	sleep(100);			/* its Req is freed after its reply */
+
 	/* a QUEUED request, flushed */
 	srvhook(ctx, "objhold", 1);
 	memset(&t, 0, sizeof t);
@@ -1714,6 +1724,25 @@ tflush(void)
 	t.count = strlen(t.data);
 	clput(&cl, &t);
 	sleep(200);			/* ... and this one is behind it */
+
+	/*
+	 * The pool's depth, with one request running and one queued: what
+	 * /status reports is the two of them and not the three that have
+	 * been pushed since the server started (store.md §7).
+	 */
+	srvcount(ctx, &np, &nd);
+	eqv("pushes counted while two requests are in flight", np, 3);
+	eqv("completions counted while two requests are in flight", nd, 1);
+	w[0] = "status";
+	if(clopenpath(&cl, Froot, Ffile, 1, w, OREAD, &r) != Ropen)
+		fail("open /status under the hold: %s", errof(&r));
+	else{
+		clslurp(&cl, Ffile, buf, sizeof buf);
+		eqs("/status qdepth= under the hold",
+			clfield(buf, "qdepth", val, sizeof val), "2");
+		clclunk(&cl, Ffile, &r);
+	}
+
 	memset(&t, 0, sizeof t);
 	t.type = Tflush;
 	t.tag = tf = cltag(&cl);
@@ -1848,6 +1877,11 @@ tflush(void)
 	checks++;
 	if(r.type != Rflush || r.tag != tf)
 		fail("a Tflush of an unknown tag: type %d", r.type);
+	sleep(200);			/* the parked Rflushes have been answered */
+	srvcount(ctx, &np, &nd);
+	eqv("every request the flush cases pushed is accounted for",
+		np - nd, 0);
+	istrue("and the count is not zero either way", np > 0);
 Out:
 	clstop(&cl);
 	srvfree(ctx);
