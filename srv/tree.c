@@ -38,6 +38,7 @@ static char Edeleted[] = "object deleted";
 
 static void rootread(Req*);
 static char* objgate(Srvctx*, Sfid*, Req*, int);
+static char* chgate(Srvctx*, Sfid*, Req*, int);
 static void mapopenq(Req*);
 
 /*
@@ -105,6 +106,7 @@ Sfile srvfiles[Nfile] =
 	.walk	= Arepl,
 	.rd	= Arepl,
 	.wr	= Arepl,
+	.gate	= chgate,
 },
 [Qrpc] = {
 	.name	= "rpc",
@@ -112,6 +114,7 @@ Sfile srvfiles[Nfile] =
 	.walk	= Arepl|Aadmin,
 	.rd	= Arepl|Aadmin,
 	.wr	= Arepl|Aadmin,
+	.gate	= chgate,
 },
 [Qadvert] = {
 	.name	= "advert",
@@ -189,7 +192,12 @@ reservedid(uchar *oid, int oidlen)
 /*
  * The object rows' gate, run right after the role gate on every open,
  * create, remove and wstat that reaches an object or the directory one
- * is created in.  It asks three things, in this order:
+ * is created in — and on every read and write of one, where there is
+ * no role gate to run after, the open having settled the role.  A read
+ * and a write are gated because §6.4 F1 fences OPERATIONS and the
+ * fence can go on under an open fid: a fid opened before `fence on'
+ * would otherwise carry its grant past it.  It asks three things, in
+ * this order:
  *
  *	§2.1's operator rule.  role=admin's grant of /obj and /meta is
  *	read-only, and a create, write, remove or wstat of an id that is
@@ -219,17 +227,28 @@ objgate(Srvctx *c, Sfid *f, Req *r, int op)
 	uchar *oid;
 	int oidlen, wr, rsvd, m;
 
-	if(op == Gcreate){
+	oid = f->oid;
+	oidlen = f->oidlen;
+	switch(op){
+	case Gcreate:
 		oid = (uchar*)r->ifcall.name;
 		oidlen = strlen(r->ifcall.name);
 		wr = 1;
-	}else{
-		oid = f->oid;
-		oidlen = f->oidlen;
-		m = r->ifcall.mode;
-		wr = op != Gopen
-			|| (m&OMASK) == OWRITE || (m&OMASK) == ORDWR
+		break;
+	case Gread:
+		wr = 0;
+		break;
+	case Gwrite:
+		wr = 1;
+		break;
+	case Gopen:
+		m = r->ifcall.mode;		/* the mode says which column */
+		wr = (m&OMASK) == OWRITE || (m&OMASK) == ORDWR
 			|| (m&OTRUNC) != 0;
+		break;
+	default:			/* Gremove, Gwstat */
+		wr = 1;
+		break;
 	}
 	rsvd = reservedid(oid, oidlen);
 	if(wr && f->role == Radmin && !rsvd)
@@ -242,6 +261,30 @@ objgate(Srvctx *c, Sfid *f, Req *r, int op)
 			return nil;
 		return Efenced;
 	}
+	return nil;
+}
+
+/*
+ * The channel rows' gate.  §6.4 F1 fences "every /repl and /rpc
+ * operation", which is every operation on these two rows and not the
+ * open alone: the work a channel carries is the replication work F1
+ * exists to stop, and the fence can go on under a fid a peer already
+ * holds open.
+ *
+ * Neither of §2.1's other two rules is theirs.  The operator rule is
+ * about an object's name and these rows name none; F3's `down' is
+ * about role=client I/O, and neither row admits role=client — a
+ * channel between instances is not a client serving path, which is
+ * what F3 is about (§6.4 "What F3 does not bar").
+ */
+static char*
+chgate(Srvctx *c, Sfid *f, Req *r, int op)
+{
+	USED(f);
+	USED(r);
+	USED(op);
+	if(srvfencekind(c) != Fencenone)
+		return Efenced;
 	return nil;
 }
 
@@ -480,6 +523,50 @@ srvauxlate(Srvctx *c)
 	n = c->nauxlate;
 	unlock(&c->auxlk);
 	return n;
+}
+
+/*
+ * The T1 cell point.  A row's handler cells are what the rest of the
+ * surface fills in (dat.h), and the rules this library holds around
+ * them — the gate that runs before a read and a write, the precedence
+ * a read cell has over a rendered Text, the give-back a create owes
+ * the directory fid it is issued on — are testable before any of
+ * those bodies exist.  With the point on, rows carry a cell of the
+ * server's own:
+ *
+ *	[Qctl].read	answers fixed bytes.  /ctl also renders at open,
+ *			so a read of it says which of the two serves it.
+ *	[Qobjfile].write
+ *			answers an Rwrite counting the bytes, so a write
+ *			the fence refuses is distinguishable from one no
+ *			cell would have taken anyway.
+ *
+ * The cells are the table's and the table is the program's, so this
+ * point is global rather than per-context: a T1 program sets it,
+ * drives what it wants and clears it.
+ */
+static char Celltext[] = "cell\n";
+
+static void
+cellread(Req *r)
+{
+	readstr(r, Celltext);
+	respond(r, nil);
+}
+
+static void
+cellwrite(Req *r)
+{
+	r->ofcall.count = r->ifcall.count;
+	respond(r, nil);
+}
+
+void
+srvcellpoint(Srvctx *c, int on)
+{
+	USED(c);
+	srvfiles[Qctl].read = on ? cellread : nil;
+	srvfiles[Qobjfile].write = on ? cellwrite : nil;
 }
 
 void
@@ -974,19 +1061,35 @@ mapopenq(Req *r)
 }
 
 /*
- * Read.  A row with a read cell gets every read on it, whether or not
- * the fid also holds a rendered Text — a row that renders bytes at
- * open AND wants the read itself serves them with textread — and only
- * a row with render and no read takes the automatic path (dat.h).
+ * Read and write.  The row's gate runs first on both, for the reason
+ * objgate gives: §6.4 F1 fences operations rather than opens, and the
+ * operator fence can go on while a fid is open, so the fid's grant is
+ * not the answer to the operation.  There is no role gate to run
+ * before it — 9P settles the role at the open, which srvopen gated —
+ * and none of these rows has one of its own.  It is done here rather
+ * than in each row's cell so that a row cannot be built without it.
+ *
+ * Then the cells.  A row with a read cell gets every read on it,
+ * whether or not the fid also holds a rendered Text — a row that
+ * renders bytes at open AND wants the read itself serves them with
+ * textread — and only a row with render and no read takes the
+ * automatic path (dat.h).
  */
 void
 srvread(Req *r)
 {
+	char *e;
+	Srvctx *c;
 	Sfid *f;
 	Sfile *file;
 
+	c = r->srv->aux;
 	f = r->fid->aux;
 	file = &srvfiles[f->file];
+	if(file->gate != nil && (e = file->gate(c, f, r, Gread)) != nil){
+		respond(r, e);
+		return;
+	}
 	if(file->read != nil){
 		file->read(r);
 		return;
@@ -1001,11 +1104,18 @@ srvread(Req *r)
 void
 srvwrite(Req *r)
 {
+	char *e;
+	Srvctx *c;
 	Sfid *f;
 	Sfile *file;
 
+	c = r->srv->aux;
 	f = r->fid->aux;
 	file = &srvfiles[f->file];
+	if(file->gate != nil && (e = file->gate(c, f, r, Gwrite)) != nil){
+		respond(r, e);
+		return;
+	}
 	if(file->write != nil){
 		file->write(r);
 		return;

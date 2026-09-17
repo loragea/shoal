@@ -271,6 +271,18 @@ void	srvhook(Srvctx*, char *name, uvlong n);
  * the list the shutdown's sweep follows — which a caller compares
  * against the fids it knows are live.
  */
+/*
+ * The cell point, which fills handler cells of the file table with
+ * cells of the server's own: a read on /ctl, which renders at open as
+ * well, and a write on /obj/<oid>.  It is how the rules this library
+ * holds around those cells — the gate before a read and a write, a
+ * read cell's precedence over a rendered Text, the state a create
+ * gives back — are driven before the rows that will carry them are
+ * built.  The cells are the file table's, so the point is the
+ * program's rather than one context's: set it, drive it, clear it.
+ */
+void	srvcellpoint(Srvctx*, int on);
+
 void	srvauxpoint(Srvctx*, int on);
 void	srvauxcount(Srvctx*, uvlong *flushed, uvlong *closed, uvlong *freed);
 uvlong	srvauxlate(Srvctx*);

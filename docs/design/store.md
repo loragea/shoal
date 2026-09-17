@@ -5278,7 +5278,12 @@ name a half that is not built; each says which.
     which is about the **name**: `role=admin` may create and write
     reserved `shoal.` ids and no others. Each row therefore carries a
     gate, run right after the role gate on open, create, remove and
-    wstat, and the gate of `/obj`, `/obj/<oid>` and `/meta/<oid>`
+    wstat, and before the row's cell on read and write — where there
+    is no role gate to run after, 9P having settled the role at the
+    open. A read and a write are gated because §6.4 F1 fences
+    **operations**, and the operator fence F4 can go on while a fid is
+    open: a fid opened before `fence on` would otherwise carry its
+    grant past it. The gate of `/obj`, `/obj/<oid>` and `/meta/<oid>`
     answers three rules in this order:
 
     1. §2.1's operator rule: a `role=admin` create, write, remove or
@@ -5297,6 +5302,13 @@ name a half that is not built; each says which.
        `shoal.` id, which is what makes §8.6's monitor rebuild
        executable. §2.1 grants admin *writes* of reserved ids only
        while unfenced, so the exemption is the read alone.
+
+    `/repl` and `/rpc` carry a gate of their own, and it is the fence
+    alone: F1 fences "every `/repl` and `/rpc` operation", which is
+    every operation on those two rows and not the open alone. The
+    other two rules are not theirs — the operator rule is about an
+    object's name, and F3's `down` is about `role=client` I/O, which
+    neither row admits.
 
     A `role=client` create of a reserved id is §1.1's `reserved
     name`; that one belongs to the create body, which is not built.
@@ -5361,7 +5373,10 @@ name a half that is not built; each says which.
     ctl verb whose content is not built answers the single local
     string `shoalsrv: not built`, **after** its role gate, its row's
     gate and the fence, so the gates are complete and testable before
-    the content is; `/obj` and `/meta` directory reads, `/repl`,
+    the content is. A `Tread` and a `Twrite` have no role gate of
+    their own — 9P settles the role at the open, which is where
+    §2.1's matrix is applied — and the row's gate runs on them as it
+    does on an open (§14(24)). `/obj` and `/meta` directory reads, `/repl`,
     `/rpc`, `/advert`, `/dirty`, `/stale`, `/tombs`, `/lost`,
     `/jobs`, the object rows' open, read, write, create, remove and
     wstat, and every ctl verb but `fence` and `verify` answer it

@@ -1515,6 +1515,97 @@ Out:
 }
 
 /*
+ * §6.4 F1 fences OPERATIONS rather than opens — "every role=client
+ * read and write, every role=repl and role=admin read of an object
+ * through /obj or /meta, every /repl and /rpc operation" — and the
+ * operator fence can go on while a fid is open.  So a Tread and a
+ * Twrite are gated by the row exactly as an open is, and the two
+ * channel rows are gated at all.  The write that the fence refuses
+ * here is one that succeeds without it: the cell point gives
+ * /obj/<oid> a write cell, since §2.4's own is not built.
+ */
+static void
+tiogate(void)
+{
+	char *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall r;
+	char *w[2];
+
+	clstage = "iogate";
+	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4)) == nil)
+		return;
+	mkobj(srvstore(ctx), "alpha", nil, 0, 1);
+	mkobj(srvstore(ctx), "shoal.map.7", nil, 0, 1);
+	srvcellpoint(ctx, 1);
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
+		fail("attach admin: %s", errof(&r));
+		goto Out;
+	}
+	w[0] = "ctl";
+	if(clopenpath(&cl, Froot, Fctl, 1, w, OWRITE, &r) != Ropen){
+		fail("open /ctl: %s", errof(&r));
+		goto Out;
+	}
+
+	/* a write fid on a reserved id and a read fid on an ordinary one */
+	w[0] = "obj";
+	w[1] = "shoal.map.7";
+	if(clopenpath(&cl, Froot, Ffile, 2, w, OWRITE, &r) != Ropen){
+		fail("open /obj/shoal.map.7 for writing: %s", errof(&r));
+		goto Out;
+	}
+	clwrite(&cl, Ffile, 0, "bytes", &r);
+	checks++;
+	if(r.type != Rwrite)
+		fail("an admin write of a reserved id while unfenced: %s",
+			errof(&r));
+	w[1] = "alpha";
+	if(clopenpath(&cl, Froot, Ffile2, 2, w, OREAD, &r) != Ropen)
+		fail("open /obj/alpha for reading: %s", errof(&r));
+	clread(&cl, Ffile2, 0, 16, &r);
+	eqs("an admin read of an object while unfenced", errof(&r),
+		"shoalsrv: not built");
+
+	if(clwrite(&cl, Fctl, 0, "fence on", &r) != Rwrite)
+		fail("fence on: %s", errof(&r));
+	clwrite(&cl, Ffile, 0, "bytes", &r);
+	eqs("a write on a fid opened before the fence", errof(&r), "fenced");
+	clread(&cl, Ffile2, 0, 16, &r);
+	eqs("a read on a fid opened before the fence", errof(&r), "fenced");
+	clclunk(&cl, Ffile, &r);
+	clclunk(&cl, Ffile2, &r);
+	clclunk(&cl, Fctl, &r);
+	clclunk(&cl, Froot, &r);
+
+	/* the channels are in F1's list; F3's `down' is not theirs */
+	if(clattach(&cl, Froot2, "role=repl,peer=n1.1", &r) != Rattach){
+		fail("attach repl: %s", errof(&r));
+		goto Out;
+	}
+	w[0] = "repl";
+	clopenpath(&cl, Froot2, Ffile, 1, w, ORDWR, &r);
+	eqs("a repl open of /repl while fenced", errof(&r), "fenced");
+	w[0] = "rpc";
+	clopenpath(&cl, Froot2, Ffile2, 1, w, ORDWR, &r);
+	eqs("a repl open of /rpc while fenced", errof(&r), "fenced");
+	clclunk(&cl, Ffile, &r);
+	clclunk(&cl, Ffile2, &r);
+	clclunk(&cl, Froot2, &r);
+Out:
+	srvcellpoint(ctx, 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * §6.4 F3: an instance whose own map record says up=no or status=out
  * refuses role=client I/O with `down', and answers everything else as
  * it otherwise would.  The map is the static one (store.md §14(18)),
@@ -2491,6 +2582,7 @@ threadmain(int argc, char **argv)
 	tverify();
 	tdevintr();
 	tobjgate();
+	tiogate();
 	tdown("in", "no");
 	tdown("out", "yes");
 	tfidstate();

@@ -56,7 +56,9 @@ enum
 /*
  * What a row's gate is asked about.  The request carries the rest: the
  * mode of an open or a create is r->ifcall.mode, and the name a create
- * names is r->ifcall.name.
+ * names is r->ifcall.name.  A read and a write carry no mode — the
+ * open settled that — so the op is the whole of what the gate is told
+ * about which column they are in.
  */
 enum
 {
@@ -64,6 +66,8 @@ enum
 	Gcreate,
 	Gremove,
 	Gwstat,
+	Gread,
+	Gwrite,
 };
 
 /*
@@ -79,7 +83,11 @@ enum
  * of one row do not meet in the same line.
  *
  *	gate	the row's own rules, run right after the role gate on
- *		open, create, remove and wstat.  It answers nil, or the
+ *		open, create, remove and wstat, and before the cell on
+ *		read and write — where there is no role gate, the open
+ *		having settled the role, and where the gate runs because
+ *		layer-a §6.4 F1 fences operations and the operator fence
+ *		can go on under an open fid.  It answers nil, or the
  *		error string the operation is refused with.  What the
  *		object rows' gate asks, and in what order, is beside it
  *		in tree.c and in store.md §14(24).
