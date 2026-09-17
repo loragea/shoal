@@ -1778,7 +1778,7 @@ tfidstate(void)
 	Srvctx *ctx;
 	Dev *d;
 	Cl cl;
-	Fcall r;
+	Fcall t, r;
 	uvlong nc, nf;
 
 	clstage = "fidstate";
@@ -1828,6 +1828,24 @@ tfidstate(void)
 		fail("attach: %s", errof(&r));
 		goto Out;
 	}
+
+	/*
+	 * A walk of a fid onto itself that names nothing does not move it
+	 * — it is 9P's probe of the fid — so it gives nothing back.
+	 */
+	memset(&t, 0, sizeof t);
+	t.type = Twalk;
+	t.tag = cltag(&cl);
+	t.fid = Froot;
+	t.newfid = Froot;
+	t.nwname = 0;
+	clrpc(&cl, &t, &r);
+	checks++;
+	if(r.type != Rwalk || r.nwqid != 0)
+		fail("a zero-name walk of a fid onto itself: %s", errof(&r));
+	srvauxcount(ctx, nil, &nc, &nf);
+	eqv("a fid that did not move closed nothing", nc, 2);
+	eqv("a fid that did not move freed nothing", nf, 2);
 Out:
 	clstop(&cl);
 	srvauxcount(ctx, nil, &nc, &nf);

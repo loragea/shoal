@@ -839,7 +839,13 @@ dowalk(Req *r)
 		return;
 	}
 	if(i == r->ifcall.nwname){
-		if(r->fid == r->newfid){
+		/*
+		 * A walk of a fid onto itself that names nothing is 9P's
+		 * probe of that fid: it resolves, and the fid stays where it
+		 * is.  Only a fid that MOVES gives its state back (dat.h), so
+		 * the probe must leave what the fid holds alone.
+		 */
+		if(r->fid == r->newfid && r->ifcall.nwname > 0){
 			/*
 			 * The fid moves, and what it held does not move with
 			 * it: a fid names one file, and the state it carries
@@ -870,7 +876,7 @@ dowalk(Req *r)
 			f->oidlen = g.oidlen;
 			f->qidpath = g.qidpath;
 			f->qidvers = g.qidvers;
-		}else{
+		}else if(r->fid != r->newfid){
 			if((nf = mallocz(sizeof *nf, 1)) == nil){
 				srvqdone(r, "shoalsrv: out of memory");
 				return;
