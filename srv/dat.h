@@ -304,6 +304,7 @@ struct Srvctx
 	Lock	auxlk;		/* not fidlk: the hooks run under that one */
 	uvlong	nauxclose;
 	uvlong	nauxfree;
+	uvlong	nauxopen;	/* ... of those that found the store open */
 	uvlong	nauxflush;
 	uvlong	nauxlate;	/* auxflush ran after the request responded */
 

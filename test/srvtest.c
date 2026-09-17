@@ -1602,6 +1602,7 @@ tfidstate(void)
 	clstage = "fidstate";
 	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
 	d = newdisk();
+	freedseen = 0;
 	if((ctx = startsrv(d, m, 4)) == nil)
 		return;
 	srvauxpoint(ctx, 1);
@@ -1633,7 +1634,14 @@ tfidstate(void)
 	eqv("the moved fid had nothing left to close", nc, 2);
 	eqv("the moved fid had nothing left to free", nf, 2);
 
-	/* a fid still open when the loop ends: the store closes first */
+	/*
+	 * A fid still open when the connection drops.  Its state is given
+	 * back in two halves and the shutdown is what separates them: the
+	 * close hook runs in the shutdown's sweep, with the store still
+	 * open — which is what a fid holding a stage needs, since §9
+	 * allows nothing but the Objsnap calls after the close — and the
+	 * free hook runs with lib9p's fid pool, after it.
+	 */
 	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
 		fail("attach: %s", errof(&r));
 		goto Out;
@@ -1641,8 +1649,11 @@ tfidstate(void)
 Out:
 	clstop(&cl);
 	srvauxcount(ctx, nil, &nc, &nf);
-	eqv("a fid outliving the loop runs no close hook", nc, 2);
+	eqv("a fid outliving the loop has its state closed as well", nc, 3);
 	eqv("a fid outliving the loop still runs its free hook", nf, 3);
+	eqv("every close hook ran with the store still open",
+		srvauxopen(ctx), nc);
+	eqv("and the store was closed after them", freedseen, 1);
 	srvfree(ctx);
 	devclose(d);
 	free(m);

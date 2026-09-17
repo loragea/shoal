@@ -271,11 +271,32 @@ auxpointflush(Sfid *f, Req *r)
 static void
 auxpointclose(void *a)
 {
+	char err[ERRMAX];
+	Objinfo oi;
 	Srvctx *c;
+	int open;
 
 	c = a;
+	/*
+	 * This hook may call the engine, and whether it still can is the
+	 * fact worth recording: a sweep run after the store had closed
+	 * would be no use at all to a fid holding a stage.  The id is one
+	 * nothing creates, so the answer is `no such object' while the
+	 * store is open and `store closed' after it is not.
+	 */
+	open = 0;
+	if(c->store != nil){
+		if(objstat(c->store, (uchar*)"shoal.auxprobe", 14, &oi) == 0)
+			open = 1;
+		else{
+			rerrstr(err, sizeof err);
+			open = strstr(err, "store closed") == nil;
+		}
+	}
 	lock(&c->auxlk);
 	c->nauxclose++;
+	if(open)
+		c->nauxopen++;
 	unlock(&c->auxlk);
 }
 
@@ -414,6 +435,18 @@ srvauxcount(Srvctx *c, uvlong *flushed, uvlong *closed, uvlong *freed)
 	if(freed != nil)
 		*freed = c->nauxfree;
 	unlock(&c->auxlk);
+}
+
+/* how many close hooks found the engine still there; all of them */
+uvlong
+srvauxopen(Srvctx *c)
+{
+	uvlong n;
+
+	lock(&c->auxlk);
+	n = c->nauxopen;
+	unlock(&c->auxlk);
+	return n;
 }
 
 /* how many of those flush hooks ran late; the answer is always zero */

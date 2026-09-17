@@ -251,8 +251,11 @@ void	srvhook(Srvctx*, char *name, uvlong n);
  * own.  srvauxcount answers how many times each has run, and takes nil
  * for a count the caller does not want; srvauxlate answers how many of
  * the flush hooks ran after their request had already responded, which
- * is what step 7 running too late would look like.
+ * is what step 7 running too late would look like.  srvauxopen
+ * answers how many of the close hooks found the engine still open,
+ * which every one of them must.
  */
 void	srvauxpoint(Srvctx*, int on);
 void	srvauxcount(Srvctx*, uvlong *flushed, uvlong *closed, uvlong *freed);
 uvlong	srvauxlate(Srvctx*);
+uvlong	srvauxopen(Srvctx*);

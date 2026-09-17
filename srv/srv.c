@@ -363,10 +363,24 @@ jobwait(Srvctx *c)
  * because such a call blocks on the state lock holding nothing that
  * keeps the Store alive.
  *
- * The fids outlive this.  lib9p frees the fid pool after Srv.end, so
- * srvdestroyfid runs with the store already closed — which is exactly
- * what §9 permits an Objsnap taken before the close, and is how the
- * /obj directory fids of the enumeration surface will end their lives.
+ * The fids outlive this, but what they are holding may not: a fid open
+ * when the connection dropped can be holding a stage, and §9 allows
+ * nothing but the Objsnap calls once the store has closed.  So every
+ * live fid's auxclose runs here — after the two waits, because a hook
+ * may call the engine, and before the store closes, because that is
+ * the whole point of it.  It runs before `closed' is set for the same
+ * reason: that flag is what tells the hooks the engine has gone.
+ *
+ * It cannot deadlock against a clunk: srvfidsclose sweeps with the
+ * registry lock held and a hook may call the engine but never the
+ * registry (dat.h), and by here the service loop has ended and the
+ * drain has finished, so nothing else is walking or clunking a fid.
+ *
+ * lib9p then frees the fid pool, after Srv.end, so srvdestroyfid runs
+ * with the store already closed: auxclose is spent by then and
+ * auxfree is what runs — which is exactly what §9 permits an Objsnap
+ * taken before the close, and is how the /obj directory fids of the
+ * enumeration surface will end their lives.
  */
 void
 srvshutdown(Srvctx *c)
@@ -376,9 +390,10 @@ srvshutdown(Srvctx *c)
 	lock(&c->joblk);
 	c->stopping = 1;
 	unlock(&c->joblk);
-	c->closed = 1;
 	srvqdrain(c);
 	jobwait(c);
+	srvfidsclose(c);
+	c->closed = 1;
 	srvqfree(c);
 	if(c->store != nil){
 		storeclose(c->store);
