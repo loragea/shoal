@@ -61,7 +61,9 @@ unhex(uchar *out, char *s, int n)
  * store.md §7: in the server every proc is a proccreate, the Reqqueue
  * procs included, and the engine takes its spawn callback rather than
  * making procs itself so that the same engine runs under a plain-libc
- * T1 program.
+ * T1 program.  This is the engine's half; the queue procs are lib9p's
+ * and take the program's mainstacksize instead, which is why srv.h
+ * makes setting that the program's job.
  */
 static int
 srvspawn(void (*fn)(void*), void *a)

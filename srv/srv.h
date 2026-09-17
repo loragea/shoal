@@ -58,11 +58,16 @@ enum
 	Nqueuemax	= 4096,
 
 	/*
-	 * mainstacksize for a program that runs this service: every proc
-	 * in it, the Reqqueue procs included, is a proccreate (store.md
-	 * §7), and a queue proc runs engine code that builds a record on
-	 * its stack.  A program sets the global itself; this is the value
-	 * cmd/shoalsrv and the T1 server tests use.
+	 * The stack every proc of this service gets, and the value a
+	 * program linking this library MUST set `mainstacksize' to before
+	 * it makes a Srvctx.  That is not a convention: lib9p creates the
+	 * Reqqueue procs itself, with the program's mainstacksize
+	 * (9pqueue(2), /sys/src/lib9p/queue.c), so this library cannot
+	 * size them and a program that leaves the default in place gets
+	 * queue procs too small for the engine code they run — a queue
+	 * proc composes a blksz block and builds a record on its stack
+	 * (store.md §7).  The procs this library does create, the
+	 * engine's among them, take this size through srvspawn.
 	 */
 	Srvstack	= 256*1024,
 };
