@@ -5164,9 +5164,13 @@ name a half that is not built; each says which.
     the start-up adoption — rather than against the monotonic clock,
     so the lease half can never elapse and `fence=` in `/status`
     never reads `lease`. F4, the operator fence of `fence on|off`, is
-    live and is what the fenced-verb gate and the object-open gate
+    live and is what the fenced-verb gate and the object rows' gate
     are tested against. A refresh loop restores F1 by passing the
-    real clock at that one call site.
+    real clock at that one call site. F3 is not inert in the same
+    way: it asks this instance's own record in that static map, so an
+    instance started under a map that says `up=no` or `status=out`
+    for itself refuses `role=client` object I/O with `down` for as
+    long as it runs (§14(24)).
 
 20. **The msize floor is enforced at `Tattach`, not at `Tversion`.**
     layer-a §5.5 sizes the forwarded-write payload off the negotiated
@@ -5243,6 +5247,42 @@ name a half that is not built; each says which.
       non-admin fid can hold `/ctl` open and write to it; §2.1's
       grant of `/ctl` to `role=admin` is that same gate said the
       other way round, since every row of §2.5's table is `admin`.
+    - `/advert` is `role=repl` alone, read-only, walk included. §2.1
+      grants it to `role=repl` and says nothing about the other two:
+      it is the bulk version advertisement peers reconcile from
+      (§7.2), and what an operator wants of it is in `/dirty` and
+      `/stale`, which are admin-only.
+    - `/obj/<oid>` and `/meta/<oid>` may be walked and opened for
+      reading by every role, and opened for writing — `/obj/<oid>`
+      alone, since §2.2 makes `/meta` read-only — by `role=client`
+      and `role=admin`.
+
+    A matrix by role and file cannot state §2.1's operator rule,
+    which is about the **name**: `role=admin` may create and write
+    reserved `shoal.` ids and no others. Each row therefore carries a
+    gate, run right after the role gate on open, create, remove and
+    wstat, and the gate of `/obj`, `/obj/<oid>` and `/meta/<oid>`
+    answers three rules in this order:
+
+    1. §2.1's operator rule: a `role=admin` create, write, remove or
+       wstat of an id that is not a reserved one is `permission
+       denied`. It is first because it reads the fid and the name
+       alone, and neither changes while the fid lives, so no later
+       state can make an operation §2.1 forbids permissible.
+    2. §6.4 F3: `role=client` I/O on an instance whose own map record
+       says `up=no` or `status=out` is `down`. F3 is **live** here,
+       read off the static map (§14(18)), so it is a standing state
+       of the instance rather than one that moves under an open fid;
+       `up=heal` is not in F3's list, and the attach is not gated,
+       since §2.1 names no such refusal for it.
+    3. §6.4 F1 and F4's fence: `fenced`, with the sole exemption §2.1
+       and F1 both name — a `role=admin` **read** of a reserved
+       `shoal.` id, which is what makes §8.6's monitor rebuild
+       executable. §2.1 grants admin *writes* of reserved ids only
+       while unfenced, so the exemption is the read alone.
+
+    A `role=client` create of a reserved id is §1.1's `reserved
+    name`; that one belongs to the create body, which is not built.
 
 25. **An attach specifier missing a required attribute answers `bad
     aname`.** §2.1 makes `epoch` REQUIRED for `role=client` and
@@ -5302,12 +5342,16 @@ name a half that is not built; each says which.
     intended. `store closed`, `store condemned: …`, `i/o error`,
     `stage expired` and the `Eobj:` family are that case. A file or a
     ctl verb whose content is not built answers the single local
-    string `shoalsrv: not built`, **after** its role and fence gates,
-    so the gates are complete and testable before the content is;
-    `/obj` and `/meta` directory reads, `/repl`, `/rpc`, `/advert`,
-    `/dirty`, `/stale`, `/tombs`, `/lost`, `/jobs`, the object rows'
-    open, read, write, create, remove and wstat, and every ctl verb
-    but `fence` and `verify` answer it today.
+    string `shoalsrv: not built`, **after** its role gate, its row's
+    gate and the fence, so the gates are complete and testable before
+    the content is; `/obj` and `/meta` directory reads, `/repl`,
+    `/rpc`, `/advert`, `/dirty`, `/stale`, `/tombs`, `/lost`,
+    `/jobs`, the object rows' open, read, write, create, remove and
+    wstat, and every ctl verb but `fence` and `verify` answer it
+    today. A caller sees it only where those gates pass: a
+    `role=admin` create or write of an id that is not reserved never
+    reaches it, because §2.1 makes that `permission denied`
+    (§14(24)), and neither does anything F3 or the fence refuses.
 
 ## 15. Alternatives considered
 
