@@ -1323,6 +1323,70 @@ Out:
 }
 
 /*
+ * store.md §7's other unwind: a note aborts a system call whether or
+ * not a Tflush sent it, so a handler can be told `interrupted' by the
+ * device with its queue's flush flag clear.  §7 puts both causes
+ * through the whole of step 7, and the wire keeps them apart — the
+ * flush answers `interrupted', the device answers under this server's
+ * own prefix.  The store is not condemned by one (§0), so the next
+ * verify of the same object succeeds.
+ */
+static void
+tdevintr(void)
+{
+	char *m;
+	uchar data[4096];
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall r;
+	char *w[1];
+	uvlong n7, np, nd;
+	int i;
+
+	clstage = "devintr";
+	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4)) == nil)
+		return;
+	srvauxpoint(ctx, 1);
+	for(i = 0; i < sizeof data; i++)
+		data[i] = (uchar)(0x31 + (i & 0x3f));
+	mkobj(srvstore(ctx), "alpha", data, sizeof data, 1);
+
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach)
+		fail("attach: %s", errof(&r));
+	w[0] = "ctl";
+	if(clopenpath(&cl, Froot, Fctl, 1, w, OWRITE, &r) != Ropen){
+		fail("open /ctl: %s", errof(&r));
+		goto Out;
+	}
+	simfault(d, Sfintr, 1);
+	clwrite(&cl, Fctl, 0, "verify alpha", &r);
+	eqs("a device interrupt with no flush pending", errof(&r),
+		"shoalsrv: interrupted");
+	srvauxcount(ctx, &n7, nil, nil);
+	eqv("a device interrupt unwinds into step 7", n7, 1);
+	eqv("step 7 ran before the reply", srvauxlate(ctx), 0);
+	sleep(100);			/* the Req is freed after its reply */
+	srvcount(ctx, &np, &nd);
+	eqv("the interrupted request is counted complete", np - nd, 0);
+
+	clwrite(&cl, Fctl, 0, "verify alpha", &r);
+	checks++;
+	if(r.type != Rwrite)
+		fail("verify after a device interrupt: %s", errof(&r));
+	srvauxcount(ctx, &n7, nil, nil);
+	eqv("a request that was not interrupted runs no step 7", n7, 1);
+Out:
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * The object rows' gate, layer-a §2.1 and §6.4: the operator rule and
  * its reserved-id exemption, and the fence with the one read §2.1 lets
  * through it.  Every answer below that is not a refusal is the local
@@ -1911,6 +1975,7 @@ threadmain(int argc, char **argv)
 	tstatus();
 	tctl();
 	tverify();
+	tdevintr();
 	tobjgate();
 	tdown("in", "no");
 	tdown("out", "yes");

@@ -13,6 +13,8 @@ extern char Edown[];
 extern char Enoobj[];
 extern char Ecsum[];
 extern char Einterrupted[];
+extern char Edevintr[];
+int	srvintr(char*);
 
 /* text.c */
 void	textread(Req*, Text*);

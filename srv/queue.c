@@ -284,6 +284,16 @@ srvstep7(Req *r)
  * one condition however far the request had got.  The reply may
  * precede the Rflush; 9P has the client discard the reply to a request
  * it flushed (§5.4.1, store.md §14(14)).
+ *
+ * store.md §7 gives a device `interrupted' the same unwind: "either
+ * one unwinds into the whole of step 7".  A note aborts a system call
+ * whether or not a Tflush sent it, so a handler can be told
+ * `interrupted' by the device with this queue's flush flag still
+ * clear, and a step 7 skipped there would leave a stage behind and an
+ * object whose currency check was never re-run.  The two causes stay
+ * distinguishable on the wire — `interrupted' for the flush, this
+ * server's own `shoalsrv: interrupted' for the other — because only
+ * the flag says a request was flushed (err.c).
  */
 void
 srvqdone(Req *r, char *err)
@@ -292,9 +302,9 @@ srvqdone(Req *r, char *err)
 	Qreq *qr;
 
 	qr = r->aux;
-	if(qr != nil && qr->q->flush != 0){
+	if(qr != nil && (qr->q->flush != 0 || srvintr(err))){
 		srvstep7(r);
-		respond(r, Einterrupted);
+		respond(r, qr->q->flush != 0 ? Einterrupted : Edevintr);
 		return;
 	}
 	if(err != nil)

@@ -57,16 +57,44 @@ char Ecsum[]		= "checksum mismatch";
 
 /*
  * Not a §2.6 string: what lib9p's reqqueueflush answers a request it
- * removed from a queue, and what a handler answers one it found
- * flushed (layer-a §5.4.1, store.md §14(14)).  It is also what the
- * device answers a system call a note interrupted (store.md §0), and
- * the two must not be confused: the queue's flush flag is what says a
- * request was flushed, never the text of an error.  srvqcheck is the
- * only thing that reads the flag and the only thing that produces this
- * string; a device `interrupted' arriving anywhere else is an ordinary
- * internal error and is marked like one.
+ * removed from a queue, and what srvqdone answers one it found flushed
+ * (layer-a §5.4.1, store.md §14(14)).  It is also what the device
+ * answers a system call a note interrupted (store.md §0), and the two
+ * causes must stay apart on the wire even though §7 unwinds both into
+ * the whole of step 7: the queue's flush flag is what says a request
+ * was flushed, never the text of an error, so a device `interrupted'
+ * with no flush pending is answered under this server's own prefix
+ * like any other error it did not anticipate.
+ *
+ * srvqdone is what reads the flag, what classifies the error and what
+ * produces both strings; srvqcheck only reports the flag to a handler
+ * that wants to stop early.
  */
 char Einterrupted[]	= "interrupted";
+char Edevintr[]		= "shoalsrv: interrupted";
+
+/*
+ * Is e the device's interrupted class (store.md §0)?  The rule is
+ * deverr's, because this is the same condition arriving one layer up:
+ * only the last `: '-separated segment is matched, since a device call
+ * reports which syscall failed on which device and this server marks
+ * what it passes on, so the kernel's own word is what follows the last
+ * wrap.  `shoalsrv: interrupted' and a bare `interrupted' are both
+ * that class; `no such object' is not.
+ */
+int
+srvintr(char *e)
+{
+	char *p;
+
+	if(e == nil)
+		return 0;
+	if((p = strrchr(e, ':')) != nil && p[1] == ' ')
+		p += 2;
+	else
+		p = e;
+	return strcmp(p, Einterrupted) == 0;
+}
 
 /* layer-a §2.6, exactly.  The set is prefix-free; this is the check. */
 static char *e26[] =
