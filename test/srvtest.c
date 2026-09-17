@@ -1053,6 +1053,57 @@ Out:
 	free(m);
 }
 
+/*
+ * A row that renders at open AND takes its own reads.  dat.h gives
+ * the read cell precedence: such a row gets every read, and may serve
+ * the rendered bytes itself with textread; only a row with a render
+ * cell and no read cell takes the automatic text path.  /ctl is both
+ * here, through the cell point, and its own render is empty -- so the
+ * bytes a read answers say which of the two served it.
+ */
+static void
+treadcell(void)
+{
+	char buf[256], *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall r;
+	char *w[1];
+	long n;
+
+	clstage = "readcell";
+	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4)) == nil)
+		return;
+	srvcellpoint(ctx, 1);
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
+		fail("attach: %s", errof(&r));
+		goto Out;
+	}
+	w[0] = "ctl";
+	if(clopenpath(&cl, Froot, Fctl, 1, w, OREAD, &r) != Ropen)
+		fail("open /ctl for reading: %s", errof(&r));
+	else{
+		n = clslurp(&cl, Fctl, buf, sizeof buf);
+		istrue("a row with both cells serves its reads from the read one",
+			n > 0);
+		if(n > 0)
+			eqs("... and not from the text its open rendered", buf,
+				"cell\n");
+		clclunk(&cl, Fctl, &r);
+	}
+	clclunk(&cl, Froot, &r);
+Out:
+	srvcellpoint(ctx, 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
 /* §2.5's ctl framework: the four gates over every verb row */
 static void
 tctl(void)
@@ -2578,6 +2629,7 @@ threadmain(int argc, char **argv)
 	tmodes();
 	tobjects();
 	tstatus();
+	treadcell();
 	tctl();
 	tverify();
 	tdevintr();
