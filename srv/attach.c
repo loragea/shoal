@@ -31,7 +31,33 @@
  * on.  store.md §14(25) records that reading.  peer= on a role that
  * does not need it parses and is ignored, because the grammar permits
  * it on any attr list.
+ *
+ * A run of digits too long to be a u64 is one of those values: the
+ * grammar admits u64 and nothing else, so it is `bad aname' and not an
+ * epoch compare against a saturated value, which would answer `future
+ * epoch' for a specifier that never named an epoch at all.
  */
+static int
+u64(char *s, uvlong *vp)
+{
+	uvlong v;
+	int d;
+
+	if(*s == 0)
+		return -1;
+	v = 0;
+	for(; *s != 0; s++){
+		if(*s < '0' || *s > '9')
+			return -1;
+		d = *s - '0';
+		if(v > (~(uvlong)0 - d)/10)
+			return -1;
+		v = v*10 + d;
+	}
+	*vp = v;
+	return 0;
+}
+
 int
 srvaname(Sfid *f, char *aname)
 {
@@ -60,9 +86,8 @@ srvaname(Sfid *f, char *aname)
 			if(seen & 1)
 				return -1;
 			seen |= 1;
-			if(*v == 0 || strspn(v, "0123456789") != strlen(v))
+			if(u64(v, &f->epoch) < 0)
 				return -1;
-			f->epoch = strtoull(v, nil, 10);
 			f->hasepoch = 1;
 		}else if(strcmp(p, "role") == 0){
 			if(seen & 2)

@@ -344,10 +344,26 @@ tattach(void)
 		{"epoch=",			"bad aname"},
 		{"epoch=x",			"bad aname"},
 		{"epoch=7,epoch=7",		"bad aname"},
+		{"role=admin,role=admin",	"bad aname"},
+		{"role=repl,peer=n1.1,peer=n1.1", "bad aname"},
+		{"role=",			"bad aname"},
+		{"peer=,epoch=7",		"bad aname"},
 		{"role=bogus,epoch=7",		"bad aname"},
 		{"frob=1,epoch=7",		"bad aname"},
 		{"epoch7",			"bad aname"},
 		{"role=repl",			"bad aname"},
+		/* an iid is at most Iidlen bytes; this one is 80 */
+		{"role=repl,peer=nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn"
+		 "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn.0",	"bad aname"},
+		/*
+		 * §2.1's epoch is a u64.  A run of digits above that names no
+		 * epoch — it is an unparseable specifier, not an epoch in the
+		 * future — while the largest u64 there is parses and compares.
+		 */
+		{"epoch=18446744073709551616",	"bad aname"},
+		{"epoch=99999999999999999999",	"bad aname"},
+		{"epoch=184467440737095516150",	"bad aname"},
+		{"epoch=18446744073709551615",	"future epoch"},
 		{"epoch=6",			"stale epoch"},
 		{"epoch=8",			"future epoch"},
 		{"role=repl,peer=n2.0",		"permission denied"},
