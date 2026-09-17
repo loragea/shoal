@@ -241,7 +241,18 @@ srvctlwrite(Req *r)
 	}
 	if(ct->qfn != nil){
 		/*
-		 * A queued verb names its object in argv[0].  layer-a §2.6
+		 * A queued verb names its object in argv[0], so its row must
+		 * ask for at least one argument; a row that does not is
+		 * refused here rather than read past the end of the line
+		 * (dat.h's Sctl).
+		 */
+		if(ct->nargmin < 1){
+			free(cb);
+			respond(r, Ebadctl);
+			return;
+		}
+		/*
+		 * layer-a §2.6
 		 * makes `bad object name' the answer to "any operation
 		 * naming an oid that violates §1.1"; §2.5's rows answer bad
 		 * arguments `bad ctl'.  The more specific string wins here

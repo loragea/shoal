@@ -54,67 +54,28 @@ enum
 };
 
 /*
- * What a row's gate is asked about.  The request carries the rest: the
- * mode of an open or a create is r->ifcall.mode, and the name a create
- * names is r->ifcall.name.
- */
-enum
-{
-	Gopen	= 0,
-	Gcreate,
-	Gremove,
-	Gwstat,
-};
-
-/*
  * One file of §2.2.  walk/rd/wr are §2.1's role matrix: which roles
  * may walk to this file, open it for reading, and open it for writing.
  * §2.1 states the matrix by role rather than by file, and is silent
  * about several cells; store.md §14(24) records what those cells are
  * here and why.
  *
- * The handler cells are what the rest of the surface fills in.  Each
- * row of the table names one field per line, so a field added to this
- * struct touches no existing row and two hands filling different cells
- * of one row do not meet in the same line.
+ * The three handler cells are what the rest of the surface fills in:
  *
- *	gate	the row's own rules, run right after the role gate on
- *		open, create, remove and wstat.  It answers nil, or the
- *		error string the operation is refused with.  What the
- *		object rows' gate asks, and in what order, is beside it
- *		in tree.c and in store.md §14(24).
  *	render	the file is a render-at-open text file (§2.2's MUST):
  *		open composes its bytes once into the fid's Text and
  *		every read is served from them.  It answers nil, or an
  *		error string.
  *	read	a read that is not served from a snapshot — a channel
- *		(/repl, /rpc) or a directory read.  It responds.  A row
- *		with a read cell gets every read, whether or not the fid
- *		also holds a rendered Text, and may serve that Text
- *		itself with textread(r, f->text); only a row with render
- *		and no read takes the automatic text path.
+ *		(/repl, /rpc) or a directory read.  It responds.
  *	write	a write.  It responds.
  *	open	a file whose open takes checks of its own (the object
  *		rows' mode rules, layer-a §2.4).  It responds.
- *	create	a Tcreate in this directory.  It responds.
- *	remove	a Tremove of this file.  It responds.
- *	wstat	a Twstat of this file.  It responds.
  *
- * A row with every handler cell nil is a file whose content is not
- * built: after the role gate and the row's gate, the operation answers
- * the local Enotbuilt.  That is deliberate, so the gate matrix is
- * complete and testable before the content is.
- *
- * Which cells belong with which body of work.  The /obj directory
- * row's open and read cells — and the aux a fid of that row carries
- * while it is a directory fid, which is that read's snapshot — belong
- * with the enumeration of that directory.  That row's create cell, and
- * the /obj/<oid> and /meta/<oid> rows entire, belong with object I/O.
- * The two meet in one place: a Tcreate turns the directory fid it is
- * issued on into a fid for the created object, so the create cell is
- * what gives the directory fid's aux back — auxclose, then auxfree —
- * before it sets the fid's file, oid and qid, since one fid cannot
- * hold an enumeration's snapshot and an object's state at once.
+ * A row with render, read, write and open all nil is a file whose
+ * content is not built: after the role gate, its open answers the
+ * local Enotbuilt.  That is deliberate, so the gate matrix is complete
+ * and testable before the content is.
  */
 struct Sfile
 {
@@ -124,14 +85,10 @@ struct Sfile
 	int	walk;
 	int	rd;
 	int	wr;
-	char*	(*gate)(Srvctx*, Sfid*, Req*, int op);
 	char*	(*render)(Srvctx*, Sfid*, Text*);
 	void	(*read)(Req*);
 	void	(*write)(Req*);
 	void	(*open)(Req*);
-	void	(*create)(Req*);
-	void	(*remove)(Req*);
-	void	(*wstat)(Req*);
 };
 
 extern Sfile srvfiles[Nfile];
@@ -142,24 +99,10 @@ extern Sfile srvfiles[Nfile];
  * fid derived from that attach (layer-a §2.1: the role and the epoch
  * travel in aname and a walk clones them).
  *
- * aux is the rest of the surface's — an /obj directory fid will hold
- * its Objsnap there and a /obj/<oid> fid its staged write — and the
- * two hooks beside it are when it is given back.  Nothing in this
- * file's own handlers touches aux.
- *
- *	auxclose  runs before the store closes, and at clunk; it may
- *		  call the engine.  A stage handle MUST be discarded
- *		  here: store.md §9 allows only objsnapent, objsnapcount
- *		  and objsnapclose after the store has closed.
- *	auxfree	  runs last, after the store may already have closed
- *		  (D16): it may only release memory and close an
- *		  Objsnap, which is the one thing §9 lets outlive it.
- *
- * A fid that moves — a walk of a fid onto itself that resolves — gives
- * its state back the same way before it takes the new file's, so no
- * state and no hook survives the move.  The server keeps its own
- * registry of the live fids (ctx, prev, next), because lib9p exposes
- * no way to iterate them and srvfidsclose must reach every one.
+ * aux and auxfree are the rest of the surface's: an /obj directory fid
+ * will hold its Objsnap there and a /obj/<oid> fid its staged write,
+ * and destroyfid calls auxfree after the store has closed, which is
+ * what D16 lets an Objsnap outlive.  Nothing in this file touches aux.
  */
 struct Sfid
 {
@@ -174,12 +117,7 @@ struct Sfid
 	uvlong	qidvers;
 	Text	*text;		/* the render-at-open snapshot, once open */
 	void	*aux;
-	void	(*auxclose)(void*);
 	void	(*auxfree)(void*);
-	int	auxclosed;	/* auxclose has run for this state */
-	Srvctx	*ctx;		/* the registry's, and the hooks' */
-	Sfid	*prev;
-	Sfid	*next;
 };
 
 /*
@@ -254,19 +192,6 @@ struct Srvctx
 
 	Fence	fence;		/* §6.4; F1 is inert here, F4 is live */
 	QLock	fencelk;
-
-	/*
-	 * The live fids, and the T1 fid-state point over them.  Every
-	 * Sfid is on this list from the attach or walk that made it
-	 * until destroyfid; auxclose runs with fidlk held, so a hook
-	 * may reach the engine but must not reach back in here.
-	 */
-	QLock	fidlk;
-	Sfid	*fids;
-	int	fidaux;		/* srvauxpoint: fids carry a test state */
-	Lock	auxlk;		/* not fidlk: the hooks run under that one */
-	uvlong	nauxclose;
-	uvlong	nauxfree;
 
 	Reqqueue **q;
 	int	nq;
