@@ -1,0 +1,15 @@
+</$objtype/mkfile
+
+TARG=shoalsrv
+
+OFILES=\
+	main.$O\
+
+HFILES=\
+	../../lib/shoal.h\
+	../../srv/srv.h\
+
+LIB=../../srv/libshoalsrv.a$O ../../lib/libshoal.a$O
+BIN=/$objtype/bin
+
+</sys/src/cmd/mkone

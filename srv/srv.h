@@ -1,0 +1,197 @@
+/*
+ * shoalsrv: the storage instance's 9P service, docs/design/layer-a.md
+ * §2.  This is the library; cmd/shoalsrv/main.c is argument parsing
+ * and start-up over it, and test/srvtest.c drives the same calls over
+ * a pipe.  The 9P surface is here rather than in the command because
+ * a T1 test links libraries and execs nothing (AGENTS.md), and the
+ * whole of §2 — attach, the tree, the queue pool, Tflush, the ctl
+ * framework — is what T1 has to drive.
+ *
+ * Include after <u.h>, <libc.h>, <libsec.h>, <fcall.h>, <thread.h>,
+ * <9p.h> and "../lib/shoal.h".
+ *
+ * libshoal itself knows nothing of lib9p or libthread and must not
+ * learn: the engine takes a spawn callback and uses QLock, Rendez and
+ * Lock alone (docs/design/store.md §7), so the same engine runs under
+ * a plain-libc T1 program and under this libthread server.  The
+ * dependency goes one way, from here to there.
+ *
+ * srv/dat.h and srv/fns.h are private to srv/.  What a builder of the
+ * rest of the surface needs is here and in dat.h's tables.
+ */
+
+typedef struct Srvctx Srvctx;
+typedef struct Srvcfg Srvcfg;
+typedef struct Text Text;
+
+/*
+ * Srvctx is opaque outside srv/: its definition is in srv/dat.h.
+ * 2c(1)'s type signatures are computed from the C signof operator, so
+ * a function taking a Srvctx* signs differently in a file that has the
+ * definition and one that has not; the pragma is what that mechanism
+ * provides for exactly this case, as lib/shoal.h does for Store.
+ */
+#pragma incomplete Srvctx
+
+enum
+{
+	/* layer-a §2.1's roles, and the access matrix's bit per role */
+	Rclient		= 0,
+	Rrepl,
+	Radmin,
+	Nrole,
+
+	Aclient		= 1<<Rclient,
+	Arepl		= 1<<Rrepl,
+	Aadmin		= 1<<Radmin,
+	Aall		= Aclient|Arepl|Aadmin,
+
+	/*
+	 * The msize floor.  lib9p answers Tversion itself and offers no
+	 * hook (9p(2): Srv has none), so the only place a server can see
+	 * the negotiated size is the first request that carries a Srv*,
+	 * which is Tattach.  store.md §14(18) records that.
+	 */
+	Msizemin	= 8192+IOHDRSZ,
+
+	Nqueuedflt	= 64,		/* store.md §7's default pool */
+	Nqueuemax	= 4096,
+
+	/*
+	 * mainstacksize for a program that runs this service: every proc
+	 * in it, the Reqqueue procs included, is a proccreate (store.md
+	 * §7), and a queue proc runs engine code that builds a record on
+	 * its stack.  A program sets the global itself; this is the value
+	 * cmd/shoalsrv and the T1 server tests use.
+	 */
+	Srvstack	= 256*1024,
+};
+
+/*
+ * A render-at-open snapshot.  layer-a §2.2 makes snapshot-at-open a
+ * MUST for the small attr=value files: the bytes are composed once,
+ * when the fid is opened, and every Tread on that fid is served out
+ * of them, so a concurrent mutation cannot tear a read.  /status and
+ * /map are rendered this way; so are the status files that are not
+ * built yet, which is why the helper is public.
+ */
+struct Text
+{
+	char	*p;
+	long	n;
+	long	max;
+	int	err;		/* an allocation failed: the text is short */
+};
+
+Text*	textnew(void);
+void	textfree(Text*);
+int	textprint(Text*, char*, ...);
+int	textwrite(Text*, void*, long);
+#pragma	varargck	argpos	textprint	2
+
+/*
+ * The error API, docs/design/store.md §3.7.  Its mapping rule is
+ * normative: a condition layer-a §2.6 names MUST be answered with
+ * §2.6's prefix and nothing else, and an internal-invariant or device
+ * error MUST NEVER begin with one.  Every handler turns an engine
+ * failure into an Rerror through these and through nothing else.
+ *
+ *	srv26		the §2.6 prefix a string carries, or nil.  A
+ *			prefix matches when it is the whole string or is
+ *			followed by ": " — §2.6's own detail form, which
+ *			`not primary: n5.0' and D20's `disk full: <n>
+ *			object snapshots open, objsnapmax <max>' use.
+ *	srverrs		what goes on the wire for one error string: a
+ *			§2.6 string verbatim, anything else under this
+ *			server's own `shoalsrv: ' prefix.  buf is
+ *			written only in the second case.
+ *	srverr		srverrs over the current %r.
+ *	srvrerror	respond(r, srverr(...)).
+ *
+ * Enotbuilt is the local refusal a file or a ctl verb whose body is
+ * not built answers after its gates.  It is deliberately not a §2.6
+ * condition: nothing layer-a names has happened.
+ */
+extern char Enotbuilt[];
+
+char*	srv26(char*);
+char*	srverrs(char *buf, int nbuf, char *e);
+char*	srverr(char *buf, int nbuf);
+void	srvrerror(Req*);
+
+struct Srvcfg
+{
+	Dev	*dev;		/* the store's device, already open */
+	char	*maptext;	/* the static cluster map's bytes (-m) */
+	long	maplen;
+	int	nqueue;		/* -q; 0 takes Nqueuedflt */
+	int	noflush;	/* -w, store.md §3.2, reported in /status */
+	Storecfg store;		/* the engine's; spawn is filled in here */
+};
+
+/*
+ * srvnew is the whole of start-up that is not argument parsing: it
+ * reads the superblock with superselect (which writes nothing), parses
+ * the map, settles this instance's identity from the map record whose
+ * uuid= is the disk's (layer-a §3.4), refuses a map whose geometry is
+ * not the disk's (store.md §14(8)), refuses one this instance may not
+ * adopt (layer-a §6.3), opens the store, makes the adopted epoch and
+ * the pinned monid durable before anything is served, and starts the
+ * queue pool.  It answers nil with an error string for every one of
+ * those refusals.
+ *
+ * srv9p is the lib9p Srv: a caller that posts the service hands it to
+ * threadpostmountsrv, and a caller that speaks 9P over a pipe sets
+ * infd/outfd and calls srvrun.  srvrun returns when the connection
+ * closes, by which time the shutdown sequence below has run.
+ *
+ * srvfree releases what is left after the loop has ended.  It does NOT
+ * close the store — the shutdown sequence did — and it does not close
+ * the device, which stays the caller's.
+ *
+ * A Srvctx serves ONE service loop.  The loop ending is the shutdown's
+ * trigger and the shutdown closes the store, so a second srvrun over
+ * the same context would serve a closed one; a caller that wants
+ * another connection makes another context.  (lib9p's own multiplexing
+ * is inside one loop and is unaffected: threadpostmountsrv serves
+ * every client of the posted service over the one channel.)
+ */
+Srvctx*	srvnew(Srvcfg*);
+Srv*	srv9p(Srvctx*);
+void	srvrun(Srvctx*, int infd, int outfd);
+void	srvpost(Srvctx*, char *name);
+void	srvfree(Srvctx*);
+
+/*
+ * D16's shutdown, in the order §9's close contract fixes: stop
+ * accepting, let the requests in flight drain, stop the 9P loop, and
+ * only then close the store.  It is wired to Srv.end, so it runs when
+ * the connection closes and a caller does not call it; the trigger is
+ * the only part of it that lives in cmd/shoalsrv.
+ *
+ * After it, the one thing that may still be used is an Objsnap taken
+ * before it, through a fid that outlived the loop — which is how the
+ * /obj directory fids of the enumeration surface will survive their
+ * own store's close.  Per-fid state is freed by Srv.destroyfid, which
+ * lib9p runs after Srv.end: a fid's aux is released there, after the
+ * store has closed, which is exactly what §9 permits an Objsnap.
+ */
+void	srvshutdown(Srvctx*);
+
+/* what a caller and the tests read back */
+Store*	srvstore(Srvctx*);
+Cmap*	srvmap(Srvctx*);
+char*	srviid(Srvctx*);
+void	srvcount(Srvctx*, uvlong *pushed, uvlong *done);
+
+/*
+ * store.md §13's -X shape, for this library's own points: inert until
+ * set, present in every build.  One point today:
+ *
+ *	objhold	n != 0 holds every queued object request at its check
+ *		point, so a test can have a request that is running and
+ *		one that is still queued at a known moment.  A held
+ *		request leaves the hold when the point is cleared or
+ *		when its queue's flush flag is set, whichever is first.
+ */
+void	srvhook(Srvctx*, char *name, uvlong n);

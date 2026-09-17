@@ -48,23 +48,24 @@ naming the release those line numbers were read from.
 shoal is written in the Plan 9 C dialect and built on 9front with
 `6c`/`6l` under `mk` (decisions.md D12). From the repo root:
 
-- `mk` — build `lib/libshoal.a$O`, then every command in `cmd/`,
-  then the T1 test programs in `test/`.
+- `mk` — build `lib/libshoal.a$O`, then `srv/libshoalsrv.a$O`, then
+  every command in `cmd/`, then the T1 test programs in `test/`.
 - `mk test` — build everything, then run T1 (below).
 - `mk clean`, `mk nuke` — remove build products in every
   subdirectory.
 
 | Path | Holds |
 |---|---|
-| `mkfile` | Root. Iterates `lib cmd test` for `all`, `clean` and `nuke`, and runs T1 for `test`. |
-| `lib/` | `libshoal.a$O`: code shared by servers, commands and tests. `lib/shoal.h` is its header; includers name it by relative path after `<u.h>`, `<libc.h>`, `<libsec.h>` and `<fcall.h>` — the last for the GBIT/PBIT macros every on-disk integer is packed with. `lib/store.h` is private to `lib/`: it holds the store engine's own structures, which are opaque to everything else. Built by `/sys/src/cmd/mklib`. |
+| `mkfile` | Root. Iterates `lib srv cmd test` for `all`, `clean` and `nuke`, and runs T1 for `test`. |
+| `lib/` | `libshoal.a$O`: code shared by servers, commands and tests. `lib/shoal.h` is its header; includers name it by relative path after `<u.h>`, `<libc.h>`, `<libsec.h>` and `<fcall.h>` — the last for the GBIT/PBIT macros every on-disk integer is packed with. `lib/store.h` is private to `lib/`: it holds the store engine's own structures, which are opaque to everything else. Built by `/sys/src/cmd/mklib`. libshoal depends on neither lib9p nor libthread and must not come to: the same engine runs under a plain-libc T1 program and under the libthread 9P server (`docs/design/store.md` §7). |
+| `srv/` | `libshoalsrv.a$O`: the storage instance's 9P service (`docs/design/layer-a.md` §2) — attach, the file tree, the `Reqqueue` pool, `Tflush`, the ctl framework, start-up and shutdown. `srv/srv.h` is its header, included after `<thread.h>`, `<9p.h>` and `lib/shoal.h`; `srv/dat.h` and `srv/fns.h` are private to `srv/`. It is a library for the same reason `lib/` is: a T1 test links libraries and execs nothing, and §2 is what T1 has to drive. Built by `/sys/src/cmd/mklib`. |
 | `cmd/` | One directory per command, each built by `/sys/src/cmd/mkone` — so it produces `$O.out` and installs as `$TARG` in `/$objtype/bin`. `cmd/mkfile` lists them in `DIRS`. |
 | `test/` | T1 test programs. |
 
 Every mkfile starts with `</$objtype/mkfile`. A new command is a
 directory under `cmd/` with an `mkone` mkfile plus its name in
 `cmd/mkfile`'s `DIRS`; a new library source file is a name in
-`lib/mkfile`'s `OFILES`.
+`lib/mkfile`'s or `srv/mkfile`'s `OFILES`.
 
 ## Test tiers
 

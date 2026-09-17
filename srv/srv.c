@@ -1,0 +1,324 @@
+#include <u.h>
+#include <libc.h>
+#include <libsec.h>
+#include <fcall.h>
+#include <thread.h>
+#include <9p.h>
+#include "../lib/shoal.h"
+#include "srv.h"
+#include "dat.h"
+#include "fns.h"
+
+/*
+ * Start-up, the Srv glue and D16's shutdown.
+ *
+ * Start-up is here rather than in cmd/shoalsrv because every one of
+ * its refusals is a rule from the design — the geometry check of
+ * store.md §14(8), layer-a §3.4's identity, §6.3's adoption decision
+ * and its two durable values — and a T1 program must be able to drive
+ * them.  What is left in the command is argument parsing, opening the
+ * device, reading the map file, posting the service and the shutdown's
+ * trigger.
+ */
+
+static void
+hexof(char *out, uchar *p, int n)
+{
+	static char hex[] = "0123456789abcdef";
+	int i;
+
+	for(i = 0; i < n; i++){
+		out[2*i] = hex[p[i]>>4];
+		out[2*i+1] = hex[p[i]&15];
+	}
+	out[2*n] = 0;
+}
+
+static int
+unhex(uchar *out, char *s, int n)
+{
+	int i, c, v;
+
+	for(i = 0; i < 2*n; i++){
+		c = s[i];
+		if(c >= '0' && c <= '9')
+			v = c - '0';
+		else if(c >= 'a' && c <= 'f')
+			v = c - 'a' + 10;
+		else if(c >= 'A' && c <= 'F')
+			v = c - 'A' + 10;
+		else
+			return -1;
+		if((i & 1) == 0)
+			out[i/2] = v<<4;
+		else
+			out[i/2] |= v;
+	}
+	return s[2*n] == 0 ? 0 : -1;
+}
+
+/*
+ * store.md §7: in the server every proc is a proccreate, the Reqqueue
+ * procs included, and the engine takes its spawn callback rather than
+ * making procs itself so that the same engine runs under a plain-libc
+ * T1 program.
+ */
+static int
+srvspawn(void (*fn)(void*), void *a)
+{
+	if(proccreate(fn, a, Srvstack) < 0)
+		return -1;
+	return 0;
+}
+
+static void
+srvend(Srv *s)
+{
+	srvshutdown(s->aux);
+}
+
+Srvctx*
+srvnew(Srvcfg *cfg)
+{
+	char want[64];
+	Srvctx *c;
+	Sbsel sel;
+	Adopt ad;
+	Cinst *in;
+	uchar monid[16];
+	int i, fl;
+
+	if((c = mallocz(sizeof *c, 1)) == nil)
+		return nil;
+	c->cfg = *cfg;
+	c->dev = cfg->dev;
+	c->maplen = cfg->maplen;
+	if((c->maptext = malloc(c->maplen)) == nil){
+		free(c);
+		return nil;
+	}
+	memmove(c->maptext, cfg->maptext, c->maplen);
+	if((c->map = mapparse(c->maptext, c->maplen)) == nil)
+		goto Fail;
+
+	/*
+	 * The superblock, read before the store is opened: superselect
+	 * writes nothing, and the geometry and the identity it carries
+	 * are what decide whether this instance may serve this map at
+	 * all.
+	 */
+	if(superselect(c->dev, &sel) < 0)
+		goto Fail;
+	if(sel.start < 0){
+		werrstr("neither superblock copy is valid: %s; %s",
+			sel.why[0], sel.why[1]);
+		goto Fail;
+	}
+	c->sb = sel.sb[sel.start];
+
+	/*
+	 * store.md §14(8): the server MUST refuse to serve if the adopted
+	 * map's blksz, objmax or csumalg differs from what the disk was
+	 * formatted with — csumalg because a mismatch invalidates every
+	 * stored digest.
+	 */
+	if(c->map->blksz != c->sb.blksz){
+		werrstr("map blksz %lud is not the disk's %lud",
+			c->map->blksz, c->sb.blksz);
+		goto Fail;
+	}
+	if(c->map->objmax != c->sb.objmax){
+		werrstr("map objmax %llud is not the disk's %llud",
+			c->map->objmax, c->sb.objmax);
+		goto Fail;
+	}
+	snprint(want, sizeof want, "%s", csumalgname(c->sb.csumalg));
+	if(strcmp(c->map->csumalg, want) != 0){
+		werrstr("map csumalg %s is not the disk's %s",
+			c->map->csumalg, want);
+		goto Fail;
+	}
+
+	/*
+	 * layer-a §3.4: the disk carries the identity, and the map's
+	 * instance record for it is the one whose uuid= matches.  There
+	 * is no other way for an instance to learn its own iid, and the
+	 * whole of §6.4's self-state and §4.3's primaryship is asked of
+	 * that record.
+	 */
+	hexof(c->uuid, c->sb.uuid, 16);
+	c->self = nil;
+	for(i = 0; i < c->map->ninst; i++){
+		in = &c->map->inst[i];
+		if(strcmp(in->uuid, c->uuid) == 0){
+			c->self = in;
+			break;
+		}
+	}
+	if(c->self == nil){
+		werrstr("no instance record in the map carries uuid %s",
+			c->uuid);
+		goto Fail;
+	}
+	strcpy(c->iid, c->self->iid);
+	strcpy(c->monid, c->map->monid);
+
+	/*
+	 * layer-a §6.3's adoption decision, over the pair the superblock
+	 * holds (store.md §2.2).  A map this instance may not adopt is
+	 * refused at start rather than served: there is no refresh in
+	 * this wave, so there is no later map to replace it with, and an
+	 * instance that served under a map it had refused would be the
+	 * split brain the rule exists to prevent.  /status's
+	 * epochregress= and monidmismatch= therefore always read `no'
+	 * while this server is running (store.md §14(16)).
+	 */
+	memset(&ad, 0, sizeof ad);
+	ad.pinned = c->sb.monidset != 0;
+	hexof(ad.monid, c->sb.monid, 16);
+	ad.epoch = c->sb.epochhigh;
+	if((fl = mapadoptable(&ad, c->map)) != Mapok){
+		werrstr("map may not be adopted: %s%s%s",
+			(fl&Mapregress) ? adoptwhy(Mapregress) : "",
+			(fl&Mapregress) && (fl&Mapmonid) ? " " : "",
+			(fl&Mapmonid) ? adoptwhy(Mapmonid) : "");
+		goto Fail;
+	}
+
+	c->cfg.store.spawn = srvspawn;
+	c->cfg.store.noflush = cfg->noflush;
+	if((c->store = storeopen(c->dev, &c->cfg.store)) == nil)
+		goto Fail;
+
+	/*
+	 * §6.3: both facts must survive a restart, and the epoch MUST be
+	 * durable before the instance acts under it.  Nothing is served
+	 * until these have returned.
+	 */
+	if(!ad.pinned){
+		if(unhex(monid, c->map->monid, 16) < 0){
+			werrstr("map monid %s is not 32 hex digits",
+				c->map->monid);
+			goto Fail;
+		}
+		if(monidpin(c->store, monid) < 0)
+			goto Fail;
+	}
+	if(epochadopt(c->store, c->map->epoch) < 0)
+		goto Fail;
+
+	/*
+	 * §6.4's fence state.  The adoption above is this instance's one
+	 * successful refresh; F4 starts clear.
+	 */
+	c->fence.leasems = c->map->leasems;
+	fencerefresh(&c->fence, 0);
+
+	if(srvqinit(c, cfg->nqueue) < 0)
+		goto Fail;
+
+	c->srv.aux = c;
+	c->srv.attach = srvattach;
+	c->srv.walk = srvwalk;
+	c->srv.open = srvopen;
+	c->srv.read = srvread;
+	c->srv.write = srvwrite;
+	c->srv.stat = srvstat;
+	c->srv.create = srvcreate;
+	c->srv.remove = srvremove;
+	c->srv.wstat = srvwstat;
+	c->srv.flush = srvqflush;
+	c->srv.destroyfid = srvdestroyfid;
+	c->srv.destroyreq = srvdestroyreq;
+	c->srv.end = srvend;
+	return c;
+
+Fail:
+	if(c->store != nil){
+		srvqfree(c);
+		storeclose(c->store);
+		c->store = nil;
+	}
+	mapfree(c->map);
+	free(c->maptext);
+	free(c);
+	return nil;
+}
+
+Srv*
+srv9p(Srvctx *c)
+{
+	return &c->srv;
+}
+
+void
+srvrun(Srvctx *c, int infd, int outfd)
+{
+	c->srv.infd = infd;
+	c->srv.outfd = outfd;
+	threadsrv(&c->srv);
+}
+
+void
+srvpost(Srvctx *c, char *name)
+{
+	threadpostmountsrv(&c->srv, name, nil, 0);
+}
+
+/*
+ * D16's order, which store.md §9 derives from the close contract
+ * rather than from taste: stop accepting requests, let the ones in
+ * flight drain, stop the 9P loop, and only then close the store.  The
+ * loop is what stops first here — this runs from Srv.end, which lib9p
+ * calls once the connection has gone — and the drain is what makes the
+ * engine's "quiesce, then close" true: no call taking the Store* may
+ * still be in flight when storeclose runs, because such a call blocks
+ * on the state lock holding nothing that keeps the Store alive.
+ *
+ * The fids outlive this.  lib9p frees the fid pool after Srv.end, so
+ * srvdestroyfid runs with the store already closed — which is exactly
+ * what §9 permits an Objsnap taken before the close, and is how the
+ * /obj directory fids of the enumeration surface will end their lives.
+ */
+void
+srvshutdown(Srvctx *c)
+{
+	if(c->closed)
+		return;
+	c->closed = 1;
+	srvqdrain(c);
+	srvqfree(c);
+	if(c->store != nil){
+		storeclose(c->store);
+		c->store = nil;
+	}
+}
+
+void
+srvfree(Srvctx *c)
+{
+	if(c == nil)
+		return;
+	srvshutdown(c);
+	mapfree(c->map);
+	free(c->maptext);
+	free(c);
+}
+
+Store*
+srvstore(Srvctx *c)
+{
+	return c->store;
+}
+
+Cmap*
+srvmap(Srvctx *c)
+{
+	return c->map;
+}
+
+char*
+srviid(Srvctx *c)
+{
+	return c->iid;
+}
