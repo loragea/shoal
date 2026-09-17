@@ -193,6 +193,14 @@ void	srvcount(Srvctx*, uvlong *pushed, uvlong *done);
  *		one that is still queued at a known moment.  A held
  *		request leaves the hold when the point is cleared or
  *		when its queue's flush flag is set, whichever is first.
+ *
+ * These points are reachable in-process only.  store.md §13's -X flag
+ * names the points of the device under the store — it is what drives
+ * on the real device the same named points a test drives on the
+ * simulated one — and cmd/shoalsrv routes the flag there; a server
+ * point is set by the program that holds the Srvctx, which is a T1
+ * program.  Nothing on the wire reaches one either: layer-a §2.5 fixes
+ * the ctl grammar, so a debug verb would be a wire change.
  */
 void	srvhook(Srvctx*, char *name, uvlong n);
 
