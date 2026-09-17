@@ -244,6 +244,154 @@ objgate(Srvctx *c, Sfid *f, Req *r, int op)
 	return nil;
 }
 
+/*
+ * The T1 fid-state point.  With it on, every fid this server makes
+ * carries a state object of the server's own whose two hooks count
+ * themselves, which is how the hooks are driven before a row fills
+ * aux with anything.
+ */
+static void
+auxpointclose(void *a)
+{
+	Srvctx *c;
+
+	c = a;
+	lock(&c->auxlk);
+	c->nauxclose++;
+	unlock(&c->auxlk);
+}
+
+static void
+auxpointfree(void *a)
+{
+	Srvctx *c;
+
+	c = a;
+	lock(&c->auxlk);
+	c->nauxfree++;
+	unlock(&c->auxlk);
+}
+
+static void
+auxpoint(Srvctx *c, Sfid *f)
+{
+	if(!c->fidaux)
+		return;
+	f->aux = c;
+	f->auxclose = auxpointclose;
+	f->auxfree = auxpointfree;
+	f->auxclosed = 0;
+}
+
+/*
+ * The live-fid registry.  lib9p's fid pool is not iterable from a
+ * server (9p(2) exposes no walk over it), so the fids this server
+ * makes are kept on a list of their own, from the attach or walk that
+ * made one until destroyfid.  srvfidsclose is what a caller that must
+ * reach every pending auxclose — before the store closes — uses.
+ *
+ * auxclose runs with fidlk held, so a hook may call the engine but
+ * must not reach back into the registry.  It runs once per state a fid
+ * holds, and not at all once the store has closed: store.md §9 allows
+ * nothing but the Objsnap calls after that, which is auxfree's half.
+ *
+ * A clunk and a walk that moves a fid run their own fid's hook, so the
+ * only caller srvfidsclose has is a shutdown that must reach the fids
+ * still open when the service loop ends.  The shutdown sequence does
+ * not call it yet, and no row fills a fid with state that must be
+ * given back before the store closes.
+ */
+void
+srvfidnew(Srvctx *c, Sfid *f)
+{
+	f->ctx = c;
+	auxpoint(c, f);
+	qlock(&c->fidlk);
+	f->prev = nil;
+	f->next = c->fids;
+	if(c->fids != nil)
+		c->fids->prev = f;
+	c->fids = f;
+	qunlock(&c->fidlk);
+}
+
+static void
+auxclose1(Srvctx *c, Sfid *f)		/* fidlk held */
+{
+	if(f->auxclosed)
+		return;
+	f->auxclosed = 1;
+	if(f->auxclose != nil && !c->closed && c->store != nil)
+		f->auxclose(f->aux);
+}
+
+void
+srvfidsclose(Srvctx *c)
+{
+	Sfid *f;
+
+	qlock(&c->fidlk);
+	for(f = c->fids; f != nil; f = f->next)
+		auxclose1(c, f);
+	qunlock(&c->fidlk);
+}
+
+/*
+ * Give back what a fid holds.  The order is the two hooks' own:
+ * auxclose while the store is still there, then auxfree, which may run
+ * after it has gone.  gone says the fid itself is ending, so it also
+ * leaves the registry.
+ */
+static void
+fidgive(Sfid *f, int gone)
+{
+	Srvctx *c;
+	void (*fr)(void*);
+	void *a;
+
+	c = f->ctx;
+	if(c != nil){
+		qlock(&c->fidlk);
+		auxclose1(c, f);
+		if(gone){
+			if(f->prev != nil)
+				f->prev->next = f->next;
+			else
+				c->fids = f->next;
+			if(f->next != nil)
+				f->next->prev = f->prev;
+			f->prev = f->next = nil;
+			f->ctx = nil;
+		}
+		qunlock(&c->fidlk);
+	}
+	fr = f->auxfree;
+	a = f->aux;
+	f->aux = nil;
+	f->auxclose = nil;
+	f->auxfree = nil;
+	f->auxclosed = 0;
+	if(fr != nil)
+		fr(a);
+	textfree(f->text);
+	f->text = nil;
+}
+
+void
+srvauxpoint(Srvctx *c, int on)
+{
+	c->fidaux = on;
+}
+
+void
+srvauxcount(Srvctx *c, uvlong *closed, uvlong *freed)
+{
+	lock(&c->auxlk);
+	*closed = c->nauxclose;
+	*freed = c->nauxfree;
+	unlock(&c->auxlk);
+}
+
 void
 srvfileqid(int file, Qid *q)
 {
@@ -452,7 +600,11 @@ dowalk(Req *r)
 	g = *f;
 	g.text = nil;
 	g.aux = nil;
+	g.auxclose = nil;
 	g.auxfree = nil;
+	g.auxclosed = 0;
+	g.ctx = nil;
+	g.prev = g.next = nil;
 	e = nil;
 	for(i = 0; i < r->ifcall.nwname; i++){
 		e = walk1(c, &g, r->ifcall.wname[i], &r->ofcall.wqid[i],
@@ -466,14 +618,28 @@ dowalk(Req *r)
 		return;
 	}
 	if(i == r->ifcall.nwname){
-		if(r->fid == r->newfid)
+		if(r->fid == r->newfid){
+			/*
+			 * The fid moves, and what it held does not move with
+			 * it: a fid names one file, and the state it carries
+			 * is that file's.  It is given back here — the close
+			 * hook first, while the store is certainly open —
+			 * rather than dropped, which would leak it and lose
+			 * the hook (dat.h's Sfid).  Its place on the registry
+			 * is the fid's own and stays.
+			 */
+			fidgive(f, 0);
+			g.ctx = f->ctx;
+			g.prev = f->prev;
+			g.next = f->next;
 			*f = g;
-		else{
+		}else{
 			if((nf = mallocz(sizeof *nf, 1)) == nil){
 				srvqdone(r, "shoalsrv: out of memory");
 				return;
 			}
 			*nf = g;
+			srvfidnew(c, nf);
 			r->newfid->aux = nf;
 		}
 	}
@@ -785,11 +951,13 @@ srvwstat(Req *r)
 }
 
 /*
- * A fid's state goes when lib9p frees the fid, which is after
- * Srv.end — so after the shutdown sequence has closed the store.  That
- * ordering is D16's: an Objsnap a fid holds in aux is the one thing
- * that may outlive a storeclose, and auxfree is where the rest of the
- * surface gives it back.
+ * A fid's state goes when lib9p frees the fid.  At a clunk that is at
+ * once, with the store open, and both hooks run here; after the
+ * service loop has ended it is lib9p freeing the fid pool, which is
+ * after Srv.end and so after the shutdown has closed the store — D16's
+ * ordering, and the reason auxclose does not run then and auxfree
+ * still does: an Objsnap a fid holds in aux is the one thing that may
+ * outlive a storeclose (store.md §9).
  */
 void
 srvdestroyfid(Fid *fid)
@@ -799,9 +967,7 @@ srvdestroyfid(Fid *fid)
 	if((f = fid->aux) == nil)
 		return;
 	fid->aux = nil;
-	if(f->auxfree != nil)
-		f->auxfree(f->aux);
-	textfree(f->text);
+	fidgive(f, 1);
 	free(f);
 }
 

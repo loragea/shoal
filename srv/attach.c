@@ -130,6 +130,7 @@ srvattach(Req *r)
 		respond(r, "shoalsrv: out of memory");
 		return;
 	}
+	srvfidnew(c, f);
 	r->fid->aux = f;
 	if(srvaname(f, r->ifcall.aname) < 0){
 		respond(r, Ebadaname);

@@ -142,10 +142,24 @@ extern Sfile srvfiles[Nfile];
  * fid derived from that attach (layer-a §2.1: the role and the epoch
  * travel in aname and a walk clones them).
  *
- * aux and auxfree are the rest of the surface's: an /obj directory fid
- * will hold its Objsnap there and a /obj/<oid> fid its staged write,
- * and destroyfid calls auxfree after the store has closed, which is
- * what D16 lets an Objsnap outlive.  Nothing in this file touches aux.
+ * aux is the rest of the surface's — an /obj directory fid will hold
+ * its Objsnap there and a /obj/<oid> fid its staged write — and the
+ * two hooks beside it are when it is given back.  Nothing in this
+ * file's own handlers touches aux.
+ *
+ *	auxclose  runs before the store closes, and at clunk; it may
+ *		  call the engine.  A stage handle MUST be discarded
+ *		  here: store.md §9 allows only objsnapent, objsnapcount
+ *		  and objsnapclose after the store has closed.
+ *	auxfree	  runs last, after the store may already have closed
+ *		  (D16): it may only release memory and close an
+ *		  Objsnap, which is the one thing §9 lets outlive it.
+ *
+ * A fid that moves — a walk of a fid onto itself that resolves — gives
+ * its state back the same way before it takes the new file's, so no
+ * state and no hook survives the move.  The server keeps its own
+ * registry of the live fids (ctx, prev, next), because lib9p exposes
+ * no way to iterate them and srvfidsclose must reach every one.
  */
 struct Sfid
 {
@@ -160,7 +174,12 @@ struct Sfid
 	uvlong	qidvers;
 	Text	*text;		/* the render-at-open snapshot, once open */
 	void	*aux;
+	void	(*auxclose)(void*);
 	void	(*auxfree)(void*);
+	int	auxclosed;	/* auxclose has run for this state */
+	Srvctx	*ctx;		/* the registry's, and the hooks' */
+	Sfid	*prev;
+	Sfid	*next;
 };
 
 /*
@@ -235,6 +254,19 @@ struct Srvctx
 
 	Fence	fence;		/* §6.4; F1 is inert here, F4 is live */
 	QLock	fencelk;
+
+	/*
+	 * The live fids, and the T1 fid-state point over them.  Every
+	 * Sfid is on this list from the attach or walk that made it
+	 * until destroyfid; auxclose runs with fidlk held, so a hook
+	 * may reach the engine but must not reach back in here.
+	 */
+	QLock	fidlk;
+	Sfid	*fids;
+	int	fidaux;		/* srvauxpoint: fids carry a test state */
+	Lock	auxlk;		/* not fidlk: the hooks run under that one */
+	uvlong	nauxclose;
+	uvlong	nauxfree;
 
 	Reqqueue **q;
 	int	nq;

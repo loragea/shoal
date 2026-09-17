@@ -1519,6 +1519,72 @@ Out:
 }
 
 /*
+ * A fid's own state and its two hooks, through the fid-state point.
+ * The close hook runs while the store is open — at a clunk, and at the
+ * walk that moves a fid off the file whose state it is — and the free
+ * hook runs last, which for a fid that outlives the service loop is
+ * after the store has closed (D16, store.md §9).
+ */
+static void
+tfidstate(void)
+{
+	char *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall r;
+	uvlong nc, nf;
+
+	clstage = "fidstate";
+	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4)) == nil)
+		return;
+	srvauxpoint(ctx, 1);
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
+		fail("attach: %s", errof(&r));
+		goto Out;
+	}
+	srvauxcount(ctx, &nc, &nf);
+	eqv("a live fid's state is not given back", nc + nf, 0);
+
+	clclunk(&cl, Froot, &r);
+	srvauxcount(ctx, &nc, &nf);
+	eqv("a clunk closes the fid's state", nc, 1);
+	eqv("a clunk frees the fid's state", nf, 1);
+
+	/* a walk that moves a fid gives back what that fid was holding */
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
+		fail("attach: %s", errof(&r));
+		goto Out;
+	}
+	if(clwalk1(&cl, Froot, Froot, "ctl", &r) != Rwalk)
+		fail("walk /ctl onto the same fid: %s", errof(&r));
+	srvauxcount(ctx, &nc, &nf);
+	eqv("a walk that moves a fid closes the state it held", nc, 2);
+	eqv("a walk that moves a fid frees the state it held", nf, 2);
+	clclunk(&cl, Froot, &r);
+	srvauxcount(ctx, &nc, &nf);
+	eqv("the moved fid had nothing left to close", nc, 2);
+	eqv("the moved fid had nothing left to free", nf, 2);
+
+	/* a fid still open when the loop ends: the store closes first */
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
+		fail("attach: %s", errof(&r));
+		goto Out;
+	}
+Out:
+	clstop(&cl);
+	srvauxcount(ctx, &nc, &nf);
+	eqv("a fid outliving the loop runs no close hook", nc, 2);
+	eqv("a fid outliving the loop still runs its free hook", nf, 3);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * layer-a §5.4.1's Tflush, both halves: a request still queued is
  * removed and answered `interrupted', then the Rflush follows; a
  * request already running is interrupted, unwinds through step 7 and
@@ -1836,6 +1902,7 @@ threadmain(int argc, char **argv)
 	tobjgate();
 	tdown("in", "no");
 	tdown("out", "yes");
+	tfidstate();
 	tflush();
 	terrors();
 	tshutdown();
