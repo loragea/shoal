@@ -1546,11 +1546,11 @@ tfidstate(void)
 		fail("attach: %s", errof(&r));
 		goto Out;
 	}
-	srvauxcount(ctx, &nc, &nf);
+	srvauxcount(ctx, nil, &nc, &nf);
 	eqv("a live fid's state is not given back", nc + nf, 0);
 
 	clclunk(&cl, Froot, &r);
-	srvauxcount(ctx, &nc, &nf);
+	srvauxcount(ctx, nil, &nc, &nf);
 	eqv("a clunk closes the fid's state", nc, 1);
 	eqv("a clunk frees the fid's state", nf, 1);
 
@@ -1561,11 +1561,11 @@ tfidstate(void)
 	}
 	if(clwalk1(&cl, Froot, Froot, "ctl", &r) != Rwalk)
 		fail("walk /ctl onto the same fid: %s", errof(&r));
-	srvauxcount(ctx, &nc, &nf);
+	srvauxcount(ctx, nil, &nc, &nf);
 	eqv("a walk that moves a fid closes the state it held", nc, 2);
 	eqv("a walk that moves a fid frees the state it held", nf, 2);
 	clclunk(&cl, Froot, &r);
-	srvauxcount(ctx, &nc, &nf);
+	srvauxcount(ctx, nil, &nc, &nf);
 	eqv("the moved fid had nothing left to close", nc, 2);
 	eqv("the moved fid had nothing left to free", nf, 2);
 
@@ -1576,7 +1576,7 @@ tfidstate(void)
 	}
 Out:
 	clstop(&cl);
-	srvauxcount(ctx, &nc, &nf);
+	srvauxcount(ctx, nil, &nc, &nf);
 	eqv("a fid outliving the loop runs no close hook", nc, 2);
 	eqv("a fid outliving the loop still runs its free hook", nf, 3);
 	srvfree(ctx);
@@ -1590,6 +1590,11 @@ Out:
  * request already running is interrupted, unwinds through step 7 and
  * answers, and the Rflush follows that.  One queue makes which is
  * which deterministic.
+ *
+ * Step 7 is observed through the fid-state point's flush hook, which
+ * is the cell the object-I/O surface will discard its stage from: it
+ * runs for the request that was running and not for the one that was
+ * never started, and never after the reply.
  */
 static void
 tflush(void)
@@ -1601,6 +1606,7 @@ tflush(void)
 	Cl cl;
 	Fcall t, r;
 	char *w[1];
+	uvlong n7;
 	ushort ta, tb, tf;
 
 	clstage = "flush";
@@ -1608,6 +1614,7 @@ tflush(void)
 	d = newdisk();
 	if((ctx = startsrv(d, m, 1)) == nil)
 		return;
+	srvauxpoint(ctx, 1);
 	memset(data, 0x71, sizeof data);
 	mkobj(srvstore(ctx), "alpha", data, sizeof data, 1);
 	mkobj(srvstore(ctx), "beta", data, sizeof data, 1);
@@ -1666,6 +1673,8 @@ tflush(void)
 	if(r.type != Rwrite || r.tag != ta)
 		fail("the held request completes: type %d tag %ud", r.type,
 			r.tag);
+	srvauxcount(ctx, &n7, nil, nil);
+	eqv("a request that never started runs no step 7", n7, 0);
 
 	/* a RUNNING request, flushed */
 	srvhook(ctx, "objhold", 1);
@@ -1695,6 +1704,9 @@ tflush(void)
 	if(r.type != Rflush || r.tag != tf)
 		fail("the Rflush after the running one: type %d tag %ud",
 			r.type, r.tag);
+	srvauxcount(ctx, &n7, nil, nil);
+	eqv("a flushed running request runs step 7 once", n7, 1);
+	eqv("step 7 ran before the reply", srvauxlate(ctx), 0);
 	srvhook(ctx, "objhold", 0);
 
 	/* a Tflush naming a request answered on the loop is still answered */

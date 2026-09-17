@@ -207,11 +207,15 @@ void	srvhook(Srvctx*, char *name, uvlong n);
 /*
  * The fid-state point, in the same shape and with the same reach.
  * With it on, every fid this server makes carries a per-fid state of
- * the server's own whose auxclose and auxfree count themselves, so a
- * test can drive both hooks of a fid's state — the one that runs
- * before the store closes and the one that runs last — before any row
- * of the tree fills that state with something of its own.  srvauxcount
- * answers how many times each has run.
+ * the server's own whose three hooks count themselves, so a test can
+ * drive all three — the one step 7 calls on a flushed request, the one
+ * that runs before the store closes and the one that runs last —
+ * before any row of the tree fills that state with something of its
+ * own.  srvauxcount answers how many times each has run, and takes nil
+ * for a count the caller does not want; srvauxlate answers how many of
+ * the flush hooks ran after their request had already responded, which
+ * is what step 7 running too late would look like.
  */
 void	srvauxpoint(Srvctx*, int on);
-void	srvauxcount(Srvctx*, uvlong *closed, uvlong *freed);
+void	srvauxcount(Srvctx*, uvlong *flushed, uvlong *closed, uvlong *freed);
+uvlong	srvauxlate(Srvctx*);

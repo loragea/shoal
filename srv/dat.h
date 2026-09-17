@@ -144,9 +144,15 @@ extern Sfile srvfiles[Nfile];
  *
  * aux is the rest of the surface's — an /obj directory fid will hold
  * its Objsnap there and a /obj/<oid> fid its staged write — and the
- * two hooks beside it are when it is given back.  Nothing in this
+ * three hooks beside it are when it is called upon.  Nothing in this
  * file's own handlers touches aux.
  *
+ *	auxflush  runs from srvstep7, on the fid of a request that is
+ *		  unwinding flushed (layer-a §5.4.1 step 7), once per
+ *		  such request and before it responds.  The store is
+ *		  open and the fid lives on: this is where a stage the
+ *		  flushed request staged is discarded, not where the
+ *		  fid's own state is given back.
  *	auxclose  runs before the store closes, and at clunk; it may
  *		  call the engine.  A stage handle MUST be discarded
  *		  here: store.md §9 allows only objsnapent, objsnapcount
@@ -154,6 +160,10 @@ extern Sfile srvfiles[Nfile];
  *	auxfree	  runs last, after the store may already have closed
  *		  (D16): it may only release memory and close an
  *		  Objsnap, which is the one thing §9 lets outlive it.
+ *
+ * So a fid that stages a write may see auxflush any number of times
+ * while it lives, and sees auxclose and then auxfree exactly once for
+ * each state it holds.
  *
  * A fid that moves — a walk of a fid onto itself that resolves — gives
  * its state back the same way before it takes the new file's, so no
@@ -174,6 +184,7 @@ struct Sfid
 	uvlong	qidvers;
 	Text	*text;		/* the render-at-open snapshot, once open */
 	void	*aux;
+	void	(*auxflush)(Sfid*, Req*);
 	void	(*auxclose)(void*);
 	void	(*auxfree)(void*);
 	int	auxclosed;	/* auxclose has run for this state */
@@ -267,6 +278,8 @@ struct Srvctx
 	Lock	auxlk;		/* not fidlk: the hooks run under that one */
 	uvlong	nauxclose;
 	uvlong	nauxfree;
+	uvlong	nauxflush;
+	uvlong	nauxlate;	/* auxflush ran after the request responded */
 
 	Reqqueue **q;
 	int	nq;

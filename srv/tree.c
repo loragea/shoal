@@ -246,10 +246,27 @@ objgate(Srvctx *c, Sfid *f, Req *r, int op)
 
 /*
  * The T1 fid-state point.  With it on, every fid this server makes
- * carries a state object of the server's own whose two hooks count
+ * carries a state object of the server's own whose three hooks count
  * themselves, which is how the hooks are driven before a row fills
- * aux with anything.
+ * aux with anything.  The flush hook also counts the times it ran
+ * after its request had already responded, which is never: step 7
+ * runs before the reply (layer-a §5.4.1).
  */
+static void
+auxpointflush(Sfid *f, Req *r)
+{
+	Srvctx *c;
+
+	c = f->ctx;
+	if(c == nil)
+		return;
+	lock(&c->auxlk);
+	c->nauxflush++;
+	if(r->responded)
+		c->nauxlate++;
+	unlock(&c->auxlk);
+}
+
 static void
 auxpointclose(void *a)
 {
@@ -278,6 +295,7 @@ auxpoint(Srvctx *c, Sfid *f)
 	if(!c->fidaux)
 		return;
 	f->aux = c;
+	f->auxflush = auxpointflush;
 	f->auxclose = auxpointclose;
 	f->auxfree = auxpointfree;
 	f->auxclosed = 0;
@@ -368,6 +386,7 @@ fidgive(Sfid *f, int gone)
 	fr = f->auxfree;
 	a = f->aux;
 	f->aux = nil;
+	f->auxflush = nil;
 	f->auxclose = nil;
 	f->auxfree = nil;
 	f->auxclosed = 0;
@@ -384,12 +403,28 @@ srvauxpoint(Srvctx *c, int on)
 }
 
 void
-srvauxcount(Srvctx *c, uvlong *closed, uvlong *freed)
+srvauxcount(Srvctx *c, uvlong *flushed, uvlong *closed, uvlong *freed)
 {
 	lock(&c->auxlk);
-	*closed = c->nauxclose;
-	*freed = c->nauxfree;
+	if(flushed != nil)
+		*flushed = c->nauxflush + c->nauxlate;
+	if(closed != nil)
+		*closed = c->nauxclose;
+	if(freed != nil)
+		*freed = c->nauxfree;
 	unlock(&c->auxlk);
+}
+
+/* how many of those flush hooks ran late; the answer is always zero */
+uvlong
+srvauxlate(Srvctx *c)
+{
+	uvlong n;
+
+	lock(&c->auxlk);
+	n = c->nauxlate;
+	unlock(&c->auxlk);
+	return n;
 }
 
 void
@@ -600,6 +635,7 @@ dowalk(Req *r)
 	g = *f;
 	g.text = nil;
 	g.aux = nil;
+	g.auxflush = nil;
 	g.auxclose = nil;
 	g.auxfree = nil;
 	g.auxclosed = 0;

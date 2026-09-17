@@ -29,7 +29,7 @@ void	srvqdone(Req*, char *err);
 void	srvqended(Qreq*);
 void	srvqdrain(Srvctx*);
 void	srvqfree(Srvctx*);
-void	srvstep7(Srvctx*, uchar *oid, int oidlen);
+void	srvstep7(Req*);
 
 /* tree.c */
 void	srvfidnew(Srvctx*, Sfid*);

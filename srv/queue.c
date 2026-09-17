@@ -237,13 +237,18 @@ srvqcheck(Req *r)
  * invalidate `cur' for the object, and re-run the currency check
  * before serving it again.
  *
+ * It takes the flushed request, because that is what reaches the three
+ * things the halves need: the fid through r->fid (a stage is per-fid),
+ * the context through r->srv->aux, and the oid through the Qreq.
+ *
  * Which halves exist today, and where the rest hook in:
  *
  *	discard the stage — nothing is staged here.  The stage belongs
  *		to a fid's write path (lib/shoal.h's stageopen and
- *		stagediscard), which is the object-I/O surface; its
- *		per-fid discard hooks in here, reaching the stage
- *		through the flushed request's fid.
+ *		stagediscard), which is the object-I/O surface; that
+ *		surface fills the flushed fid's auxflush cell (dat.h) and
+ *		this function calls it, so the discard is added without
+ *		touching this file.
  *	clear the sync state — this instance has no peers: there is no
  *		outbound peer client in this wave, so no candidate was
  *		ever told anything and the dirty set (lib/shoal.h's
@@ -255,16 +260,20 @@ srvqcheck(Req *r)
  *		(store.md §14(1)) and which nothing computes without
  *		peers to query.  The currency check hooks in here.
  *
- * So the function is a no-op today and is still called, from the one
- * exit below, because the call site is the contract: the halves are
- * added to this function, not to the handlers.
+ * So the only half this function performs today is the per-fid one,
+ * and it is still called from the one exit below whether or not a fid
+ * has filled its cell, because the call site is the contract: the
+ * halves are added to this function, not to the handlers.
  */
 void
-srvstep7(Srvctx *c, uchar *oid, int oidlen)
+srvstep7(Req *r)
 {
-	USED(c);
-	USED(oid);
-	USED(oidlen);
+	Sfid *f;
+
+	if(r->fid == nil || (f = r->fid->aux) == nil)
+		return;
+	if(f->auxflush != nil)
+		f->auxflush(f, r);
 }
 
 /*
@@ -284,7 +293,7 @@ srvqdone(Req *r, char *err)
 
 	qr = r->aux;
 	if(qr != nil && qr->q->flush != 0){
-		srvstep7(qr->ctx, qr->oid, qr->oidlen);
+		srvstep7(r);
 		respond(r, Einterrupted);
 		return;
 	}
