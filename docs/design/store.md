@@ -5303,6 +5303,23 @@ name a half that is not built; each says which.
        executable. §2.1 grants admin *writes* of reserved ids only
        while unfenced, so the exemption is the read alone.
 
+    Only the first of those three positions is derivable. Rule 1 is:
+    §2.1's operator rule reads the fid's role and the name alone, and
+    neither changes while the fid lives, so no later state can make an
+    operation §2.1 forbids permissible, and placing it anywhere else
+    would only answer a differently-spelled refusal to an operation
+    that is refused either way. Rules 2 and 3 are a collision of two
+    MUSTs: an instance that is `up=no` or `status=out` for itself
+    **and** fenced owes a `role=client` read both F3's `down` and
+    F1's `fenced`, and layer-a settles neither above the other.
+    *Settled here as implementation policy:* `down` wins. It is the
+    instance's own standing state, read off the map it was started
+    with (§14(18)), while the fence is the one gate an operator moves
+    under an open fid; and §2.6 has a client answer both the same way
+    — re-read the map and re-evaluate placement — so no client
+    behaviour turns on the choice. A conforming implementation may
+    answer `fenced` there instead.
+
     `/repl` and `/rpc` carry a gate of their own, and it is the fence
     alone: F1 fences "every `/repl` and `/rpc` operation", which is
     every operation on those two rows and not the open alone. The

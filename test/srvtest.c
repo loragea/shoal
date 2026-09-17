@@ -1533,6 +1533,15 @@ tobjgate(void)
 		fail("walk /obj while fenced: %s", errof(&r));
 	clcreate(&cl, Ffile, "shoal.map.9", OWRITE, &r);
 	eqs("fenced admin create of a reserved id", errof(&r), "fenced");
+	/*
+	 * The order of the gate's rules is on the wire.  §2.1's operator
+	 * rule is asked first, so an operation it forbids is `permission
+	 * denied' whatever the fence says: the fence is a state that
+	 * moves, and the name and the role are not.
+	 */
+	clcreate(&cl, Ffile, "brandnew", OWRITE, &r);
+	eqs("fenced admin create of an id that is not reserved", errof(&r),
+		"permission denied");
 	clclunk(&cl, Ffile, &r);
 	if(clwrite(&cl, Fctl, 0, "fence off", &r) != Rwrite)
 		fail("fence off: %s", errof(&r));
@@ -1670,7 +1679,7 @@ tdown(char *status, char *up)
 	Dev *d;
 	Cl cl;
 	Fcall r;
-	char *w[2];
+	char *w[2], *w2[1];
 
 	clstage = "down";
 	m = mkmapself(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid, status, up);
@@ -1716,7 +1725,30 @@ tdown(char *status, char *up)
 	eqs("an admin read on the same instance", errof(&r),
 		"shoalsrv: not built");
 	clclunk(&cl, Ffile, &r);
+
+	/*
+	 * F3 and the fence are two MUSTs over one operation once the
+	 * instance is both: the gate asks F3 first, so a client read on a
+	 * down AND fenced instance is `down' (store.md §14(24)).
+	 */
+	w2[0] = "ctl";
+	if(clopenpath(&cl, Froot, Fctl, 1, w2, OWRITE, &r) != Ropen)
+		fail("open /ctl as admin: %s", errof(&r));
+	else if(clwrite(&cl, Fctl, 0, "fence on", &r) != Rwrite)
+		fail("fence on: %s", errof(&r));
+	clclunk(&cl, Fctl, &r);
 	clclunk(&cl, Froot, &r);
+	if(clattach(&cl, Froot2, "role=client,epoch=7", &r) != Rattach){
+		fail("attach client while fenced: %s", errof(&r));
+		goto Out;
+	}
+	if(clwalk(&cl, Froot2, Ffile, 2, w, &r) != Rwalk)
+		fail("walk /obj/alpha while fenced: %s", errof(&r));
+	clopen(&cl, Ffile, OREAD, &r);
+	eqs("a client read on an instance that is both down and fenced",
+		errof(&r), "down");
+	clclunk(&cl, Ffile, &r);
+	clclunk(&cl, Froot2, &r);
 Out:
 	clstop(&cl);
 	srvfree(ctx);
