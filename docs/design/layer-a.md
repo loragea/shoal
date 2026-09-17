@@ -627,7 +627,7 @@ once the job is *accepted*; progress is read from `/jobs`.
 | `verify` | admin | `verify <oid>` | Re-hash and compare now. | `bad ctl`, `no such object`, `checksum mismatch` |
 | `scrub` | admin | `scrub [start\|stop] [rate=<n>]` | Control the scrubber; `rate` in KiB/s. | `bad ctl` |
 | `forget` | admin | `forget <iid>` | Discard the fine-grained dirty set for a peer, marking it `fullsync` (§7.1). Does **not** clear the peer's stale mark at the monitor. | `fenced`, `bad ctl` |
-| `fence` | admin | `fence on\|off` | Set or clear an **operator** fence (§6.4). `fence off` MUST NOT clear a lease-derived fence; only a successful refresh does. | `bad ctl` |
+| `fence` | admin | `fence on\|off` | Set or clear an **operator** fence (§6.4). `fence off` MUST NOT clear a lease-derived fence; only a successful refresh does, and `fence off` is refused while one is in force. | `bad ctl`, `fenced` |
 | `newmonid` | admin | `newmonid <hex32>` | Replace this instance's pinned `monid` (§6.3), so its next refresh may adopt a map carrying the new value. The instance-side half of `forceepoch <e> monid=`. MUST be logged. Available while fenced — a `monid` mismatch is precisely what keeps refresh failing. | `bad ctl` |
 
 The role column is uniformly `admin`, and that is the point: `/ctl`
@@ -644,10 +644,18 @@ because they apply to every row.
 **ctl is inside the fence.** While the instance is fenced (§6.4),
 every verb that mutates data or replication state — `pull`, `push`,
 `drop`, `forget`, `reconcile`, `advert`, `fence off` — MUST fail with
-`fenced`. Only `refresh`, `register`, `fence on`, `verify`, `scrub`
-and `newmonid` remain available. The first draft left `/ctl` outside both
-the epoch check and the fence, so a deposed instance could be driven
-to overwrite, delete, discard replication state, or unfence itself.
+`fenced`, except that `fence off` MUST fail that way only while a
+**lease-derived** fence (F1) is in force. Only `refresh`, `register`,
+`fence on`, `verify`, `scrub` and `newmonid` remain available, plus
+`fence off` against an operator fence alone. The first draft left
+`/ctl` outside both the epoch check and the fence, so a deposed
+instance could be driven to overwrite, delete, discard replication
+state, or unfence itself. The one exception keeps all of that: the
+fence a deposed instance carries is F1's, which `fence off` MUST NOT
+clear anyway (§6.4 F4), while without the exception F4 would be a
+one-way flag — the verb that clears an operator fence refused because
+that fence is in force, and the instance serving nothing until it was
+restarted.
 
 Unknown verbs MUST fail with `unknown ctl`; a known verb with bad
 arguments MUST fail with `bad ctl`; a verb issued on a fid whose

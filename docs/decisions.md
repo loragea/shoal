@@ -847,12 +847,10 @@ grains some other way entirely — all within D18's one rule.
 
 ## D25 — `fence off` is refused only under a lease fence (2026-09-17)
 
-**Decision:** `/ctl`'s `fence off` verb is refused with `fenced` when
-the **lease** fence of `design/layer-a.md` §6.4 F1 is in force, and
-clears the operator flag otherwise. Every other verb of §2.5's fenced
-set — `pull`, `push`, `drop`, `forget`, `reconcile`, `advert` — is
-refused while **either** fence is in force, as §2.5 says.
-`design/store.md` §14(26) records the deviation.
+**Decision:** `design/layer-a.md` §2.5 scopes the `fence off` refusal
+to a lease-derived fence, and this row is the argument for that
+amendment; the rule itself is read there, not here.
+`design/store.md` §14(26) records the amendment.
 **Rationale:** §2.5 lists `fence off` among the verbs that MUST fail
 `fenced` while the instance is fenced, and §6.4 F4 makes `fence off`
 the only thing that clears an operator fence — "a separate flag with
@@ -877,9 +875,8 @@ fence would then be cleared only by restarting the instance, and
 rejected: dropping `fence off` from the fenced set entirely, which
 would let a lease-fenced instance answer it `ok` while clearing
 nothing, telling the operator the fence is gone when it is not.
-**Normative:** that a lease-fenced instance MUST refuse `fence off`
-with `fenced`, and that `fence off` MUST NOT clear a lease-derived
-fence (§6.4 F4 already). A reimplementation must match both.
+**Normative:** the amended §2.5 sentence and §6.4 F4, which carry the
+rule; a reimplementation matches those, not this row.
 **Implementation policy:** that an operator-fenced-only instance
 accepts `fence off` rather than refusing it. An implementation that
 refuses it conforms to §2.5's letter; it is then an implementation in

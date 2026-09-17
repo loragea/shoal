@@ -4965,9 +4965,9 @@ Twenty-nine places where layer-a is silent, self-defeating, or
 contradicted by the measurements or by the platform. Each entry
 states the tension, its resolution, and where the argument for it
 lives; nothing here repeats an argument made in a section above.
-Items 1–5, 8, 9, 11, 12, 13 and 14 are amendments **made** to
-`docs/design/layer-a.md`; items 6, 7, 15, 17 and 18–29 are recorded
-here and not made there; items 10 and 16 are **proposals** rather
+Items 1–5, 8, 9, 11, 12, 13, 14 and 26 are amendments **made** to
+`docs/design/layer-a.md`; items 6, 7, 15, 17, 18–25 and 27–29 are
+recorded here and not made there; items 10 and 16 are **proposals** rather
 than amendments, because they touch the wire.
 
 Items 18 to 29 are the object server's, and they describe what
@@ -5259,15 +5259,15 @@ name a half that is not built; each says which.
     floor, then the epoch compare, then the `role=repl` membership
     check.
 
-26. **`fence off` is refused only under a lease fence.** §2.5 lists
+26. **`fence off` is refused only under a lease fence.** §2.5 listed
     `fence off` among the verbs that MUST fail `fenced` while the
     instance is fenced, and §6.4 F4 makes `fence off` the only way to
-    clear an operator fence. Read together they make an operator
-    fence permanent: the verb that clears it is refused because it is
-    in force. *Not made:* `fence off` is refused `fenced` when the
-    **lease** fence is in force and clears the operator flag
-    otherwise, which is what §2.5's rule is protecting — a deposed
-    instance must not unfence itself — without making F4 one-way.
+    clear an operator fence. Read together they made an operator
+    fence permanent: the verb that clears it was refused because it
+    was in force. *Made:* §2.5 now scopes that refusal to the
+    **lease** fence, which is the fence a deposed instance carries
+    and the one `fence off` MUST NOT clear anyway, so the rule §2.5
+    is protecting survives without F4 becoming one-way.
     `decisions.md` D25 carries the argument.
 
 27. **A ctl verb naming a malformed oid answers `bad object
