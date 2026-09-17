@@ -449,6 +449,27 @@ srvauxopen(Srvctx *c)
 	return n;
 }
 
+/*
+ * How many fids the registry holds.  It is the list srvfidsclose
+ * follows, counted where a test can compare it against the fids that
+ * are really live: an entry lost off the list is a fid whose state is
+ * never given back and whose own destroy then writes through a
+ * neighbour that has been freed.
+ */
+int
+srvfidcount(Srvctx *c)
+{
+	Sfid *f;
+	int n;
+
+	n = 0;
+	qlock(&c->fidlk);
+	for(f = c->fids; f != nil; f = f->next)
+		n++;
+	qunlock(&c->fidlk);
+	return n;
+}
+
 /* how many of those flush hooks ran late; the answer is always zero */
 uvlong
 srvauxlate(Srvctx *c)
@@ -697,12 +718,28 @@ dowalk(Req *r)
 			 * rather than dropped, which would leak it and lose
 			 * the hook (dat.h's Sfid).  Its place on the registry
 			 * is the fid's own and stays.
+			 *
+			 * The commit names the fields a walk changes and no
+			 * others, because the registry links beside them are
+			 * not this proc's to write: a walk that names an
+			 * object runs on that object's queue, while an attach
+			 * or a clone on the service loop links a new fid in
+			 * at the head under fidlk.  Links read before that
+			 * and written back after it would put the new fid's
+			 * neighbour where the new fid is — and the list is
+			 * how srvfidsclose reaches every live fid.  A whole
+			 * structure copy is what carried them; walk1 changes
+			 * the file, the oid and the qid alone, and the role,
+			 * the epoch and the peer are the attach's for the
+			 * fid's whole life.
 			 */
 			fidgive(f, 0);
-			g.ctx = f->ctx;
-			g.prev = f->prev;
-			g.next = f->next;
-			*f = g;
+			srvqwalkhold(r);
+			f->file = g.file;
+			memmove(f->oid, g.oid, sizeof f->oid);
+			f->oidlen = g.oidlen;
+			f->qidpath = g.qidpath;
+			f->qidvers = g.qidvers;
 		}else{
 			if((nf = mallocz(sizeof *nf, 1)) == nil){
 				srvqdone(r, "shoalsrv: out of memory");

@@ -1660,6 +1660,93 @@ Out:
 }
 
 /*
+ * The fid registry under a walk that moves a fid.  A walk that names
+ * an object runs on that object's queue while attaches and clones run
+ * on the service loop, and both reach the same list: the walk gives
+ * the fid's state back and writes the new one, the attach links a new
+ * fid in at the head.  What the walk MUST NOT carry across that
+ * window is the fid's registry links — putting back what it read
+ * before the attach drops the attach's fid off the list, where
+ * srvfidsclose can no longer reach it and where its own destroy
+ * writes through a neighbour that has been freed.
+ *
+ * The window is forced rather than raced for: the point parks the
+ * queued walk at its commit, the attach runs on the loop inside it,
+ * and what the count says after the walked fid is clunked is whether
+ * anything left the list with it.
+ */
+static void
+tfidwalk(void)
+{
+	char *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall t, r;
+	ushort ta;
+
+	clstage = "fidwalk";
+	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4)) == nil)
+		return;
+	mkobj(srvstore(ctx), "alpha", nil, 0, 1);
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
+		fail("attach: %s", errof(&r));
+		goto Out;
+	}
+	if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk){
+		fail("walk /obj: %s", errof(&r));
+		goto Out;
+	}
+	eqv("the registry holds the attach's fid and the walk's",
+		srvfidcount(ctx), 2);
+
+	/*
+	 * A self-walk of that fid onto an object: it moves, and it runs on
+	 * that object's queue.  The fid is the newest one, so it is the
+	 * head of the list — which is the entry an attach writes.
+	 */
+	srvhook(ctx, "walkhold", 1);
+	memset(&t, 0, sizeof t);
+	t.type = Twalk;
+	t.tag = ta = cltag(&cl);
+	t.fid = Ffile;
+	t.newfid = Ffile;
+	t.nwname = 1;
+	t.wname[0] = "alpha";
+	clput(&cl, &t);
+	sleep(200);			/* it is held at its commit */
+
+	if(clattach(&cl, Froot2, "role=admin", &r) != Rattach)
+		fail("attach while a walk is held at its commit: %s", errof(&r));
+	eqv("the attach's fid is on the registry too", srvfidcount(ctx), 3);
+
+	srvhook(ctx, "walkhold", 0);
+	clget(&cl, &r);
+	checks++;
+	if(r.type != Rwalk || r.tag != ta || r.nwqid != 1)
+		fail("the held self-walk: type %d tag %ud %s", r.type, r.tag,
+			errof(&r));
+	eqv("and it is still there once the walk has committed",
+		srvfidcount(ctx), 3);
+
+	/* the moved fid leaves; nothing else may leave with it */
+	clclunk(&cl, Ffile, &r);
+	eqv("a fid the walk moved takes only itself off the registry",
+		srvfidcount(ctx), 2);
+	clclunk(&cl, Froot2, &r);
+	eqv("the fid the attach made was still on it", srvfidcount(ctx), 1);
+Out:
+	srvhook(ctx, "walkhold", 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * layer-a §5.4.1's Tflush, both halves: a request still queued is
  * removed and answered `interrupted', then the Rflush follows; a
  * request already running is interrupted, unwinds through step 7 and
@@ -2407,6 +2494,7 @@ threadmain(int argc, char **argv)
 	tdown("in", "no");
 	tdown("out", "yes");
 	tfidstate();
+	tfidwalk();
 	tflush();
 	tanyq();
 	tflushrace();

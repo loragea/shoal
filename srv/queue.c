@@ -309,6 +309,24 @@ srvqcheck(Req *r)
 }
 
 /*
+ * The third point, at a queued walk's commit: the moment a walk that
+ * moves its fid has given the old state back and is about to write
+ * the new one.  It is where the service loop is concurrent with the
+ * fid a queue proc is rewriting, so it is where a test drives an
+ * attach against a walk.  A walk answered on the service loop carries
+ * no Qreq and cannot be held.
+ */
+void
+srvqwalkhold(Req *r)
+{
+	Qreq *qr;
+
+	if((qr = r->aux) == nil)
+		return;
+	qhold(qr->ctx, qr, &qr->ctx->walkhold);
+}
+
+/*
  * The second point, at the other end of a handler: after its engine
  * call and before its exit, so a test can flush a request whose work
  * is already done and watch it leave through srvqdone all the same.
@@ -480,6 +498,8 @@ srvhook(Srvctx *c, char *name, uvlong n)
 		c->flushhold = n;
 	else if(strcmp(name, "mapopen") == 0)
 		c->mapopen = n;
+	else if(strcmp(name, "walkhold") == 0)
+		c->walkhold = n;
 	qunlock(&c->holdlk);
 }
 
@@ -498,6 +518,7 @@ srvholdclear(Srvctx *c)
 	c->exithold = 0;
 	c->flushhold = 0;
 	c->mapopen = 0;
+	c->walkhold = 0;
 	qunlock(&c->holdlk);
 }
 

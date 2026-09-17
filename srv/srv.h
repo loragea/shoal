@@ -225,6 +225,13 @@ void	srvcount(Srvctx*, uvlong *pushed, uvlong *done);
  *		answers it on the service loop after all.  It is how a
  *		test drives the offload path before a row of the tree
  *		really needs one.
+ *	walkhold
+ *		n != 0 holds a queued walk that moves its fid at the
+ *		commit: after the fid's old state has been given back and
+ *		before the new one is written.  That is the window in
+ *		which the service loop is making and unmaking fids on the
+ *		same registry, so it is where a test drives an attach
+ *		against a walk.
  *	flushhold
  *		n != 0 holds a Tflush of a pooled request between the
  *		lookup that found it and the flush itself, which is the
@@ -259,8 +266,13 @@ void	srvhook(Srvctx*, char *name, uvlong n);
  * is what step 7 running too late would look like.  srvauxopen
  * answers how many of the close hooks found the engine still open,
  * which every one of them must.
+ *
+ * srvfidcount answers how many fids the server's own registry holds —
+ * the list the shutdown's sweep follows — which a caller compares
+ * against the fids it knows are live.
  */
 void	srvauxpoint(Srvctx*, int on);
 void	srvauxcount(Srvctx*, uvlong *flushed, uvlong *closed, uvlong *freed);
 uvlong	srvauxlate(Srvctx*);
 uvlong	srvauxopen(Srvctx*);
+int	srvfidcount(Srvctx*);

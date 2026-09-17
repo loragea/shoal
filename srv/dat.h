@@ -321,6 +321,7 @@ struct Srvctx
 	uvlong	exithold;	/* srvhook("objexit") */
 	uvlong	flushhold;	/* srvhook("flushhold") */
 	uvlong	mapopen;	/* srvhook("mapopen") */
+	uvlong	walkhold;	/* srvhook("walkhold") */
 
 	/*
 	 * The background jobs of §9's quiesce: work that is inside the
