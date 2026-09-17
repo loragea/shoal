@@ -291,7 +291,10 @@ struct Qreq
  *
  * A qfn row therefore has nargmin >= 1: argv[0] must be there for the
  * framework to read.  That invariant is enforced where the table is
- * consumed, and a row that breaks it answers `bad ctl'.
+ * consumed, and a row that breaks it answers `bad ctl'.  No row here
+ * can reach that refusal — §2.5 gives every verb that names an object
+ * at least one argument — so it is a check on a row added wrong, not
+ * a path a client can drive.
  */
 struct Sctl
 {
