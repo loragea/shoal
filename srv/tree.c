@@ -216,11 +216,9 @@ walk1(Srvctx *c, Sfid *f, char *name, Qid *q, char *buf, int nbuf)
 	}
 	if(f->file == Qobj || f->file == Qmeta){
 		n = strlen(name);
-		if(n > Oidmax)
+		if(!srvoidok((uchar*)name, n))
 			return Ebadname;
 		memmove(oid, name, n);
-		if(!srvoidok(oid, n))
-			return Ebadname;
 		if(objstat(c->store, oid, n, &oi) < 0)
 			return srverr(buf, nbuf);
 		if(oi.state != Slive)
@@ -343,9 +341,15 @@ walkoid(Sfid *f, Req *r, uchar *oid, int *oidlen)
 			continue;
 		}
 		if(at == Qobj || at == Qmeta){
+			/*
+			 * An id §1.1 forbids names no object and so has no
+			 * queue: it is answered `bad object name' on the
+			 * service loop rather than cut to Oidmax, which would
+			 * order the walk against a different object.
+			 */
 			n = strlen(name);
-			if(n > Oidmax)
-				n = Oidmax;
+			if(!srvoidok((uchar*)name, n))
+				return 0;
 			memmove(oid, name, n);
 			*oidlen = n;
 			return 1;

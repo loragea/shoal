@@ -9,6 +9,7 @@ extern char Efenced[];
 extern char Ebadctl[];
 extern char Eunknownctl[];
 extern char Ebadname[];
+extern char Edown[];
 extern char Enoobj[];
 extern char Ecsum[];
 extern char Einterrupted[];
@@ -31,6 +32,8 @@ void	srvqfree(Srvctx*);
 void	srvstep7(Srvctx*, uchar *oid, int oidlen);
 
 /* tree.c */
+void	srvfidnew(Srvctx*, Sfid*);
+void	srvfidsclose(Srvctx*);
 void	srvattachqid(Sfid*, Qid*);
 void	srvfileqid(int file, Qid*);
 void	srvobjqid(Sfid*, Objinfo*, Qid*);

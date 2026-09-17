@@ -51,6 +51,7 @@ char Efenced[]		= "fenced";
 char Ebadctl[]		= "bad ctl";
 char Eunknownctl[]	= "unknown ctl";
 char Ebadname[]		= "bad object name";
+char Edown[]		= "down";
 char Enoobj[]		= "no such object";
 char Ecsum[]		= "checksum mismatch";
 

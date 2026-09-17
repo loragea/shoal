@@ -246,16 +246,19 @@ srvctlwrite(Req *r)
 		 * naming an oid that violates §1.1"; §2.5's rows answer bad
 		 * arguments `bad ctl'.  The more specific string wins here
 		 * (store.md §14(27)).
+		 *
+		 * An over-long id is one of those violations and is refused
+		 * whole.  Cutting it to Oidmax first would leave the verb
+		 * naming a different object — one that may well exist — so
+		 * the length is the id's, never the buffer's.
 		 */
 		oidlen = strlen(cb->f[1]);
-		if(oidlen > Oidmax)
-			oidlen = Oidmax;
-		memmove(oid, cb->f[1], oidlen);
-		if(!srvoidok(oid, oidlen)){
+		if(!srvoidok((uchar*)cb->f[1], oidlen)){
 			free(cb);
 			respond(r, Ebadname);
 			return;
 		}
+		memmove(oid, cb->f[1], oidlen);
 		if((qr = srvqprep(c, oid, oidlen, r, ct->qfn)) == nil){
 			free(cb);
 			return;

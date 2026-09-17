@@ -717,7 +717,7 @@ tobjects(void)
 {
 	char buf[64], longname[Oidmax+2], *m;
 	uchar oid[Oidmax], data[2048];
-	uvlong path1, path2;
+	uvlong path1, path2, np, np2, nd;
 	Objinfo oi;
 	Srvctx *ctx;
 	Store *st;
@@ -799,11 +799,21 @@ tobjects(void)
 	checks++;
 	if(r.type != Rerror || strcmp(r.ename, "bad object name") != 0)
 		fail("walk to a bad id: %s", r.type == Rerror ? r.ename : "ok");
+	/*
+	 * An over-long id names no object, so it is not ordered against
+	 * one either: the pushed count does not move.  Cutting it to
+	 * Oidmax would put the walk on the queue of whatever object its
+	 * first 128 bytes name.
+	 */
+	srvcount(ctx, &np, &nd);
 	clwalk1(&cl, Ffile, Ffile2, longname, &r);
 	checks++;
 	if(r.type != Rerror || strcmp(r.ename, "bad object name") != 0)
 		fail("walk to an over-long id: %s",
 			r.type == Rerror ? r.ename : "ok");
+	srvcount(ctx, &np2, &nd);
+	eqv("a walk to an over-long id is queued against no object",
+		np2 - np, 0);
 	/* ".." is the parent, not an oid */
 	if(clwalk1(&cl, Ffile, Ffile2, "..", &r) != Rwalk || r.nwqid != 1)
 		fail("walk .. from /obj: %s", r.type == Rerror ? r.ename : "short");
@@ -1016,7 +1026,7 @@ tctl(void)
 		{"pull alpha",		"bad ctl"},
 		{"verify not!a!name",	"bad object name"},
 	};
-	char *m;
+	char *m, oid[Oidmax+2], line[Oidmax+16];
 	uchar data[1024];
 	Srvctx *ctx;
 	Dev *d;
@@ -1064,6 +1074,29 @@ tctl(void)
 			fail("%#q: %s, want %s", bad[i].line,
 				r.type == Rerror ? r.ename : "ok", bad[i].err);
 	}
+	/*
+	 * An id one byte over §1.1's bound, with the object its first 128
+	 * bytes name sitting right there in the store: the verb names
+	 * neither object and is refused, because an id is never cut to fit.
+	 */
+	memset(oid, 'a', Oidmax);
+	oid[Oidmax] = 0;
+	mkobj(srvstore(ctx), oid, nil, 0, 1);
+	snprint(line, sizeof line, "verify %s", oid);
+	clwrite(&cl, Fctl, 0, line, &r);
+	checks++;
+	if(r.type != Rwrite)
+		fail("verify of a 128-byte id: %s",
+			r.type == Rerror ? r.ename : "?");
+	oid[Oidmax] = 'a';
+	oid[Oidmax+1] = 0;
+	snprint(line, sizeof line, "verify %s", oid);
+	clwrite(&cl, Fctl, 0, line, &r);
+	checks++;
+	if(r.type != Rerror || strcmp(r.ename, "bad object name") != 0)
+		fail("verify of a 129-byte id: %s",
+			r.type == Rerror ? r.ename : "ok");
+
 	/* a trailing newline is one line, not a partial one */
 	clwrite(&cl, Fctl, 0, "verify alpha\n", &r);
 	checks++;
