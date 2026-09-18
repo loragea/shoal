@@ -490,21 +490,21 @@ srvqwalkhold(Req *r)
 }
 
 /*
- * The point between a staged update and its commit: after §5.4 step
- * 3's stage and the look that says it is still live, and before the
- * engine call that publishes it.  It is the window in which the fid's
- * stage belongs to a handler that has not finished with it, so it is
- * where a test drives step 7 — a Tflush of another request on the same
- * fid — against a commit that is about to happen.
+ * A point of the context's, named by the field it is set in, held by
+ * the queue proc that is carrying this request: the park and its two
+ * exits — the point cleared, or this queue's flush flag raised — are
+ * this file's, and which windows are worth a point is the handler's
+ * (obj.c holds two of the object write path's).  A request answered on
+ * the service loop carries no Qreq and cannot be held.
  */
 void
-srvqstagehold(Req *r)
+srvqhold(Req *r, uvlong *pt)
 {
 	Qreq *qr;
 
 	if((qr = r->aux) == nil)
 		return;
-	qhold(qr->ctx, qr, &qr->ctx->stagehold);
+	qhold(qr->ctx, qr, pt);
 }
 
 /*
@@ -736,6 +736,8 @@ srvhook(Srvctx *c, char *name, uvlong n)
 		c->hold = n;
 	else if(strcmp(name, "objstage") == 0)
 		c->stagehold = n;
+	else if(strcmp(name, "objlook") == 0)
+		c->lookhold = n;
 	else if(strcmp(name, "objexit") == 0)
 		c->exithold = n;
 	else if(strcmp(name, "flushhold") == 0)
@@ -768,6 +770,7 @@ srvholdclear(Srvctx *c)
 	qlock(&c->holdlk);
 	c->hold = 0;
 	c->stagehold = 0;
+	c->lookhold = 0;
 	c->exithold = 0;
 	c->flushhold = 0;
 	c->mapopen = 0;

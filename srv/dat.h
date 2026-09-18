@@ -518,6 +518,7 @@ struct Srvctx
 	QLock	holdlk;
 	uvlong	hold;		/* srvhook("objhold") */
 	uvlong	stagehold;	/* srvhook("objstage") */
+	uvlong	lookhold;	/* srvhook("objlook") */
 	uvlong	exithold;	/* srvhook("objexit") */
 	uvlong	flushhold;	/* srvhook("flushhold") */
 	uvlong	mapopen;	/* srvhook("mapopen") */

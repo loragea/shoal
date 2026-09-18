@@ -410,21 +410,44 @@ stagetake(Sfid *f, Sstage *s)
 /*
  * Is the fid's stage still this handler's, and still live?  The look a
  * handler takes before the step that must not happen once step 7 has
- * run for this fid.  `busy' is cleared across it, so a sweep that
- * lands here sees a stage nobody is inside.
+ * run for this fid.
+ *
+ * `busy' stays SET across it.  It says a handler is inside a step on
+ * this stage, and a handler between two steps of one operation is not
+ * an absence of arrivals (store.md §3.6): a sweep landing in a window
+ * this look cleared would expire the stage the look was about to call
+ * live.  The two fields the sweep writes, `dead' and `released', are
+ * read under stagelk, which is where it writes them, and the slot
+ * under the fid's state lock, which is where the hooks write it — in
+ * that order, the only order the two locks are ever taken in (dat.h).
  */
 static int
-stagelive(Sfid *f, Sstage *s)
+stagelive(Srvctx *c, Sfid *f, Sstage *s, Req *r)
 {
 	int ok;
 
-	s->busy = 0;
 	qlock(&f->lk);
+	qlock(&c->stagelk);
+	srvqhold(r, &c->lookhold);
 	ok = f->aux == s && !s->dead && !s->released;
-	qunlock(&f->lk);
-	s->busy = 1;
 	s->last = nsec();
+	qunlock(&c->stagelk);
+	qunlock(&f->lk);
 	return ok;
+}
+
+/*
+ * The stage is nobody's step any more: a handler that leaves one
+ * behind — which is the stage point, and will be the /repl fid between
+ * two chunks — clears `busy' here, under the lock the sweep reads it
+ * under, and the sweep may have it from this moment (§3.6).
+ */
+static void
+stagerest(Srvctx *c, Sstage *s)
+{
+	qlock(&c->stagelk);
+	s->busy = 0;
+	qunlock(&c->stagelk);
 }
 
 static void
@@ -691,12 +714,12 @@ objwriteq(Req *r)
 		srvqdone(r, e);
 		return;
 	}
-	if(!stagelive(f, s)){
+	if(!stagelive(c, f, s, r)){
 		stagedone(f, s);
 		srvqdone(r, Estagegone);
 		return;
 	}
-	srvqstagehold(r);
+	srvqhold(r, &c->stagehold);
 	/*
 	 * The bytes are the Req's and the key is the stage's.  lib9p keeps
 	 * the Req's buffer until this handler responds, so a step 7 that
@@ -796,7 +819,7 @@ objopenq(Req *r)
 			srvqdone(r, e);
 			return;
 		}
-		if(!stagelive(f, s)){
+		if(!stagelive(c, f, s, r)){
 			stagedone(f, s);
 			srvqdone(r, Estagegone);
 			return;
@@ -822,7 +845,7 @@ objopenq(Req *r)
 	if(stagepointon(c) && (r->ifcall.mode&3) != OREAD)
 		if((s = stagenew(c, f, Stpoint, f->oid, f->oidlen, 0, 0,
 			0, 0, &e)) != nil)
-			s->busy = 0;
+			stagerest(c, s);
 	srvqdone(r, nil);
 }
 
@@ -896,7 +919,7 @@ objremoveq(Req *r)
 		srvqdone(r, e);
 		return;
 	}
-	if(!stagelive(f, s)){
+	if(!stagelive(c, f, s, r)){
 		stagedone(f, s);
 		srvqdone(r, Estagegone);
 		return;
@@ -977,7 +1000,7 @@ objwstatq(Req *r)
 		srvqdone(r, e);
 		return;
 	}
-	if(!stagelive(f, s)){
+	if(!stagelive(c, f, s, r)){
 		stagedone(f, s);
 		srvqdone(r, Estagegone);
 		return;

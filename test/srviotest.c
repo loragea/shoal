@@ -1544,6 +1544,106 @@ Out:
 }
 
 /*
+ * §3.6's sweep trigger is an absence of ARRIVALS, and a handler that
+ * is between two steps of one operation is not one.  The look a
+ * handler takes at its own stage before the commit (§5.4 step 3) is
+ * that moment, and the objlook point is what holds a request inside
+ * it: a sweep driven by an operation on another object — which is
+ * where the sweep runs — must not expire the stage the look is about
+ * to call live.  `gamma' is the other object because it hashes to a
+ * different queue than `alpha' does, so its operation is not behind
+ * the held one.
+ */
+static void
+tstagelook(void)
+{
+	char buf[64], *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall t, r;
+	ushort ta, tg;
+	int n;
+
+	clstage = "stagelook";
+	m = mkmap(Palone, Tblksz, Tobjmax, Tuuid);
+	d = newdisk(Tnslots);
+	if((ctx = startsrv(d, m, 0, 50)) == nil)
+		return;
+	mkobj(srvstore(ctx), "alpha", "orig!", 5);
+	mkobj(srvstore(ctx), "gamma", nil, 0);
+
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, Nclient, &r) != Rattach){
+		fail("attach: %s", clerr(&r));
+		goto Out;
+	}
+	if(clwalkobj(&cl, Froot, Ffile, "obj", "alpha", &r) != Rwalk
+	|| clopen(&cl, Ffile, ORDWR, &r) != Ropen){
+		fail("open /obj/alpha: %s", clerr(&r));
+		goto Out;
+	}
+	if(clwalkobj(&cl, Froot, Ffile2, "obj", "gamma", &r) != Rwalk){
+		fail("walk /obj/gamma: %s", clerr(&r));
+		goto Out;
+	}
+	srvhook(ctx, "objlook", 1);
+	memset(&t, 0, sizeof t);
+	t.type = Twrite;
+	t.tag = ta = cltag(&cl);
+	t.fid = Ffile;
+	t.offset = 0;
+	t.data = "NEW!!";
+	t.count = 5;
+	clput(&cl, &t);
+	sleep(200);			/* held in the look, and idle past stagems */
+
+	/* the sweep runs at the head of this, on the other object's queue */
+	memset(&t, 0, sizeof t);
+	t.type = Topen;
+	t.tag = tg = cltag(&cl);
+	t.fid = Ffile2;
+	t.mode = OREAD;
+	clput(&cl, &t);
+	sleep(150);
+	srvhook(ctx, "objlook", 0);
+
+	if(clgettag(&cl, ta, &r) < 0)
+		fail("no answer for the write held in its look");
+	else{
+		checks++;
+		if(r.type != Rwrite)
+			fail("the sweep took a stage its handler was inside:"
+				" %s", clerr(&r));
+		else
+			eqv("... and the write commits", r.count, 5);
+	}
+	cltagfree(&cl, ta);
+	if(clgettag(&cl, tg, &r) < 0)
+		fail("no answer for the open that drove the sweep");
+	else{
+		checks++;
+		if(r.type != Ropen)
+			fail("open /obj/gamma: %s", clerr(&r));
+	}
+	cltagfree(&cl, tg);
+	n = clslurp(&cl, Ffile, buf, sizeof buf - 1);
+	if(n < 0)
+		n = 0;
+	buf[n] = 0;
+	eqs("... with the bytes it was carrying", buf, "NEW!!");
+	clclunk(&cl, Ffile, &r);
+	clclunk(&cl, Ffile2, &r);
+	clclunk(&cl, Froot, &r);
+Out:
+	srvhook(ctx, "objlook", 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * D16's shutdown: a fid holding a stage when the connection drops has
  * it discarded by the shutdown's sweep, BEFORE the store closes —
  * store.md §9 allows nothing but the snapshot calls afterwards, so a
@@ -1704,6 +1804,7 @@ threadmain(int argc, char **argv)
 	tstagesweep();
 	tstageflush();
 	tstagecommit();
+	tstagelook();
 	tstageclose();
 	tqueued();
 
