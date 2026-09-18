@@ -738,6 +738,8 @@ srvhook(Srvctx *c, char *name, uvlong n)
 	qlock(&c->holdlk);
 	if(strcmp(name, "objhold") == 0)
 		c->hold = n;
+	else if(strcmp(name, "objprelook") == 0)
+		c->prelookhold = n;
 	else if(strcmp(name, "objstage") == 0)
 		c->stagehold = n;
 	else if(strcmp(name, "objlook") == 0)
@@ -773,6 +775,7 @@ srvholdclear(Srvctx *c)
 {
 	qlock(&c->holdlk);
 	c->hold = 0;
+	c->prelookhold = 0;
 	c->stagehold = 0;
 	c->lookhold = 0;
 	c->exithold = 0;

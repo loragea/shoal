@@ -1821,6 +1821,166 @@ Out:
 }
 
 /*
+ * The look §5.4 step 3 owes before its commit, and the two answers
+ * store.md §14(33) keeps apart.  Step 7 discards the stage the FID
+ * holds, whichever of the fid's requests was flushed, so a Tflush of a
+ * second write QUEUED on this fid takes the running write's stage —
+ * and the objprelook point parks that write in exactly the window
+ * between its stage and its look (srv.h), so the look is what it comes
+ * back to.  It commits nothing and answers `staged update discarded'.
+ * A Tflush of the running write's OWN tag is the other answer:
+ * `interrupted', with §5.4.1's licence to have applied the update or
+ * not, which is why nothing is asserted of the bytes there.
+ */
+static void
+tstagediscard(void)
+{
+	char buf[64], *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall t, r;
+	uvlong live, done, np, np2, nd;
+	ushort ta, tb, tf;
+	int i, n;
+
+	clstage = "stagediscard";
+	m = mkmap(Palone, Tblksz, Tobjmax, Tuuid);
+	d = newdisk(Tnslots);
+	if((ctx = startsrv(d, m, 0, 0)) == nil)
+		return;
+	mkobj(srvstore(ctx), "alpha", "orig!", 5);
+
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, Nclient, &r) != Rattach){
+		fail("attach: %s", clerr(&r));
+		goto Out;
+	}
+	if(clwalkobj(&cl, Froot, Ffile, "obj", "alpha", &r) != Rwalk
+	|| clopen(&cl, Ffile, ORDWR, &r) != Ropen){
+		fail("open /obj/alpha: %s", clerr(&r));
+		goto Out;
+	}
+
+	/* the write stages, then waits short of the look */
+	srvhook(ctx, "objprelook", 1);
+	memset(&t, 0, sizeof t);
+	t.type = Twrite;
+	t.tag = ta = cltag(&cl);
+	t.fid = Ffile;
+	t.offset = 0;
+	t.data = "NEW!!";
+	t.count = 5;
+	clput(&cl, &t);
+	for(i = 0; i < 400; i++){
+		srvstagecount(ctx, &live, nil, nil);
+		if(live == 1)
+			break;
+		sleep(5);
+	}
+	eqv("the parked write holds the fid's stage", live, 1);
+
+	/*
+	 * A second write on the same fid, and the Tflush of it: the loop
+	 * reads the two in the order they were sent and queues the write
+	 * behind the request that is parked, so the flush finds it waiting
+	 * and performs step 7 for it there (queue.c).
+	 */
+	srvcount(ctx, &np, &nd);
+	t.tag = tb = cltag(&cl);
+	clput(&cl, &t);
+	for(i = 0; i < 400; i++){
+		srvcount(ctx, &np2, &nd);
+		if(np2 > np)
+			break;
+		sleep(5);
+	}
+	memset(&t, 0, sizeof t);
+	t.type = Tflush;
+	t.tag = tf = cltag(&cl);
+	t.oldtag = tb;
+	clput(&cl, &t);
+	if(clgettag(&cl, tb, &r) < 0)
+		fail("no answer for the flushed write");
+	else
+		eqs("the flushed queued write", clerr(&r), "interrupted");
+	cltagfree(&cl, tb);
+	if(clgettag(&cl, tf, &r) < 0)
+		fail("no Rflush");
+	else{
+		checks++;
+		if(r.type != Rflush)
+			fail("the Rflush after it: %s", clerr(&r));
+	}
+	cltagfree(&cl, tf);
+	srvstagecount(ctx, &live, &done, nil);
+	eqv("step 7 took the stage the parked write staged", live, 0);
+	eqv("... and gave back what it held", done, 1);
+
+	srvhook(ctx, "objprelook", 0);
+	if(clgettag(&cl, ta, &r) < 0)
+		fail("no answer for the parked write");
+	else
+		eqs("a write whose stage step 7 took", clerr(&r),
+			"shoalsrv: staged update discarded");
+	cltagfree(&cl, ta);
+	n = clslurp(&cl, Ffile, buf, sizeof buf - 1);
+	if(n < 0)
+		n = 0;
+	buf[n] = 0;
+	eqs("... and commits none of its bytes", buf, "orig!");
+
+	/* the other answer: the write's own request is what was flushed */
+	srvhook(ctx, "objprelook", 1);
+	memset(&t, 0, sizeof t);
+	t.type = Twrite;
+	t.tag = ta = cltag(&cl);
+	t.fid = Ffile;
+	t.offset = 0;
+	t.data = "AGAIN";
+	t.count = 5;
+	clput(&cl, &t);
+	for(i = 0; i < 400; i++){
+		srvstagecount(ctx, &live, nil, nil);
+		if(live == 1)
+			break;
+		sleep(5);
+	}
+	eqv("the second parked write holds a stage of its own", live, 1);
+	memset(&t, 0, sizeof t);
+	t.type = Tflush;
+	t.tag = tf = cltag(&cl);
+	t.oldtag = ta;
+	clput(&cl, &t);
+	if(clgettag(&cl, ta, &r) < 0)
+		fail("no answer for the flushed running write");
+	else
+		eqs("a write whose own request was flushed", clerr(&r),
+			"interrupted");
+	cltagfree(&cl, ta);
+	if(clgettag(&cl, tf, &r) < 0)
+		fail("no Rflush for the running write");
+	else{
+		checks++;
+		if(r.type != Rflush)
+			fail("the Rflush after the running write: %s", clerr(&r));
+	}
+	cltagfree(&cl, tf);
+	srvhook(ctx, "objprelook", 0);
+	srvstagecount(ctx, &live, &done, nil);
+	eqv("the flushed write leaves no stage behind", live, 0);
+	eqv("... and that is the second stage given back", done, 2);
+	clclunk(&cl, Ffile, &r);
+	clclunk(&cl, Froot, &r);
+Out:
+	srvhook(ctx, "objprelook", 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * §3.6's sweep trigger is an absence of ARRIVALS, and a handler that
  * is between two steps of one operation is not one.  The look a
  * handler takes at its own stage before the commit (§5.4 step 3) is
@@ -2084,6 +2244,7 @@ threadmain(int argc, char **argv)
 	tsweepclunk();
 	tstageflush();
 	tstagecommit();
+	tstagediscard();
 	tstagelook();
 	tstageclose();
 	tqueued();

@@ -830,6 +830,13 @@ objwriteq(Req *r)
 		srvqdone(r, e);
 		return;
 	}
+	/*
+	 * The window this handler owns a stage it has not yet looked at:
+	 * from here to the look below, a step 7 for another request on this
+	 * fid takes the stage out from under it, and the look is what turns
+	 * that into an answer instead of a commit (srv.h's objprelook).
+	 */
+	srvqhold(r, &c->prelookhold);
 	if((e = replicate(c, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
 		stagedone(f, s);
 		srvqdone(r, e);
