@@ -5973,12 +5973,15 @@ other files cite, so a gap is cheaper than a renumbering.
     fresh because that clearing runs before it. Which step of the
     handler clears it depends on what the chunk still owes. For a
     chunk in the middle of a transfer it is the look its engine write
-    returns to. For a `final=1` chunk the look keeps the mark set,
-    because that chunk holds the stage across the arbitration and the
-    commit, and the give-back behind the look is what clears it —
-    unless the stage was already dead when that look ran, in which
-    case the look answers `stage expired` and clears the mark itself,
-    like any other chunk's ((45)). For
+    returns to. For a `final=1` chunk whose write went through the
+    look keeps the mark set, because that chunk holds the stage across
+    the arbitration and the commit, and the give-back behind the look
+    is what clears it — unless the stage was already dead when that
+    look ran, in which case the look answers `stage expired` and
+    clears the mark itself, like any other chunk's ((45)). A `final=1`
+    chunk whose write FAILED asks for no mark to be kept either: its
+    look clears the mark and leaves the stage in the slot for a later
+    chunk or the fid's clunk, which is the paragraph above. For
     the chunk that OPENS a transfer there is no look at all in the
     window this exception covers — it runs between the stage and the
     handle — so what clears it is the give-back behind an arm that
