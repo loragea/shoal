@@ -60,7 +60,6 @@ enum
 
 	/* what qjob runs on the object's queue */
 	Jscrub		= 0,
-	Jdiscard,
 };
 
 /*
@@ -73,9 +72,10 @@ enum
  * freeing commit's flush returns, which says nothing about a reader
  * that started earlier, so a scrubber reading beside the queue would
  * hash grains freed and staged into under it and durably flag a live,
- * correct object `corrupt'.  The same goes for the reclaim walk's
- * discards: the queue is the object's ordering point (§5.4 step 2),
- * and a mutation outside it is ordered against nothing.
+ * correct object `corrupt'.  The queue is the object's ordering point
+ * (§5.4 step 2), and a read or a mutation outside it is ordered
+ * against nothing — so a discard, when the replication surface brings
+ * one, belongs here too; the reclaim walk below makes none.
  *
  * Most of the pool's entry points take a Req, because every other
  * caller is one.  A pass is not, so it enters through srvqjob
@@ -93,7 +93,6 @@ struct Qwork
 	int	op;
 	uchar	oid[Oidmax];
 	int	oidlen;
-	uvlong	ver, wepoch, epoch;
 	int	rc;
 	int	bad;
 	char	err[ERRMAX];
@@ -128,13 +127,6 @@ qworkrun(void *a)
 		}else
 			j->bad = v.arraybad || v.nbad > 0;
 		vfyfree(&v);
-		break;
-	case Jdiscard:
-		if(objdiscard(j->ctx->store, j->oid, j->oidlen, j->ver,
-			j->wepoch, j->epoch) < 0){
-			j->rc = -1;
-			rerrstr(j->err, sizeof j->err);
-		}
 		break;
 	}
 }
@@ -267,10 +259,10 @@ srvjobstext(Srvctx *c, Sfid *f, Text *t)
 	unlock(&c->joblk);
 	for(i = 0; i < n; i++)
 		textprint(t, "job=%s state=%s rate=%lud done=%llud/%llud "
-			"bad=%llud tombs=%llud dropped=%llud\n",
+			"bad=%llud reclaimable=%llud dropped=%llud\n",
 			cp[i].verb, cp[i].running ? "running" : "queued",
 			rate, cp[i].done, cp[i].total, cp[i].bad,
-			cp[i].tombs, cp[i].dropped);
+			cp[i].reclaimable, cp[i].dropped);
 	return nil;
 }
 
@@ -330,22 +322,41 @@ scrubpace(Srvctx *c, uvlong *bytes, vlong t0, uvlong len)
 }
 
 /*
- * store.md §9's tombstone reclaim, which is the caller's walk and not
- * the engine's: the engine holds no `tombdays', because layer-a §3.1
- * makes it a map-header attribute.  The walk opens a /tombs snapshot,
- * tests each entry's mtime against the cutoff that attribute names
- * and its wepoch against this instance's map epoch, and discards by
- * the entry's OWN key rather than by its slot — which is what makes
- * it safe under concurrent mutation, since §1.5's receiver checks
- * then refuse a record that is not the one the walk inspected instead
- * of removing whatever the slot came to hold.
+ * store.md §9's tombstone reclaim walk, which COUNTS and discards
+ * nothing.
+ *
+ * layer-a §1.5 licenses a discard only when all three of its
+ * conditions hold: (1) full confirmation — every instance in the map
+ * whose status is not `dead' has said, since the tombstone was
+ * written, that it holds a copy at a key at least the tombstone's or
+ * no copy at all; (2) `tombdays' of retention since the tombstone's
+ * mtime; and (3) the current epoch strictly above the tombstone's
+ * wepoch.  Conditions 2 and 3 are local, and this walk is where they
+ * are tested: `tombdays' is a map-header attribute (§3.1) the engine
+ * does not hold, and 0 is a value it may carry — the cutoff is then
+ * the present, and a tombstone written before this second has served
+ * its retention.
+ *
+ * Condition 1 is not local and is not reachable in this build: there
+ * is no outbound peer client, so no instance has confirmed anything
+ * and every tombstone is blocked by an unanswered instance.  §1.5 is
+ * explicit about what discarding on 2 and 3 alone costs — it is the
+ * first draft's rule, and the resurrection hole it names: a peer that
+ * has been down since before the delete comes back holding the live
+ * copy, the primary holds nothing for the object, and absence loses
+ * arbitration (§1.3).  So the walk reports what it finds and leaves
+ * every record where it is: `reclaimable=' at /jobs is the count of
+ * tombstones past conditions 2 and 3, and it is the number of
+ * discards the replication surface will have to confirm.  The discard
+ * itself — §1.5's op=discard to every confirming instance, this
+ * instance's own record removed last — lands with that surface.
+ * store.md §14(31) and decisions.md D26 record it.
  *
  * It runs from the scrub pass and has no verb of its own.  layer-a
  * §2.5 fixes the ctl grammar and has no verb for it, so a new one
  * would be a wire change; `scrub' is the only verb §2.5 gives an
  * instance for walking its own index on a schedule, and store.md §8
  * already makes that pass the place other whole-index work rides on.
- * store.md §14(31) records it.
  */
 static void
 reclaim(Srvctx *c, Sjob *j)
@@ -353,26 +364,17 @@ reclaim(Srvctx *c, Sjob *j)
 	char buf[ERRMAX];
 	Objsnap *sn;
 	Objinfo oi;
-	Qwork w;
 	uchar oid[Oidmax];
+	uvlong epoch;
 	vlong cutoff;
 	ulong i, n;
 	int oidlen, rc;
 
-	/*
-	 * `tombdays' is the map's, layer-a §3.1, and 0 is a value it may
-	 * carry: the cutoff is then the present, and a tombstone written
-	 * before this second is reclaimable.  Nothing here special-cases
-	 * it — the comparison says what the attribute means.
-	 */
 	cutoff = time(0) - (vlong)c->map->tombdays*86400;
+	epoch = c->map->epoch;
 	if((sn = srvsnapopen(c->store, Snaptomb, buf, sizeof buf)) == nil)
 		return;
 	n = objsnapcount(sn);
-	memset(&w, 0, sizeof w);
-	w.ctx = c;
-	w.op = Jdiscard;
-	w.epoch = c->map->epoch;
 	for(i = 0; i < n; i++){
 		if(passover(c))
 			break;
@@ -381,16 +383,13 @@ reclaim(Srvctx *c, Sjob *j)
 			break;
 		if(rc == 0)
 			continue;
-		if(oi.mtime >= cutoff)
+		if(oi.mtime >= cutoff)		/* §1.5 condition 2 */
 			continue;
-		if(oi.wepoch >= w.epoch)
+		if(oi.wepoch >= epoch)		/* §1.5 condition 3 */
 			continue;
-		memmove(w.oid, oid, oidlen);
-		w.oidlen = oidlen;
-		w.ver = oi.ver;
-		w.wepoch = oi.wepoch;
-		if(qjob(&w) == 0)
-			j->tombs++;
+		lock(&c->joblk);
+		j->reclaimable++;
+		unlock(&c->joblk);
 	}
 	objsnapclose(sn);
 }

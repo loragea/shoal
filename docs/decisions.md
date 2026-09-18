@@ -895,7 +895,13 @@ answers success once the job is accepted, and is read from `/jobs`.
 That is `scrub` (`design/layer-a.md` §2.5, §7.5) and also `forget`,
 which §2.5 does not describe as background work. `design/store.md`
 §9's tombstone reclaim gets no verb of its own: it runs at the end of
-a `scrub` pass that was not stopped. §14(30) and §14(31) record both.
+a `scrub` pass that was not stopped, and it **counts without
+discarding**: `design/layer-a.md` §1.5 licenses a discard only when
+all three of its conditions hold, the walk tests the two local ones
+(retention and epoch supersession) and reports the count at `/jobs`,
+and the third — full confirmation from every non-`dead` instance —
+has nothing to answer it while this build has no peer client.
+§14(30) and §14(31) record both.
 **Rationale:** lib9p's service loop is single-threaded, and layer-a
 §5.4.1 requires a `Tflush` to be answerable while anything else is in
 flight; a verb that made durable commits on that loop would park it
@@ -922,10 +928,14 @@ whole-index walk with no way for an operator to see or stop it, where
 **Normative:** nothing. layer-a §2.5's grammar, its role and fence
 columns, and its rule that a verb starting background work returns on
 acceptance are what a reimplementation matches; none of them is
-changed here.
+changed here. §1.5's three discard conditions are normative and are
+layer-a's, not this row's — what this row settles is that the walk
+carrying them rides on `scrub`, and that a walk which can test only
+two of the three discards nothing.
 **Implementation policy:** all of it — which verbs are passes, that
 one pass carries the reclaim walk, the scrub's rate default and the
-bytes it charges itself (§14(31)), `/jobs`'s line format, and that a
-second `scrub start` while a pass runs starts nothing. An
+bytes it charges itself (§14(31)), `/jobs`'s line format, the
+`reclaimable=` count it reports, and that a second `scrub start`
+while a pass runs starts nothing. An
 implementation that answers `forget` synchronously, or that reclaims
 tombstones from a timer, conforms.

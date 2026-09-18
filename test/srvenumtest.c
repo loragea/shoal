@@ -1284,15 +1284,54 @@ Out:
 }
 
 /*
- * store.md §9's tombstone reclaim, which rides on the scrub pass: the
- * cutoff is the map header's `tombdays' and the entry's own wepoch
- * against the map epoch, and the discard names the entry's key rather
- * than its slot.  Both sides of both tests are driven here.
+ * Wait for a pass to reach the end of its walk and park at §13's
+ * jobhold point, then answer one field of its /jobs line.  That point
+ * is what makes a finished pass readable at all: /jobs lists a pass
+ * only while it is running or queued (layer-a §2.2), so its counters
+ * and the error it gave up with are gone the moment it unlinks.
+ *
+ * The walk being over is `done=' having reached `total=', which
+ * jobfield reads as the numerator of the done=<n>/<n> pair.  Answers
+ * nil if no pass parked.
+ */
+static char*
+jobparked(Cl *cl, char *attr, char *val, int nval)
+{
+	char buf[4096], *p;
+	uvlong done, total;
+	int i;
+
+	for(i = 0; i < 500; i++){
+		if(slurpfile(cl, Ffile2, "jobs", buf, sizeof buf) > 0
+		&& (p = strstr(buf, "done=")) != nil){
+			done = strtoull(p+5, &p, 10);
+			total = *p == '/' ? strtoull(p+1, nil, 10) : 0;
+			if(total != 0 && done == total)
+				return jobfield(cl, attr, val, nval);
+		}
+		sleep(20);
+	}
+	return nil;
+}
+
+/*
+ * store.md §9's tombstone reclaim walk, which rides on the scrub pass
+ * and discards NOTHING.
+ *
+ * layer-a §1.5 licenses a discard only when all three of its
+ * conditions hold, and the two the walk can test are local: the
+ * entry's mtime against the map header's `tombdays', and its wepoch
+ * strictly below the map epoch.  The third — confirmation from every
+ * non-dead instance in the map — has nothing to answer it while there
+ * is no peer client, so what the walk produces is the count at /jobs
+ * and every record stays where it is.  Both sides of both local tests
+ * are driven here, and the count is read while the pass is parked at
+ * §13's jobhold point, since /jobs lists a pass only while it runs.
  */
 static void
 treclaim(void)
 {
-	char buf[8192], *m;
+	char buf[8192], val[128], *m;
 	Objinfo oi;
 	Srvctx *ctx;
 	Store *st;
@@ -1315,12 +1354,19 @@ treclaim(void)
 	clstart(&cl, ctx, Clmsize);
 	if(!adminctl(&cl, "role=admin"))
 		goto Out;
+	srvhook(ctx, "jobhold", 1);
 	if(clwrite(&cl, Fctl, 0, "scrub start rate=1000000", &r) != Rwrite)
 		fail("scrub start: %s", clerr(&r));
+	if(jobparked(&cl, "reclaimable", val, sizeof val) == nil)
+		fail("the pass never reached its hold");
+	else
+		eqs("a tombstone younger than tombdays is not reclaimable",
+			val, "0");
+	srvhook(ctx, "jobhold", 0);
 	for(i = 0; i < 400 && jobrunning(&cl); i++)
 		sleep(20);
 	if(slurpfile(&cl, Ffile, "tombs", buf, sizeof buf) >= 0)
-		eqv("a tombstone younger than tombdays is kept",
+		eqv("and both tombstones are still there",
 			nlines(buf, "oid="), 2);
 Out:
 	clstop(&cl);
@@ -1331,8 +1377,10 @@ Out:
 	/*
 	 * tombdays=0: the cutoff is the present, so a tombstone written
 	 * before this second is past it.  The wepoch test is what still
-	 * separates the two — `young' carries the map's own epoch, which
-	 * §1.5's receiver checks require the discard to be strictly below.
+	 * separates the two — `young' carries the map's own epoch, and
+	 * §1.5's condition 3 wants the epoch strictly above it.  Nothing
+	 * re-checks that condition downstream any more, since there is no
+	 * discard to re-check it: the count is the whole of the verdict.
 	 */
 	m = mkmapd(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid, 0);
 	d = newdisk();
@@ -1347,18 +1395,26 @@ Out:
 	clstart(&cl, ctx, Clmsize);
 	if(!adminctl(&cl, "role=admin"))
 		goto Out2;
+	srvhook(ctx, "jobhold", 1);
 	if(clwrite(&cl, Fctl, 0, "scrub start rate=1000000", &r) != Rwrite)
 		fail("scrub start: %s", clerr(&r));
+	if(jobparked(&cl, "reclaimable", val, sizeof val) == nil)
+		fail("the pass never reached its hold");
+	else
+		eqs("the tombstone past both cutoffs is counted, and it "
+			"alone: the other's wepoch is not below the map "
+			"epoch", val, "1");
+	srvhook(ctx, "jobhold", 0);
 	for(i = 0; i < 400 && jobrunning(&cl); i++)
 		sleep(20);
 	if(slurpfile(&cl, Ffile, "tombs", buf, sizeof buf) >= 0){
-		eqv("a tombstone past the cutoff is discarded",
-			nlines(buf, "oid="), 1);
-		istrue("the one left is the one whose wepoch is not below "
-			"the map epoch", nlines(buf, "oid=young ") == 1);
+		eqv("a counted tombstone is kept: §1.5's condition 1 has "
+			"nothing to answer it", nlines(buf, "oid="), 2);
+		istrue("including the one past both cutoffs",
+			nlines(buf, "oid=old ") == 1);
 	}
-	istrue("the discarded record is gone from the index",
-		statof(st, "old", &oi) < 0);
+	istrue("and its record is still in the index",
+		statof(st, "old", &oi) == 0);
 Out2:
 	clstop(&cl);
 	srvfree(ctx);

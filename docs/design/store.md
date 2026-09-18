@@ -5498,11 +5498,29 @@ name a half that is not built; each says which.
     and has no verb for it, so adding one would be a wire change
     (§13's own argument for `-X` being a flag), and `scrub` is the
     only verb §2.5 gives an instance for walking its own index on a
-    schedule. It is the walk §9 describes — a `/tombs` snapshot, each
-    entry's `mtime` against the map header's `tombdays` and its
-    `wepoch` against the map epoch, discarded by the entry's own key
-    — and every discard goes through that oid's queue, as the scrub's
-    own reads do.
+    schedule.
+
+    **The walk counts and discards nothing.** layer-a §1.5 licenses a
+    discard only when **all three** of its conditions hold. Two are
+    local and are what the walk tests: condition 2, `tombdays` of
+    retention since the entry's `mtime`, read from the map header
+    (§3.1) because the engine does not hold it; and condition 3, the
+    map epoch strictly above the entry's `wepoch`. Condition 1, full
+    confirmation from every instance in the map whose `status` is not
+    `dead`, is **open**: this build has no outbound peer client
+    (§14(18)), so no instance has confirmed anything and condition 1
+    blocks every discard. §1.5 names discarding on 2 and 3 alone as
+    the first draft's unsound rule and the resurrection hole it
+    leaves — a holder absent since before the delete returns with the
+    live copy, and absence loses arbitration (§1.3). *Not made:* the
+    walk reports instead. `/jobs` carries `reclaimable=<n>`, the
+    tombstones past conditions 2 and 3, which is the number of
+    discards the replication surface will have to confirm; every
+    record stays where it is, and `/tombs` still lists it. When that
+    surface lands it adds condition 1 and §1.5's execution — `op=
+    discard` to every confirming instance, this instance's own record
+    removed last — and every discard then goes through that oid's
+    queue, as the scrub's own reads do.
 
 32. **`newmonid` cannot replace a pinned `monid`, and nothing logs
     it (layer-a §2.5, §6.3).** §2.5 has the verb *replace* this

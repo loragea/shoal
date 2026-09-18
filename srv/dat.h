@@ -422,7 +422,7 @@ struct Sjob
 	int	running;	/* the proc has started: `queued' until then */
 	uvlong	done, total;	/* index slots walked, and to walk */
 	uvlong	bad;		/* objects the pass found mismatching */
-	uvlong	tombs;		/* tombstones the reclaim walk discarded */
+	uvlong	reclaimable;	/* tombstones past layer-a §1.5's local two */
 	uvlong	dropped;	/* dirty records `forget' discarded */
 	char	arg[Peermax+1];	/* `forget's peer */
 };
