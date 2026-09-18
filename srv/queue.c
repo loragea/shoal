@@ -598,6 +598,32 @@ srvreclaimhold(Srvctx *c, uvlong i)
 }
 
 /*
+ * The point inside the /obj and /meta directory read's entry walk
+ * (enum.c), which is the one stretch of a queued handler that runs
+ * over the fid's state with the fid's state lock NOT held.  n != 0
+ * parks the read before its n-1'th entry, with the entries before it
+ * already converted, so a test can drive the service loop at a fid a
+ * queue proc is part-way through a listing of — a Tflush of a sibling
+ * request on that same fid, which the loop performs step 7 for.  Set
+ * to n+1, like slotfail; the hold ends on this queue's flush flag as
+ * the other request holds do, so the read itself stays flushable.
+ */
+void
+srvdirhold(Req *r, uvlong i)
+{
+	Qreq *qr;
+	uvlong n;
+
+	if((qr = r->aux) == nil)
+		return;
+	qlock(&qr->ctx->holdlk);
+	n = qr->ctx->dirhold;
+	qunlock(&qr->ctx->holdlk);
+	if(n != 0 && i == n-1)
+		qhold(qr->ctx, qr, &qr->ctx->dirhold);
+}
+
+/*
  * The third point, at a queued walk's commit: the moment a walk that
  * moves its fid has given the old state back and is about to write
  * the new one.  It is where the service loop is concurrent with the
@@ -703,6 +729,20 @@ srvqexit(Req *r)
  * has filled its cell, because the call site is the contract: the
  * halves are added to this function, not to the handlers.
  */
+/*
+ * §13's point, wherever step 7 parks: on the loop it ends on its own
+ * deadline, because the shutdown that would clear it runs on the loop
+ * it is parking (srv.h).
+ */
+static void
+holdstep7(Srvctx *c, int onloop)
+{
+	if(onloop)
+		holdms(c, &c->step7hold);
+	else
+		qhold(c, nil, &c->step7hold);
+}
+
 void
 srvstep7(Req *r, int onloop)
 {
@@ -711,6 +751,28 @@ srvstep7(Req *r, int onloop)
 
 	if(r->fid == nil || (f = r->fid->aux) == nil)
 		return;
+	c = r->srv->aux;
+	/*
+	 * A fid with no flush cell has nothing here to do, and this runs
+	 * on the SERVICE LOOP for a request that was still queued — where
+	 * the state lock is a lock queue procs hold across work of their
+	 * own, and the loop must block on nothing a queue proc needs
+	 * (dat.h).  So the cell is read before the lock and the lock taken
+	 * only when there is a call to make under it; the read under the
+	 * lock is still what decides, so a cell cleared in between calls
+	 * nothing.  A cell INSTALLED in between is missed, which is the
+	 * race the lock leaves in any case — a flush that landed a moment
+	 * earlier misses it too, and the handler that installed it is the
+	 * one that gives it back.
+	 *
+	 * The point parks either way: with no cell there is no state for a
+	 * test to drive a clunk or a walk against, so the park outside the
+	 * lock is the same park.
+	 */
+	if(f->auxflush == nil){
+		holdstep7(c, onloop);
+		return;
+	}
 	/*
 	 * Under the FID'S STATE lock, over the read of the cell and the
 	 * call through it.  lib9p's own reference keeps the Fid alive
@@ -736,7 +798,6 @@ srvstep7(Req *r, int onloop)
 	 * every request in flight before it closes the store (D16), and a
 	 * request in flight is what this runs for.
 	 */
-	c = r->srv->aux;
 	/*
 	 * The hold is inside the state lock, which is what a test drives a
 	 * clunk or a moving walk of this fid against, and outside the
@@ -747,10 +808,7 @@ srvstep7(Req *r, int onloop)
 	 * same deadline the flush hold does.
 	 */
 	qlock(&f->lk);
-	if(onloop)
-		holdms(c, &c->step7hold);
-	else
-		qhold(c, nil, &c->step7hold);
+	holdstep7(c, onloop);
 	if(f->auxflush != nil)
 		f->auxflush(f, r);
 	qunlock(&f->lk);
@@ -898,6 +956,8 @@ srvhook(Srvctx *c, char *name, uvlong n)
 		c->slotfail = n;
 	else if(strcmp(name, "reclaimhold") == 0)
 		c->reclaimhold = n;
+	else if(strcmp(name, "dirhold") == 0)
+		c->dirhold = n;
 	qunlock(&c->holdlk);
 }
 
@@ -930,6 +990,7 @@ srvholdclear(Srvctx *c)
 	c->jobhold = 0;
 	c->slotfail = 0;
 	c->reclaimhold = 0;
+	c->dirhold = 0;
 	qunlock(&c->holdlk);
 }
 

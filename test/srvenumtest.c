@@ -90,7 +90,7 @@ enum
 	 * threadmain.  Every check this file makes is unconditional once
 	 * its case is entered, so the number is fixed.
 	 */
-	Nchecks	= 215,
+	Nchecks	= 218,
 
 	/* fids the cases use */
 	Froot	= 1,
@@ -1162,6 +1162,117 @@ tdirflush(void)
 	clclunk(&cl, Fdir, &r);
 Out:
 	srvhook(ctx, "objexit", 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
+ * The service loop does not wait for a directory read.
+ *
+ * A Tflush of a request that is still QUEUED has step 7 performed on
+ * the service loop (srv/queue.c), and step 7 takes the flushed fid's
+ * state lock.  The directory read works over that same fid's state —
+ * a whole listing's worth of objsnapent calls, each taking the
+ * engine's lock — and if it held the fid's lock across that walk the
+ * loop would block behind it for the length of the walk, which dat.h
+ * forbids: nothing a queue proc holds may stop the loop.  So the read
+ * lifts the snapshot and the cursor under the lock, walks unlocked,
+ * and retakes the lock to commit.
+ *
+ * §13's `dirhold' point parks the read inside that walk, with no lock
+ * of the fid's held.  A second read on the same fid then waits on the
+ * reserved queue — one proc — and flushing THAT one is the loop-side
+ * step 7 this case is about.  The reply order is the answer: the
+ * flushed sibling and its Rflush first, the held read last.
+ *
+ * The rescue proc is what keeps a failure a failure rather than a
+ * wedged program: a loop stalled behind the walk clears nothing, so
+ * the point is cleared from a proc of its own and the three replies
+ * still arrive — in the other order.
+ */
+static Srvctx *dirrctx;
+
+static void
+dirrescue(void*)
+{
+	sleep(1500);
+	srvhook(dirrctx, "dirhold", 0);
+	threadexits(nil);
+}
+
+static void
+tdirstall(void)
+{
+	char name[32], *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall t, r;
+	char *w[1];
+	ushort ta, tb, tf, tg[3];
+	int i, ty[3];
+
+	clstage = "dirstall";
+	m = mkmap();
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4, 0)) == nil)
+		return;
+	for(i = 0; i < 20; i++){
+		snprint(name, sizeof name, "obj%.2d", i);
+		mkobj(srvstore(ctx), name, nil, 0, 1);
+	}
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
+		fail("attach: %s", clerr(&r));
+		goto Out;
+	}
+	w[0] = "obj";
+	if(clopenpath(&cl, Froot, Fdir, 1, w, OREAD, &r) != Ropen){
+		fail("open /obj: %s", clerr(&r));
+		goto Out;
+	}
+
+	srvhook(ctx, "dirhold", 3);	/* held before the third entry */
+	memset(&t, 0, sizeof t);
+	t.type = Tread;
+	t.tag = ta = cltag(&cl);
+	t.fid = Fdir;
+	t.offset = 0;
+	t.count = 4096;
+	clput(&cl, &t);
+	sleep(200);			/* it is now held inside the walk */
+	t.tag = tb = cltag(&cl);
+	clput(&cl, &t);
+	sleep(200);			/* ... and this one is queued behind it */
+
+	dirrctx = ctx;
+	if(proccreate(dirrescue, nil, 8192) < 0)
+		sysfatal("proccreate: %r");
+	memset(&t, 0, sizeof t);
+	t.type = Tflush;
+	t.tag = tf = cltag(&cl);
+	t.oldtag = tb;
+	clput(&cl, &t);
+	for(i = 0; i < 3; i++){
+		if(clget(&cl, &r) < 0){
+			fail("only %d of the three replies arrived", i);
+			goto Out;
+		}
+		tg[i] = r.tag;
+		ty[i] = r.type;
+		cltagfree(&cl, r.tag);
+	}
+	istrue("the flushed sibling is answered while the read is held",
+		tg[0] == tb && ty[0] == Rerror);
+	istrue("and its Rflush comes after it",
+		tg[1] == tf && ty[1] == Rflush);
+	istrue("the held read is the last of the three",
+		tg[2] == ta && ty[2] == Rread);
+	clclunk(&cl, Fdir, &r);
+Out:
+	srvhook(ctx, "dirhold", 0);
 	clstop(&cl);
 	srvfree(ctx);
 	devclose(d);
@@ -2776,6 +2887,7 @@ threadmain(int argc, char **argv)
 	tdir();
 	tdircursor();
 	tdirflush();
+	tdirstall();
 	tdiropenflush();
 	tsnaprefuse();
 	tscrub();

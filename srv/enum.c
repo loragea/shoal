@@ -407,9 +407,32 @@ dirfree(Dir *d)
 
 /*
  * The directory read, on the reserved queue.  The fid's state lock is
- * held across the whole of it, which is what dat.h asks of a handler
- * that works on what aux names: a clunk or a walk that moves the fid
- * then waits for this read rather than freeing the snapshot under it.
+ * held over the cursor and NOT over the entry walk between the two
+ * holds of it: the walk is up to msize/entrysize objsnapent calls,
+ * each taking the engine's state lock, and the service loop takes this
+ * fid's state lock to perform step 7 for another request on the same
+ * fid (queue.c) — which dat.h forbids the loop to wait on.  So the
+ * snapshot and the cursor are lifted under the lock, the walk runs
+ * over them unlocked, and the lock is retaken to commit the cursor.
+ *
+ * What makes the walk safe unlocked is that neither the Objdir nor its
+ * snapshot can be given back while this read is in flight:
+ *
+ *	auxfree is the only thing that closes the snapshot (above), and
+ *		it runs from the clunk or the moving walk — lib9p holds a
+ *		reference to this request's Fid until the request is
+ *		freed, so destroyfid cannot run inside this handler, and a
+ *		walk cannot move a fid that is OPEN, which this one is or
+ *		lib9p would not have reached a read cell at all.
+ *	auxflush frees it for a flushed OPEN alone (objdirflush), and no
+ *		Topen can be outstanding on an open fid either: lib9p
+ *		refuses one from Fid.omode.  A read's own step 7 does not
+ *		free it, by the same test.
+ *	the shutdown's sweep runs after the drain, which this request is
+ *		part of, and this row's auxclose is nil in any case.
+ *
+ * Two reads on one fid cannot overlap, the reserved queue having one
+ * proc, so the cursor has one writer between its two holds of the lock.
  *
  * An entry that has gone is skipped and not listed, so no tombstone
  * appears in /obj and nothing is listed twice; the cursor advances
@@ -436,11 +459,12 @@ objdirreadq(Req *r)
 	Srvctx *c;
 	Sfid *f;
 	Objdir *d;
+	Objsnap *sn;
 	Objinfo oi;
 	Dir dir;
 	uchar oid[Oidmax], *p;
 	uvlong soff;
-	ulong nent, spos;
+	ulong nent, spos, pos;
 	long n, m, cnt;
 	int oidlen, rc;
 
@@ -465,16 +489,20 @@ objdirreadq(Req *r)
 		d->pos = d->prevpos;
 	}else if(r->ifcall.offset != d->off)
 		e = Eseek;
+	sn = d->sn;
+	soff = d->off;
+	spos = d->pos;
+	qunlock(&f->lk);
 	n = 0;
 	if(e == nil){
-		soff = d->off;
-		spos = d->pos;
+		pos = spos;
 		cnt = r->ifcall.count;
-		nent = objsnapcount(d->sn);
+		nent = objsnapcount(sn);
 		p = (uchar*)r->ofcall.data;
-		while(d->pos < nent){
-			rc = objsnapent(d->sn, d->pos, oid, &oidlen, &oi);
-			if(rc >= 0 && srvslotfail(c, d->pos)){
+		while(pos < nent){
+			srvdirhold(r, pos);
+			rc = objsnapent(sn, pos, oid, &oidlen, &oi);
+			if(rc >= 0 && srvslotfail(c, pos)){
 				werrstr("snapshot entry refused at the point");
 				rc = -1;
 			}
@@ -483,26 +511,28 @@ objdirreadq(Req *r)
 				e = buf;
 				break;
 			}
-			d->pos++;
+			pos++;
 			if(rc == 0)
 				continue;
 			objdirent(c, f, oid, oidlen, &oi, &dir);
 			m = convD2M(&dir, p+n, cnt-n);
 			dirfree(&dir);
 			if(m <= BIT16SZ){
-				d->pos--;
+				pos--;
 				break;
 			}
 			n += m;
 		}
+		qlock(&f->lk);
 		if(e == nil){
 			d->prevoff = soff;
 			d->prevpos = spos;
 			d->off = soff + n;
+			d->pos = pos;
 		}else
 			d->pos = spos;
+		qunlock(&f->lk);
 	}
-	qunlock(&f->lk);
 	srvqexit(r);
 	if(e != nil){
 		srvqdone(r, e);

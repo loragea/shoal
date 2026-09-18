@@ -63,6 +63,7 @@ void	srvqanyexit(Srvctx*);
 void	srvjobhold(Srvctx*);
 int	srvslotfail(Srvctx*, uvlong slot);
 void	srvreclaimhold(Srvctx*, uvlong i);
+void	srvdirhold(Req*, uvlong i);
 void	srvqdone(Req*, char *err);
 void	srvqended(Qreq*);
 void	srvqdrain(Srvctx*);
