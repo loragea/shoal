@@ -110,9 +110,13 @@ qrun(Req *r)
 	/*
 	 * Marked before the handler and under the lock srvqflush reads it
 	 * under, so that a Tflush either finds the request still waiting
-	 * — and performs step 7 itself, since lib9p will answer such a
-	 * request without this handler ever running — or finds it started
-	 * and leaves step 7 to srvqdone.
+	 * — and performs step 7 itself, since lib9p answers a request it
+	 * unlinks from the queue without this handler running at all — or
+	 * finds it started and leaves step 7 to srvqdone.  A Tflush in
+	 * the window between lib9p taking the request off the queue and
+	 * this mark takes the first branch and this handler then runs all
+	 * the same (srvqflush), which is why step 7 is the fid's state's
+	 * and not this request's to hold.
 	 */
 	qlock(&qr->lk);
 	qr->running = 1;
@@ -317,14 +321,28 @@ srvqpush(Srvctx *c, uchar *oid, int oidlen, Req *r, void (*f)(Req*))
  * MUST on flush however far the request had got, and a fid's stage
  * spans several Twrites, so a Tflush of the next queued write on a
  * staging fid must still discard that fid's stage; but reqqueueflush
- * unlinks such a request and answers it itself, so its handler —
- * and with it srvqdone, the one exit that performs step 7 — never
- * runs.  `running' is what tells the two apart, and `step7' is what
- * keeps them from both doing it: a request whose handler has started
- * leaves through srvqdone, which does it there with nothing else
- * touching the fid.  The fid is live either way — sflush holds a
- * reference to the flushed Req, which holds one to its Fid
- * (/sys/src/lib9p/req.c, fid.c) — so r->oldreq->fid is safe to read.
+ * unlinks such a request and answers it itself, and then neither the
+ * handler nor srvqdone — the one exit that performs step 7 — runs.
+ * `running' is what tells the two apart, and `step7' is what keeps
+ * them from both doing it: a request whose handler has started leaves
+ * through srvqdone, which does it there.  The fid is live either way —
+ * sflush holds a reference to the flushed Req, which holds one to its
+ * Fid (/sys/src/lib9p/req.c, fid.c) — so r->oldreq->fid is safe to
+ * read.
+ *
+ * Step 7 run here runs on the SERVICE LOOP, which is what the fid's
+ * state lock is for (srvstep7): the flushed request's fid may be one
+ * another outstanding request is working through on a queue proc, and
+ * the flushed request's own handler may still run after this.  That
+ * last is lib9p's window, not this server's: _reqqueueproc unlinks the
+ * request and sets q->cur under one qlock and only then calls the
+ * handler, which is where `running' is marked, so a Tflush that lands
+ * in between finds running == 0, performs step 7 here, and is then
+ * taken by reqqueueflush's q->cur branch — an interrupt of the queue
+ * proc, with no unlink and no answer — after which the handler runs
+ * with its fid's state already discarded.  A handler tolerates that
+ * (dat.h); it is why step 7 belongs to the fid's state and not to the
+ * request.
  */
 void
 srvqflush(Req *r)
@@ -408,7 +426,17 @@ srvqcheck(Req *r)
 	qr = r->aux;
 	if(qr == nil)
 		return 0;
+	/*
+	 * The hold is a step of the handler, so the fid-state point takes
+	 * the fid's state lock across it and marks the state mid-step:
+	 * that is what a row's own handler does around the engine call
+	 * that works on what its fid holds (dat.h), and what the point is
+	 * modelling here is exactly that handler.  Both calls are inert
+	 * while the point is off.
+	 */
+	srvauxstep(r, 1);
 	qhold(qr->ctx, qr, &qr->ctx->hold);
+	srvauxstep(r, 0);
 	return qr->q->flush != 0;
 }
 
@@ -509,22 +537,42 @@ srvstep7(Req *r)
 	if(r->fid == nil || (f = r->fid->aux) == nil)
 		return;
 	/*
-	 * Under the registry lock, over the read of the cell AND the call
-	 * through it.  lib9p's own reference keeps the Fid alive across
-	 * this, but not what the fid is holding: a clunk or a walk that
-	 * moves the fid runs srvfidgive on the service loop, which clears
-	 * the cells and frees the state, and this runs on a queue proc.
-	 * Without the lock the two interleave into a call through a cell
-	 * whose state has already been freed.  fidgive takes the same lock
-	 * across its own clear-and-free, and auxclose runs under it by the
-	 * documented rule (dat.h), so the three cannot overlap.
+	 * Under the FID'S STATE lock, over the read of the cell and the
+	 * call through it.  lib9p's own reference keeps the Fid alive
+	 * across this, but not what the fid is holding, and two things
+	 * reach the same state: a clunk or a moving walk runs fidgive,
+	 * which clears the cells and frees what they named, and another
+	 * request on this same fid may be part-way through the state the
+	 * hook is discarding — 9P allows two requests to be outstanding
+	 * on one fid, and this can run on the service loop (srvqflush)
+	 * while a queue proc is inside such a handler.  All of them take
+	 * this lock, so the hook runs between two of that handler's steps
+	 * and never inside one, and fidgive waits for it rather than
+	 * freeing under it (dat.h).
+	 *
+	 * The registry lock is NOT held here: a hook may call the engine,
+	 * and fidlk held across device I/O would block every attach,
+	 * clunk and clone-walk behind this one discard (store.md §7
+	 * rule 2).  Nothing of the registry is read, either — the context
+	 * comes from the Srv and the fid from the request.
+	 *
+	 * `closed' is not tested, as auxclose1 tests it, because nothing
+	 * can reach here after the store has closed: the shutdown drains
+	 * every request in flight before it closes the store (D16), and a
+	 * request in flight is what this runs for.
 	 */
 	c = r->srv->aux;
-	qlock(&c->fidlk);
+	/*
+	 * The hold is inside the state lock, which is what a test drives a
+	 * clunk or a moving walk of this fid against, and outside the
+	 * registry lock, which a parked proc holding would wedge the loop
+	 * and with it the shutdown that clears the point.
+	 */
+	qlock(&f->lk);
 	qhold(c, nil, &c->step7hold);
 	if(f->auxflush != nil)
 		f->auxflush(f, r);
-	qunlock(&c->fidlk);
+	qunlock(&f->lk);
 }
 
 /*

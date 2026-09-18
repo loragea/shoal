@@ -214,15 +214,46 @@ extern Sfile srvfiles[Nfile];
  * three hooks beside it are when it is called upon.  Nothing in this
  * file's own handlers touches aux.
  *
+ * `lk' is that state's lock, and it is the one a builder of a row has
+ * to hold in mind.  It covers aux, the three cells below it and
+ * auxclosed, and every access a handler makes to what aux names is
+ * under it: the hooks below run under it, so a handler that holds it
+ * across a step of its own work — the engine call that appends to a
+ * stage, say — is a handler no hook can run in the middle of.  The
+ * registry lock (Srvctx.fidlk) is a different lock over different
+ * things: the list the fids are on, the fid-state point, and the
+ * rendered Text.  A caller may take `lk' while holding fidlk, never
+ * the other way round, and nothing in srv/ holds fidlk across a hook
+ * or across an engine call.
+ *
  *	auxflush  runs from srvstep7, on the fid of a request that is
  *		  unwinding flushed (layer-a §5.4.1 step 7), once per
  *		  such request and before it responds.  The store is
  *		  open and the fid lives on: this is where a stage the
  *		  flushed request staged is discarded, not where the
- *		  fid's own state is given back.  It runs on a queue proc
- *		  while the service loop may be clunking or moving the
- *		  same fid, which is why the registry lock spans the read
- *		  of the cell and the call through it.
+ *		  fid's own state is given back.
+ *
+ *		  Where it runs from is the rest of what it must
+ *		  tolerate.  It runs on the queue proc that is unwinding
+ *		  the request (from srvqdone), OR on the service loop
+ *		  (from srvqflush, for a request flushed while it was
+ *		  still queued — with that request's own Qreq.lk held, so
+ *		  the hook takes neither that lock nor the registry lock
+ *		  and must not block on anything a queue proc needs).
+ *		  9P allows two requests to be outstanding on one fid,
+ *		  and two requests naming one object share a queue, so
+ *		  another request may be part-way through this same fid
+ *		  when the hook runs: `lk' is what keeps the hook between
+ *		  two steps of that handler rather than inside one, and
+ *		  the handler sees the discarded state at its next access.
+ *		  A handler must therefore tolerate finding its fid's
+ *		  state already discarded — including the flushed
+ *		  request's own handler, which lib9p may start right after
+ *		  a loop-side step 7 has run for it (/sys/src/lib9p/queue.c:
+ *		  _reqqueueproc sets q->cur before the handler marks the
+ *		  request running, so a Tflush in that window takes the
+ *		  step-7-here path and reqqueueflush then interrupts the
+ *		  proc instead of unlinking the request).
  *	auxclose  runs before the store closes, and at clunk; it may
  *		  call the engine.  A stage handle MUST be discarded
  *		  here: store.md §9 allows only objsnapent, objsnapcount
@@ -253,11 +284,13 @@ struct Sfid
 	uvlong	qidpath;
 	uvlong	qidvers;
 	Text	*text;		/* the render-at-open snapshot, once open */
+	QLock	lk;		/* over aux, the three cells and auxclosed */
 	void	*aux;
 	void	(*auxflush)(Sfid*, Req*);
 	void	(*auxclose)(void*);
 	void	(*auxfree)(void*);
 	int	auxclosed;	/* auxclose has run for this state */
+	int	auxbusy;	/* srvauxpoint: a handler is mid-step on it */
 	Srvctx	*ctx;		/* the registry's, and the hooks' */
 	Sfid	*prev;
 	Sfid	*next;
@@ -364,19 +397,24 @@ struct Srvctx
 	/*
 	 * The live fids, and the T1 fid-state point over them.  Every
 	 * Sfid is on this list from the attach or walk that made it
-	 * until destroyfid.  All three hooks run with fidlk held, and so
-	 * does the read of the cell that calls one, so a hook may reach
-	 * the engine but must not reach back in here.
+	 * until destroyfid.  This lock covers the list, the point below
+	 * it and the fids' rendered Text — NOT the per-fid state the
+	 * three hooks are called on, which has a lock of its own
+	 * (Sfid.lk) so that no hook and no engine call runs under this
+	 * one: a hook may reach the engine, and a lock held across
+	 * device I/O here would block every attach, clunk and
+	 * clone-walk with it (docs/design/store.md §7 rule 2).
 	 */
 	QLock	fidlk;
 	Sfid	*fids;
 	int	fidaux;		/* srvauxpoint: fids carry a test state */
-	Lock	auxlk;		/* not fidlk: the hooks run under that one */
+	Lock	auxlk;		/* not fidlk: the hooks run under Sfid.lk */
 	uvlong	nauxclose;
 	uvlong	nauxfree;
 	uvlong	nauxopen;	/* ... of those that found the store open */
 	uvlong	nauxflush;
 	uvlong	nauxlate;	/* auxflush ran after the request responded */
+	uvlong	nauxbusy;	/* ... ran while a handler was mid-step */
 
 	Reqqueue **q;
 	int	nq;

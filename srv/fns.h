@@ -68,6 +68,7 @@ void	srvholdclear(Srvctx*);
 
 /* tree.c */
 void	srvfidnew(Srvctx*, Sfid*);
+void	srvauxstep(Req*, int on);
 void	srvfidgive(Sfid*);
 void	srvfidsclose(Srvctx*);
 void	srvfileqid(int file, Qid*);

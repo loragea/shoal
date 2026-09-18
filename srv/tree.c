@@ -313,7 +313,10 @@ chgate(Srvctx *c, Sfid *f, Req *r, int op)
  * themselves, which is how the hooks are driven before a row fills
  * aux with anything.  The flush hook also counts the times it ran
  * after its request had already responded, which is never: step 7
- * runs before the reply (layer-a §5.4.1).
+ * runs before the reply (layer-a §5.4.1) — and the times it ran while
+ * a handler was mid-step on the same fid's state, which is never
+ * either: the state lock the hook is called under is the one such a
+ * handler holds across its step (dat.h).
  */
 static void
 auxpointflush(Sfid *f, Req *r)
@@ -327,6 +330,8 @@ auxpointflush(Sfid *f, Req *r)
 	c->nauxflush++;
 	if(r->responded)
 		c->nauxlate++;
+	if(f->auxbusy)
+		c->nauxbusy++;
 	unlock(&c->auxlk);
 }
 
@@ -383,6 +388,36 @@ auxpoint(Srvctx *c, Sfid *f)
 	f->auxclose = auxpointclose;
 	f->auxfree = auxpointfree;
 	f->auxclosed = 0;
+	f->auxbusy = 0;
+}
+
+/*
+ * The point's handler side: a queued handler is between two steps of
+ * its own work on the fid's state, or inside one.  A row's handler
+ * marks that by holding the fid's state lock across the step it takes
+ * on what aux names; this marks it for the state the point itself
+ * filled in, so that the flush hook can say whether step 7 ever ran
+ * inside such a step.  It is the check point's hold that stands in for
+ * the step (queue.c), because that is the moment a test can hold a
+ * handler at.
+ *
+ * Inert unless the point filled this fid's cells: a row that fills
+ * aux with something of its own takes the lock in its own handler.
+ */
+void
+srvauxstep(Req *r, int on)
+{
+	Sfid *f;
+
+	if(r->fid == nil || (f = r->fid->aux) == nil)
+		return;
+	if(f->auxflush != auxpointflush)
+		return;
+	if(on)
+		qlock(&f->lk);
+	f->auxbusy = on;
+	if(!on)
+		qunlock(&f->lk);
 }
 
 /*
@@ -392,10 +427,12 @@ auxpoint(Srvctx *c, Sfid *f)
  * made one until destroyfid.  srvfidsclose is what a caller that must
  * reach every pending auxclose — before the store closes — uses.
  *
- * auxclose runs with fidlk held, so a hook may call the engine but
- * must not reach back into the registry.  It runs once per state a fid
- * holds, and not at all once the store has closed: store.md §9 allows
- * nothing but the Objsnap calls after that, which is auxfree's half.
+ * A hook runs under the FID'S state lock and never under this one: it
+ * may call the engine, and a registry lock held across device I/O
+ * would block every attach, clunk and clone-walk behind it (dat.h,
+ * store.md §7 rule 2).  auxclose runs once per state a fid holds, and
+ * not at all once the store has closed: store.md §9 allows nothing but
+ * the Objsnap calls after that, which is auxfree's half.
  *
  * A clunk and a walk that moves a fid run their own fid's hook, so the
  * only caller srvfidsclose has is the shutdown, which must reach the
@@ -420,7 +457,7 @@ srvfidnew(Srvctx *c, Sfid *f)
 }
 
 static void
-auxclose1(Srvctx *c, Sfid *f)		/* fidlk held */
+auxclose1(Srvctx *c, Sfid *f)		/* f->lk held */
 {
 	if(f->auxclosed)
 		return;
@@ -429,14 +466,24 @@ auxclose1(Srvctx *c, Sfid *f)		/* fidlk held */
 		f->auxclose(f->aux);
 }
 
+/*
+ * The shutdown's sweep.  It is the one place that holds the registry
+ * lock while it takes a fid's state lock — the order the two are
+ * always taken in (dat.h) — and the one place a hook runs with fidlk
+ * held: by here the service loop has ended and the drain has finished,
+ * so there is no attach, clunk or walk left for it to hold up.
+ */
 void
 srvfidsclose(Srvctx *c)
 {
 	Sfid *f;
 
 	qlock(&c->fidlk);
-	for(f = c->fids; f != nil; f = f->next)
+	for(f = c->fids; f != nil; f = f->next){
+		qlock(&f->lk);
 		auxclose1(c, f);
+		qunlock(&f->lk);
+	}
 	qunlock(&c->fidlk);
 }
 
@@ -446,14 +493,19 @@ srvfidsclose(Srvctx *c)
  * after it has gone.  gone says the fid itself is ending, so it also
  * leaves the registry.
  *
- * The whole of it is under the registry lock, the clearing of the
- * cells and the freeing of what they named included.  lib9p keeps the
- * Fid alive while a request holds it, but not what the fid carries:
- * this runs on the service loop, at a clunk or at a walk that moves
- * the fid, while a queue proc may be in srvstep7 reading the flush
- * cell of that same fid or in srvopentext writing its rendered text.
- * Those two take the same lock, so one give-back cannot free a state
- * out from under a call that is already in it.
+ * Two locks, over two different things.  The registry lock covers the
+ * list and the rendered Text, which srvopentext writes from a queue
+ * proc; the FID'S state lock covers the state and its cells, and is
+ * held across the close hook and the clearing of the cells, so that a
+ * give-back cannot free a state out from under a call that is already
+ * in it.  There are two such calls: srvstep7, which discards this
+ * fid's stage on a flush from a queue proc or from the service loop,
+ * and any handler of another request outstanding on this same fid.
+ * This waits for them; it does not run beside them (dat.h).
+ *
+ * What the state lock is NOT held across is the free itself, which is
+ * safe because the cells are cleared under it: anything that would
+ * call into the state has to take the lock and finds nothing there.
  */
 static void
 fidgive(Sfid *f, int gone)
@@ -464,10 +516,8 @@ fidgive(Sfid *f, int gone)
 	Text *t;
 
 	c = f->ctx;
-	if(c != nil)
-		qlock(&c->fidlk);
 	if(c != nil){
-		auxclose1(c, f);
+		qlock(&c->fidlk);
 		if(gone){
 			if(f->prev != nil)
 				f->prev->next = f->next;
@@ -478,21 +528,28 @@ fidgive(Sfid *f, int gone)
 			f->prev = f->next = nil;
 			f->ctx = nil;
 		}
+		t = f->text;
+		f->text = nil;
+		qunlock(&c->fidlk);
+	}else{
+		t = f->text;
+		f->text = nil;
 	}
+	qlock(&f->lk);
+	if(c != nil)
+		auxclose1(c, f);
 	fr = f->auxfree;
 	a = f->aux;
-	t = f->text;
 	f->aux = nil;
 	f->auxflush = nil;
 	f->auxclose = nil;
 	f->auxfree = nil;
 	f->auxclosed = 0;
-	f->text = nil;
+	f->auxbusy = 0;
+	qunlock(&f->lk);
 	if(fr != nil)
 		fr(a);
 	textfree(t);
-	if(c != nil)
-		qunlock(&c->fidlk);
 }
 
 /*
@@ -534,6 +591,22 @@ srvauxcount(Srvctx *c, uvlong *flushed, uvlong *closed, uvlong *freed)
 	if(freed != nil)
 		*freed = c->nauxfree;
 	unlock(&c->auxlk);
+}
+
+/*
+ * How many flush hooks ran while a handler was mid-step on the same
+ * fid's state; the answer is always zero, because the hook and such a
+ * handler take the same lock (dat.h).
+ */
+uvlong
+srvauxbusy(Srvctx *c)
+{
+	uvlong n;
+
+	lock(&c->auxlk);
+	n = c->nauxbusy;
+	unlock(&c->auxlk);
+	return n;
 }
 
 /* how many close hooks found the engine still there; all of them */
@@ -1125,9 +1198,10 @@ srvopentext(Req *r)
 	}
 	/*
 	 * Composed into a text of its own and hung on the fid under the
-	 * registry lock: this runs on a queue proc when the row's open was
-	 * offloaded, and fidgive frees whatever the fid holds under that
-	 * same lock on the service loop.
+	 * registry lock, which is the lock the rendered Text is under
+	 * (dat.h): this runs on a queue proc when the row's open was
+	 * offloaded, and fidgive takes the fid's Text under that same lock
+	 * on the service loop.
 	 */
 	qlock(&c->fidlk);
 	textfree(f->text);

@@ -2823,7 +2823,8 @@ tshutdown(void)
  * calls through it on a queue proc; a clunk, and a walk that moves the
  * fid, clear those cells and free what they named on the service loop.
  * lib9p's own reference keeps the Fid alive across both, but not what
- * the fid is carrying, so the registry lock spans each of them whole.
+ * the fid is carrying, so the fid's state lock spans each of them
+ * whole.
  *
  * The window is forced rather than raced for: the point parks step 7
  * between the read and the call, and the walk is issued into it.
@@ -2919,6 +2920,219 @@ tstep7fid(void)
 			clerr(&r));
 	cltagfree(&cl, tw);
 	clclunk(&cl, Ffile, &r);
+Out:
+	srvhook(ctx, "step7", 0);
+	srvhook(ctx, "objhold", 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
+ * Step 7 on a fid another request is still working through.  9P allows
+ * two requests to be outstanding on one fid, and two requests naming
+ * one object share a queue — serialised with each other, but not with
+ * the service loop, which performs step 7 itself for a request flushed
+ * while it was still queued (layer-a §5.4.1).  So the loop can reach
+ * the flushed fid's state while a queue proc is part-way through a
+ * step on it, which for object I/O is a stage discard landing in the
+ * middle of the Twrite before it.
+ *
+ * The fid's state lock is what rules that out, and the fid-state point
+ * is what shows it: its handler side marks the state mid-step across
+ * the check point's hold, under that lock, and its flush hook counts
+ * the times it ran on a state so marked.
+ */
+static void
+tstep7busy(void)
+{
+	char *m;
+	uchar data[1024];
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall t, r;
+	char *w[1];
+	uvlong n7;
+	ushort ta, tb, tf;
+
+	clstage = "step7busy";
+	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
+	d = newdisk();
+	if((ctx = startsrv(d, m, 1)) == nil)
+		return;
+	srvauxpoint(ctx, 1);
+	memset(data, 0x77, sizeof data);
+	mkobj(srvstore(ctx), "alpha", data, sizeof data, 1);
+
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach)
+		fail("attach: %s", clerr(&r));
+	w[0] = "ctl";
+	if(clopenpath(&cl, Froot, Fctl, 1, w, OWRITE, &r) != Ropen){
+		fail("open /ctl: %s", clerr(&r));
+		goto Out;
+	}
+
+	/*
+	 * Two writes on the ONE fid, naming the one object: the first runs
+	 * and is held mid-step, the second waits on the same queue behind
+	 * it.  Flushing the second is what sends step 7 to that fid from
+	 * the service loop.
+	 */
+	srvhook(ctx, "objhold", 1);
+	memset(&t, 0, sizeof t);
+	t.type = Twrite;
+	t.tag = ta = cltag(&cl);
+	t.fid = Fctl;
+	t.offset = 0;
+	t.data = "verify alpha";
+	t.count = strlen(t.data);
+	clput(&cl, &t);
+	sleep(200);			/* running, and held mid-step */
+	t.tag = tb = cltag(&cl);
+	clput(&cl, &t);
+	sleep(200);			/* ... and this one is behind it */
+
+	memset(&t, 0, sizeof t);
+	t.type = Tflush;
+	t.tag = tf = cltag(&cl);
+	t.oldtag = tb;
+	clput(&cl, &t);
+	sleep(300);
+	srvauxcount(ctx, &n7, nil, nil);
+	eqv("step 7 waits for the handler working on the same fid", n7, 0);
+
+	srvhook(ctx, "objhold", 0);
+	sleep(300);
+	srvauxcount(ctx, &n7, nil, nil);
+	eqv("and runs once that handler is between steps", n7, 1);
+	eqv("no step 7 ran inside a handler's step", srvauxbusy(ctx), 0);
+	eqv("and none ran after its request had answered", srvauxlate(ctx), 0);
+
+	checks++;
+	if(clgettag(&cl, tb, &r) != Rerror
+	|| strcmp(r.ename, "interrupted") != 0)
+		fail("the flushed queued request: type %d %s", r.type,
+			clerr(&r));
+	cltagfree(&cl, tb);
+	checks++;
+	if(clgettag(&cl, tf, &r) != Rflush)
+		fail("the Rflush after it: type %d", r.type);
+	cltagfree(&cl, tf);
+	checks++;
+	if(clgettag(&cl, ta, &r) != Rwrite)
+		fail("the request that was mid-step: type %d %s", r.type,
+			clerr(&r));
+	cltagfree(&cl, ta);
+Out:
+	srvhook(ctx, "objhold", 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
+ * Where the step 7 hold leaves the service loop.  A queue proc parked
+ * inside step 7 holds the fid whose state it is discarding and nothing
+ * else: every other fid goes on being attached, walked and clunked on
+ * the loop, the connection dropping still ends the loop, and the
+ * shutdown clears the point that is holding the proc.  A hold that sat
+ * on the fid registry instead would stop the first clunk to come along
+ * and, with the loop stopped there, the shutdown that would have
+ * released it.
+ */
+static void
+tstep7hold(void)
+{
+	char *m;
+	uchar data[1024];
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall t, r;
+	uvlong n7;
+	ushort ta, tf, tc;
+
+	clstage = "step7hold";
+	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
+	d = newdisk();
+	if((ctx = startsrv(d, m, 1)) == nil)
+		return;
+	srvauxpoint(ctx, 1);
+	memset(data, 0x88, sizeof data);
+	mkobj(srvstore(ctx), "alpha", data, sizeof data, 1);
+
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach)
+		fail("attach: %s", clerr(&r));
+	if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk
+	|| clwalk1(&cl, Froot, Fctl, "ctl", &r) != Rwalk){
+		fail("the two fids: %s", clerr(&r));
+		goto Out;
+	}
+
+	/* a queued walk, running and held, then flushed: step 7 unwinds it */
+	srvhook(ctx, "objhold", 1);
+	memset(&t, 0, sizeof t);
+	t.type = Twalk;
+	t.tag = ta = cltag(&cl);
+	t.fid = Ffile;
+	t.newfid = Ffile;
+	t.nwname = 1;
+	t.wname[0] = "alpha";
+	clput(&cl, &t);
+	sleep(200);			/* running, and held */
+	srvhook(ctx, "step7", 1);
+	memset(&t, 0, sizeof t);
+	t.type = Tflush;
+	t.tag = tf = cltag(&cl);
+	t.oldtag = ta;
+	clput(&cl, &t);
+	sleep(300);			/* unwinding, and held inside step 7 */
+
+	/*
+	 * A clunk of an unrelated fid, pipelined so that a loop that never
+	 * answers it fails the case here rather than hanging it, and then
+	 * the connection drops.  Both must go through with the point still
+	 * set: the shutdown is what clears it.
+	 */
+	memset(&t, 0, sizeof t);
+	t.type = Tclunk;
+	t.tag = tc = cltag(&cl);
+	t.fid = Fctl;
+	clput(&cl, &t);
+	clhangup(&cl);
+	istrue("the service loop ends with a request held inside step 7",
+		clwaitend(&cl, 8000));
+	/* the shutdown cleared it; this is for a loop that never got there */
+	srvhook(ctx, "step7", 0);
+
+	checks++;
+	if(clgettag(&cl, tc, &r) != Rclunk)
+		fail("the clunk of an unrelated fid: type %d %s", r.type,
+			clerr(&r));
+	cltagfree(&cl, tc);
+	checks++;
+	if(clgettag(&cl, ta, &r) != Rerror
+	|| strcmp(r.ename, "interrupted") != 0)
+		fail("the flushed walk: type %d %s", r.type, clerr(&r));
+	cltagfree(&cl, ta);
+	checks++;
+	if(clgettag(&cl, tf, &r) != Rflush)
+		fail("the Rflush after it: type %d", r.type);
+	cltagfree(&cl, tf);
+	srvauxcount(ctx, &n7, nil, nil);
+	eqv("step 7 ran once", n7, 1);
+	clclose(&cl);
+	srvhook(ctx, "step7", 0);
+	srvhook(ctx, "objhold", 0);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+	return;
 Out:
 	srvhook(ctx, "step7", 0);
 	srvhook(ctx, "objhold", 0);
@@ -3040,6 +3254,8 @@ threadmain(int argc, char **argv)
 	tfidwalk();
 	tflush();
 	tstep7fid();
+	tstep7busy();
+	tstep7hold();
 	tanyq();
 	tflushrace();
 	terrors();
