@@ -458,11 +458,21 @@ dirfree(Dir *d)
  * snapshot can be given back while this read is in flight:
  *
  *	auxfree is the only thing that closes the snapshot (above), and
- *		it runs from the clunk or the moving walk — lib9p holds a
- *		reference to this request's Fid until the request is
- *		freed, so destroyfid cannot run inside this handler, and a
- *		walk cannot move a fid that is OPEN, which this one is or
- *		lib9p would not have reached a read cell at all.
+ *		it runs from the clunk, from the moving walk, or from the
+ *		create cell's give-back once its object is made (obj.c) —
+ *		lib9p holds a reference to this request's Fid until the
+ *		request is freed, so destroyfid cannot run inside this
+ *		handler, and a walk cannot move a fid that is OPEN, which
+ *		this one is or lib9p would not have reached a read cell at
+ *		all.  The create's give-back is the one of the three that
+ *		runs on another queue's proc — a per-oid queue, while this
+ *		read has the reserved one — and it is safe because a
+ *		create that reaches it holds `moving', set before it
+ *		staged anything, and both of objdiropenq's objdirfid tests
+ *		refuse under `moving', the second under the same hold of
+ *		the fid's state lock the create set it beneath.  So no
+ *		open can install a listing on this fid, and no Tread can
+ *		be reading one, across that give-back.
  *	auxflush frees it for a flushed OPEN alone (objdirflush), and no
  *		open of this fid can RUN while this read walks: both cells
  *		are offloaded to the one reserved queue (srvqpushany), and
