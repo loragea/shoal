@@ -245,15 +245,24 @@ jobproc(void *a)
 	unlock(&c->joblk);
 	j->fn(j);
 	/*
+	 * The pass is over, so the flag that keeps a second pass off one
+	 * index goes back BEFORE the point below rather than after it: a
+	 * `scrub start' written while the pass is parked there would
+	 * otherwise be refused `scrub stopping' for a pass that has
+	 * finished walking, which is a job that is not running and is not
+	 * going to be.  The record stays linked either way, so /jobs
+	 * still lists what the pass finished with.
+	 */
+	lock(&c->joblk);
+	if(strcmp(j->verb, "scrub") == 0)
+		c->scrubbing = 0;
+	unlock(&c->joblk);
+	/*
 	 * §13's point, while the record is still on the list: /jobs lists
 	 * a pass only while it is running or queued, so what one finished
 	 * with is readable here and nowhere later (srv.h).
 	 */
 	srvjobhold(c);
-	lock(&c->joblk);
-	if(strcmp(j->verb, "scrub") == 0)	/* the pass is over */
-		c->scrubbing = 0;
-	unlock(&c->joblk);
 	jobunlink(j);
 	srvjobend(c);
 	threadexits(nil);

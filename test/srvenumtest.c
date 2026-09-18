@@ -90,7 +90,7 @@ enum
 	 * threadmain.  Every check this file makes is unconditional once
 	 * its case is entered, so the number is fixed.
 	 */
-	Nchecks	= 223,
+	Nchecks	= 225,
 
 	/* fids the cases use */
 	Froot	= 1,
@@ -2540,7 +2540,7 @@ Out:
 static void
 tscrubctl(void)
 {
-	char buf[16*1024], name[32], line[64], *m;
+	char buf[16*1024], name[32], line[64], val[64], *m;
 	uchar oid[Oidmax];
 	Objinfo oi;
 	Srvctx *ctx;
@@ -2644,6 +2644,32 @@ tscrubctl(void)
 		sleep(20);
 	clclunk(&cl, Ffile, &r);
 	clclunk(&cl, Froot2, &r);
+
+	/*
+	 * A pass parked at the END of its run, with `scrub stop' raised
+	 * over it.  The pass has walked its index and is held at §13's
+	 * jobhold point with its record still listed, so the job the next
+	 * `scrub start' asks for is neither running nor stopping: it is
+	 * over.  jobproc gives `scrubbing' back before it parks for
+	 * exactly that, and a `start' refused `scrub stopping' here would
+	 * be naming a pass that had already finished.
+	 */
+	srvhook(ctx, "jobhold", 1);
+	if(clwrite(&cl, Fctl, 0, "scrub start rate=1000000", &r) != Rwrite)
+		fail("a scrub whose walk ends at the hold: %s", clerr(&r));
+	if(jobparked(&cl, "done", val, sizeof val) == nil)
+		fail("the pass never reached its hold");
+	sleep(200);			/* and is past its reclaim walk */
+	if(clwrite(&cl, Fctl, 0, "scrub stop", &r) != Rwrite)
+		fail("scrub stop over a parked pass: %s", clerr(&r));
+	checks++;
+	if(clwrite(&cl, Fctl, 0, "scrub start", &r) != Rwrite)
+		fail("a scrub start over a pass that has finished: %s",
+			clerr(&r));
+	srvhook(ctx, "jobhold", 0);
+	for(i = 0; i < 400 && jobrunning(&cl); i++)
+		sleep(20);
+	istrue("the passes over that index ended", !jobrunning(&cl));
 
 	/* fill the job cap, so that the next `scrub start' is refused */
 	srvhook(ctx, "jobhold", 1);
