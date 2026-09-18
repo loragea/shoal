@@ -140,11 +140,18 @@ enum
  * while it is a directory fid, which is that read's snapshot — belong
  * with the enumeration of that directory.  That row's create cell, and
  * the /obj/<oid> and /meta/<oid> rows entire, belong with object I/O.
- * The two meet in one place: a Tcreate turns the directory fid it is
- * issued on into a fid for the created object, so the create cell is
- * what gives the directory fid's aux back — auxclose, then auxfree —
- * before it sets the fid's file, oid and qid, since one fid cannot
- * hold an enumeration's snapshot and an object's state at once.
+ * The two meet in one place: a Tcreate that SUCCEEDS turns the
+ * directory fid it is issued on into a fid for the created object, so
+ * the create cell is what gives the directory fid's aux back —
+ * auxclose, then auxfree — as it sets the fid's file, oid and qid,
+ * since one fid cannot hold an enumeration's snapshot and an object's
+ * state at once.  A create that FAILS leaves the fid where it was,
+ * holding what it held: 9P moves a fid only on a create that
+ * succeeded, and layer-a §2.4 keeps the same rule the other way round
+ * for remove, where 9P clunks the fid whether or not the remove
+ * succeeded.  So the give-back goes after the last refusal the cell
+ * can answer, not before it; a cell that gave it back first would drop
+ * the directory fid's Objsnap on a create the client will retry.
  * srvfidgive (fns.h) is that give-back: it runs the two hooks in
  * order under the registry lock, which is where the shutdown's own
  * sweep runs them, so the two cannot both close one state.

@@ -1784,14 +1784,19 @@ Out:
 }
 
 /*
- * The give-back a create owes the directory fid it is issued on.  A
- * Tcreate turns that fid into the created object's, and one fid
- * cannot hold an enumeration's snapshot and an object's state at once
- * (dat.h), so a create cell gives the old state back -- the close
- * hook, then the free hook -- before it retargets the fid.  The cell
- * point's create cell does exactly that and nothing else, and the
- * fid-state point counts the two hooks; what the case asks is that
- * both ran, once, and that the clunk behind them finds nothing left.
+ * The give-back a create owes the directory fid it is issued on, and
+ * what a create that FAILS owes it instead.  A Tcreate that succeeds
+ * turns that fid into the created object's, and one fid cannot hold an
+ * enumeration's snapshot and an object's state at once (dat.h), so a
+ * create cell gives the old state back -- the close hook, then the
+ * free hook -- as it retargets the fid.  A create that fails moves no
+ * fid: 9P leaves it exactly where it was, so the cell gives nothing
+ * back, and once /obj is enumerated the state a failed create dropped
+ * would be that fid's own listing snapshot.
+ *
+ * The cell point's create cell is both halves -- it refuses a name
+ * §1.1 forbids and retargets on any other -- and the fid-state point
+ * counts the hooks.
  */
 static void
 tcreategive(void)
@@ -1822,8 +1827,16 @@ tcreategive(void)
 	srvauxcount(ctx, nil, &nc, &nf);
 	eqv("the directory fid is still holding its state", nc + nf, 0);
 
+	clcreate(&cl, Ffile, "shoal.bad name", 0666, OWRITE, &r);
+	clerris("a create of a name §1.1 forbids", &r, "bad object name");
+	srvauxcount(ctx, nil, &nc, &nf);
+	eqv("a failed create closes nothing of the fid's", nc, 0);
+	eqv("a failed create frees nothing of the fid's", nf, 0);
+
 	clcreate(&cl, Ffile, "shoal.map.9", 0666, OWRITE, &r);
-	clerris("the create cell answered", &r, "shoalsrv: not built");
+	checks++;
+	if(r.type != Rcreate)
+		fail("the create cell answered: %s", clerr(&r));
 	srvauxcount(ctx, nil, &nc, &nf);
 	eqv("a create closes the directory fid's state", nc, 1);
 	eqv("a create frees the directory fid's state", nf, 1);

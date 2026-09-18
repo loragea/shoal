@@ -593,10 +593,16 @@ srvauxlate(Srvctx *c)
  *			answers an Rwrite counting the bytes, so a write
  *			the fence refuses is distinguishable from one no
  *			cell would have taken anyway.
- *	[Qobj].create	gives the directory fid's state back with
- *			srvfidgive, which is what a create cell owes that
- *			fid before it retargets it (dat.h), and answers
- *			`not built' since the retargeting is §2.4's.
+ *	[Qobj].create	retargets the directory fid onto the named object
+ *			and answers Rcreate, giving the fid's state back
+ *			with srvfidgive first, which is what a create cell
+ *			owes the fid it moves (dat.h).  Nothing is created
+ *			in the store — the create body is §2.4's — so the
+ *			qid it answers is the object row's own and says
+ *			nothing about an object.  A name §1.1 forbids is
+ *			refused with `bad object name', and that refusal is
+ *			what a failed create looks like here: the fid does
+ *			not move, so it gives nothing back.
  *
  * The cells are the table's and the table is the program's, so this
  * point is global rather than per-context: a T1 program sets it,
@@ -621,8 +627,23 @@ cellwrite(Req *r)
 static void
 cellcreate(Req *r)
 {
-	srvfidgive(r->fid->aux);
-	respond(r, Enotbuilt);
+	Sfid *f;
+	int n;
+
+	f = r->fid->aux;
+	n = strlen(r->ifcall.name);
+	if(!srvoidok((uchar*)r->ifcall.name, n)){
+		respond(r, Ebadname);
+		return;
+	}
+	srvfidgive(f);
+	f->file = Qobjfile;
+	memmove(f->oid, r->ifcall.name, n);
+	f->oidlen = n;
+	srvfileqid(Qobjfile, &r->ofcall.qid);
+	f->qidpath = r->ofcall.qid.path;
+	f->qidvers = r->ofcall.qid.vers;
+	respond(r, nil);
 }
 
 void
