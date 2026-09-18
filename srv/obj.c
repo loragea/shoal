@@ -558,14 +558,34 @@ stagelive(Srvctx *c, Sfid *f, Sstage *s, Req *r)
  * driven on a real one.  And it stops being a handler's step: from
  * here the sweep may have it (§3.6).  Both under the lock the sweep
  * reads them under.
+ *
+ * The stage may be gone by now.  The handle is taken from the engine
+ * with no lock held, because that call blocks, and a step 7 for another
+ * request on this same fid strips the stage in that window — finding
+ * `g' still nil, so it releases nothing.  A handle stored into a
+ * stripped stage is one nothing ever reaches, every later strip
+ * returning early, so it goes to the drain instead: the handle is the
+ * context's from the moment it has no stage, exactly as it is when the
+ * flush hook parks one (dat.h's Sstage).
  */
 static void
 stagepointarm(Srvctx *c, Sstage *s, Stage *g)
 {
+	int open;
+
 	qlock(&c->stagelk);
-	s->g = g;
+	open = c->store != nil && !c->closed;
+	if(g != nil && (s->dead || s->released)){
+		if(open && stagepend(c, g))
+			g = nil;
+	}else{
+		s->g = g;
+		g = nil;
+	}
 	s->busy = 0;
 	qunlock(&c->stagelk);
+	if(g != nil && open)
+		stagediscard(g);
 }
 
 static void
@@ -621,9 +641,10 @@ stagepointon(Srvctx *c)
  * (dat.h).  nil for a count the caller does not want.
  */
 /*
- * How many engine handles the flush-side discard has parked for the
- * drain — which is every one it has met, since it makes no engine call
- * of its own.
+ * How many engine handles have been parked for the drain: every one
+ * the flush-side discard has met, since it makes no engine call of its
+ * own, and every one the stage point armed onto a stage that had
+ * already been stripped.
  */
 uvlong
 srvstagepend(Srvctx *c)
@@ -985,9 +1006,17 @@ objopenq(Req *r)
 	r->ofcall.qid = q;
 	if(stagepointon(c) && (r->ifcall.mode&3) != OREAD)
 		if((s = stagenew(c, f, Stpoint, f->oid, f->oidlen, 0, 0,
-			0, 0, &e)) != nil)
+			0, 0, &e)) != nil){
+			/*
+			 * The window the stage exists in and the handle does
+			 * not: the call below blocks, and a step 7 for another
+			 * request on this fid strips the stage while it does
+			 * (srv.h's objarm).
+			 */
+			srvqhold(r, &c->armhold);
 			stagepointarm(c, s, stageopen(c->store, f->oid,
 				f->oidlen, 0, 0));
+		}
 	srvqdone(r, nil);
 }
 

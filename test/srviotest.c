@@ -1735,6 +1735,130 @@ Out:
 }
 
 /*
+ * The window between the stage point's stage and the engine handle it
+ * arms that stage with.  The handle is taken with no lock held, because
+ * the call blocks, and a step 7 for another request on this same fid
+ * strips the stage while it is in flight — finding `g' still nil, so it
+ * releases nothing.  The arm therefore has to FIND the stage gone: a
+ * handle stored into a stripped stage is one every later strip returns
+ * early past, so it goes to the drain instead, exactly as the flush
+ * hook's does.  The objarm point is what parks the open in that window
+ * (srv.h), and srvstagepend is what says the handle reached the drain.
+ */
+static void
+tstagearm(void)
+{
+	char *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall t, r;
+	uvlong live, done, openat, np0, nd0, np, nd;
+	ushort ta, tb, tf;
+	int i;
+
+	clstage = "stagearm";
+	m = mkmap(Palone, Tblksz, Tobjmax, Tuuid);
+	d = newdisk(Tnslots);
+	if((ctx = startsrv(d, m, 0, 0)) == nil)
+		return;
+	mkobj(srvstore(ctx), "alpha", nil, 0);
+
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, Nclient, &r) != Rattach){
+		fail("attach: %s", clerr(&r));
+		goto Out;
+	}
+	if(clwalkobj(&cl, Froot, Ffile, "obj", "alpha", &r) != Rwalk){
+		fail("walk /obj/alpha: %s", clerr(&r));
+		goto Out;
+	}
+
+	/* the open stages, then parks short of the arm */
+	waitidle(ctx, &np0, &nd0);
+	srvstagepoint(ctx, 1);
+	srvhook(ctx, "objarm", 1);
+	memset(&t, 0, sizeof t);
+	t.type = Topen;
+	t.tag = ta = cltag(&cl);
+	t.fid = Ffile;
+	t.mode = OWRITE;
+	clput(&cl, &t);
+	for(i = 0; i < 400; i++){
+		srvstagecount(ctx, &live, nil, nil);
+		if(live == 1)
+			break;
+		sleep(5);
+	}
+	eqv("the parked open holds the fid's stage", live, 1);
+
+	/* a stat of the same object on the same fid, queued behind it */
+	memset(&t, 0, sizeof t);
+	t.type = Tstat;
+	t.tag = tb = cltag(&cl);
+	t.fid = Ffile;
+	clput(&cl, &t);
+	waitpush(ctx, np0, 2, &np, &nd);
+	eqv("the stat is queued behind the parked open", np - np0, 2);
+
+	/* flushed where it waits, so step 7 strips the stage on the loop */
+	memset(&t, 0, sizeof t);
+	t.type = Tflush;
+	t.tag = tf = cltag(&cl);
+	t.oldtag = tb;
+	clput(&cl, &t);
+	if(clgettag(&cl, tb, &r) < 0)
+		fail("no answer for the flushed stat");
+	else
+		eqs("the flushed queued stat", clerr(&r), "interrupted");
+	cltagfree(&cl, tb);
+	if(clgettag(&cl, tf, &r) < 0)
+		fail("no Rflush");
+	else{
+		checks++;
+		if(r.type != Rflush)
+			fail("the Rflush after it: %s", clerr(&r));
+	}
+	cltagfree(&cl, tf);
+	srvstagecount(ctx, &live, &done, &openat);
+	eqv("step 7 strips the stage the open is arming", live, 0);
+	eqv("... and gives back what it held, which is nothing yet", done, 1);
+	eqv("... owing one discard the store is still open for", openat, 1);
+	eqv("and the strip found no handle to park", srvstagepend(ctx), 0);
+
+	/* the arm now meets a stage that is gone, and the handle is real */
+	srvhook(ctx, "objarm", 0);
+	if(clgettag(&cl, ta, &r) < 0)
+		fail("no answer for the parked open");
+	else{
+		checks++;
+		if(r.type != Ropen)
+			fail("open /obj/alpha: %s", clerr(&r));
+	}
+	cltagfree(&cl, ta);
+	srvstagepoint(ctx, 0);
+	eqv("the handle armed onto a stripped stage goes to the drain",
+		srvstagepend(ctx), 1);
+	srvstagecount(ctx, &live, &done, &openat);
+	eqv("... and no second stage is left behind", live, 0);
+	eqv("... nor a second discard owed", openat, 1);
+
+	/* the drain at the head of the next queued operation makes the call */
+	if(clstat(&cl, Ffile, &r) != Rstat)
+		fail("stat /obj/alpha after the arm: %s", clerr(&r));
+	eqv("... and parks nothing behind it", srvstagepend(ctx), 1);
+	clclunk(&cl, Ffile, &r);
+	clclunk(&cl, Froot, &r);
+Out:
+	srvhook(ctx, "objarm", 0);
+	srvstagepoint(ctx, 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * layer-a §5.4.1 step 7's discard half: a Tflush discards the STAGE
  * THE FID HOLDS, whichever of the fid's requests was flushed.  Two
  * requests are outstanding on one fid — one running and held at its
@@ -2511,6 +2635,7 @@ threadmain(int argc, char **argv)
 	tstagesweep();
 	tsweepsites();
 	tsweepclunk();
+	tstagearm();
 	tstageflush();
 	tstagecommit();
 	tstagediscard();

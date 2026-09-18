@@ -542,6 +542,7 @@ struct Srvctx
 	uvlong	prelookhold;	/* srvhook("objprelook") */
 	uvlong	stagehold;	/* srvhook("objstage") */
 	uvlong	lookhold;	/* srvhook("objlook") */
+	uvlong	armhold;	/* srvhook("objarm") */
 	uvlong	exithold;	/* srvhook("objexit") */
 	uvlong	flushhold;	/* srvhook("flushhold") */
 	uvlong	mapopen;	/* srvhook("mapopen") */

@@ -277,6 +277,12 @@ void	srvcount(Srvctx*, uvlong *pushed, uvlong *done);
  *		where a test drives the idle sweep against a stage a
  *		handler is still inside — and where it drives a step 7 for
  *		another request on the same fid against one.
+ *	objarm	n != 0 holds the open that the stage point stages on
+ *		between the stage and the engine handle it arms it with.
+ *		The handle is taken from the engine with no lock held, so
+ *		a step 7 for another request on the same fid can strip the
+ *		stage in that window — which is what the arm has to find
+ *		rather than store a handle nothing would reach (obj.c).
  *	objexit	n != 0 holds every queued object request at the other
  *		end of its handler: after the engine call and before the
  *		exit, so a test can flush a request whose work is done
@@ -345,8 +351,8 @@ void	srvhook(Srvctx*, char *name, uvlong n);
  *
  * srvholdclear, which the shutdown runs before it drains, clears the
  * whole of srvhook's set and nothing else: objhold, objprelook,
- * objstage, objlook, objexit, flushhold, mapopen, walkhold, anyexit
- * and step7.  A HOLD therefore
+ * objstage, objlook, objarm, objexit, flushhold, mapopen, walkhold,
+ * anyexit and step7.  A HOLD therefore
  * belongs in srvhook — a program that set a point and stopped watching
  * must not be able to hold the store's close.  (The shutdown also
  * turns srvcellpoint off, by its own call and for its own reason: the

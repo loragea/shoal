@@ -744,6 +744,8 @@ srvhook(Srvctx *c, char *name, uvlong n)
 		c->stagehold = n;
 	else if(strcmp(name, "objlook") == 0)
 		c->lookhold = n;
+	else if(strcmp(name, "objarm") == 0)
+		c->armhold = n;
 	else if(strcmp(name, "objexit") == 0)
 		c->exithold = n;
 	else if(strcmp(name, "flushhold") == 0)
@@ -778,6 +780,7 @@ srvholdclear(Srvctx *c)
 	c->prelookhold = 0;
 	c->stagehold = 0;
 	c->lookhold = 0;
+	c->armhold = 0;
 	c->exithold = 0;
 	c->flushhold = 0;
 	c->mapopen = 0;
