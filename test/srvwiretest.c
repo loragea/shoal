@@ -1375,15 +1375,18 @@ statusnum(Cl *cl, ulong root, ulong fid, char *attr)
  * §14(43)).  What is NOT a divergence: an equal key whose csum already
  * matches, a lower key — which is `stale version' regardless of force
  * — and a copy that fails local verification, which contributes no key
- * to be equal to (D14).
+ * to be equal to (D14).  Nor is a push whose commit is refused: the
+ * count is the commit's, taken once the repair has been applied, and a
+ * transfer that published nothing repaired nothing.
  */
 static void
 tdiverged(void)
 {
-	char *m, csb[Csumhexlen], csc[Csumhexlen], db[2*Blkdlen+1];
-	char dc[2*Blkdlen+1], *hdr;
+	char *m, csa[Csumhexlen], csb[Csumhexlen], csc[Csumhexlen];
+	char db[2*Blkdlen+1], dc[2*Blkdlen+1], got[Csumhexlen], *hdr;
 	uchar a[Tblksz], b[Tblksz], c[Tblksz];
 	Srvctx *ctx;
+	Objinfo oi;
 	Store *st;
 	Dev *d;
 	Cl cl;
@@ -1401,6 +1404,7 @@ tdiverged(void)
 		b[i] = i*3 + 1;
 		c[i] = i*5 + 2;
 	}
+	ocsum(csa, a, sizeof a);
 	ocsum(csb, b, sizeof b);
 	dcs(db, b, sizeof b);
 	ocsum(csc, c, sizeof c);
@@ -1448,6 +1452,28 @@ tdiverged(void)
 		repler(&cl, Frepl, hdr, b, sizeof b), "ok");
 	eqv("... is §7.5's reconcile and records nothing",
 		statusnum(&cl, Frepl2, Frpc2, "diverged"), 1);
+	free(hdr);
+
+	/*
+	 * The record is the COMMIT's and not the comparison's.  This one
+	 * names the csum `a' has over a copy that holds `b' at the same
+	 * key, so §1.3's comparison says divergence — and pushes `c', so
+	 * the resulting csum is not the one it names and the commit
+	 * publishes nothing (D23).  A repair that repaired nothing
+	 * records nothing.
+	 */
+	hdr = smprint("op=full oid=alpha epoch=7 ver=2 wepoch=7 len=%d off=0"
+		" n=%d dcsum=%s csum=%s final=1 force=1", Tblksz, Tblksz, dc,
+		csa);
+	eqs("a force=1 repair at an equal key whose commit is refused",
+		cond(repler(&cl, Frepl, hdr, c, sizeof c)), "checksum mismatch");
+	eqv("... repaired nothing, so it records nothing",
+		statusnum(&cl, Frepl2, Frpc2, "diverged"), 1);
+	if(statof(st, "alpha", &oi) < 0)
+		fail("objstat alpha: %r");
+	else
+		eqs("... and left the copy it found",
+			hexs(got, oi.csum, Csumlen), csb);
 	free(hdr);
 	clclunk(&cl, Frepl, &r);
 	clclunk(&cl, Frepl2, &r);
