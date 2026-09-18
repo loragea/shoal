@@ -544,14 +544,16 @@ extern int nsrvctls;
  *
  * The rules are the same for both, and they are the fid's:
  *
- *	one per fid.  A second is refused `disk full', which is §3.6's
- *		refusal for its per-fid bound, and so is an update
- *		covering more than `stagemax' allows — grains for a /repl
- *		stage, checksum blocks for a client write, which is this
- *		server's own quantity (store.md §14(37)).  A client write
- *		is SHORTENED to that bound rather than refused (layer-a
- *		§2.4's short write), so only a fid that already holds a
- *		stage reaches the refusal.
+ *	one per fid.  A second is refused `disk full', the pick §2.6's
+ *		set offers for a bound §3.6 does not define (store.md
+ *		§14(43)), and so is an update covering more than
+ *		`stagemax' allows — grains for a /repl stage, which is
+ *		§3.6's own quantity and which the ENGINE charges against
+ *		the handle for every chunk but the first; checksum blocks
+ *		for a client write, which is this server's own quantity
+ *		(store.md §14(37)).  A client write is SHORTENED to that
+ *		bound rather than refused (layer-a §2.4's short write), so
+ *		only a fid that already holds a stage reaches the refusal.
  *	discarded by step 7, through auxflush, whichever of the fid's
  *		requests was flushed: the stage is the fid's, and a stage
  *		spanning several Twrites has no one request to belong to.

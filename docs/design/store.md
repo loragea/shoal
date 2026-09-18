@@ -5811,9 +5811,9 @@ other files cite, so a gap is cheaper than a renumbering.
     *Not made; recorded here as this server's policy:* one accepted
     write covers at most `stagemax` checksum blocks and is answered
     short at that boundary, so the bound is back-pressure and not a
-    refusal. `disk full` on that bound is still reachable, and is
-    what a fid that already holds a stage is told — one stage to a
-    fid — which is the replication surface's case, where a chunk's
+    refusal. `disk full` is still what a fid that already holds a
+    stage is told — one stage to a fid, which is §14(43)'s refusal —
+    and that is the replication surface's case, where a chunk's
     offset is the sender's and shortening would publish a hole.
 
     **The quantity bounded is not §3.6's.** §3.6's `stagemax` bounds
@@ -5828,9 +5828,11 @@ other files cite, so a gap is cheaper than a renumbering.
     engine's, enforced in the store over the handles `stageopen`
     makes; it became live with the `/repl` surface (§5.5), whose
     stages reserve, and `/status` carries a `staged=<grains>` row
-    read straight off `Storestat.staged`. What the 9P server enforces
-    over a `/repl` fid is the per-fid `stagemax`, in grains and over
-    the whole of one transfer (§14(43)).
+    read straight off `Storestat.staged`. Over a `/repl` fid the
+    grain bound is the ENGINE's to enforce, per handle and over the
+    whole of one transfer; one handle to a fid is what makes that
+    §3.6's per-fid bound, and the 9P server keeps no count beside it.
+    §14(43) has that and the one chunk the server weighs itself.
 
     **Which string a client sees when its staged update goes.** A
     `Twrite` whose own request was flushed is answered `interrupted`

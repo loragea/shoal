@@ -458,12 +458,13 @@ srvstagesweep(Srvctx *c)
 /*
  * §5.4 step 3: stage the update on the fid.  The slot is single — a
  * fid stages one operation at a time — and a fid that already holds
- * one is refused `disk full', which is §3.6's refusal for its per-fid
- * bound.  So is an update covering more grains than that bound
- * allows, which no client path can reach: a client write is SHORTENED
- * to the bound before it gets here (wclamp, store.md §14(37)), and
- * the /repl surface whose chunks cannot be shortened is what will
- * (dat.h's Sstage).
+ * one is refused `disk full', the pick §2.6's set offers for it
+ * (store.md §14(43)).  So is an update covering more grains than
+ * §3.6's bound allows, which no client path can reach: a client write
+ * is SHORTENED to the bound before it gets here (wclamp, store.md
+ * §14(37)), and the opening chunk of a /repl transfer, which cannot
+ * be shortened, is the one that does reach it — every later chunk is
+ * charged against the handle by the engine instead (dat.h's Sstage).
  *
  * The bytes of a write are NOT copied here: they stay the Req's, and
  * the commit reads them from it.  A client stage lives inside its one
@@ -824,13 +825,15 @@ srvstagefull(Srvctx *c, Sfid *f, uchar *oid, int oidlen, uvlong flen,
  * holds no stage at all, which is the first chunk's case and the
  * caller's to take to srvstagefull.
  *
- * The refusals are §3.6's per-fid ones.  A chunk naming another object
- * is a SECOND stage on one fid and is `disk full', which is §3.6's
- * refusal for its per-fid bound (store.md §14(43)).  The GRAIN half of
- * that bound is not counted here: the engine charges `stagemax' against
- * the handle, exactly and grain by grain, and one handle is all a fid
- * may hold, so a count on this side would only be a coarser one over
- * the same reservations.  A `len' or `force' that differs from the
+ * The refusals are the per-fid ones.  A chunk naming another object is
+ * a SECOND stage on one fid and is `disk full' — a pick from layer-a
+ * §2.6's set rather than a refusal §3.6 defines, because what §3.6
+ * bounds is the SPACE a fid holds staged and not how many transfers
+ * may be in flight on one (store.md §14(43)).  §3.6's grain bound is
+ * not counted here either: the engine charges `stagemax' against the
+ * handle, exactly and grain by grain, and one handle is all a fid may
+ * hold, so a count on this side would only be a coarser one over the
+ * same reservations.  A `len' or `force' that differs from the
  * transfer's own is a header §5.5 forbids a conforming sender to send,
  * so it is `bad ctl'.
  *
