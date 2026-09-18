@@ -488,6 +488,19 @@ void	srvcellpoint(Srvctx*, int on);
 void	srvendpoint(Srvctx*, uvlong ms);
 
 /*
+ * The period the tombstone reclaim walk will run its passes on, in
+ * ms, overriding the map's own.  Nothing reads it yet: the walk runs
+ * at the end of a scrub pass and has no period of its own, so a T1
+ * that drives it starts a scrub (job.c).  The knob is here because
+ * the period a walk of its own would take is `tombdays'/2 and the
+ * shortest a map can ask for is half a day, which is longer than any
+ * test can wait for.  0 puts the map's own period back.  Like
+ * srvendpoint and unlike the srvhook holds, the shutdown does not
+ * clear it.
+ */
+void	srvreclaimms(Srvctx*, uvlong ms);
+
+/*
  * The stage point, over the per-fid staged operation layer-a §5.4 step
  * 3 creates and §5.4.1 step 7 discards.  With it on, an open of
  * /obj/<oid> for writing leaves a stage on the fid — one that stages

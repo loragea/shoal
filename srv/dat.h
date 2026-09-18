@@ -700,11 +700,17 @@ struct Srvctx
 	 * raises, which a running pass tests between objects exactly as
 	 * it tests srvstopping.  `scrubbing' is what keeps a second
 	 * `scrub start' from putting two passes over one index.
+	 *
+	 * `reclaimms' is the T1 knob over the period the tombstone
+	 * reclaim walk will run on (srv.h).  Nothing reads it yet: the
+	 * walk runs at the end of a scrub pass and has no period of its
+	 * own (job.c).
 	 */
 	Sjob	*jobs;
 	int	scrubbing;
 	int	scrubstop;
 	ulong	scrubrate;
+	uvlong	reclaimms;
 	int	stopping;	/* the shutdown has begun: no new jobs */
 	int	served;		/* a service loop was started over this context */
 	int	released;	/* lib9p has let go of the Srv (Srv.free) */

@@ -535,6 +535,18 @@ reclaimpass(Sjob *j)
 }
 
 /*
+ * The T1 knob over the period the reclaim walk will run on (srv.h).
+ * 0 puts the map's own period back.
+ */
+void
+srvreclaimms(Srvctx *c, uvlong ms)
+{
+	lock(&c->joblk);
+	c->reclaimms = ms;
+	unlock(&c->joblk);
+}
+
+/*
  * layer-a §7.5's scrub: walk the index in order and re-verify every
  * live object, each through its own queue, at the configured rate.
  * The verdict's durable half is objscrub's — a mismatch flags the
