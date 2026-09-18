@@ -408,8 +408,8 @@ srvjobcount(Srvctx *c)
  * the shutdown is over.  So the shutdown waits for the proc to see
  * `stopping' and end.  The wait is bounded by the proc's own slice,
  * which is half a second (job.c), and no pass can be started behind
- * it: srvjobstart refuses once the shutdown has begun, which is the
- * same gate every verb meets.
+ * it: jobadmit reads `stopping' under joblk and refuses once the
+ * shutdown has begun, which is the same gate every verb meets.
  */
 static void
 reclaimwait(Srvctx *c)
@@ -449,7 +449,7 @@ jobwait(Srvctx *c)
  * keeps the Store alive.
  *
  * Nothing new is taken on from here — the loop has ended and
- * srvjobstart refuses — and the §13 points that can hold a request are
+ * jobadmit refuses — and the §13 points that can hold a request are
  * cleared first, so a request left holding cannot hold the drain up.
  * The same clearing is what frees a pass parked at `jobhold' before
  * jobwait reaches it, which matters more there: that wait is unbounded

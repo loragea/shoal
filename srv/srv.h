@@ -233,8 +233,9 @@ void	srvshutdown(Srvctx*);
  * shutdown has begun, which is the answer a verb turns into its
  * refusal.  The passes this library starts take the same count with
  * the rest of their admission, under the one lock (job.c), and give
- * it back through srvjobend like any other caller.  A pass already running SHOULD test srvstopping between
- * units of work and give up rather than leave the shutdown waiting.
+ * it back through srvjobend like any other caller.  A pass already
+ * running SHOULD test srvstopping between units of work and give up
+ * rather than leave the shutdown waiting.
  *
  * The tombstone reclaim walk's timer is the one proc here that is NOT
  * a job: it starts passes and makes no engine call of its own, so it
@@ -394,9 +395,13 @@ int	srvreclaimlive(Srvctx*);	/* ... and the timer, which holds none */
  *		narrow to write into without a hold.  Only the timer's call
  *		parks here, never a verb's: a verb's call IS the loop, and
  *		a loop parked answers nothing else either.  The proc it
- *		parks holds no job, so it carries none of jobhold's hazard
- *		— the shutdown clears every point before it waits for the
- *		timer.
+ *		parks does hold a job — the admission has counted and
+ *		linked the pass before the timer reaches this point, so
+ *		/jobs lists it while it is parked — but it carries none of
+ *		jobhold's hazard, because a tick that reaches the point
+ *		was admitted before `stopping' was set: jobadmit reads
+ *		that flag under the same joblk hold the shutdown sets it
+ *		in, so no shutdown can have begun behind the parked tick.
  *	flushhold
  *		n != 0 holds a Tflush of a pooled request between the
  *		lookup that found it and the flush itself, which is the
@@ -433,7 +438,8 @@ void	srvhook(Srvctx*, char *name, uvlong n);
  * srvholdclear, which the shutdown runs before it drains, clears the
  * whole of srvhook's set and nothing else: objhold, objprelook,
  * objstage, objlook, objarm, objexit, flushhold, mapopen, walkhold,
- * anyexit, step7, jobhold, slotfail, reclaimhold and dirhold.  A HOLD
+ * anyexit, step7, jobhold, slotfail, reclaimhold, tickhold and
+ * dirhold.  A HOLD
  * therefore belongs in srvhook — a program that set a point and
  * stopped watching must not be able to hold the store's close.  (The
  * shutdown also
