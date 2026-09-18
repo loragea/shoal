@@ -299,6 +299,26 @@ placeids(Srvctx *ctx, char *pfx, char **mine, char **theirs)
 	}
 }
 
+/* how many directory entries a read answered */
+static int
+dirents(char *p, long n)
+{
+	Dir dir;
+	char *ep;
+	int m, k;
+
+	k = 0;
+	ep = p + n;
+	while(p < ep){
+		m = convM2D((uchar*)p, ep-p, &dir, p+BIT16SZ);
+		if(m <= BIT16SZ)
+			break;
+		p += m;
+		k++;
+	}
+	return k;
+}
+
 static int
 objinfoof(Store *s, char *name, Objinfo *oi)
 {
@@ -2093,6 +2113,122 @@ Out:
 }
 
 /*
+ * A Tcreate on a fid that is mid-listing, which is where the /obj
+ * row's two halves meet on one fid: the directory open installs the
+ * listing's snapshot as the fid's state (enum.c), and the create cell
+ * gives the fid's state back as it moves the fid onto the object it
+ * created (obj.c).  One fid cannot hold both, and the state a create
+ * would drop here is the listing the client is part-way through.
+ *
+ * It never has to choose, because 9P settles it a message earlier:
+ * lib9p refuses a Tcreate on a fid that is already open, with its own
+ * string, before any cell of this row is reached.  So the two halves
+ * cannot meet on an open fid at all, and what this case pins is that
+ * refusal and the listing carrying on from exactly where it was.  The
+ * name it creates is a reserved one, which is the name this role may
+ * create (§2.1): a name the gate would have refused anyway would make
+ * the check pass for the wrong reason.
+ *
+ * A create on another fid of the same directory is the case that IS
+ * allowed, and it moves neither the cursor nor the snapshot -- the
+ * snapshot was taken at the open, so what a later create adds is not
+ * in it (store.md §9).
+ */
+static void
+tdircreate(void)
+{
+	static char *ids[3] = {"dira", "dirb", "dirc"};
+	char buf[8192], *m;
+	char *w[1];
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall r;
+	Dir dir;
+	vlong off;
+	long one;
+	int i, nent;
+
+	clstage = "dircreate";
+	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4)) == nil)
+		return;
+	for(i = 0; i < nelem(ids); i++)
+		mkobj(srvstore(ctx), ids[i], nil, 0, 1);
+	w[0] = "obj";
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
+		fail("attach: %s", clerr(&r));
+		goto Out;
+	}
+	/*
+	 * What one entry takes on the wire, measured on a fid of its own
+	 * rather than computed, so that the read below stops inside the
+	 * listing whatever an entry carries.  The three ids are the same
+	 * length, so any of them is the measure.
+	 */
+	one = 0;
+	if(clopenpath(&cl, Froot, Ffile2, 1, w, OREAD, &r) != Ropen)
+		fail("open /obj to measure an entry: %s", clerr(&r));
+	else if(clread(&cl, Ffile2, 0, 4096, &r) == Rread && r.count > 0)
+		one = convM2D((uchar*)r.data, r.count, &dir, buf);
+	clclunk(&cl, Ffile2, &r);
+	checks++;
+	if(one <= BIT16SZ){
+		fail("no /obj entry to measure");
+		goto Out;
+	}
+
+	if(clopenpath(&cl, Froot, Ffile, 1, w, OREAD, &r) != Ropen){
+		fail("open /obj: %s", clerr(&r));
+		goto Out;
+	}
+	if(clread(&cl, Ffile, 0, one, &r) != Rread){
+		fail("the first read of /obj: %s", clerr(&r));
+		goto Out;
+	}
+	off = r.count;
+	nent = dirents(r.data, r.count);
+	eqv("the first read stops inside the listing", nent, 1);
+
+	clcreate(&cl, Ffile, "shoal.map.9", 0666, OWRITE, &r);
+	clerris("a create on a fid that is mid-listing", &r,
+		"9P protocol botch");
+
+	/* the snapshot and the cursor are where the create found them */
+	for(;;){
+		if(clread(&cl, Ffile, off, 4096, &r) != Rread){
+			fail("the listing after the refused create: %s",
+				clerr(&r));
+			goto Out;
+		}
+		if(r.count == 0)
+			break;
+		nent += dirents(r.data, r.count);
+		off += r.count;
+	}
+	eqv("the listing carries on over the refused create", nent,
+		nelem(ids));
+	clclunk(&cl, Ffile, &r);
+
+	/* the create this row does answer is one on a fid of its own */
+	if(clwalk(&cl, Froot, Ffile, 1, w, &r) != Rwalk)
+		fail("walk /obj for the create: %s", clerr(&r));
+	clcreate(&cl, Ffile, "shoal.map.9", 0666, OWRITE, &r);
+	checks++;
+	if(r.type != Rcreate)
+		fail("a create on a fid that is not listing: %s", clerr(&r));
+	clclunk(&cl, Ffile, &r);
+	clclunk(&cl, Froot, &r);
+Out:
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * The fid registry under a walk that moves a fid.  A walk that names
  * an object runs on that object's queue while attaches and clones run
  * on the service loop, and both reach the same list: the walk gives
@@ -3609,6 +3745,7 @@ threadmain(int argc, char **argv)
 	tdown("out", "yes");
 	tfidstate();
 	tcreategive();
+	tdircreate();
 	tfidwalk();
 	tflush();
 	tstep7fid();
