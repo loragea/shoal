@@ -432,7 +432,7 @@ struct Sjob
 	uvlong	bad;		/* objects the pass found mismatching */
 	uvlong	reclaimable;	/* tombstones past layer-a §1.5's local two */
 	uvlong	dropped;	/* dirty records `forget' discarded */
-	char	arg[Peermax+1];	/* `forget's peer */
+	char	arg[Iidlen+1];	/* `forget's peer, an instance id (§3.3) */
 	char	err[ERRMAX];	/* what the pass gave up with, or empty */
 };
 

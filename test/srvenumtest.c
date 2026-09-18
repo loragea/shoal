@@ -416,7 +416,7 @@ tparse(void)
 		"reconcile",
 		"advert",
 	};
-	char what[128], *m;
+	char what[128], idline[16+Iidlen], *m;
 	Srvctx *ctx;
 	Dev *d;
 	Cl cl;
@@ -457,6 +457,27 @@ tparse(void)
 				r.type == Rerror ? r.ename : "ok",
 				lines[i].err);
 	}
+	/*
+	 * `forget's argument is an instance id (§3.3: a node name, a dot
+	 * and the index), and the longest one is well formed: a peer this
+	 * store has no record for is not an error, so the bound is the
+	 * id's own width and not that of the `peer' field a dirty record
+	 * carries, which is two digits narrower.
+	 */
+	strcpy(idline, "forget ");
+	memset(idline+7, 'n', Iidlen);
+	idline[7+Nodelen] = '.';
+	idline[7+Iidlen] = 0;
+	clwrite(&cl, Fctl, 0, idline, &r);
+	checks++;
+	if(r.type != Rwrite)
+		fail("forget of an id of the full instance-id width: %s",
+			clerr(&r));
+	idline[7+Iidlen] = '0';
+	idline[7+Iidlen+1] = 0;
+	clwrite(&cl, Fctl, 0, idline, &r);
+	clerris("forget of an id one character past it", &r, "bad ctl");
+
 	/* the verbs that gate and then answer the local `not built' */
 	for(i = 0; i < nelem(notbuilt); i++){
 		clwrite(&cl, Fctl, 0, notbuilt[i], &r);

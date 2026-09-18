@@ -685,11 +685,18 @@ srvctlscrub(Srvctx *c, Sfid *f, int argc, char **argv)
 /*
  * §2.5's `forget <iid>'.  The argument is an instance id and not an
  * oid, so the row is an `fn' and the work is a pass (see the head of
- * this file).  An id no dirty record can carry is `bad ctl': §2.5's
+ * this file).  An id no instance id can be is `bad ctl': §2.5's
  * error column for this verb names `fenced' and `bad ctl' and
  * nothing else, and a peer name is an argument rather than an object.
  * A well-formed id this store has no record for is not an error —
  * §7.1's meaning of forget for such a peer is already in force.
+ *
+ * So the bound is Iidlen, layer-a §3.3's node name plus a dot plus
+ * the instance index, and NOT Peermax, which is the width of the
+ * `peer' field a dirty record carries and is two digits narrower.
+ * Bounding by the record would refuse the longest well-formed ids —
+ * precisely the ids this store has no record for, which the sentence
+ * above says are not an error.
  */
 char*
 srvctlforget(Srvctx *c, Sfid *f, int argc, char **argv)
@@ -699,7 +706,7 @@ srvctlforget(Srvctx *c, Sfid *f, int argc, char **argv)
 	USED(f);
 	USED(argc);
 	n = strlen(argv[0]);
-	if(n < 1 || n > Peermax)
+	if(n < 1 || n > Iidlen)
 		return Ebadctl;
 	return jobstart(c, "forget", forgetpass, argv[0]);
 }
