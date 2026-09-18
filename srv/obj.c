@@ -33,10 +33,12 @@
  *
  * The stage is per FID, one at a time (dat.h's Sstage).  For a client
  * operation it is created at step 3 and consumed at step 6 or
- * discarded at step 7, inside the one request; for the /repl fid of
- * the replication surface it will hold an engine Stage across many
+ * discarded at step 7, inside the one request; on the /repl fid of
+ * the replication surface it holds an engine Stage across many
  * Twrites, which is the lifetime §3.6 gives one and the reason the
- * state is the fid's rather than the request's.
+ * state is the fid's rather than the request's.  The four calls the
+ * channel drives that stage through are below, beside the client
+ * paths that share the slot.
  */
 
 /*
@@ -93,9 +95,10 @@ oidstr(char *buf, uchar *oid, int oidlen)
  * and commits from the Req's buffer.  This server's own policy shares
  * the configured value because the two bound the same appetite for one
  * operation, and store.md §14(37) records that.  The process-wide
- * stagetot bounds reservations, so it is the engine's alone until the
- * /repl surface makes stages that hold them.  The engine reads a zero
- * as "the default" and so does this.
+ * stagetot bounds reservations and is the engine's alone; what this
+ * same number bounds on a /repl fid is that fid's staged grains,
+ * which is §3.6's own quantity.  The engine reads a zero as "the
+ * default" and so does this.
  */
 static ulong
 stagemaxof(Srvctx *c)
@@ -352,9 +355,9 @@ stageflushhook(Sfid *f, Req *r)
 	s->dead = 1;
 	/*
 	 * A handler inside an engine call THROUGH this handle is the one
-	 * case where the handle may not be taken here: §5.5's chunk passes
-	 * the Stage* to stagewrite, and a discard made while that call is
-	 * in flight is a discard made under it.  `dead' is enough — the
+	 * case where the handle may not be taken here (store.md §14(45)):
+	 * §5.5's chunk passes the Stage* to stagewrite, and a discard made
+	 * while that call is in flight is a discard made under it.  `dead' is enough — the
 	 * look that handler takes when its call returns finds it and
 	 * releases the handle itself (srvstagelive below), which is an
 	 * engine call made from a queue proc holding no lock, where it
@@ -674,12 +677,12 @@ stagedone(Sfid *f, Sstage *s)
  * still open, the idle sweep, and the `disk full' a second stage on
  * one fid is refused with.
  *
- * It exists because no operation in THIS half of the surface leaves a
- * stage behind: a client write stages at §5.4 step 3 and gives the
- * stage back at step 6 or 7, inside the one request.  The stage that
- * outlives its request is the op=full stage of the replication surface
- * (§3.6, §5.5), which is the next unit's; the lifetime rules are this
- * unit's and are testable now.  The point is per context, like
+ * It exists because no CLIENT operation leaves a stage behind: a
+ * client write stages at §5.4 step 3 and gives the stage back at step
+ * 6 or 7, inside the one request.  The stage that outlives its request
+ * is the op=full stage of the replication surface (§3.6, §5.5), and
+ * the point is what drives the lifetime rules with no transfer in
+ * flight and no engine handle to carry.  The point is per context, like
  * srvauxpoint and unlike the cell point, because what it fills is a
  * fid rather than a row of the file table.
  */
@@ -806,8 +809,8 @@ srvstagefull(Srvctx *c, Sfid *f, uchar *oid, int oidlen, uvlong flen,
  *
  * The refusals are §3.6's per-fid ones.  A chunk naming another object
  * is a SECOND stage on one fid and is `disk full', which is §3.6's
- * refusal for its per-fid bound; so is one that would take the
- * transfer past `stagemax' staged grains.  A `len' or `force' that
+ * refusal for its per-fid bound (store.md §14(43)); so is one that
+ * would take the transfer past `stagemax' staged grains.  A `len' or `force' that
  * differs from the transfer's own is a header §5.5 forbids a
  * conforming sender to send, so it is `bad ctl'.
  *
@@ -815,7 +818,8 @@ srvstagefull(Srvctx *c, Sfid *f, uchar *oid, int oidlen, uvlong flen,
  * `stage expired' — and the refusal is what takes it out of the slot.
  * §3.6 has the owner discard an expired stage and start the transfer
  * over, which is free; leaving the handle in the slot would refuse
- * that restart with the same string for as long as the fid lived.
+ * that restart with the same string for as long as the fid lived
+ * (store.md §14(44)).
  */
 Stage*
 srvstagemore(Srvctx *c, Sfid *f, uchar *oid, int oidlen, uvlong flen,

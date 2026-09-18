@@ -497,7 +497,7 @@ void	srvendpoint(Srvctx*, uvlong ms);
  * `disk full' a second stage on one fid is refused with.  No client
  * operation leaves a stage behind, because each gives its own back
  * inside its request; the stage that outlives its request is §5.5's
- * op=full, whose surface is not built.
+ * op=full, whose own lifetimes are driven through /repl (peer.c).
  *
  * srvstagecount answers how many stages the live fids hold, how many
  * have been given back and how many of those found the store still

@@ -203,15 +203,17 @@ enum
  * puts the render on the reserved queue; /stale reads the adopted map
  * and /jobs the job list, so both stay on the service loop.
  *
- * /repl and /rpc are the peer channels: their read and write cells
- * belong with the replication surface (§5.5, §5.6) and are not built.
- * The per-fid state a multi-request op stages has its slot and its
- * lifetime rules here already (Sstage below), because the client
- * operations stage on the same slot; what is unfilled is §5.5's
- * op=full, the one kind of stage that outlives its request.  The two
- * channels' gate is already filled, because the fence is this file's
- * (tree.c's chgate); /advert has none, because F1's list names /repl
- * and /rpc alone.
+ * /repl and /rpc are the peer channels and are built (peer.c): /repl
+ * fills a write cell and a read cell — §5.5 defines no read, so a
+ * Tread of it is end of data — and /rpc fills all three, its open
+ * cell being where §5.6's ORDWR-only rule is applied.  The per-fid
+ * state a multi-request op stages is Sstage below, which the client
+ * operations share: §5.5's op=full is the one kind of stage that
+ * outlives its request, and it is the one that fills `g'.  A /rpc fid
+ * uses the same slot for the request it has outstanding and the
+ * response it has buffered.  The two channels' gate is this file's,
+ * because the fence is (tree.c's chgate); /advert has none, because
+ * F1's list names /repl and /rpc alone.
  *
  * The srvctls table below says the same for the verbs: a verb is
  * built by filling its row's fn or qfn, and the body of work that

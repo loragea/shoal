@@ -962,7 +962,7 @@ srvreplread(Req *r)
  * under the fid's state lock, which is the lock the handler installs
  * its response under, so the two cannot cross: a handler whose claim
  * is gone when it comes to install finds it gone and throws the
- * response away (store.md §14(42)).
+ * response away.
  */
 static void
 rpcflush(Sfid *f, Req *r)
@@ -1007,7 +1007,8 @@ rpcfree(void *a)
  * Twrite.  Both are kept: a Twrite that arrives while a request is in
  * flight, or while a response nobody has read is buffered, is refused,
  * and a Twrite that arrives after the response was delivered destroys
- * it and takes the fid.  store.md §14(43) records the reading.
+ * it and takes the fid.  store.md §14(42) records the reading, and
+ * why both of §5.6's sentences are live under it.
  */
 static char*
 rpcclaim(Srvctx *c, Sfid *f)
