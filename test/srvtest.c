@@ -1047,6 +1047,64 @@ Out:
 	free(m);
 }
 
+/*
+ * The cell point goes with the context that set it.  Its cells are the
+ * file table's, and the table is the program's, so a point left on
+ * when a context ends would hand its cells to the next server started
+ * in the same program.  The shutdown is where they go, with the holds:
+ * it is after the service loop and the drain, so nothing can still be
+ * inside one.  A second server over the same disk is what sees the
+ * difference — a read of its /ctl is served from the row's own
+ * rendered text, which is empty, and not from a dead context's cell.
+ */
+static void
+tcellclear(void)
+{
+	char buf[256], *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall r;
+	char *w[1];
+	long n;
+
+	clstage = "cellclear";
+	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4)) == nil){
+		devclose(d);
+		free(m);
+		return;
+	}
+	srvcellpoint(ctx, 1);
+	clstart(&cl, ctx, Clmsize);
+	clstop(&cl);			/* the hangup is the shutdown's trigger */
+	srvfree(ctx);
+
+	if((ctx = startsrv(d, m, 4)) == nil){
+		devclose(d);
+		free(m);
+		return;
+	}
+	clstart(&cl, ctx, Clmsize);
+	w[0] = "ctl";
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach)
+		fail("attach to the second server: %s", clerr(&r));
+	else if(clopenpath(&cl, Froot, Fctl, 1, w, OREAD, &r) != Ropen)
+		fail("open /ctl on the second server: %s", clerr(&r));
+	else{
+		n = clslurp(&cl, Fctl, buf, sizeof buf);
+		eqv("a server started after a shutdown carries no cells of its"
+			" own", n, 0);
+		clclunk(&cl, Fctl, &r);
+	}
+	srvcellpoint(ctx, 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
 /* §2.5's ctl framework: the four gates over every verb row */
 static void
 tctl(void)
@@ -2969,6 +3027,7 @@ threadmain(int argc, char **argv)
 	tobjects();
 	tstatus();
 	treadcell();
+	tcellclear();
 	tctl();
 	tverify();
 	tdevintr();

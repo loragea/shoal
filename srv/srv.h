@@ -312,6 +312,10 @@ void	srvhook(Srvctx*, char *name, uvlong n);
  * gives back — are driven before the rows that will carry them are
  * built.  The cells are the file table's, so the point is the
  * program's rather than one context's: set it, drive it, clear it.
+ * The shutdown clears it as well, like the holds above and unlike the
+ * observables below, because the table outlives the context: cells a
+ * program forgot would otherwise be served by the next server it
+ * starts.
  */
 void	srvcellpoint(Srvctx*, int on);
 

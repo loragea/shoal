@@ -607,7 +607,12 @@ srvauxlate(Srvctx *c)
  *
  * The cells are the table's and the table is the program's, so this
  * point is global rather than per-context: a T1 program sets it,
- * drives what it wants and clears it.
+ * drives what it wants and clears it — and the shutdown clears it too,
+ * so cells a context was given cannot be inherited by the next server
+ * the program starts.  The write is under the points' lock, which is
+ * where the shutdown's own clearing runs; the table is read unlocked
+ * on the service loop and on the queue procs, so the point is moved
+ * when nothing is driving the rows it fills.
  */
 static char Celltext[] = "cell\n";
 
@@ -650,10 +655,11 @@ cellcreate(Req *r)
 void
 srvcellpoint(Srvctx *c, int on)
 {
-	USED(c);
+	qlock(&c->holdlk);
 	srvfiles[Qctl].read = on ? cellread : nil;
 	srvfiles[Qobjfile].write = on ? cellwrite : nil;
 	srvfiles[Qobj].create = on ? cellcreate : nil;
+	qunlock(&c->holdlk);
 }
 
 void

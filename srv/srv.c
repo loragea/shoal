@@ -396,6 +396,10 @@ jobwait(Srvctx *c)
  * Nothing new is taken on from here — the loop has ended and
  * srvjobstart refuses — and the §13 points that can hold a request are
  * cleared first, so a request left holding cannot hold the drain up.
+ * The cell point goes with them: its cells are the file table's, which
+ * is the program's and not this context's, so a context that ends
+ * without clearing them would leave them to the next server started in
+ * the same program.
  *
  * The fids outlive this, but what they are holding may not: a fid open
  * when the connection dropped can be holding a stage, and §9 allows
@@ -425,6 +429,7 @@ srvshutdown(Srvctx *c)
 	c->stopping = 1;
 	unlock(&c->joblk);
 	srvholdclear(c);
+	srvcellpoint(c, 0);
 	srvqdrain(c);
 	jobwait(c);
 	srvfidsclose(c);
