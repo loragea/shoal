@@ -540,6 +540,19 @@ srvqanyexit(Srvctx *c)
 }
 
 /*
+ * The point at the end of a background pass, which is not a request
+ * and has no queue: a pass is parked here with its record still on the
+ * job list, so that what it finished with is readable at /jobs rather
+ * than raced against the unlink.  It holds a pass proc, so the
+ * shutdown's srvholdclear reaches it before jobwait.
+ */
+void
+srvjobhold(Srvctx *c)
+{
+	qhold(c, nil, &c->jobhold);
+}
+
+/*
  * The third point, at a queued walk's commit: the moment a walk that
  * moves its fid has given the old state back and is about to write
  * the new one.  It is where the service loop is concurrent with the
@@ -793,6 +806,8 @@ srvhook(Srvctx *c, char *name, uvlong n)
 		c->anyexit = n;
 	else if(strcmp(name, "step7") == 0)
 		c->step7hold = n;
+	else if(strcmp(name, "jobhold") == 0)
+		c->jobhold = n;
 	qunlock(&c->holdlk);
 }
 
@@ -818,6 +833,7 @@ srvholdclear(Srvctx *c)
 	c->walkhold = 0;
 	c->anyexit = 0;
 	c->step7hold = 0;
+	c->jobhold = 0;
 	qunlock(&c->holdlk);
 }
 

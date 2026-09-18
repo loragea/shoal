@@ -276,6 +276,14 @@ void	srvcount(Srvctx*, uvlong *pushed, uvlong *done);
  *		which the service loop is making and unmaking fids on the
  *		same registry, so it is where a test drives an attach
  *		against a walk.
+ *	jobhold	n != 0 holds a background pass at the end of its run:
+ *		after its walk, while its record is still on the job list
+ *		and still holds the job the shutdown waits on, and before
+ *		the proc unlinks it.  A pass's counters and the error it
+ *		gave up with are read from /jobs, and /jobs lists a pass
+ *		only while it is running or queued, so this is where a
+ *		test reads what a pass finished with instead of racing the
+ *		unlink for it.
  *	flushhold
  *		n != 0 holds a Tflush of a pooled request between the
  *		lookup that found it and the flush itself, which is the
@@ -311,7 +319,7 @@ void	srvhook(Srvctx*, char *name, uvlong n);
  *
  * srvholdclear, which the shutdown runs before it drains, clears the
  * whole of srvhook's set and nothing else: objhold, objexit,
- * flushhold, mapopen, walkhold, anyexit and step7.  A HOLD therefore
+ * flushhold, mapopen, walkhold, anyexit, step7 and jobhold.  A HOLD therefore
  * belongs in srvhook — a program that set a point and stopped watching
  * must not be able to hold the store's close.  (The shutdown also
  * turns srvcellpoint off, by its own call and for its own reason: the

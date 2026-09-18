@@ -58,6 +58,7 @@ int	srvqcheck(Req*);
 void	srvqexit(Req*);
 void	srvqwalkhold(Req*);
 void	srvqanyexit(Srvctx*);
+void	srvjobhold(Srvctx*);
 void	srvqdone(Req*, char *err);
 void	srvqended(Qreq*);
 void	srvqdrain(Srvctx*);

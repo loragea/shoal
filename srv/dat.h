@@ -498,6 +498,7 @@ struct Srvctx
 	uvlong	walkhold;	/* srvhook("walkhold") */
 	uvlong	anyexit;	/* srvhook("anyexit") */
 	uvlong	step7hold;	/* srvhook("step7") */
+	uvlong	jobhold;	/* srvhook("jobhold") */
 	uvlong	endhold;	/* srvendpoint: ms held in srvqended */
 
 	/*

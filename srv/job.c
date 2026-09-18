@@ -203,6 +203,12 @@ jobproc(void *a)
 	j->running = 1;
 	unlock(&c->joblk);
 	j->fn(j);
+	/*
+	 * §13's point, while the record is still on the list: /jobs lists
+	 * a pass only while it is running or queued, so what one finished
+	 * with is readable here and nowhere later (srv.h).
+	 */
+	srvjobhold(c);
 	lock(&c->joblk);
 	if(strcmp(j->verb, "scrub") == 0)	/* the pass is over */
 		c->scrubbing = 0;
