@@ -106,6 +106,11 @@ void	srvobjdirread(Req*);
 char*	srvtombstext(Srvctx*, Sfid*, Text*);
 char*	srvadverttext(Srvctx*, Sfid*, Text*);
 
+/* job.c */
+char*	srvjobstext(Srvctx*, Sfid*, Text*);
+char*	srvctlscrub(Srvctx*, Sfid*, int, char**);
+char*	srvctlforget(Srvctx*, Sfid*, int, char**);
+
 /* ctl.c */
 void	srvctlwrite(Req*);
 int	srvfencekind(Srvctx*);

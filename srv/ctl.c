@@ -120,7 +120,7 @@ Sctl srvctls[] =
 	.fenced	= 0,
 	.nargmin= 0,
 	.nargmax= 2,
-	.fn	= ctlnotbuilt,
+	.fn	= srvctlscrub,
 },
 {
 	.verb	= "forget",
@@ -128,7 +128,7 @@ Sctl srvctls[] =
 	.fenced	= 1,
 	.nargmin= 1,
 	.nargmax= 1,
-	.fn	= ctlnotbuilt,
+	.fn	= srvctlforget,
 },
 {
 	.verb	= "fence",

@@ -543,7 +543,7 @@ tmatrix(void)
 		{"lost",  {"permission denied", "permission denied", nil},
 			  {nil, nil, nil}},
 		{"jobs",  {"permission denied", "permission denied", nil},
-			  {nil, nil, "shoalsrv: not built"}},
+			  {nil, nil, nil}},
 	};
 	static int nwalkable[3] = {3, 6, 11};
 	char buf[8192], *m, *want;
@@ -1122,8 +1122,8 @@ tctl(void)
 		{"advert",	"shoalsrv: not built",	"fenced"},
 		{"drop alpha",	"shoalsrv: not built",	"fenced"},
 		{"verify alpha", nil,			nil},
-		{"scrub",	"shoalsrv: not built",	"shoalsrv: not built"},
-		{"forget n1.1",	"shoalsrv: not built",	"fenced"},
+		{"scrub",	nil,			nil},
+		{"forget n1.1",	nil,			"fenced"},
 		{"newmonid 00112233445566778899aabbccddeeff",
 				"shoalsrv: not built",	"shoalsrv: not built"},
 	};

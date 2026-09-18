@@ -9,6 +9,7 @@ typedef struct Sfid Sfid;
 typedef struct Sfile Sfile;
 typedef struct Sctl Sctl;
 typedef struct Qreq Qreq;
+typedef struct Sjob Sjob;
 
 /*
  * layer-a §2.2's tree, one entry per file, in the order it is listed
@@ -366,6 +367,35 @@ struct Qreq
  * at least one argument — so it is a check on a row added wrong, not
  * a path a client can drive.
  */
+/*
+ * One background pass, as /jobs reports it (layer-a §2.2: "one line
+ * per running or queued background job").  A pass is a proc of its
+ * own holding one of srv.h's jobs for its whole run, so the shutdown
+ * waits for it; this record is what the pass is visible as while it
+ * runs, and it is on Srvctx.jobs from the moment the verb that starts
+ * it is accepted — §2.5 has such a verb "return success once the job
+ * is accepted", so the line is there before the proc has run a step,
+ * which is what `queued' means in it.
+ *
+ * The counters are the pass's own to write and /jobs' to read under
+ * Srvctx.joblk.  Nothing outside a line of /jobs consumes them: §2.2
+ * makes that file's format implementation policy beyond its being one
+ * record per line.
+ */
+struct Sjob
+{
+	Sjob	*next;
+	Srvctx	*ctx;
+	char	*verb;		/* the ctl verb that started it */
+	void	(*fn)(Sjob*);
+	int	running;	/* the proc has started: `queued' until then */
+	uvlong	done, total;	/* index slots walked, and to walk */
+	uvlong	bad;		/* objects the pass found mismatching */
+	uvlong	tombs;		/* tombstones the reclaim walk discarded */
+	uvlong	dropped;	/* dirty records `forget' discarded */
+	char	arg[Peermax+1];	/* `forget's peer */
+};
+
 struct Sctl
 {
 	char	*verb;
@@ -446,6 +476,17 @@ struct Srvctx
 	 */
 	Lock	joblk;
 	int	njob;
+	/*
+	 * The passes /jobs lists, and the scrubber's own policy: the
+	 * rate `scrub rate=' sets, in KiB/s, and the flag `scrub stop'
+	 * raises, which a running pass tests between objects exactly as
+	 * it tests srvstopping.  `scrubbing' is what keeps a second
+	 * `scrub start' from putting two passes over one index.
+	 */
+	Sjob	*jobs;
+	int	scrubbing;
+	int	scrubstop;
+	ulong	scrubrate;
 	int	stopping;	/* the shutdown has begun: no new jobs */
 	int	served;		/* a service loop was started over this context */
 	int	released;	/* lib9p has let go of the Srv (Srv.free) */

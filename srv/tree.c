@@ -170,6 +170,7 @@ Sfile srvfiles[Nfile] =
 	.walk	= Aadmin,
 	.rd	= Aadmin,
 	.wr	= 0,
+	.render	= srvjobstext,
 },
 [Qobjfile] = {
 	.name	= nil,
