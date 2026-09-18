@@ -176,6 +176,26 @@ joblen(Srvctx *c)			/* joblk held */
 	return n;
 }
 
+/*
+ * What a pass gave up with, from %r, recorded once: the pass has no
+ * client to answer, so /jobs is where the failure is reported and
+ * this is the only place it is written.  The first failure wins,
+ * because it is the one that stopped the walk.
+ */
+static void
+joberr(Sjob *j)
+{
+	char buf[ERRMAX];
+	Srvctx *c;
+
+	rerrstr(buf, sizeof buf);
+	c = j->ctx;
+	lock(&c->joblk);
+	if(j->err[0] == 0)
+		strecpy(j->err, j->err + sizeof j->err, buf);
+	unlock(&c->joblk);
+}
+
 static void
 jobunlink(Sjob *j)
 {
@@ -301,10 +321,11 @@ srvjobstext(Srvctx *c, Sfid *f, Text *t)
 	unlock(&c->joblk);
 	for(i = 0; i < k; i++)
 		textprint(t, "job=%s state=%s rate=%lud done=%llud/%llud "
-			"bad=%llud reclaimable=%llud dropped=%llud\n",
+			"bad=%llud reclaimable=%llud dropped=%llud%s%s\n",
 			cp[i].verb, cp[i].running ? "running" : "queued",
 			rate, cp[i].done, cp[i].total, cp[i].bad,
-			cp[i].reclaimable, cp[i].dropped);
+			cp[i].reclaimable, cp[i].dropped,
+			cp[i].err[0] != 0 ? " err=" : "", cp[i].err);
 	free(cp);
 	return nil;
 }
@@ -415,15 +436,20 @@ reclaim(Srvctx *c, Sjob *j)
 
 	cutoff = time(0) - (vlong)c->map->tombdays*86400;
 	epoch = c->map->epoch;
-	if((sn = srvsnapopen(c->store, Snaptomb, buf, sizeof buf)) == nil)
+	if((sn = srvsnapopen(c->store, Snaptomb, buf, sizeof buf)) == nil){
+		werrstr("%s", buf);
+		joberr(j);
 		return;
+	}
 	n = objsnapcount(sn);
 	for(i = 0; i < n; i++){
 		if(passover(c))
 			break;
 		rc = objsnapent(sn, i, oid, &oidlen, &oi);
-		if(rc < 0)
+		if(rc < 0){
+			joberr(j);
 			break;
+		}
 		if(rc == 0)
 			continue;
 		if(oi.mtime >= cutoff)		/* §1.5 condition 2 */
@@ -469,11 +495,17 @@ scrubpass(Sjob *j)
 		if(passover(c))
 			break;
 		rc = objslot(c->store, (ulong)slot, oid, &oidlen, &oi);
+		if(rc >= 0 && srvslotfail(c, slot)){
+			werrstr("shoalsrv: index read refused at the point");
+			rc = -1;
+		}
 		lock(&c->joblk);
 		j->done = slot+1;
 		unlock(&c->joblk);
-		if(rc < 0)
+		if(rc < 0){
+			joberr(j);
 			break;
+		}
 		if(rc == 0 || oi.state != Slive)
 			continue;
 		memmove(w.oid, oid, oidlen);
@@ -485,7 +517,15 @@ scrubpass(Sjob *j)
 		}
 		scrubpace(c, &bytes, t0, oi.len);
 	}
-	if(!passover(c))
+	/*
+	 * The reclaim walk rides on a scrub that COMPLETED, and on no
+	 * other: it counts what a whole walk of the index found, and a
+	 * walk that stopped part-way — told to stop, shutting down, or
+	 * broken off by an index read that failed — has counted a
+	 * prefix.  Reporting that prefix as the pass's answer would make
+	 * a partial pass indistinguishable from a whole one.
+	 */
+	if(slot >= st.nslots && !passover(c) && j->err[0] == 0)
 		reclaim(c, j);
 }
 
@@ -515,8 +555,10 @@ forgetpass(Sjob *j)
 
 	c = j->ctx;
 	plen = strlen(j->arg);
-	if(dirtysnap(c->store, &dr, &n) < 0)
+	if(dirtysnap(c->store, &dr, &n) < 0){
+		joberr(j);
 		return;
+	}
 	lock(&c->joblk);
 	j->total = n;
 	unlock(&c->joblk);
@@ -535,8 +577,10 @@ forgetpass(Sjob *j)
 		if(dr[i].peerlen != plen
 		|| memcmp(dr[i].peer, j->arg, plen) != 0)
 			continue;
-		if(dirtydel(c->store, dr[i].oid, dr[i].oidlen, j->arg) < 0)
+		if(dirtydel(c->store, dr[i].oid, dr[i].oidlen, j->arg) < 0){
+			joberr(j);
 			break;
+		}
 		lock(&c->joblk);
 		j->dropped++;
 		unlock(&c->joblk);

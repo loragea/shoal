@@ -553,6 +553,27 @@ srvjobhold(Srvctx *c)
 }
 
 /*
+ * The one point here that refuses rather than holds: whether the scrub
+ * pass's read of this index slot is to be treated as having failed.
+ * It is the only way to break a whole-index walk off part-way while
+ * the store underneath it stays healthy — the engine's own way of
+ * refusing an index read is to be condemned, which refuses every other
+ * call the pass would make as well, so a pass broken off that way
+ * cannot be told from one whose store has gone.  Set to slot+1; 0 is
+ * off, and srvholdclear turns it off with the rest.
+ */
+int
+srvslotfail(Srvctx *c, uvlong slot)
+{
+	uvlong n;
+
+	qlock(&c->holdlk);
+	n = c->slotfail;
+	qunlock(&c->holdlk);
+	return n != 0 && slot == n-1;
+}
+
+/*
  * The third point, at a queued walk's commit: the moment a walk that
  * moves its fid has given the old state back and is about to write
  * the new one.  It is where the service loop is concurrent with the
@@ -808,6 +829,8 @@ srvhook(Srvctx *c, char *name, uvlong n)
 		c->step7hold = n;
 	else if(strcmp(name, "jobhold") == 0)
 		c->jobhold = n;
+	else if(strcmp(name, "slotfail") == 0)
+		c->slotfail = n;
 	qunlock(&c->holdlk);
 }
 
@@ -834,6 +857,7 @@ srvholdclear(Srvctx *c)
 	c->anyexit = 0;
 	c->step7hold = 0;
 	c->jobhold = 0;
+	c->slotfail = 0;
 	qunlock(&c->holdlk);
 }
 

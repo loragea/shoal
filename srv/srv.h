@@ -284,6 +284,13 @@ void	srvcount(Srvctx*, uvlong *pushed, uvlong *done);
  *		only while it is running or queued, so this is where a
  *		test reads what a pass finished with instead of racing the
  *		unlink for it.
+ *	slotfail
+ *		the one point here that refuses rather than holds: n != 0
+ *		makes the scrub pass treat its read of index slot n-1 as
+ *		having failed.  It is how a whole-index walk is broken off
+ *		part-way with the store under it still healthy — the
+ *		engine's own way of refusing an index read is to be
+ *		condemned, which refuses the rest of the pass's calls too.
  *	flushhold
  *		n != 0 holds a Tflush of a pooled request between the
  *		lookup that found it and the flush itself, which is the
@@ -319,7 +326,8 @@ void	srvhook(Srvctx*, char *name, uvlong n);
  *
  * srvholdclear, which the shutdown runs before it drains, clears the
  * whole of srvhook's set and nothing else: objhold, objexit,
- * flushhold, mapopen, walkhold, anyexit, step7 and jobhold.  A HOLD therefore
+ * flushhold, mapopen, walkhold, anyexit, step7, jobhold and
+ * slotfail.  A HOLD therefore
  * belongs in srvhook — a program that set a point and stopped watching
  * must not be able to hold the store's close.  (The shutdown also
  * turns srvcellpoint off, by its own call and for its own reason: the

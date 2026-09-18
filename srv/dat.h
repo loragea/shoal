@@ -408,10 +408,17 @@ struct Qjob
  * is accepted", so the line is there before the proc has run a step,
  * which is what `queued' means in it.
  *
- * The counters are the pass's own to write and /jobs' to read under
- * Srvctx.joblk.  Nothing outside a line of /jobs consumes them: §2.2
- * makes that file's format implementation policy beyond its being one
- * record per line.
+ * The counters and `err' are the pass's own to write and /jobs' to
+ * read under Srvctx.joblk.  Nothing outside a line of /jobs consumes
+ * them: §2.2 makes that file's format implementation policy beyond
+ * its being one record per line.
+ *
+ * `err' is what a pass gave up with, and it is the only record of it:
+ * a pass has no client to answer and no log to write to, so a walk
+ * that broke off silently was a walk that reported success.  It is
+ * set once, where the pass stops, and it is also what says the walk
+ * did not complete — the reclaim that rides on a scrub runs only over
+ * a walk that did (store.md §14(30)).
  */
 struct Sjob
 {
@@ -426,6 +433,7 @@ struct Sjob
 	uvlong	reclaimable;	/* tombstones past layer-a §1.5's local two */
 	uvlong	dropped;	/* dirty records `forget' discarded */
 	char	arg[Peermax+1];	/* `forget's peer */
+	char	err[ERRMAX];	/* what the pass gave up with, or empty */
 };
 
 struct Sctl
@@ -500,6 +508,7 @@ struct Srvctx
 	uvlong	anyexit;	/* srvhook("anyexit") */
 	uvlong	step7hold;	/* srvhook("step7") */
 	uvlong	jobhold;	/* srvhook("jobhold") */
+	uvlong	slotfail;	/* srvhook("slotfail") */
 	uvlong	endhold;	/* srvendpoint: ms held in srvqended */
 
 	/*

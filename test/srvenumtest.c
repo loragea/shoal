@@ -1491,6 +1491,130 @@ Out:
 	free(m);
 }
 
+/* poll /jobs until a parked pass shows an err=, or give up */
+static int
+joberred(Cl *cl, char *val, int nval)
+{
+	char buf[4096];
+	int i;
+
+	for(i = 0; i < 400; i++){
+		if(slurpfile(cl, Ffile2, "jobs", buf, sizeof buf) > 0
+		&& strstr(buf, "err=") != nil)
+			return jobfield(cl, "err", val, nval) != nil;
+		sleep(20);
+	}
+	return 0;
+}
+
+/*
+ * A pass that fails says so, and a scrub that failed reclaims
+ * nothing.
+ *
+ * Every error inside a pass used to be swallowed: the walk broke off
+ * and the verb had already answered success, so the wire said the
+ * index had been scrubbed.  Worse, the reclaim walk ran after a scrub
+ * that had broken off at slot 0, and reported its count as a whole
+ * pass's.
+ *
+ * Two points drive it.  `slotfail' fails one index read with the
+ * store under it healthy, which is what tells a broken-off walk from
+ * a walk whose store has gone: the tombstone here is past both of
+ * §1.5's local cutoffs, so a whole pass counts it and a pass that
+ * broke off must not.  `fatal' condemns the engine outright, which is
+ * how a `dirtydel' is made to fail.  `jobhold' keeps the pass listed
+ * long enough to read what it gave up with either way.
+ */
+static void
+tpassfail(void)
+{
+	char buf[8192], val[ERRMAX], name[32], *m;
+	Srvctx *ctx;
+	Store *st;
+	Dev *d;
+	Cl cl;
+	Fcall r;
+	int i;
+
+	clstage = "passfail";
+	m = mkmapd(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid, 0);
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4, 0)) == nil)
+		return;
+	st = srvstore(ctx);
+	for(i = 0; i < 20; i++){
+		snprint(name, sizeof name, "obj%.2d", i);
+		mkobj(st, name, nil, 0, 1);
+	}
+	rmobj(st, "obj19", 9, 3);	/* past both of §1.5's local cutoffs */
+	sleep(1100);			/* past the cutoff's second */
+	clstart(&cl, ctx, Clmsize);
+	if(!adminctl(&cl, "role=admin"))
+		goto Out;
+	srvhook(ctx, "jobhold", 1);
+
+	/* a scrub that breaks off part-way through the index */
+	srvhook(ctx, "slotfail", 4);		/* the read of slot 3 fails */
+	if(clwrite(&cl, Fctl, 0, "scrub start rate=1000000", &r) != Rwrite){
+		fail("scrub start: %s", clerr(&r));
+		goto Out;
+	}
+	if(!joberred(&cl, val, sizeof val))
+		fail("a scrub that broke off reported nothing at /jobs");
+	else{
+		istrue("/jobs says what the pass gave up with", val[0] != 0);
+		if(jobfield(&cl, "reclaimable", val, sizeof val) == nil)
+			fail("the failed pass left no /jobs line");
+		else
+			eqs("and a scrub that broke off reclaims nothing",
+				val, "0");
+	}
+	srvhook(ctx, "slotfail", 0);
+	srvhook(ctx, "jobhold", 0);
+	for(i = 0; i < 400 && jobrunning(&cl); i++)
+		sleep(20);
+
+	/* the same for a forget whose dirtydel fails */
+	if(dirtyadd(st, (uchar*)"obj00", 5, "n1.1", 11) < 0)
+		fail("dirtyadd: %r");
+	srvhook(ctx, "jobhold", 1);
+	storehook(st, "fatal", 1);
+	if(clwrite(&cl, Fctl, 0, "forget n1.1", &r) != Rwrite)
+		fail("forget: %s", clerr(&r));
+	if(!joberred(&cl, val, sizeof val))
+		fail("a forget that could not discard reported nothing");
+	else
+		istrue("/jobs says what the forget pass gave up with",
+			val[0] != 0);
+	storehook(st, "fatal", 0);
+	srvhook(ctx, "jobhold", 0);
+	for(i = 0; i < 400 && jobrunning(&cl); i++)
+		sleep(20);
+	istrue("the record the failed forget could not discard is still there",
+		dirtyhas(st, (uchar*)"obj00", 5, "n1.1"));
+
+	/* a whole pass over the same index does report a reclaimable one */
+	srvhook(ctx, "jobhold", 1);
+	if(clwrite(&cl, Fctl, 0, "scrub start rate=1000000", &r) != Rwrite)
+		fail("second scrub start: %s", clerr(&r));
+	if(jobparked(&cl, "reclaimable", val, sizeof val) == nil)
+		fail("the whole pass never reached its hold");
+	else
+		eqs("a scrub that completed does reclaim-count", val, "1");
+	if(slurpfile(&cl, Ffile2, "jobs", buf, sizeof buf) > 0)
+		istrue("and carries no err=", strstr(buf, "err=") == nil);
+Out:
+	storehook(srvstore(ctx), "fatal", 0);
+	srvhook(ctx, "slotfail", 0);
+	srvhook(ctx, "jobhold", 0);
+	for(i = 0; i < 400 && jobrunning(&cl); i++)
+		sleep(20);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
 /*
  * What `scrub start' and `scrub stop' do to a pass that is running,
  * and what a REFUSED `scrub start' leaves behind.
@@ -1815,6 +1939,7 @@ threadmain(int argc, char **argv)
 	treclaim();
 	tforget();
 	tscrubctl();
+	tpassfail();
 	tjobs();
 	tdrop();
 	tshutdown();

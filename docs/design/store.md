@@ -5492,6 +5492,20 @@ name a half that is not built; each says which.
     running or queued background job" requires and which the cap
     bounds the cost of.
 
+    A pass has no client to answer and this build has no operator log,
+    so a walk that broke off — a failed index read, a failed
+    `dirtydel`, a snapshot that would not open — reported success by
+    saying nothing. *Not made:* a pass records what it gave up with,
+    and `/jobs` renders it as a trailing **`err=<string>`** on that
+    job's line, present only when there is one and last on the line
+    because the string may hold spaces. §2.2 makes `/jobs`'s format
+    implementation policy beyond its being one record per line, so the
+    field is policy entire. The same record is what says the walk did
+    not complete: §9's reclaim walk runs only at the end of a scrub
+    that walked every slot, was not stopped and recorded no error,
+    because `reclaimable=` over a prefix of the index is
+    indistinguishable from `reclaimable=` over the whole of it.
+
 31. **The scrub's pace is this server's, and it carries the reclaim
     walk (§8, §9; layer-a §2.5, §7.5).** layer-a §7.5 leaves
     `scrubdays` and the rate to the implementation and sizes its own
