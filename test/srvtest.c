@@ -1105,6 +1105,29 @@ tcellclear(void)
 	free(m);
 }
 
+/*
+ * Which refusal `drop <oid>' answers for an id this store does not
+ * hold.  §7.4's guard runs before the engine's drop, so an id this
+ * instance is in P(o) for is `still placed' and one it is not is `no
+ * such object'.  Which of the two a given id gets is the map's to
+ * say, so the expected string is computed from the same map the
+ * server adopted rather than guessed.
+ */
+static char*
+droperr(Srvctx *ctx, char *oid)
+{
+	Cinst *pl[Maxplace];
+	int i, n;
+
+	n = mapplace(srvmap(ctx), oid, pl, nelem(pl));
+	if(n > nelem(pl))
+		n = nelem(pl);
+	for(i = 0; i < n; i++)
+		if(strcmp(pl[i]->iid, srviid(ctx)) == 0)
+			return "still placed";
+	return "no such object";
+}
+
 /* §2.5's ctl framework: the four gates over every verb row */
 static void
 tctl(void)
@@ -1120,12 +1143,12 @@ tctl(void)
 		{"push alpha n1.1", "shoalsrv: not built", "fenced"},
 		{"reconcile",	"shoalsrv: not built",	"fenced"},
 		{"advert",	"shoalsrv: not built",	"fenced"},
-		{"drop alpha",	"shoalsrv: not built",	"fenced"},
+		{"drop dropprobe", nil,			"fenced"},
 		{"verify alpha", nil,			nil},
 		{"scrub",	nil,			nil},
 		{"forget n1.1",	nil,			"fenced"},
 		{"newmonid 00112233445566778899aabbccddeeff",
-				"shoalsrv: not built",	"shoalsrv: not built"},
+				nil,			nil},
 	};
 	static struct {
 		char	*line;
@@ -1159,6 +1182,9 @@ tctl(void)
 		return;
 	memset(data, 0x5a, sizeof data);
 	mkobj(srvstore(ctx), "alpha", data, sizeof data, 1);
+	for(i = 0; i < nelem(verbs); i++)
+		if(strncmp(verbs[i].line, "drop ", 5) == 0)
+			verbs[i].unfenced = droperr(ctx, verbs[i].line+5);
 	clstart(&cl, ctx, Clmsize);
 
 	/* every verb is refused a non-admin fid (§2.5's role column) */
@@ -1267,7 +1293,7 @@ tctl(void)
 	if(r.type != Rwrite)
 		fail("fence off under an operator fence: %s",
 			r.type == Rerror ? r.ename : "?");
-	clwrite(&cl, Fctl, 0, "drop alpha", &r);
+	clwrite(&cl, Fctl, 0, "pull alpha n1.1", &r);
 	clerris("a fenced-set verb after fence off", &r,
 		"shoalsrv: not built");
 Out:
