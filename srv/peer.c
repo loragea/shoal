@@ -801,6 +801,22 @@ replcreateq(Req *r, Srvctx *c, Hdr *h)
  *
  * A failed objstat is not this operation's error to answer — the
  * commit below makes its own — so it counts nothing and says nothing.
+ *
+ * One copy answers this yes and the commit behind it no.  What
+ * stagefinal asks is `(flags & Icorrupt) || bad', and `bad' is the
+ * memory-only half of a condemned slot: what objstat publishes as
+ * `corrupt' is the Icorrupt flag alone, and a slot whose index entry
+ * would not unpack at start-up carries `bad' without it.  The commit
+ * also reads its own entry AFTER this one: an extent map that fails
+ * its csum128 is found when it is read, and the read that finds it is
+ * the commit's own (§5 step 10, lib/obj.c's mapread), so a slot this
+ * look saw whole can be condemned inside the very update being
+ * counted.  Either way the commit applies the push as §7.5's
+ * reconcile over a copy with no key to defend (D14) while the count
+ * here records §1.3's divergence.  The window is one objstat wide and
+ * the durable record §14(15) is waiting on is where it is worth
+ * closing; a repair counted as a repair is not a wrong answer to the
+ * operation.
  */
 static int
 divergedat(Srvctx *c, Hdr *h)
