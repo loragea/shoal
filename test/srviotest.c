@@ -2130,12 +2130,20 @@ Out:
  * §3.6's sweep trigger is an absence of ARRIVALS, and a handler that
  * is between two steps of one operation is not one.  The look a
  * handler takes at its own stage before the commit (§5.4 step 3) is
- * that moment, and the objlook point is what holds a request inside
- * it: a sweep driven by an operation on another object — which is
- * where the sweep runs — must not expire the stage the look is about
- * to call live.  `gamma' is the other object because it hashes to a
- * different queue than `alpha' does, so its operation is not behind
- * the held one.
+ * that moment, and the objlook point is what parks a request at it: a
+ * sweep driven by an operation on another object — which is where the
+ * sweep runs — must not expire the stage the look is about to call
+ * live.  `gamma' is the other object because it hashes to a different
+ * queue than `alpha' does, so its operation is not behind the parked
+ * one.
+ *
+ * What holds the sweep off is the stage's `busy' mark and nothing else:
+ * the parked request holds no lock, so the sweep really does walk the
+ * list while the look is parked in the middle of it.  The open of
+ * `gamma' is therefore waited for BEFORE the point is cleared, and the
+ * stage counted while the write is still parked — a stage stripped
+ * there is one the sweep took out from under a handler, whatever the
+ * write answers afterwards.
  */
 static void
 tstagelook(void)
@@ -2145,6 +2153,7 @@ tstagelook(void)
 	Dev *d;
 	Cl cl;
 	Fcall t, r;
+	uvlong live, done;
 	ushort ta, tg;
 	int n;
 
@@ -2179,7 +2188,7 @@ tstagelook(void)
 	t.data = "NEW!!";
 	t.count = 5;
 	clput(&cl, &t);
-	sleep(200);			/* held in the look, and idle past stagems */
+	sleep(200);			/* parked at the look, and idle past stagems */
 
 	/* the sweep runs at the head of this, on the other object's queue */
 	memset(&t, 0, sizeof t);
@@ -2188,11 +2197,22 @@ tstagelook(void)
 	t.fid = Ffile2;
 	t.mode = OREAD;
 	clput(&cl, &t);
-	sleep(150);
+	if(clgettag(&cl, tg, &r) < 0)
+		fail("no answer for the open that drove the sweep");
+	else{
+		checks++;
+		if(r.type != Ropen)
+			fail("open /obj/gamma: %s", clerr(&r));
+	}
+	cltagfree(&cl, tg);
+	/* the sweep has run, and the write is still parked in its look */
+	srvstagecount(ctx, &live, &done, nil);
+	eqv("the sweep leaves the stage a handler is inside", live, 1);
+	eqv("... and gives nothing back", done, 0);
 	srvhook(ctx, "objlook", 0);
 
 	if(clgettag(&cl, ta, &r) < 0)
-		fail("no answer for the write held in its look");
+		fail("no answer for the write parked in its look");
 	else{
 		checks++;
 		if(r.type != Rwrite)
