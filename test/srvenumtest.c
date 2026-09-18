@@ -1018,6 +1018,122 @@ Out:
 	free(m);
 }
 
+/*
+ * store.md §14(33)'s rewind branch, which nothing else reaches.
+ *
+ * lib9p refuses a directory read at an offset that is neither 0 nor
+ * where the fid left off, against its own `Fid.diroffset', before this
+ * row's read cell is reached — so the cursor's own refusal is behind
+ * that guard, and the one place the two can disagree is a read this
+ * server answered `interrupted' after it had advanced the cursor.  9P
+ * has the client discard that reply and ask again from where it was,
+ * and the cursor keeps the offset the previous read started at for
+ * exactly this.
+ *
+ * §13's `objexit' point is what puts a read there: it holds the read
+ * at the far end of its handler, with the cursor already committed,
+ * so the Tflush lands after the advance rather than racing it.
+ */
+static void
+tdirflush(void)
+{
+	char names[64][Oidmax+1];
+	char buf[16*1024], name[32], *m;
+	Srvctx *ctx;
+	Store *st;
+	Dev *d;
+	Cl cl;
+	Fcall t, r;
+	char *w[1];
+	ushort ta, tf;
+	vlong off;
+	long n;
+	int i, k;
+
+	clstage = "dirflush";
+	m = mkmap();
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4, 0)) == nil)
+		return;
+	st = srvstore(ctx);
+	for(i = 0; i < 20; i++){
+		snprint(name, sizeof name, "obj%.2d", i);
+		mkobj(st, name, nil, 0, 1);
+	}
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
+		fail("attach: %s", clerr(&r));
+		goto Out;
+	}
+	w[0] = "obj";
+	if(clopenpath(&cl, Froot, Fdir, 1, w, OREAD, &r) != Ropen){
+		fail("open /obj: %s", clerr(&r));
+		goto Out;
+	}
+	if(clread(&cl, Fdir, 0, 200, &r) != Rread){
+		fail("first read: %s", clerr(&r));
+		goto Out;
+	}
+	n = r.count;
+	memmove(buf, r.data, n);
+	k = dirnames(buf, n, names, nelem(names));
+	istrue("a bounded read stops part-way", k > 0 && k < 20);
+	off = n;
+
+	/* a read held at its exit, with the cursor advanced, then flushed */
+	srvhook(ctx, "objexit", 1);
+	memset(&t, 0, sizeof t);
+	t.type = Tread;
+	t.tag = ta = cltag(&cl);
+	t.fid = Fdir;
+	t.offset = off;
+	t.count = 4096;
+	clput(&cl, &t);
+	sleep(200);			/* it is now held at its exit */
+	memset(&t, 0, sizeof t);
+	t.type = Tflush;
+	t.tag = tf = cltag(&cl);
+	t.oldtag = ta;
+	clput(&cl, &t);
+	clget(&cl, &r);
+	checks++;
+	if(r.type != Rerror || r.tag != ta
+	|| strcmp(r.ename, "interrupted") != 0)
+		fail("a directory read flushed at its exit: type %d %s",
+			r.type, r.type == Rerror ? r.ename : "");
+	clget(&cl, &r);
+	checks++;
+	if(r.type != Rflush || r.tag != tf)
+		fail("the Rflush after it: type %d tag %ud", r.type, r.tag);
+	cltagfree(&cl, ta);
+	cltagfree(&cl, tf);
+	srvhook(ctx, "objexit", 0);
+
+	/* the client asks again where it was: the cursor rewinds to it */
+	for(i = 0; i < 64; i++){
+		if(clread(&cl, Fdir, off, 4096, &r) != Rread){
+			fail("the read after the flushed one: %s", clerr(&r));
+			goto Out;
+		}
+		if(r.count == 0)
+			break;
+		if(n + r.count > sizeof buf)
+			break;
+		memmove(buf+n, r.data, r.count);
+		n += r.count;
+		off += r.count;
+	}
+	wholedir("a flushed read leaves the listing whole and unrepeated",
+		buf, n, 20);
+	clclunk(&cl, Fdir, &r);
+Out:
+	srvhook(ctx, "objexit", 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
 , as the wire carries them.
  *
  * The bound's is layer-a §2.6's `disk full' with D20's detail, and it
@@ -2070,6 +2186,7 @@ threadmain(int argc, char **argv)
 	tfiles();
 	tdir();
 	tdircursor();
+	tdirflush();
 	tsnaprefuse();
 	tscrub();
 	tqueued();

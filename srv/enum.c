@@ -413,6 +413,7 @@ objdirreadq(Req *r)
 			d->pos = spos;
 	}
 	qunlock(&f->lk);
+	srvqexit(r);
 	if(e != nil){
 		srvqdone(r, e);
 		return;
