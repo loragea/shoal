@@ -969,8 +969,10 @@ srvstagemore(Srvctx *c, Sfid *f, uchar *oid, int oidlen, uvlong flen,
  * leave the sweep, a refusal on another queue and the flush hook free
  * to take the slot and free the stage under it (store.md §14(45)).
  * Such a caller owes the clear to the give-back it is on its way to,
- * which is srvstagefinal below.  A look that answers 0 gives the stage
- * back here whatever the caller asked for, the transfer being over.
+ * which is srvstagefinal below.  A look that answers 0 clears the mark
+ * and gives the stage back here whatever the caller asked for, the
+ * transfer being over: `keepbusy' asks to hold a stage this look has
+ * just found gone, and there is nothing left to hold it for.
  */
 int
 srvstagelive(Srvctx *c, Sfid *f, Sstage *s, int keepbusy)
@@ -980,7 +982,7 @@ srvstagelive(Srvctx *c, Sfid *f, Sstage *s, int keepbusy)
 	qlock(&f->lk);
 	qlock(&c->stagelk);
 	ok = f->aux == s && !s->dead && !s->released;
-	if(!keepbusy)
+	if(!ok || !keepbusy)
 		s->busy = 0;
 	s->last = nsec();
 	qunlock(&c->stagelk);
