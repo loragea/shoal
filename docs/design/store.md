@@ -5238,7 +5238,11 @@ name a half that is not built; each says which.
     `objsnapopen=`, which §9 makes the server's half of `objsnap=`,
     and the queue pool's `queues=`, `qdepth=`, `qpushed=` and
     `qdone=`, which §7 asks `/status` to report and which `Reqqueue`
-    does not count for itself.
+    does not count for itself. `queues=` is the size of the hash the
+    object ids land in — the ceiling §7 is about — and does not count
+    the one reserved queue an operation that names no object is
+    offloaded to; the other three count every request the pool took
+    on, the reserved queue's included.
 
 24. **§2.1's role matrix has cells §2.1 does not state.** §2.1 grants
     `/repl`, `/rpc`, `/advert` and object reads to `role=repl`, and
