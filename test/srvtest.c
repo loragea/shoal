@@ -1775,8 +1775,8 @@ Out:
 	srvauxcount(ctx, nil, &nc, &nf);
 	eqv("a fid outliving the loop has its state closed as well", nc, 3);
 	eqv("a fid outliving the loop still runs its free hook", nf, 3);
-	eqv("every close hook ran with the store still open",
-		srvauxopen(ctx), nc);
+	eqv("all three close hooks found the engine still open",
+		srvauxopen(ctx), 3);
 	eqv("and the store was closed after them", freedseen, 1);
 	srvfree(ctx);
 	devclose(d);
