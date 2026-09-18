@@ -117,6 +117,7 @@ struct Qwork
 static char Eshutting[] = "shoalsrv: shutting down";
 static char Enomem[] = "shoalsrv: out of memory";
 static char Ejobs[] = "shoalsrv: too many jobs";
+static char Estopping[] = "shoalsrv: scrub stopping";
 
 static void	scrubpass(Sjob*);
 static void	forgetpass(Sjob*);
@@ -694,8 +695,10 @@ ratearg(char *s, ulong *rate)
  * A `start' while a pass is running is accepted and starts nothing:
  * §2.5 has the verb "return success once the job is accepted", and
  * the job asked for — that the index is being scrubbed — is already
- * running.  A `stop' with no pass running is accepted too and clears
- * itself at the next `start'.
+ * running.  A `start' while a pass is STOPPING is refused instead,
+ * with the local `shoalsrv: scrub stopping' (§14(29)): the job asked
+ * for is not running and is not going to be.  A `stop' with no pass
+ * running is accepted too and clears itself at the next `start'.
  */
 char*
 srvctlscrub(Srvctx *c, Sfid *f, int argc, char **argv)
@@ -728,8 +731,27 @@ srvctlscrub(Srvctx *c, Sfid *f, int argc, char **argv)
 		c->scrubrate = rate;
 	if(stop)
 		c->scrubstop = 1;
-	if(start && c->scrubbing)
+	if(start && c->scrubbing){
+		/*
+		 * A pass that has been told to stop is not the job this
+		 * line asks for: it will read the flag between two
+		 * objects and give up, and this `start' would have been
+		 * answered success over a pass winding down — the client
+		 * told the index is being scrubbed while nothing is going
+		 * to scrub it.  Clearing the flag instead, so that the
+		 * pass carries on, races the pass's own read of it: told
+		 * before, it walks on; told after, it has already broken
+		 * off, and which of those happened is not something a
+		 * client can be told.  So the line is refused, and the
+		 * `rate=' on it stands for the next pass, as it does for
+		 * the other refusals below.
+		 */
+		if(c->scrubstop){
+			unlock(&c->joblk);
+			return Estopping;
+		}
 		start = 0;
+	}
 	if(start){
 		wasstop = c->scrubstop;
 		c->scrubbing = 1;

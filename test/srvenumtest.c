@@ -90,7 +90,7 @@ enum
 	 * threadmain.  Every check this file makes is unconditional once
 	 * its case is entered, so the number is fixed.
 	 */
-	Nchecks	= 210,
+	Nchecks	= 215,
 
 	/* fids the cases use */
 	Froot	= 1,
@@ -2306,16 +2306,30 @@ Out:
  * here: twelve passes parked at §13's jobhold point, and the `scrub
  * start' behind them.  A flag left raised makes every later `scrub
  * start' answer success and start nothing.
+ *
+ * A `start' over a pass that has been told to stop is the third
+ * answer and is refused: the job it asks for is not running and is
+ * not going to be.  Driving it needs a pass that cannot wind down
+ * while the case writes the verb, which is §13's `objhold' — a
+ * client's `verify' parked inside one object's queue, with the pass's
+ * own unit for that object queued behind it.  The object is the one
+ * at index slot 0, so that it is the first unit the pass pushes and
+ * the pool's push count says when the pass is there.
  */
 static void
 tscrubctl(void)
 {
 	char buf[16*1024], name[32], line[64], *m;
+	uchar oid[Oidmax];
+	Objinfo oi;
 	Srvctx *ctx;
 	Dev *d;
 	Cl cl;
-	Fcall r;
-	int i;
+	Fcall t, r;
+	char *w[1];
+	ushort ta;
+	uvlong np0, np, nd;
+	int i, oidlen;
 
 	clstage = "scrubctl";
 	m = mkmap();
@@ -2354,6 +2368,62 @@ tscrubctl(void)
 		sleep(20);
 	istrue("a running pass stops when it is told to", !jobrunning(&cl));
 
+	/* a `scrub start' over a pass that has been told to stop */
+	if(objslot(srvstore(ctx), 0, oid, &oidlen, &oi) <= 0)
+		fail("no object at index slot 0");
+	if(clattach(&cl, Froot2, "role=admin", &r) != Rattach)
+		fail("second attach: %s", clerr(&r));
+	w[0] = "ctl";
+	if(clopenpath(&cl, Froot2, Ffile, 1, w, OWRITE, &r) != Ropen)
+		fail("open the second /ctl: %s", clerr(&r));
+	srvcount(ctx, &np0, &nd);
+	srvhook(ctx, "objhold", 1);
+	snprint(line, sizeof line, "verify %.*s", oidlen, (char*)oid);
+	memset(&t, 0, sizeof t);
+	t.type = Twrite;
+	t.tag = ta = cltag(&cl);
+	t.fid = Fctl;
+	t.offset = 0;
+	t.data = line;
+	t.count = strlen(t.data);
+	clput(&cl, &t);
+	np = np0;
+	for(i = 0; i < 400 && np - np0 < 1; i++){
+		sleep(5);
+		srvcount(ctx, &np, &nd);
+	}
+	eqv("the held verify reached its queue", np - np0, 1);
+	if(clwrite(&cl, Ffile, 0, "scrub start rate=1000000", &r) != Rwrite)
+		fail("a scrub start over a held queue: %s", clerr(&r));
+	for(i = 0; i < 400 && np - np0 < 2; i++){
+		sleep(5);
+		srvcount(ctx, &np, &nd);
+	}
+	eqv("the pass is held inside that object's queue", np - np0, 2);
+	if(clwrite(&cl, Ffile, 0, "scrub stop", &r) != Rwrite)
+		fail("scrub stop over a held pass: %s", clerr(&r));
+	clwrite(&cl, Ffile, 0, "scrub start", &r);
+	clerris("a scrub start while a pass is stopping", &r,
+		"shoalsrv: scrub stopping");
+	srvhook(ctx, "objhold", 0);
+	if(clgettag(&cl, ta, &r) != Rwrite)
+		fail("the held verify: %s", clerr(&r));
+	cltagfree(&cl, ta);
+	for(i = 0; i < 400 && jobrunning(&cl); i++)
+		sleep(20);
+	istrue("the stopping pass ended", !jobrunning(&cl));
+	/* and the refusal latched nothing: this one really starts */
+	if(clwrite(&cl, Ffile, 0, "scrub start rate=1", &r) != Rwrite)
+		fail("a scrub start after a stopping one: %s", clerr(&r));
+	istrue("a scrub start after a stopping one starts a pass",
+		jobrunning(&cl));
+	if(clwrite(&cl, Ffile, 0, "scrub stop", &r) != Rwrite)
+		fail("scrub stop after it: %s", clerr(&r));
+	for(i = 0; i < 400 && jobrunning(&cl); i++)
+		sleep(20);
+	clclunk(&cl, Ffile, &r);
+	clclunk(&cl, Froot2, &r);
+
 	/* fill the job cap, so that the next `scrub start' is refused */
 	srvhook(ctx, "jobhold", 1);
 	for(i = 0; i < 12; i++){
@@ -2382,6 +2452,7 @@ tscrubctl(void)
 	for(i = 0; i < 400 && jobrunning(&cl); i++)
 		sleep(20);
 Out:
+	srvhook(ctx, "objhold", 0);
 	srvhook(ctx, "jobhold", 0);
 	clstop(&cl);
 	srvfree(ctx);

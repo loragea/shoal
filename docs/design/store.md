@@ -5578,6 +5578,17 @@ name a half that is not built; each says which.
     words are read in §2.5's own order and each at most once, so a
     line that reorders or repeats them is `bad ctl`.
 
+    A `start` while a pass is **stopping** — told to stop and not yet
+    wound down — is refused instead, with the local `shoalsrv: scrub
+    stopping` (§14(29)), because the job asked for is not running and
+    is not going to be: that pass reads the flag between two objects
+    and gives up. *Considered and rejected:* clearing the stop flag so
+    that the pass carries on, which races the pass's own read of it —
+    told before, it walks on; told after, it has already broken off —
+    and a verb whose effect turns on that race cannot be described to
+    a client. The `rate=` on a refused line stands, as it does for the
+    other refusals.
+
     §9's tombstone reclaim runs at the end of a pass that was not
     stopped, and has no verb of its own: §2.5 fixes the ctl grammar
     and has no verb for it, so adding one would be a wire change
