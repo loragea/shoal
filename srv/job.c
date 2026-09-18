@@ -368,17 +368,34 @@ passover(Srvctx *c)
  * the arithmetic: the bytes charged so far, at `rate' KiB/s, would
  * have taken bytes*1000/(rate*1024) ms, and the pass waits until that
  * much has passed since it started.
+ *
+ * The charge is cumulative and the rate is read fresh each object, so
+ * a `scrub rate=' written mid-pass would otherwise be applied to the
+ * bytes already charged as well as to the bytes to come — and that is
+ * not a rate change, it is a re-billing.  A raised rate would make
+ * the deadline for everything charged so far fall into the past, and
+ * the pass would run flat out until it caught up; a lowered one would
+ * park it for as long as the new rate says the whole pass should have
+ * taken.  So the charge and the clock start again from the rate the
+ * pass is now told to run at: the bytes before the change were paced
+ * at the rate in force when they were read, which is all the rate can
+ * mean.
  */
 static void
-scrubpace(Srvctx *c, uvlong *bytes, vlong t0, uvlong len)
+scrubpace(Srvctx *c, uvlong *bytes, vlong *t0, ulong *last, uvlong len)
 {
 	vlong want;
 	ulong rate;
 
 	rate = scrubrate(c);
+	if(rate != *last){
+		*last = rate;
+		*bytes = 0;
+		*t0 = nsec()/1000000;
+	}
 	*bytes += len + Scrubfloor;
 	want = ((vlong)*bytes * 1000) / ((vlong)rate * 1024);
-	while(nsec()/1000000 - t0 < want){
+	while(nsec()/1000000 - *t0 < want){
 		if(passover(c))
 			return;
 		sleep(Scrubslicems);
@@ -478,6 +495,7 @@ scrubpass(Sjob *j)
 	uchar oid[Oidmax];
 	Objinfo oi;
 	uvlong bytes, slot;
+	ulong lastrate;
 	vlong t0;
 	int oidlen, rc;
 
@@ -490,6 +508,7 @@ scrubpass(Sjob *j)
 	w.ctx = c;
 	w.op = Jscrub;
 	bytes = 0;
+	lastrate = scrubrate(c);
 	t0 = nsec()/1000000;
 	for(slot = 0; slot < st.nslots; slot++){
 		if(passover(c))
@@ -515,7 +534,7 @@ scrubpass(Sjob *j)
 			j->bad++;
 			unlock(&c->joblk);
 		}
-		scrubpace(c, &bytes, t0, oi.len);
+		scrubpace(c, &bytes, &t0, &lastrate, oi.len);
 	}
 	/*
 	 * The reclaim walk rides on a scrub that COMPLETED, and on no

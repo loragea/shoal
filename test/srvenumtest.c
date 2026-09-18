@@ -2145,6 +2145,83 @@ Out:
 }
 
 /*
+ * `scrub rate=' written to a pass that is running paces what is left
+ * of it, and does not re-bill what it has already read.
+ *
+ * store.md §14(31) makes the pace cumulative: the pass charges itself
+ * each object's bytes plus a floor and waits until the whole charge
+ * would have taken that long at the rate.  Read fresh each object,
+ * that arithmetic applies a new rate to the bytes already charged as
+ * well — so a rate raised mid-pass would put the deadline for
+ * everything read so far in the past and the pass would run flat out
+ * until it caught up, which is the opposite of what an operator
+ * raising a rate asks for.
+ *
+ * Driven by the clock, since the pace is the thing under test: a pass
+ * at 8 objects a second is left to walk for three seconds, the rate
+ * is raised fourfold, and it must still be walking more than a second
+ * later.  With the charge carried over it would have run the rest of
+ * the index off in a few tens of milliseconds.
+ */
+static void
+tscrubrate(void)
+{
+	char val[64], name[32], *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall r;
+	uvlong d0, d1;
+	int i;
+
+	clstage = "scrubrate";
+	m = mkmap();
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4, 0)) == nil)
+		return;
+	for(i = 0; i < 100; i++){
+		snprint(name, sizeof name, "obj%.2d", i);
+		mkobj(srvstore(ctx), name, nil, 0, 1);
+	}
+	clstart(&cl, ctx, Clmsize);
+	if(!adminctl(&cl, "role=admin"))
+		goto Out;
+	/* eight objects a second: an empty object is charged the floor */
+	if(clwrite(&cl, Fctl, 0, "scrub start rate=8", &r) != Rwrite){
+		fail("scrub start: %s", clerr(&r));
+		goto Out;
+	}
+	sleep(3000);
+	if(jobfield(&cl, "done", val, sizeof val) == nil){
+		fail("the pass ended before the rate was raised");
+		goto Out;
+	}
+	d0 = strtoull(val, nil, 10);
+	istrue("the pass is still walking at the rate it started with", d0 > 0);
+	if(clwrite(&cl, Fctl, 0, "scrub rate=32", &r) != Rwrite)
+		fail("scrub rate=32: %s", clerr(&r));
+	sleep(1200);
+	istrue("a raised rate paces what is left, not what is done",
+		jobrunning(&cl));
+	if(jobfield(&cl, "done", val, sizeof val) == nil)
+		fail("the pass is listed but has no done=");
+	else{
+		d1 = strtoull(val, nil, 10);
+		istrue("and it does move on at the rate it was given", d1 > d0);
+	}
+	if(clwrite(&cl, Fctl, 0, "scrub stop", &r) != Rwrite)
+		fail("scrub stop: %s", clerr(&r));
+	for(i = 0; i < 400 && jobrunning(&cl); i++)
+		sleep(20);
+	istrue("and stops when it is told to", !jobrunning(&cl));
+Out:
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * /jobs lists every pass, and the passes are bounded.
  *
  * layer-a §2.2 wants "one line per running or queued background job",
@@ -2381,6 +2458,7 @@ threadmain(int argc, char **argv)
 	treclaim();
 	tforget();
 	tscrubctl();
+	tscrubrate();
 	tpassfail();
 	tjobs();
 	tdrop();
