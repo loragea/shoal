@@ -461,19 +461,18 @@ int	srvqindex(Srvctx*, uchar *oid, int oidlen);
  * whole of srvhook's set and nothing else: objhold, objprelook,
  * objstage, objlook, objarm, objexit, fullhold, openhold, flushhold,
  * mapopen, walkhold, anyexit, step7, jobhold, slotfail, reclaimhold
- * and dirhold.  A HOLD
- * therefore belongs in srvhook — a program that set a point and
- * stopped watching must not be able to hold the store's close.  (The
- * shutdown also
- * turns srvcellpoint off, by its own call and for its own reason: the
- * file table those cells are in outlives the context that was given
- * them.)  Clearing a point is not the same as reaching the proc
- * that is parked in it: a parked QUEUE proc wakes when its point is
- * cleared, but a parked SERVICE LOOP never reaches srvholdclear at all,
- * because the shutdown runs from Srv.end, which lib9p calls on the
- * loop.  A point that can park the loop — the flush hold, and the
- * step 7 hold when the flushed request was still queued — therefore
- * bounds its own park as well as being cleared here.
+ * and dirhold.  A HOLD therefore belongs in srvhook — a program that
+ * set a point and stopped watching must not be able to hold the
+ * store's close.  (The shutdown also turns srvcellpoint off, by its
+ * own call and for its own reason: the file table those cells are in
+ * outlives the context that was given them.)  Clearing a point is not
+ * the same as reaching the proc that is parked in it: a parked QUEUE
+ * proc wakes when its point is cleared, but a parked SERVICE LOOP
+ * never reaches srvholdclear at all, because the shutdown runs from
+ * Srv.end, which lib9p calls on the loop.  A point that can park the
+ * loop — the flush hold, and the step 7 hold when the flushed request
+ * was still queued — therefore bounds its own park as well as being
+ * cleared here.
  *
  * What srvholdclear does NOT touch belongs beside srvauxpoint below:
  * the fid-state point and its counts, and the end point, whose whole

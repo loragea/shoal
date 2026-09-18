@@ -356,12 +356,14 @@ stageflushhook(Sfid *f, Req *r)
 	 * A handler inside an engine call THROUGH this handle is the one
 	 * case where the handle may not be taken here (store.md §14(45)):
 	 * §5.5's chunk passes the Stage* to stagewrite, and a discard made
-	 * while that call is in flight is a discard made under it.  `dead' is enough — the
-	 * look that handler takes when its call returns finds it and
-	 * releases the handle itself (srvstagelive below), which is an
-	 * engine call made from a queue proc holding no lock, where it
-	 * belongs.  A client stage never reaches this: it holds a key and
-	 * no handle, so `g' is nil for every one of them.
+	 * while that call is in flight is a discard made under it.  `dead'
+	 * is enough — the look that handler takes when its call returns
+	 * finds it and releases the handle itself (srvstagelive below),
+	 * which is an engine call made from a queue proc holding no lock,
+	 * where it belongs.  A client stage never reaches this: it holds a
+	 * key and no handle, so `g' is nil for every one of them, and so is
+	 * an opening chunk's, which is why the slot is what the rule is on
+	 * elsewhere and the handle is what it is on here.
 	 */
 	if(s->busy && s->g != nil){
 		qunlock(&c->stagelk);
