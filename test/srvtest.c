@@ -3837,6 +3837,7 @@ threadmain(int argc, char **argv)
 	USED(argc);
 	USED(argv);
 	quotefmtinstall();		/* the FAIL lines quote what they got */
+	clwatchms = 120*1000;		/* this program's own budget */
 	clwatchon();
 
 	tstartup();
