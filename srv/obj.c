@@ -1077,6 +1077,13 @@ srvobjremove(Req *r)
  * other settable field MUST be rejected, and a rename MUST be rejected
  * with `no rename' specifically.  Nothing §2.6 names fits the others,
  * so they carry this server's own string (§3.7, store.md §14(34)).
+ * `type' and `dev' are refused with them.  stat(5) makes them
+ * don't-touch on every wstat, so a request that carries a value is
+ * asking for something this server will not do — a refusal, not a
+ * field to ignore.  `qid' is the third of that set and is not tested
+ * here: lib9p refuses a Twstat whose qid differs from the fid's own
+ * before Srv.wstat is reached, with its own string, and a qid equal to
+ * the fid's sets nothing (store.md §14(34)).
  *
  * convM2D leaves a field the client did not set at its null value
  * (nulldir), so what the client asked for is what differs from those.
@@ -1160,7 +1167,8 @@ srvobjwstat(Req *r)
 	|| d->atime != (ulong)~0
 	|| (d->uid != nil && d->uid[0] != 0)
 	|| (d->gid != nil && d->gid[0] != 0)
-	|| (d->muid != nil && d->muid[0] != 0)){
+	|| (d->muid != nil && d->muid[0] != 0)
+	|| d->type != (ushort)~0 || d->dev != (ulong)~0){
 		respond(r, Ewstatfield);
 		return;
 	}

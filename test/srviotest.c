@@ -547,6 +547,27 @@ tmodes(void)
 	clwstat(&cl, Ffile, &dir, &r);
 	clerris("a wstat that sets mtime", &r,
 		"shoalsrv: only length may be set");
+	/*
+	 * stat(5) makes `type', `dev' and `qid' don't-touch on every
+	 * Twstat.  The first two are this row's to refuse; a qid that
+	 * differs from the fid's own is lib9p's, answered in its words
+	 * before Srv.wstat (store.md §14(34)).
+	 */
+	nulldir(&dir);
+	dir.type = 1;
+	clwstat(&cl, Ffile, &dir, &r);
+	clerris("a wstat that sets the server type", &r,
+		"shoalsrv: only length may be set");
+	nulldir(&dir);
+	dir.dev = 1;
+	clwstat(&cl, Ffile, &dir, &r);
+	clerris("a wstat that sets the server subtype", &r,
+		"shoalsrv: only length may be set");
+	nulldir(&dir);
+	dir.qid.vers = 0xdeadbeef;
+	clwstat(&cl, Ffile, &dir, &r);
+	clerris("a wstat that sets qid.vers", &r,
+		"wstat -- attempt to change qid.vers");
 	nulldir(&dir);
 	clwstat(&cl, Ffile, &dir, &r);
 	checks++;

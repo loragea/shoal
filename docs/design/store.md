@@ -5570,10 +5570,18 @@ name a half that is not built; each says which.
     §2.6 string.** §2.4 requires every other settable field to be
     rejected and names a condition for one of them alone —
     `no rename` for `name`. Nothing in §2.6 fits `mode`, `mtime`,
-    `uid`, `gid` or `muid`. *Not made:* the rename is `no rename` and
-    the rest are refused with this server's own
-    `shoalsrv: only length may be set` (§14(29)). A `Twstat` that
-    sets nothing at all is 9P's own sync of a fid and succeeds,
+    `atime`, `uid`, `gid` or `muid`, nor the `type` and `dev` that
+    `stat`(5) makes don't-touch on every `Twstat`. *Not made:* the
+    rename is `no rename` and the rest are refused with this server's
+    own `shoalsrv: only length may be set` (§14(29)); a request that
+    carries a `type` or a `dev` is asking for something this server
+    will not do, not naming a field to ignore. `qid` is the third
+    don't-touch field and is not this row's to refuse: `lib9p`
+    answers a `Twstat` whose `qid` differs from the fid's own with
+    its own string before `Srv.wstat` is reached
+    (`/sys/src/lib9p/srv.c`, `swstat`), which is §14(28)'s shape
+    again, and a `qid` equal to the fid's sets nothing. A `Twstat`
+    that sets nothing at all is 9P's own sync of a fid and succeeds,
     changing nothing.
 
 ## 15. Alternatives considered
