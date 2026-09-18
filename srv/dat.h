@@ -415,10 +415,12 @@ struct Qjob
  *
  * `err' is what a pass gave up with, and it is the only record of it:
  * a pass has no client to answer and no log to write to, so a walk
- * that broke off silently was a walk that reported success.  It is
- * set once, where the pass stops, and it is also what says the walk
- * did not complete — the reclaim that rides on a scrub runs only over
- * a walk that did (store.md §14(30)).
+ * that broke off silently was a walk that reported success.  The
+ * first failure wins, since it is the one that stopped the walk where
+ * a walk stops at all — an object that would not read does not stop
+ * one — and `err' is also what says the walk's answer is not a whole
+ * index's: the reclaim that rides on a scrub runs only over a walk
+ * that completed and recorded none (store.md §14(30)).
  */
 struct Sjob
 {
@@ -430,6 +432,7 @@ struct Sjob
 	uvlong	done;		/* index slots walked */
 	uvlong	total;		/* index slots to walk */
 	uvlong	bad;		/* objects the pass found mismatching */
+	uvlong	skipped;	/* ... gone between the index and the queue */
 	uvlong	reclaimable;	/* tombstones past layer-a §1.5's local two */
 	uvlong	dropped;	/* dirty records `forget' discarded */
 	char	arg[Iidlen+1];	/* `forget's peer, an instance id (§3.3) */

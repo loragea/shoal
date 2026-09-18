@@ -90,7 +90,7 @@ enum
 	 * threadmain.  Every check this file makes is unconditional once
 	 * its case is entered, so the number is fixed.
 	 */
-	Nchecks	= 201,
+	Nchecks	= 207,
 
 	/* fids the cases use */
 	Froot	= 1,
@@ -2001,23 +2001,32 @@ joberred(Cl *cl, char *val, int nval)
  * that had broken off at slot 0, and reported its count as a whole
  * pass's.
  *
- * Two points drive it.  `slotfail' fails one index read with the
+ * Three points drive it.  `slotfail' fails one index read with the
  * store under it healthy, which is what tells a broken-off walk from
  * a walk whose store has gone: the tombstone here is past both of
  * §1.5's local cutoffs, so a whole pass counts it and a pass that
  * broke off must not.  `fatal' condemns the engine outright, which is
- * how a `dirtydel' is made to fail.  `jobhold' keeps the pass listed
- * long enough to read what it gave up with either way.
+ * how a `dirtydel' is made to fail.  The simulated disk's own read
+ * fault over the data region is how ONE object is made unreadable
+ * with the index and the rest of the store healthy — that pass walks
+ * to the end of the index and carries an `err=' all the same, which
+ * is the one case in which the reclaim's gate turns on the error
+ * rather than on the slot count.  `jobhold' keeps the pass listed
+ * long enough to read what it gave up with in every case.
  */
 static void
 tpassfail(void)
 {
 	char buf[8192], val[ERRMAX], name[32], *m;
+	uchar data[4096];
 	Srvctx *ctx;
 	Store *st;
 	Dev *d;
 	Cl cl;
 	Fcall r;
+	Super sb;
+	Sbsel sel;
+	vlong off, len;
 	int i;
 
 	clstage = "passfail";
@@ -2026,9 +2035,11 @@ tpassfail(void)
 	if((ctx = startsrv(d, m, 4, 0)) == nil)
 		return;
 	st = srvstore(ctx);
+	for(i = 0; i < sizeof data; i++)
+		data[i] = (uchar)(0x31 + (i & 0x3f));
 	for(i = 0; i < 20; i++){
 		snprint(name, sizeof name, "obj%.2d", i);
-		mkobj(st, name, nil, 0, 1);
+		mkobj(st, name, data, sizeof data, 1);
 	}
 	rmobj(st, "obj19", 9, 3);	/* past both of §1.5's local cutoffs */
 	sleep(1100);			/* past the cutoff's second */
@@ -2079,6 +2090,39 @@ tpassfail(void)
 	istrue("the record the failed forget could not discard is still there",
 		dirtyhas(st, (uchar*)"obj00", 5, "n1.1"));
 
+	/*
+	 * one object the pass cannot read: it says so, it walks the rest
+	 * of the index all the same, and the reclaim does not ride on it
+	 */
+	if(superselect(d, &sel) < 0 || sel.start < 0)
+		fail("superselect: %r");
+	else{
+		sb = sel.sb[sel.start];
+		off = (vlong)sb.dataoff * sb.secsz;
+		len = (vlong)sb.datasecs * sb.secsz;
+		simfaultat(d, Sfeio, 1, off, len);	/* one grain read */
+		srvhook(ctx, "jobhold", 1);
+		if(clwrite(&cl, Fctl, 0, "scrub start rate=1000000", &r)
+			!= Rwrite)
+			fail("scrub start over an unreadable object: %s",
+				clerr(&r));
+		if(jobparked(&cl, "err", val, sizeof val) == nil)
+			fail("the pass walked the whole index with no err= "
+				"over an object it could not read");
+		else
+			eqs("/jobs says which object read failed", val,
+				"i/o error");
+		if(jobfield(&cl, "reclaimable", val, sizeof val) == nil)
+			fail("that pass left no /jobs line");
+		else
+			eqs("and a scrub that could not read an object "
+				"reclaims nothing", val, "0");
+		simfault(d, Sfnone, 0);
+		srvhook(ctx, "jobhold", 0);
+		for(i = 0; i < 400 && jobrunning(&cl); i++)
+			sleep(20);
+	}
+
 	/* a whole pass over the same index does report a reclaimable one */
 	srvhook(ctx, "jobhold", 1);
 	if(clwrite(&cl, Fctl, 0, "scrub start rate=1000000", &r) != Rwrite)
@@ -2094,6 +2138,116 @@ tpassfail(void)
 Out:
 	storehook(srvstore(ctx), "fatal", 0);
 	srvhook(ctx, "slotfail", 0);
+	srvhook(ctx, "jobhold", 0);
+	for(i = 0; i < 400 && jobrunning(&cl); i++)
+		sleep(20);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
+ * An object that goes away between the index read and the queue is
+ * not the pass's failure.
+ *
+ * The walk reads the index outside every queue, and the unit it
+ * pushes is ordered behind whatever that object's queue was already
+ * holding — so a drop or a delete landing in that window is the
+ * ordering working, and the engine answers the push `no such object'.
+ * A pass that recorded that as a failure would block its own reclaim
+ * on a client doing nothing wrong.
+ *
+ * §13's `objhold' point is what opens the window: a client's `verify'
+ * parked inside the one object's queue keeps the pass's own unit
+ * queued behind it, and the pool's push count says the unit is there
+ * — one push for the client's request and one for the pass's, with
+ * nothing else in flight.  The object is then dropped through the
+ * engine, and the unit runs against an id the store no longer holds.
+ */
+static void
+tobjgone(void)
+{
+	char buf[4096], val[ERRMAX], *m;
+	Srvctx *ctx;
+	Store *st;
+	Dev *d;
+	Cl cl;
+	Fcall t, r;
+	char *w[1];
+	ushort ta;
+	uvlong np0, np, nd;
+	int i;
+
+	clstage = "objgone";
+	m = mkmap();
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4, 0)) == nil)
+		return;
+	st = srvstore(ctx);
+	mkobj(st, "alpha", nil, 0, 1);		/* the index's only live object */
+	clstart(&cl, ctx, Clmsize);
+	if(!adminctl(&cl, "role=admin"))
+		goto Out;
+	/* a second /ctl, since the first carries the request that parks */
+	if(clattach(&cl, Froot2, "role=admin", &r) != Rattach){
+		fail("second attach: %s", clerr(&r));
+		goto Out;
+	}
+	w[0] = "ctl";
+	if(clopenpath(&cl, Froot2, Ffile, 1, w, OWRITE, &r) != Ropen){
+		fail("open the second /ctl: %s", clerr(&r));
+		goto Out;
+	}
+
+	/* park a client request inside alpha's queue */
+	srvcount(ctx, &np0, &nd);
+	srvhook(ctx, "objhold", 1);
+	memset(&t, 0, sizeof t);
+	t.type = Twrite;
+	t.tag = ta = cltag(&cl);
+	t.fid = Fctl;
+	t.offset = 0;
+	t.data = "verify alpha";
+	t.count = strlen(t.data);
+	clput(&cl, &t);
+	np = np0;
+	for(i = 0; i < 400 && np - np0 < 1; i++){
+		sleep(5);
+		srvcount(ctx, &np, &nd);
+	}
+	eqv("the held verify reached its queue", np - np0, 1);
+
+	/* the pass queues its unit for that object behind it */
+	srvhook(ctx, "jobhold", 1);
+	if(clwrite(&cl, Ffile, 0, "scrub start rate=1000000", &r) != Rwrite){
+		fail("scrub start: %s", clerr(&r));
+		goto Out;
+	}
+	for(i = 0; i < 400 && np - np0 < 2; i++){
+		sleep(5);
+		srvcount(ctx, &np, &nd);
+	}
+	eqv("the pass's unit is queued behind it", np - np0, 2);
+
+	/* and the object goes while the unit waits */
+	if(objdrop(st, (uchar*)"alpha", 5) < 0)
+		fail("objdrop alpha: %r");
+	srvhook(ctx, "objhold", 0);
+	clgettag(&cl, ta, &r);			/* the client's own answer */
+	cltagfree(&cl, ta);
+	if(jobparked(&cl, "skipped", val, sizeof val) == nil)
+		fail("the pass never reached its hold");
+	else
+		eqs("an object gone between the index and the queue is "
+			"counted apart", val, "1");
+	if(slurpfile(&cl, Ffile2, "jobs", buf, sizeof buf) > 0)
+		istrue("and is not the pass's failure",
+			strstr(buf, "err=") == nil);
+	else
+		fail("the parked pass left no /jobs line");
+Out:
+	srvhook(ctx, "objhold", 0);
 	srvhook(ctx, "jobhold", 0);
 	for(i = 0; i < 400 && jobrunning(&cl); i++)
 		sleep(20);
@@ -2525,6 +2679,7 @@ threadmain(int argc, char **argv)
 	tscrubctl();
 	tscrubrate();
 	tpassfail();
+	tobjgone();
 	tjobs();
 	tdrop();
 	tshutdown();

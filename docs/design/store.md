@@ -5534,17 +5534,34 @@ name a half that is not built; each says which.
 
     A pass has no client to answer and this build has no operator log,
     so a walk that broke off — a failed index read, a failed
-    `dirtydel`, a snapshot that would not open — reported success by
-    saying nothing. *Not made:* a pass records what it gave up with,
-    and `/jobs` renders it as a trailing **`err=<string>`** on that
-    job's line, present only when there is one and last on the line
-    because the string may hold spaces. §2.2 makes `/jobs`'s format
-    implementation policy beyond its being one record per line, so the
-    field is policy entire. The same record is what says the walk did
-    not complete: §9's reclaim walk runs only at the end of a scrub
-    that walked every slot, was not stopped and recorded no error,
-    because `reclaimable=` over a prefix of the index is
-    indistinguishable from `reclaimable=` over the whole of it.
+    `dirtydel`, a snapshot that would not open, an object whose grains
+    would not read — reported success by saying nothing. *Not made:* a
+    pass records what it gave up with, and `/jobs` renders it as a
+    trailing **`err=<string>`** on that job's line, present only when
+    there is one and last on the line because the string may hold
+    spaces. §2.2 makes `/jobs`'s format implementation policy beyond
+    its being one record per line, so the field is policy entire. The
+    same record is what says the walk's answer is not a whole index's:
+    §9's reclaim walk runs only at the end of a scrub that walked
+    every slot, was not stopped and recorded no error, because
+    `reclaimable=` over a prefix of the index — or over an index the
+    pass could not read all of — is indistinguishable from
+    `reclaimable=` over the whole of it.
+
+    A **per-object** read failure is a failure of the pass and not the
+    end of it: the scrub records it and walks on, since one object
+    that would not read says nothing about the next and stopping would
+    leave the rest of the index unverified as well. That is the one
+    way a pass reaches the end of its walk carrying an `err=`, and it
+    is why the reclaim's gate tests the error as well as the slot
+    count. An object that has merely **gone** between the index read
+    and the queue is not a failure at all: the walk reads the index
+    outside every queue and its unit is ordered behind whatever that
+    queue held, so a delete or a drop in between is the ordering
+    working. The engine's two answers for such an id — `no such
+    object` and `object deleted` — are told apart from a read failure
+    by the string, and `/jobs` counts them at **`skipped=<n>`**
+    (policy, like the rest of the line).
 
 31. **The scrub's pace is this server's, and it carries the reclaim
     walk (§8, §9; layer-a §2.5, §7.5).** layer-a §7.5 leaves

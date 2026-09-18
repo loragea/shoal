@@ -159,6 +159,24 @@ qjob(Qwork *j)
 }
 
 /*
+ * An object the index walk found live and the object's own queue
+ * found gone.  The walk reads the index outside every queue (objslot
+ * holds the state lock and no more), and the unit it pushes is
+ * ordered behind whatever that queue was already holding — so a
+ * delete or a drop landing in between is the ordering working, not a
+ * failure of this pass.  The engine has two answers for an id it no
+ * longer holds live, `no such object' for one it holds nothing for
+ * and `object deleted' for a tombstone (lib/obj.c), and both are
+ * that case.  Anything else is a read that failed.
+ */
+static int
+objgone(char *err)
+{
+	return strcmp(err, "no such object") == 0
+		|| strcmp(err, "object deleted") == 0;
+}
+
+/*
  * The job list.  A verb that starts a pass links the record before it
  * spawns the proc, so /jobs shows the job from the moment §2.5 says
  * it is accepted; the proc unlinks it as its last act before giving
@@ -323,10 +341,11 @@ srvjobstext(Srvctx *c, Sfid *f, Text *t)
 	unlock(&c->joblk);
 	for(i = 0; i < k; i++)
 		textprint(t, "job=%s state=%s rate=%lud done=%llud/%llud "
-			"bad=%llud reclaimable=%llud dropped=%llud%s%s\n",
+			"bad=%llud skipped=%llud reclaimable=%llud "
+			"dropped=%llud%s%s\n",
 			cp[i].verb, cp[i].running ? "running" : "queued",
 			rate, cp[i].done, cp[i].total, cp[i].bad,
-			cp[i].reclaimable, cp[i].dropped,
+			cp[i].skipped, cp[i].reclaimable, cp[i].dropped,
 			cp[i].err[0] != 0 ? " err=" : "", cp[i].err);
 	free(cp);
 	return nil;
@@ -531,7 +550,27 @@ scrubpass(Sjob *j)
 			continue;
 		memmove(w.oid, oid, oidlen);
 		w.oidlen = oidlen;
-		if(qjob(&w) == 0 && w.bad){
+		/*
+		 * An object whose read failed is the pass's failure and is
+		 * recorded as one — it is the only record there is, and a
+		 * scrub that could not read an object has not verified the
+		 * index it says it walked, so the reclaim below must not
+		 * ride on it.  The walk goes on all the same: one object
+		 * that would not read says nothing about the next, and
+		 * stopping here would leave the rest of the index
+		 * unverified as well.  An object that has merely gone is
+		 * not a failure (objgone) and is counted apart.
+		 */
+		if(qjob(&w) < 0){
+			if(objgone(w.err)){
+				lock(&c->joblk);
+				j->skipped++;
+				unlock(&c->joblk);
+			}else{
+				werrstr("%s", w.err);
+				joberr(j);
+			}
+		}else if(w.bad){
 			lock(&c->joblk);
 			j->bad++;
 			unlock(&c->joblk);
@@ -539,12 +578,15 @@ scrubpass(Sjob *j)
 		scrubpace(c, &bytes, &t0, &lastrate, oi.len);
 	}
 	/*
-	 * The reclaim walk rides on a scrub that COMPLETED, and on no
-	 * other: it counts what a whole walk of the index found, and a
-	 * walk that stopped part-way — told to stop, shutting down, or
-	 * broken off by an index read that failed — has counted a
-	 * prefix.  Reporting that prefix as the pass's answer would make
-	 * a partial pass indistinguishable from a whole one.
+	 * The reclaim walk rides on a scrub that COMPLETED and found
+	 * everything it walked readable, and on no other: it counts what
+	 * a whole walk of the index found, and a walk that stopped
+	 * part-way — told to stop, shutting down, or broken off by an
+	 * index read that failed — has counted a prefix.  Reporting that
+	 * prefix as the pass's answer would make a partial pass
+	 * indistinguishable from a whole one.  The `err' test is the
+	 * live one of the three for a walk that ran to the end with an
+	 * object it could not read.
 	 */
 	if(slot >= st.nslots && !passover(c) && j->err[0] == 0)
 		reclaim(c, j);
