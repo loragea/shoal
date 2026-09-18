@@ -481,8 +481,22 @@ reclaim(Srvctx *c, Sjob *j)
 	}
 	n = objsnapcount(sn);
 	for(i = 0; i < n; i++){
-		if(passover(c))
+		srvreclaimhold(c, i);
+		/*
+		 * A walk told to stop, or one the shutdown broke off, has
+		 * counted a PREFIX of the snapshot, and nothing else on the
+		 * line says so: `done=' and `total=' are the index walk's
+		 * and by here read done=T/T.  So the pass is marked, and
+		 * `reclaimable=' is read beside an `err=' rather than as
+		 * the whole store's answer.  One string covers both causes
+		 * — what an operator has to know is that the number is a
+		 * prefix, not which of the two cut it short.
+		 */
+		if(passover(c)){
+			werrstr("shoalsrv: stopped");
+			joberr(j);
 			break;
+		}
 		rc = objsnapent(sn, i, oid, &oidlen, &oi);
 		if(rc < 0){
 			joberr(j);

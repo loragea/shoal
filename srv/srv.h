@@ -305,6 +305,15 @@ int	srvjobcount(Srvctx*);	/* jobs held: what the shutdown waits for */
  *		and a walk broken off that way cannot be told from one
  *		whose store has gone.  The two walks are separate cases,
  *		so the one number serves both.
+ *	reclaimhold
+ *		n != 0 holds the tombstone reclaim walk that rides on a
+ *		scrub before its n-1'th entry, with the entries before
+ *		that one already counted.  Nothing else can stop that walk
+ *		part-way: it starts only once the scrub is past its index
+ *		walk, and it is paced by nothing and asks no queue.  So it
+ *		is where a test raises `scrub stop', or takes the server
+ *		down, over a walk that has counted a prefix of the
+ *		snapshot.  Set to n+1, like slotfail.
  *	flushhold
  *		n != 0 holds a Tflush of a pooled request between the
  *		lookup that found it and the flush itself, which is the
@@ -340,8 +349,8 @@ void	srvhook(Srvctx*, char *name, uvlong n);
  *
  * srvholdclear, which the shutdown runs before it drains, clears the
  * whole of srvhook's set and nothing else: objhold, objexit,
- * flushhold, mapopen, walkhold, anyexit, step7, jobhold and
- * slotfail.  A HOLD therefore
+ * flushhold, mapopen, walkhold, anyexit, step7, jobhold, slotfail
+ * and reclaimhold.  A HOLD therefore
  * belongs in srvhook — a program that set a point and stopped watching
  * must not be able to hold the store's close.  (The shutdown also
  * turns srvcellpoint off, by its own call and for its own reason: the

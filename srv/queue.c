@@ -576,6 +576,28 @@ srvslotfail(Srvctx *c, uvlong slot)
 }
 
 /*
+ * The point inside the tombstone reclaim walk (job.c), which nothing
+ * else here can stop part-way: the scrub that carries it is already
+ * past its index walk when the walk begins, and the walk itself is
+ * paced by nothing and asks no queue.  n != 0 parks it before its
+ * n-1'th entry, with the entries before that one counted, so a test
+ * can raise `scrub stop' or take the server down over a walk that
+ * has counted a prefix of the snapshot.  Set to n+1, like slotfail; 0
+ * is off, and srvholdclear turns it off with the rest.
+ */
+void
+srvreclaimhold(Srvctx *c, uvlong i)
+{
+	uvlong n;
+
+	qlock(&c->holdlk);
+	n = c->reclaimhold;
+	qunlock(&c->holdlk);
+	if(n != 0 && i == n-1)
+		qhold(c, nil, &c->reclaimhold);
+}
+
+/*
  * The third point, at a queued walk's commit: the moment a walk that
  * moves its fid has given the old state back and is about to write
  * the new one.  It is where the service loop is concurrent with the
@@ -833,6 +855,8 @@ srvhook(Srvctx *c, char *name, uvlong n)
 		c->jobhold = n;
 	else if(strcmp(name, "slotfail") == 0)
 		c->slotfail = n;
+	else if(strcmp(name, "reclaimhold") == 0)
+		c->reclaimhold = n;
 	qunlock(&c->holdlk);
 }
 
@@ -860,6 +884,7 @@ srvholdclear(Srvctx *c)
 	c->step7hold = 0;
 	c->jobhold = 0;
 	c->slotfail = 0;
+	c->reclaimhold = 0;
 	qunlock(&c->holdlk);
 }
 

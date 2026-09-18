@@ -90,7 +90,7 @@ enum
 	 * threadmain.  Every check this file makes is unconditional once
 	 * its case is entered, so the number is fixed.
 	 */
-	Nchecks	= 207,
+	Nchecks	= 210,
 
 	/* fids the cases use */
 	Froot	= 1,
@@ -1401,6 +1401,22 @@ jobrunning(Cl *cl)
 	return slurpfile(cl, Ffile2, "jobs", buf, sizeof buf) > 0;
 }
 
+/* poll /jobs until a parked pass shows an err=, or give up */
+static int
+joberred(Cl *cl, char *val, int nval)
+{
+	char buf[4096];
+	int i;
+
+	for(i = 0; i < 400; i++){
+		if(slurpfile(cl, Ffile2, "jobs", buf, sizeof buf) > 0
+		&& strstr(buf, "err=") != nil)
+			return jobfield(cl, "err", val, nval) != nil;
+		sleep(20);
+	}
+	return 0;
+}
+
 /*
  * layer-a §7.5's scrub pass: it walks the index, flags the copy whose
  * bytes no longer hash to their digest, and /lost and /status's
@@ -1894,7 +1910,44 @@ Out:
 	}
 	istrue("and its record is still in the index",
 		statof(st, "old", &oi) == 0);
+
+	/*
+	 * The same walk cut short.  `done=' and `total=' are the index
+	 * walk's and read done=T/T by the time the reclaim runs, so a
+	 * prefix of the snapshot counted would otherwise be read as the
+	 * whole store's answer — the very line the whole pass above
+	 * left.  §13's `reclaimhold' is what stops the walk part-way:
+	 * nothing else can, since it starts only once the scrub is past
+	 * its index walk and is paced by nothing.
+	 */
+	srvhook(ctx, "reclaimhold", 2);		/* held before the 2nd entry */
+	srvhook(ctx, "jobhold", 1);
+	if(clwrite(&cl, Fctl, 0, "scrub start rate=1000000", &r) != Rwrite)
+		fail("a third scrub start: %s", clerr(&r));
+	for(i = 0; i < 500; i++){
+		if(jobfield(&cl, "reclaimable", val, sizeof val) != nil
+		&& strcmp(val, "1") == 0)
+			break;
+		sleep(20);
+	}
+	istrue("the reclaim walk counted an entry and parked", i < 500);
+	if(clwrite(&cl, Fctl, 0, "scrub stop", &r) != Rwrite)
+		fail("scrub stop over the reclaim walk: %s", clerr(&r));
+	srvhook(ctx, "reclaimhold", 0);
+	if(!joberred(&cl, val, sizeof val))
+		fail("a reclaim walk stopped part-way reported nothing");
+	else
+		eqs("a reclaim walk that did not finish says so", val,
+			"shoalsrv: stopped");
+	if(jobfield(&cl, "reclaimable", val, sizeof val) == nil)
+		fail("the stopped pass left no /jobs line");
+	else
+		eqs("and the count it did reach stands beside it", val, "1");
 Out2:
+	srvhook(ctx, "reclaimhold", 0);
+	srvhook(ctx, "jobhold", 0);
+	for(i = 0; i < 400 && jobrunning(&cl); i++)
+		sleep(20);
 	clstop(&cl);
 	srvfree(ctx);
 	devclose(d);
@@ -1973,22 +2026,6 @@ Out:
 	srvfree(ctx);
 	devclose(d);
 	free(m);
-}
-
-/* poll /jobs until a parked pass shows an err=, or give up */
-static int
-joberred(Cl *cl, char *val, int nval)
-{
-	char buf[4096];
-	int i;
-
-	for(i = 0; i < 400; i++){
-		if(slurpfile(cl, Ffile2, "jobs", buf, sizeof buf) > 0
-		&& strstr(buf, "err=") != nil)
-			return jobfield(cl, "err", val, nval) != nil;
-		sleep(20);
-	}
-	return 0;
 }
 
 /*

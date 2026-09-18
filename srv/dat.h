@@ -512,6 +512,7 @@ struct Srvctx
 	uvlong	step7hold;	/* srvhook("step7") */
 	uvlong	jobhold;	/* srvhook("jobhold") */
 	uvlong	slotfail;	/* srvhook("slotfail") */
+	uvlong	reclaimhold;	/* srvhook("reclaimhold") */
 	uvlong	endhold;	/* srvendpoint: ms held in srvqended */
 
 	/*

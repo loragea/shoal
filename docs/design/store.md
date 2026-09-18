@@ -5601,7 +5601,21 @@ name a half that is not built; each says which.
     walk reports instead. `/jobs` carries `reclaimable=<n>`, the
     tombstones past conditions 2 and 3, which is the number of
     discards the replication surface will have to confirm; every
-    record stays where it is, and `/tombs` still lists it. The walk
+    record stays where it is, and `/tombs` still lists it.
+
+    A reclaim walk that is itself cut short — `scrub stop`, or the
+    shutdown, read between its entries — has counted a prefix of the
+    snapshot, and nothing else on the line says so: `done=` and
+    `total=` belong to the index walk and read `done=T/T` by then.
+    *Not made:* such a walk records `shoalsrv: stopped` through the
+    same `err=` §14(30) gives a pass that gave up, so `reclaimable=`
+    is read beside an error rather than as the whole store's answer.
+    The count it did reach is left on the line, since a prefix marked
+    as one is worth more to an operator than no number at all. One
+    string covers both causes: what has to be known is that the
+    number is a prefix, not which of the two cut it short.
+
+    The walk
     reads the tombstones through a §9 snapshot of its own and holds it
     for its whole run, so it occupies one of `objsnapmax`'s slots and
     `/status`'s `objsnapopen=` counts it: an operator who watches that
