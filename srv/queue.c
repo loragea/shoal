@@ -467,12 +467,15 @@ srvqflush(Req *r)
  * (srvholdclear) is not held up by one.  The flush hold below is the
  * exception, and says why.
  *
- * `cnt', where a point has one, counts the ARRIVALS at it — under the
- * same lock, before the park, and only while the point is set, so it
- * says a request got here and not that one is still here.  That is what
- * a test waits on: the request it wants parked is the one it just
- * pushed, and a wait on the count is a wait on the window this park
- * opens (srv.h's srvheld).  nil for a point nothing waits on.
+ * `cnt', where a point has one, counts the requests this park HELD —
+ * under the same lock and on the way in, so it says a request got here
+ * and not that one is still here.  That is what a test waits on: the
+ * request it wants parked is the one it just pushed, and a wait on the
+ * count is a wait on the window this park opens (srv.h's srvheld).  A
+ * request that reaches the point and runs straight through is not in
+ * that window and is not counted — the queue's flush flag is already
+ * up for it, which is one of the two exits, so the park it would be
+ * waited on for never happens.  nil for a point nothing waits on.
  */
 static void
 qholdpark(Srvctx *c, Qreq *qr, uvlong *pt)		/* under holdlk */
@@ -488,7 +491,7 @@ static void
 qhold(Srvctx *c, Qreq *qr, uvlong *pt, uvlong *cnt)
 {
 	qlock(&c->holdlk);
-	if(cnt != nil && *pt != 0)
+	if(cnt != nil && *pt != 0 && (qr == nil || qr->q->flush == 0))
 		(*cnt)++;
 	qholdpark(c, qr, pt);
 	qunlock(&c->holdlk);
