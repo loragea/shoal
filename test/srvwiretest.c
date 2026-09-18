@@ -1501,11 +1501,21 @@ tstagelife(void)
 	tf.tag = ft = cltag(&cl);
 	tf.oldtag = ta;
 	clput(&cl, &tf);
-	srvhook(ctx, "objhold", 0);
+	/*
+	 * The point is NOT cleared to let the chunk go: the flush itself
+	 * is the other exit from a queue proc's hold (queue.c), so the
+	 * chunk wakes inside its check point and leaves through srvqdone
+	 * with the flag up.  Clearing it first would let the chunk past
+	 * that check while the Tflush was still unread on the loop, and
+	 * the flush would then land on an operation that had already
+	 * committed and consumed the stage — a different case than this
+	 * one, and one whose answer is not `interrupted'.
+	 */
 	if(clgettag(&cl, ta, &r) < 0)
 		fail("no answer to the flushed chunk");
 	else
 		eqs("a flushed chunk", clerr(&r), "interrupted");
+	srvhook(ctx, "objhold", 0);
 	cltagfree(&cl, ta);
 	if(clgettag(&cl, ft, &r) != Rflush)
 		fail("no Rflush: %s", clerr(&r));
