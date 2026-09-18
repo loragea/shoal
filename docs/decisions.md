@@ -940,9 +940,12 @@ keeping the walk on the scrub's back, which is what the paragraph
 above weighs — the grammar stays fixed, and the operator waits a
 scrub for a count that takes seconds to make.
 **Normative:** §2.5's new `reclaim` row — its spelling, its `admin`
-role, its place in the fenced set and its two optional words — since
-that is a ctl grammar a client writes and a reimplementation must
-match. §2.5's rule that a verb starting background work returns on
+role, its two optional words, and its place in the fenced set, which
+is per form: `reclaim start` is in that set and `reclaim stop` is
+not, because `stop` mutates nothing and an instance just fenced is
+where an operator most wants a running walk stopped. All of it is a
+ctl grammar a client writes, so a reimplementation must match it.
+§2.5's rule that a verb starting background work returns on
 acceptance is unchanged and governs it. §1.5's three discard
 conditions are normative and are layer-a's, not this row's — what
 this row settles is that a walk which can test only two of the three

@@ -22,7 +22,13 @@
  * body runs.  A verb is built by filling its row's fn or qfn; nothing
  * else in this file changes.
  *
- * `fence is inside the fence' (§2.5) is the one rule with an edge.
+ * `fence is inside the fence' (§2.5) has one edge, and `reclaim' has
+ * the other: a row's `fenced' is per VERB, and both of those verbs are
+ * in §2.5's fenced set for one of their forms alone.  Such a row is
+ * outside the set here and its body applies the gate to the form that
+ * is in it — see ctlfence below and srvctlreclaim in job.c.
+ *
+ * `fence is inside the fence' (§2.5) is the first of the two.
  * §2.5 lists `fence off' among the verbs that MUST fail `fenced' while
  * the instance is fenced, and §6.4 F4 makes `fence off' the only way
  * to clear an operator fence.  Read literally the two make an operator
@@ -125,9 +131,14 @@ Sctl srvctls[] =
 	.fn	= srvctlscrub,
 },
 {
+	/*
+	 * Not the whole row: `reclaim start' is fenced and `reclaim stop'
+	 * is not, so the gate is inside the body, as `fence off's is
+	 * (job.c, store.md §14(39)).
+	 */
 	.verb	= "reclaim",
 	.roles	= Aadmin,
-	.fenced	= 1,
+	.fenced	= 0,
 	.nargmin= 0,
 	.nargmax= 1,
 	.fn	= srvctlreclaim,

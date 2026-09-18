@@ -91,7 +91,7 @@ enum
 	 * threadmain.  Every check this file makes is unconditional once
 	 * its case is entered, so the number is fixed.
 	 */
-	Nchecks	= 270,
+	Nchecks	= 271,
 
 	/* fids the cases use */
 	Froot	= 1,
@@ -431,6 +431,7 @@ tparse(void)
 	static char *unfenced[] = {
 		"scrub start",
 		"scrub stop",
+		"reclaim stop",		/* it mutates nothing: §14(39) */
 		"newmonid 00112233445566778899aabbccddeeff",
 	};
 	static char *notbuilt[] = {

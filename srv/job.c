@@ -1083,15 +1083,24 @@ srvctlscrub(Srvctx *c, Sfid *f, int argc, char **argv)
  * no word for a schedule.  An operator who wants the walk off has no
  * verb for it (§14(39)).
  *
- * The row is admin and FENCED.  §2.5's fenced set is "every verb that
- * mutates data or replication state", and this walk will: §1.5's
- * discard is what it is a walk for, and it removes records as soon as
- * the replication surface can answer condition 1.  A fenced instance
- * is one whose map may be stale, which is exactly the state in which
- * a discard decided against `tombdays' and an epoch must not be made.
- * The timer is not gated by the fence — it starts no discard either,
- * and a count taken under a fence is a count and not a mutation —
- * so what the fence refuses today is the verb, which is the surface
+ * The verb is admin, and `start' alone is FENCED.  §2.5's fenced set
+ * is "every verb that mutates data or replication state", and the
+ * walk a `start' asks for will: §1.5's discard is what it is a walk
+ * for, and it removes records as soon as the replication surface can
+ * answer condition 1.  A fenced instance is one whose map may be
+ * stale, which is exactly the state in which a discard decided
+ * against `tombdays' and an epoch must not be made.
+ *
+ * `stop' is not in that set and is answered while fenced, the way
+ * `fence off' is carved out of its own row (ctl.c): it mutates
+ * nothing — it raises a flag a walk reads between two entries — and
+ * an instance that has just been fenced is exactly where an operator
+ * wants the walk it started stopped.  A row's `fenced' cell is per
+ * verb, so the gate for `start' is here rather than there.
+ *
+ * The timer is not gated either — it starts no discard while
+ * condition 1 is unanswerable, and a count taken under a fence is a
+ * count and not a mutation — so what the fence refuses is the form
  * §2.5 governs.
  */
 char*
@@ -1111,6 +1120,8 @@ srvctlreclaim(Srvctx *c, Sfid *f, int argc, char **argv)
 		else
 			return Ebadctl;
 	}
+	if(start && srvfencekind(c) != Fencenone)
+		return Efenced;
 	if(stop){
 		lock(&c->joblk);
 		c->reclaimstop = 1;

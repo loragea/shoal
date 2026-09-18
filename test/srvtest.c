@@ -1267,7 +1267,7 @@ tctl(void)
 		{"drop dropprobe", nil,			"fenced"},
 		{"verify alpha", nil,			nil},
 		{"scrub",	nil,			nil},
-		{"reclaim",	nil,			"fenced"},
+		{"reclaim",	nil,			nil},
 		{"forget n1.1",	nil,			"fenced"},
 		{"newmonid 00112233445566778899aabbccddeeff",
 				nil,			nil},

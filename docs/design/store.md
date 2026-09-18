@@ -5860,20 +5860,28 @@ name a half that is not built; each says which.
     delete's space is reported only after a whole scrub, a `scrub
     stop` forfeits the walk with the pass that carried it, and no
     tier below a full pass can exercise it at all. *Made:* layer-a
-    §2.5 carries a `reclaim [start|stop]` row, admin and fenced, and
-    the walk is a background job like the other two — `jobstart`, a
-    `job=reclaim` line at `/jobs` with its `reclaimable=` and its
-    `err=`, the same twelve-pass cap (§14(30)), the same stop mark
-    and the same duty to test the shutdown between entries. D26
-    carries the decision and the wire change it is.
+    §2.5 carries a `reclaim [start|stop]` row, admin, with `start` in
+    the fenced set, and the walk is a background job like the other
+    two — `jobstart`, a `job=reclaim` line at `/jobs` with its
+    `reclaimable=` and its `err=`, the same twelve-pass cap
+    (§14(30)), the same stop mark and the same duty to test the
+    shutdown between entries. D26 carries the decision and the wire
+    change it is.
 
-    The row is **fenced** because §2.5's fenced set is "every verb
-    that mutates data or replication state" and this walk will: the
-    discard is what it is a walk for, and a fenced instance is one
-    whose map may be stale — which is the map `tombdays` and the
-    epoch are read from. It is fenced today, while it only counts, so
-    that the set does not have to change under a client when
-    condition 1 becomes answerable.
+    **`start` is fenced and `stop` is not.** §2.5's fenced set is
+    "every verb that mutates data or replication state" and the walk a
+    `start` asks for will: the discard is what it is a walk for, and a
+    fenced instance is one whose map may be stale — which is the map
+    `tombdays` and the epoch are read from. `start` is fenced today,
+    while it only counts, so that the set does not have to change
+    under a client when condition 1 becomes answerable. `stop` mutates
+    nothing — it raises a flag a running walk reads between two
+    entries — and an instance just fenced is where an operator most
+    wants the walk it started stopped, so it is answered while fenced
+    as `scrub stop` is. layer-a §2.5's fenced set names the two forms
+    apart for that reason, and the ctl row here is outside the set
+    with the gate for `start` in the verb's own body, which is how
+    `fence off`'s carve-out is built (§14(26)).
 
     **The timer, and its period.** A pass runs every `tombdays`/2,
     which is layer-a §8.3's own cadence for the `bump` that makes
@@ -5896,7 +5904,8 @@ name a half that is not built; each says which.
     tombstone snapshot per period and no durable change, since the
     walk discards nothing. The timer is not gated by the fence
     either: it starts no discard while condition 1 is unanswerable,
-    and the fence governs the verb, which is the surface §2.5 has.
+    and what the fence governs is `start`, which is the surface §2.5
+    has.
 
     **What it is not.** The timer proc holds none of §9's background
     jobs, because it makes no engine call — the pass it starts holds
