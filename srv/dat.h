@@ -463,7 +463,6 @@ struct Sstage
 	Stage	*g;		/* §5.5's engine handle, when it has one */
 	Sstage	*prev;
 	Sstage	*next;
-	Sstage	*nextdead;	/* the sweep's own list, off the lock */
 };
 
 struct Srvctx

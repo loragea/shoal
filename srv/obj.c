@@ -167,6 +167,24 @@ stageunlink(Srvctx *c, Sstage *s)
  * still discards (§3.6), and counted once: `openat' is how many
  * discards found the store still there, which every one of them must.
  */
+static int
+stagestrip(Srvctx *c, Sstage *s, Stage **gp)		/* under stagelk */
+{
+	*gp = nil;
+	stageunlink(c, s);
+	if(s->released)
+		return 0;
+	s->released = 1;
+	*gp = s->g;
+	s->g = nil;
+	s->ngrain = 0;
+	c->nstagedone++;
+	if(c->store == nil || c->closed)
+		return 0;
+	c->nstageopen++;
+	return 1;
+}
+
 static void
 stagerelease(Srvctx *c, Sstage *s)
 {
@@ -174,19 +192,7 @@ stagerelease(Srvctx *c, Sstage *s)
 	int open;
 
 	qlock(&c->stagelk);
-	stageunlink(c, s);
-	if(s->released){
-		qunlock(&c->stagelk);
-		return;
-	}
-	s->released = 1;
-	g = s->g;
-	s->g = nil;
-	s->ngrain = 0;
-	open = c->store != nil && !c->closed;
-	c->nstagedone++;
-	if(open)
-		c->nstageopen++;
+	open = stagestrip(c, s, &g);
 	qunlock(&c->stagelk);
 	if(g != nil && open)
 		stagediscard(g);
@@ -266,33 +272,46 @@ stagefreehook(void *a)
  * waiting for what an abandoned stage holds.  The handle is never
  * freed here — it is the fid's, and the clunk behind it is what frees
  * it (§3.6) — so the fid's next look finds it expired.
+ *
+ * Which is exactly why an expired stage is stripped WHERE IT IS FOUND,
+ * under stagelk, one at a time, rather than chained onto a list the
+ * sweep walks once the lock is down.  The sweep holds no reference to
+ * a stage and does not own it: in the gap between the lock and such a
+ * walk, a Tclunk of the staging fid runs the free hook on the service
+ * loop and the memory is gone.  Nothing of `s' is read after the
+ * unlock below — the pointer is tested against nil and no more — and
+ * the one thing the strip hands back is the engine handle, which is
+ * the context's the moment it leaves the stage and whose discard is an
+ * engine call and so may not be made under a leaf lock.
  */
 void
 srvstagesweep(Srvctx *c)
 {
-	Sstage *s, *next, *dead;
+	Sstage *s;
+	Stage *g;
 	vlong now, ms;
+	int open;
 
 	if(c->store != nil && !c->closed)
 		stagesweep(c->store, nsec());
 	ms = stagemsof(c);
-	now = nsec();
-	dead = nil;
-	qlock(&c->stagelk);
-	for(s = c->stages; s != nil; s = next){
-		next = s->next;
-		if(s->busy || now - s->last <= ms*1000000LL)
-			continue;
-		stageunlink(c, s);
-		s->dead = 1;
-		s->nextdead = dead;
-		dead = s;
-	}
-	qunlock(&c->stagelk);
-	for(s = dead; s != nil; s = next){
-		next = s->nextdead;
-		s->nextdead = nil;
-		stagerelease(c, s);
+	for(;;){
+		now = nsec();
+		g = nil;
+		open = 0;
+		qlock(&c->stagelk);
+		for(s = c->stages; s != nil; s = s->next)
+			if(!s->busy && now - s->last > ms*1000000LL)
+				break;
+		if(s != nil){
+			s->dead = 1;
+			open = stagestrip(c, s, &g);
+		}
+		qunlock(&c->stagelk);
+		if(s == nil)
+			break;
+		if(g != nil && open)
+			stagediscard(g);
 	}
 }
 

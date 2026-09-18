@@ -1325,6 +1325,88 @@ Out:
 }
 
 /*
+ * The sweep against the clunk of the fid it is sweeping.  The sweep
+ * runs on a queue proc and holds no reference to a stage, while the
+ * clunk runs on the service loop and frees whatever its fid holds, so
+ * the two meet on one Sstage: the sweep must be done with a stage
+ * before it lets go of the lock the clunk takes.  Both are driven
+ * here at once — the clunk is sent while the open that drives the
+ * sweep is still in flight — and what is asserted is that the stage
+ * is given back exactly once and the server serves on.
+ */
+static void
+tsweepclunk(void)
+{
+	char *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall t, r;
+	uvlong live, done;
+	ushort ot, ct;
+
+	clstage = "sweepclunk";
+	m = mkmap(Palone, Tblksz, Tobjmax, Tuuid);
+	d = newdisk(Tnslots);
+	if((ctx = startsrv(d, m, 0, 50)) == nil)
+		return;
+	mkobj(srvstore(ctx), "alpha", nil, 0);
+	mkobj(srvstore(ctx), "beta", nil, 0);
+	srvstagepoint(ctx, 1);
+
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, Nclient, &r) != Rattach){
+		fail("attach: %s", clerr(&r));
+		goto Out;
+	}
+	if(clwalkobj(&cl, Froot, Ffile, "obj", "alpha", &r) != Rwalk
+	|| clopen(&cl, Ffile, OWRITE, &r) != Ropen){
+		fail("open /obj/alpha: %s", clerr(&r));
+		goto Out;
+	}
+	srvstagepoint(ctx, 0);
+	if(clwalkobj(&cl, Froot, Ffile2, "obj", "beta", &r) != Rwalk){
+		fail("walk /obj/beta: %s", clerr(&r));
+		goto Out;
+	}
+	sleep(200);			/* the stage is idle past stagems */
+	memset(&t, 0, sizeof t);
+	t.type = Topen;
+	t.tag = ot = cltag(&cl);
+	t.fid = Ffile2;
+	t.mode = OREAD;
+	clput(&cl, &t);			/* the sweep runs at the head of this */
+	sleep(100);			/* ... and the clunk lands behind it */
+	memset(&t, 0, sizeof t);
+	t.type = Tclunk;
+	t.tag = ct = cltag(&cl);
+	t.fid = Ffile;
+	clput(&cl, &t);			/* and this frees the stage it holds */
+	if(clgettag(&cl, ct, &r) < 0 || r.type != Rclunk)
+		fail("the clunk of the swept fid: %s", clerr(&r));
+	cltagfree(&cl, ct);
+	if(clgettag(&cl, ot, &r) < 0 || r.type != Ropen)
+		fail("the open that drove the sweep: %s", clerr(&r));
+	cltagfree(&cl, ot);
+	srvstagecount(ctx, &live, &done, nil);
+	eqv("the sweep and the clunk leave no stage behind", live, 0);
+	eqv("... and give it back exactly once", done, 1);
+	/* the server is still serving: nothing of the list was torn */
+	if(clwalkobj(&cl, Froot, Ffile, "obj", "alpha", &r) != Rwalk
+	|| clopen(&cl, Ffile, OWRITE, &r) != Ropen)
+		fail("open /obj/alpha after the sweep: %s", clerr(&r));
+	clclunk(&cl, Ffile, &r);
+	clclunk(&cl, Ffile2, &r);
+	clclunk(&cl, Froot, &r);
+Out:
+	srvstagepoint(ctx, 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * layer-a §5.4.1 step 7's discard half: a Tflush discards the STAGE
  * THE FID HOLDS, whichever of the fid's requests was flushed.  Two
  * requests are outstanding on one fid — one running and held at its
@@ -1802,6 +1884,7 @@ threadmain(int argc, char **argv)
 	tdiskfull();
 	tstage();
 	tstagesweep();
+	tsweepclunk();
 	tstageflush();
 	tstagecommit();
 	tstagelook();
