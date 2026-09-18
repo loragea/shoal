@@ -6029,7 +6029,12 @@ other files cite, so a gap is cheaper than a renumbering.
     256 lines, and 64 when `n=` is absent, before the `msize` clamp
     applies at all; a line that would cross the budget is dropped
     whole rather than truncated, `more=1` says so, and the next page
-    re-renders it after `after=<the last oid sent>`. An `n=0` answers
+    re-renders it after `after=<the last oid sent>`. Nothing is held
+    between pages: each is a fresh scan of the index, run on the
+    reserved queue and taking the engine's state lock a chunk at a
+    time (§9), so a SEQUENCE of pages is no more a snapshot than one
+    page is (§14(17)) — the index may move under a pager, which is
+    what §5.6 has a reconcile pass tolerate. An `n=0` answers
     `lines=0 more=1`, a page of nothing being unable to say the
     inventory is over. An `op=get` whose `n` does not fit one `Tread`
     of the negotiated `msize` is refused `bad ctl` rather than
