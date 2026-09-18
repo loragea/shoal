@@ -2282,6 +2282,94 @@ Out:
 	free(m);
 }
 
+/*
+ * D16's shutdown with the peer channels' state still live: a /repl fid
+ * holding a staged transfer, a /rpc fid holding a response nothing has
+ * read, and a chunk still on a queue when the connection drops.  Every
+ * other case here clunks its fids first; this one hangs up on them.
+ *
+ * What the shutdown owes is store.md §9's order: the drain, then every
+ * live fid's auxclose while the store is still open, then the close.
+ * So the stage must be given back — `live' 0 — and every release must
+ * have found the store open, which is `done' equal to `openat' and
+ * both above zero (dat.h's Sstage).
+ */
+static void
+tshutlive(void)
+{
+	char *m, cs[Csumhexlen], d0[2*Blkdlen+1], *h0;
+	uchar want[2*Tblksz];
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall t, r;
+	uvlong live, done, openat, np0, nd0, np, nd;
+	long hn;
+	int i;
+
+	clstage = "shutlive";
+	m = mkmap();
+	d = newdisk(Tnslots, nil);
+	if((ctx = startsrv(d, m, 0, 60000)) == nil)	/* no idle sweep */
+		return;
+	for(i = 0; i < sizeof want; i++)
+		want[i] = i*5 + 1;
+	ocsum(cs, want, sizeof want);
+	dcs(d0, want, Tblksz);
+	mkobj(srvstore(ctx), "alpha", "hello", 5, 2);
+	clstart(&cl, ctx, Clmsize);
+	if(!chopen(&cl, ctx, Nrepl, Froot, Frepl, Frpc))
+		goto Out;
+	h0 = smprint("op=full oid=beta epoch=7 ver=3 wepoch=7 len=%d off=0"
+		" n=%d dcsum=%s csum=%s final=0", 2*Tblksz, Tblksz, d0, cs);
+	eqs("a transfer left staged at the shutdown",
+		repler(&cl, Frepl, h0, want, Tblksz), "ok");
+	/* a response prepared and never read (§5.6) */
+	if(chanop(&cl, Frpc, "op=meta oid=alpha epoch=7", nil, 0, &r) != Rwrite)
+		fail("op=meta: %s", clerr(&r));
+	srvstagecount(ctx, &live, &done, &openat);
+	eqv("the stage is the fid's", live, 1);
+	eqv("... and nothing has been released", done, 0);
+
+	/* a chunk still on its queue when the connection drops */
+	waitidle(ctx, &np0, &nd0);
+	srvhook(ctx, "objhold", 1);
+	memset(&t, 0, sizeof t);
+	t.type = Twrite;
+	t.tag = cltag(&cl);
+	t.fid = Frepl;
+	hn = strlen(h0);
+	t.count = hn + 1 + Tblksz;
+	if((t.data = malloc(t.count)) == nil)
+		sysfatal("malloc: %r");
+	memmove(t.data, h0, hn);
+	t.data[hn] = '\n';
+	memmove(t.data + hn + 1, want, Tblksz);
+	clput(&cl, &t);
+	waitpush(ctx, np0, 1, &np, &nd);
+	free(t.data);
+	clhangup(&cl);
+	sleep(100);
+	srvhook(ctx, "objhold", 0);	/* the shutdown clears it anyway */
+	if(!clwaitend(&cl, 10000))
+		fail("the service loop did not end");
+	clclose(&cl);
+	srvstagecount(ctx, &live, &done, &openat);
+	eqv("the shutdown released the stage the fid still held", live, 0);
+	istrue("... and there was one to release", done >= 1);
+	eqv("... and every release found the store open", done, openat);
+	free(h0);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+	return;
+Out:
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
 void
 threadmain(int argc, char **argv)
 {
@@ -2308,6 +2396,7 @@ threadmain(int argc, char **argv)
 	tlist();
 	tstaged();
 	tverifybad();
+	tshutlive();
 
 	clwatchoff();
 	if(fails > 0){
