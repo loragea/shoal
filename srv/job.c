@@ -117,9 +117,10 @@ struct Qwork
 static char Eshutting[] = "shoalsrv: shutting down";
 static char Enomem[] = "shoalsrv: out of memory";
 static char Ejobs[] = "shoalsrv: too many jobs";
-static char Estopping[] = "shoalsrv: scrub stopping";
+static char Escrubstopping[] = "shoalsrv: scrub stopping";
 
 static void	scrubpass(Sjob*);
+static void	reclaimpass(Sjob*);
 static void	forgetpass(Sjob*);
 static ulong	scrubrate(Srvctx*);
 
@@ -377,21 +378,27 @@ scrubrate(Srvctx *c)
 	return n != 0 ? n : Scrubratedflt;
 }
 
+/*
+ * What ends a pass early: the shutdown, or that pass's own stop flag.
+ * The flag is named rather than read straight, because a pass that can
+ * be stopped has one of its own — `scrub stop' names the scrub's walk
+ * and nothing else — and the reader is the same either way.
+ */
 static int
-scrubstopped(Srvctx *c)
+stopflag(Srvctx *c, int *fl)
 {
 	int n;
 
 	lock(&c->joblk);
-	n = c->scrubstop;
+	n = *fl;
 	unlock(&c->joblk);
 	return n;
 }
 
 static int
-passover(Srvctx *c)
+scrubover(Srvctx *c)
 {
-	return srvstopping(c) || scrubstopped(c);
+	return srvstopping(c) || stopflag(c, &c->scrubstop);
 }
 
 /*
@@ -427,7 +434,7 @@ scrubpace(Srvctx *c, uvlong *bytes, vlong *t0, ulong *last, uvlong len)
 	*bytes += len + Scrubfloor;
 	want = ((vlong)*bytes * 1000) / ((vlong)rate * 1024);
 	while(nsec()/1000000 - *t0 < want){
-		if(passover(c))
+		if(scrubover(c))
 			return;
 		sleep(Scrubslicems);
 	}
@@ -471,9 +478,10 @@ scrubpace(Srvctx *c, uvlong *bytes, vlong *t0, ulong *last, uvlong len)
  * already makes that pass the place other whole-index work rides on.
  */
 static void
-reclaim(Srvctx *c, Sjob *j)
+reclaimpass(Sjob *j)
 {
 	char buf[ERRMAX];
+	Srvctx *c;
 	Objsnap *sn;
 	Objinfo oi;
 	uchar oid[Oidmax];
@@ -482,6 +490,7 @@ reclaim(Srvctx *c, Sjob *j)
 	ulong i, n;
 	int oidlen, rc;
 
+	c = j->ctx;
 	cutoff = time(0) - (vlong)c->map->tombdays*86400;
 	epoch = c->map->epoch;
 	if((sn = srvsnapopen(c->store, Snaptomb, buf, sizeof buf)) == nil){
@@ -502,7 +511,7 @@ reclaim(Srvctx *c, Sjob *j)
 		 * — what an operator has to know is that the number is a
 		 * prefix, not which of the two cut it short.
 		 */
-		if(passover(c)){
+		if(scrubover(c)){
 			werrstr("shoalsrv: stopped");
 			joberr(j);
 			break;
@@ -556,7 +565,7 @@ scrubpass(Sjob *j)
 	lastrate = scrubrate(c);
 	t0 = nsec()/1000000;
 	for(slot = 0; slot < st.nslots; slot++){
-		if(passover(c))
+		if(scrubover(c))
 			break;
 		rc = objslot(c->store, (ulong)slot, oid, &oidlen, &oi);
 		if(rc >= 0 && srvslotfail(c, slot)){
@@ -612,8 +621,8 @@ scrubpass(Sjob *j)
 	 * live one of the three for a walk that ran to the end with an
 	 * object it could not read.
 	 */
-	if(slot >= st.nslots && !passover(c) && j->err[0] == 0)
-		reclaim(c, j);
+	if(slot >= st.nslots && !scrubover(c) && j->err[0] == 0)
+		reclaimpass(j);
 }
 
 /*
@@ -757,7 +766,7 @@ srvctlscrub(Srvctx *c, Sfid *f, int argc, char **argv)
 		 */
 		if(c->scrubstop){
 			unlock(&c->joblk);
-			return Estopping;
+			return Escrubstopping;
 		}
 		start = 0;
 	}
