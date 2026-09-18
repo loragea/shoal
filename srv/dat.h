@@ -592,6 +592,21 @@ extern int nsrvctls;
  *		handler is inside a step on it, that someone is the
  *		handler itself.
  *
+ *		auxclose is the exception to the NOBODY ELSE, and it is
+ *		one because it cannot land there.  stageclosehook
+ *		releases whatever the slot holds, busy or not: the clunk
+ *		and the shutdown are the last hands an engine stage can be
+ *		given back by (store.md §9), so one that waited on a
+ *		handler's look would be one the store outlives.  Neither
+ *		caller runs while a chunk is inside.  lib9p holds the Fid
+ *		across an outstanding Twrite, so the destroy behind a
+ *		Tclunk runs only once that chunk has responded; the
+ *		shutdown's own sweep runs behind srvqdrain, with every
+ *		request in flight already finished (srv.c); and the third
+ *		caller, the create cell's give-back, runs over an
+ *		enumeration's snapshot and never over a stage (tree.c's
+ *		srvfidgive).
+ *
  *		`busy' says a handler is inside a step on the stage, handle
  *		or NOT: the opening chunk of a transfer is busy from the
  *		moment it stages until the arm that fills `g', and
