@@ -72,11 +72,24 @@
  * whose cursor and snapshot the next read needs (§14(33)), and
  * nothing for a fid whose open completed, which lib9p has given an
  * omode.
+ *
+ * `opener' is which Topen that was.  Two Topens can be outstanding on
+ * one fid — lib9p refuses the second from Fid.omode, which its `ropen'
+ * sets only once the first has answered, and this open is offloaded —
+ * so the hook is not the Topen's simply by being a Topen's: a flush of
+ * the SECOND would otherwise free the FIRST's snapshot and leave the
+ * fid open with nothing to read.  The hook discards only for the
+ * request that installed what is there.  The pointer is compared and
+ * never followed, and it cannot be a stale one that matches: the only
+ * exits from the open cell after the install are the flush, which
+ * discards here, and success, after which lib9p has set an omode and
+ * the test above has already answered.
  */
 typedef struct Objdir Objdir;
 struct Objdir
 {
 	Objsnap	*sn;
+	Req	*opener;	/* the Topen that installed it (objdirflush) */
 	uvlong	off;		/* the byte offset the cursor stands at */
 	ulong	pos;		/* the snapshot position that offset names */
 	uvlong	prevoff;	/* where the read before this one started */
@@ -247,16 +260,29 @@ objdirfree(void *a)
 /*
  * layer-a §5.4.1 step 7 on a fid of this row, which is where a flushed
  * OPEN gives its snapshot back (above).  It runs under the fid's state
- * lock, from srvqdone on the queue proc that is unwinding the open, so
- * it does the give-back inline rather than through srvfidgive, which
- * takes that lock itself.
+ * lock — so it does the give-back inline rather than through
+ * srvfidgive, which takes that lock itself — and from either of step
+ * 7's two call sites: srvqdone, on the queue proc that is unwinding a
+ * request it was carrying, and srvqflush, on the SERVICE LOOP, for a
+ * request flushed while it was still queued.
  *
- * The two tests are what keep it to the open it is for.  A Tread is
+ * The give-back makes an engine call, objsnapclose, which is one of
+ * store.md §9's three and therefore one a hook may make from either
+ * site (dat.h): it takes the engine's state lock under the fid's, an
+ * order nothing runs the other way, and store.md §6 rule 2 keeps that
+ * lock off the device, so the loop waits for one queue proc's hold of
+ * it and no longer.
+ *
+ * The three tests are what keep it to the open it is for.  A Tread is
  * not it: a flushed read has advanced the cursor over a snapshot the
  * next read continues from, and discarding it would turn a flush into
  * a clunk.  An omode that is not -1 is not it either: lib9p sets the
  * mode in `ropen', which it runs only after a successful open, so a
  * fid that has one held this state before the flushed request arrived.
+ * Nor is a Topen that installed nothing: two of them can be
+ * outstanding on one fid, and the second — flushed while it was still
+ * queued, so that it never ran — would otherwise give the first's
+ * snapshot back and leave the fid open with nothing to read.
  */
 static void
 objdirflush(Sfid *f, Req *r)			/* f->lk held */
@@ -267,6 +293,8 @@ objdirflush(Sfid *f, Req *r)			/* f->lk held */
 		return;
 	if(f->auxfree != objdirfree || (d = f->aux) == nil)
 		return;
+	if(d->opener != r)
+		return;
 	f->aux = nil;
 	f->auxflush = nil;
 	f->auxclose = nil;
@@ -276,10 +304,41 @@ objdirflush(Sfid *f, Req *r)			/* f->lk held */
 }
 
 /*
+ * Does this fid hold a listing's state?  obj.c's create cell asks
+ * before it moves the fid: a Tcreate pipelined with a Topen on one
+ * /obj fid reaches both cells, and this is how the create sees that
+ * the open got there first (dat.h).
+ */
+int
+srvobjdirheld(Sfid *f)				/* f->lk held */
+{
+	return f->aux != nil && f->auxfree == objdirfree;
+}
+
+/*
+ * Is this fid still one of the two directory rows', and is it the
+ * open's to write?  A create that has moved the fid to Qobjfile, and
+ * one that is part-way through moving it, are the two answers that
+ * make this open the second request on a fid 9P gives one (dat.h).
+ */
+static int
+objdirfid(Sfid *f)				/* f->lk held */
+{
+	return !f->moving && (f->file == Qobj || f->file == Qmeta);
+}
+
+/*
  * The /obj and /meta open, on the reserved queue.  The fid gives back
  * whatever it was holding first: a fid holds one state, and taking
  * the snapshot without giving the old one back would lose its hooks
  * (dat.h).
+ *
+ * The fid is tested twice against the create cell, before the
+ * give-back and again under the lock that installs: a create claims
+ * the fid before its engine work, so a claim raised after the first
+ * test is caught by the second and the two cells cannot both win.
+ * The give-back that ran in between costs nothing — the create that
+ * raised the claim gives the same state back itself.
  */
 static void
 objdiropenq(Req *r)
@@ -289,6 +348,7 @@ objdiropenq(Req *r)
 	Sfid *f;
 	Objdir *d;
 	Objsnap *sn;
+	int ok;
 
 	if(srvqcheck(r)){
 		srvqdone(r, nil);
@@ -296,6 +356,13 @@ objdiropenq(Req *r)
 	}
 	c = r->srv->aux;
 	f = r->fid->aux;
+	qlock(&f->lk);
+	ok = objdirfid(f);
+	qunlock(&f->lk);
+	if(!ok){
+		srvqdone(r, Ebotch);
+		return;
+	}
 	if((sn = srvsnapopen(c->store, Snaplive, buf, sizeof buf)) == nil){
 		srvqdone(r, buf);
 		return;
@@ -306,8 +373,15 @@ objdiropenq(Req *r)
 		return;
 	}
 	d->sn = sn;
+	d->opener = r;
 	srvfidgive(f);
 	qlock(&f->lk);
+	if(!objdirfid(f)){
+		qunlock(&f->lk);
+		objdirfree(d);
+		srvqdone(r, Ebotch);
+		return;
+	}
 	f->aux = d;
 	f->auxflush = objdirflush;
 	f->auxclose = nil;
@@ -362,9 +436,32 @@ dirfree(Dir *d)
 
 /*
  * The directory read, on the reserved queue.  The fid's state lock is
- * held across the whole of it, which is what dat.h asks of a handler
- * that works on what aux names: a clunk or a walk that moves the fid
- * then waits for this read rather than freeing the snapshot under it.
+ * held over the cursor and NOT over the entry walk between the two
+ * holds of it: the walk is up to msize/entrysize objsnapent calls,
+ * each taking the engine's state lock, and the service loop takes this
+ * fid's state lock to perform step 7 for another request on the same
+ * fid (queue.c) — which dat.h forbids the loop to wait on.  So the
+ * snapshot and the cursor are lifted under the lock, the walk runs
+ * over them unlocked, and the lock is retaken to commit the cursor.
+ *
+ * What makes the walk safe unlocked is that neither the Objdir nor its
+ * snapshot can be given back while this read is in flight:
+ *
+ *	auxfree is the only thing that closes the snapshot (above), and
+ *		it runs from the clunk or the moving walk — lib9p holds a
+ *		reference to this request's Fid until the request is
+ *		freed, so destroyfid cannot run inside this handler, and a
+ *		walk cannot move a fid that is OPEN, which this one is or
+ *		lib9p would not have reached a read cell at all.
+ *	auxflush frees it for a flushed OPEN alone (objdirflush), and no
+ *		Topen can be outstanding on an open fid either: lib9p
+ *		refuses one from Fid.omode.  A read's own step 7 does not
+ *		free it, by the same test.
+ *	the shutdown's sweep runs after the drain, which this request is
+ *		part of, and this row's auxclose is nil in any case.
+ *
+ * Two reads on one fid cannot overlap, the reserved queue having one
+ * proc, so the cursor has one writer between its two holds of the lock.
  *
  * An entry that has gone is skipped and not listed, so no tombstone
  * appears in /obj and nothing is listed twice; the cursor advances
@@ -391,11 +488,12 @@ objdirreadq(Req *r)
 	Srvctx *c;
 	Sfid *f;
 	Objdir *d;
+	Objsnap *sn;
 	Objinfo oi;
 	Dir dir;
 	uchar oid[Oidmax], *p;
 	uvlong soff;
-	ulong nent, spos;
+	ulong nent, spos, pos;
 	long n, m, cnt;
 	int oidlen, rc;
 
@@ -420,16 +518,20 @@ objdirreadq(Req *r)
 		d->pos = d->prevpos;
 	}else if(r->ifcall.offset != d->off)
 		e = Eseek;
+	sn = d->sn;
+	soff = d->off;
+	spos = d->pos;
+	qunlock(&f->lk);
 	n = 0;
 	if(e == nil){
-		soff = d->off;
-		spos = d->pos;
+		pos = spos;
 		cnt = r->ifcall.count;
-		nent = objsnapcount(d->sn);
+		nent = objsnapcount(sn);
 		p = (uchar*)r->ofcall.data;
-		while(d->pos < nent){
-			rc = objsnapent(d->sn, d->pos, oid, &oidlen, &oi);
-			if(rc >= 0 && srvslotfail(c, d->pos)){
+		while(pos < nent){
+			srvdirhold(r, pos);
+			rc = objsnapent(sn, pos, oid, &oidlen, &oi);
+			if(rc >= 0 && srvslotfail(c, pos)){
 				werrstr("snapshot entry refused at the point");
 				rc = -1;
 			}
@@ -438,26 +540,28 @@ objdirreadq(Req *r)
 				e = buf;
 				break;
 			}
-			d->pos++;
+			pos++;
 			if(rc == 0)
 				continue;
 			objdirent(c, f, oid, oidlen, &oi, &dir);
 			m = convD2M(&dir, p+n, cnt-n);
 			dirfree(&dir);
 			if(m <= BIT16SZ){
-				d->pos--;
+				pos--;
 				break;
 			}
 			n += m;
 		}
+		qlock(&f->lk);
 		if(e == nil){
 			d->prevoff = soff;
 			d->prevpos = spos;
 			d->off = soff + n;
+			d->pos = pos;
 		}else
 			d->pos = spos;
+		qunlock(&f->lk);
 	}
-	qunlock(&f->lk);
 	srvqexit(r);
 	if(e != nil){
 		srvqdone(r, e);

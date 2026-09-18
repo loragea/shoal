@@ -37,9 +37,10 @@ extern char Eunknownctl[];
 extern char Ebadaname[];
 extern char Ebadmap[];
 
-/* not §2.6's: the two `interrupted' causes (err.c) */
+/* not §2.6's: the two `interrupted' causes, and lib9p's own (err.c) */
 extern char Einterrupted[];
 extern char Edevintr[];
+extern char Ebotch[];
 
 /* text.c */
 void	textread(Req*, Text*);
@@ -55,12 +56,14 @@ void	srvqpushany(Srvctx*, Req*, void (*)(Req*));
 void	srvqflush(Req*);
 Qreq*	srvqreq(Req*);
 int	srvqcheck(Req*);
+void	srvqhold(Req*, uvlong*);
 void	srvqexit(Req*);
 void	srvqwalkhold(Req*);
 void	srvqanyexit(Srvctx*);
 void	srvjobhold(Srvctx*);
 int	srvslotfail(Srvctx*, uvlong slot);
 void	srvreclaimhold(Srvctx*, uvlong i);
+void	srvdirhold(Req*, uvlong i);
 void	srvqdone(Req*, char *err);
 void	srvqended(Qreq*);
 void	srvqdrain(Srvctx*);
@@ -107,6 +110,7 @@ Objsnap* srvsnapopen(Store*, int kinds, char *buf, int nbuf);
 void	srvopenq(Req*);
 void	srvobjdiropen(Req*);
 void	srvobjdirread(Req*);
+int	srvobjdirheld(Sfid*);
 char*	srvtombstext(Srvctx*, Sfid*, Text*);
 char*	srvadverttext(Srvctx*, Sfid*, Text*);
 
@@ -118,3 +122,15 @@ char*	srvctlforget(Srvctx*, Sfid*, int, char**);
 /* ctl.c */
 void	srvctlwrite(Req*);
 int	srvfencekind(Srvctx*);
+
+/* obj.c: layer-a §2.4's object I/O, and the per-fid stage (dat.h) */
+void	srvobjopen(Req*);
+void	srvobjread(Req*);
+void	srvobjwrite(Req*);
+void	srvobjremove(Req*);
+void	srvobjwstat(Req*);
+void	srvobjcreate(Req*);
+void	srvmetaopen(Req*);
+char*	srvmetatext(Srvctx*, Sfid*, Text*);
+void	srvstagesweep(Srvctx*);
+void	srvstagedrain(Srvctx*);

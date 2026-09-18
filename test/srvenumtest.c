@@ -90,7 +90,7 @@ enum
 	 * threadmain.  Every check this file makes is unconditional once
 	 * its case is entered, so the number is fixed.
 	 */
-	Nchecks	= 215,
+	Nchecks	= 225,
 
 	/* fids the cases use */
 	Froot	= 1,
@@ -1169,6 +1169,117 @@ Out:
 }
 
 /*
+ * The service loop does not wait for a directory read.
+ *
+ * A Tflush of a request that is still QUEUED has step 7 performed on
+ * the service loop (srv/queue.c), and step 7 takes the flushed fid's
+ * state lock.  The directory read works over that same fid's state —
+ * a whole listing's worth of objsnapent calls, each taking the
+ * engine's lock — and if it held the fid's lock across that walk the
+ * loop would block behind it for the length of the walk, which dat.h
+ * forbids: nothing a queue proc holds may stop the loop.  So the read
+ * lifts the snapshot and the cursor under the lock, walks unlocked,
+ * and retakes the lock to commit.
+ *
+ * §13's `dirhold' point parks the read inside that walk, with no lock
+ * of the fid's held.  A second read on the same fid then waits on the
+ * reserved queue — one proc — and flushing THAT one is the loop-side
+ * step 7 this case is about.  The reply order is the answer: the
+ * flushed sibling and its Rflush first, the held read last.
+ *
+ * The rescue proc is what keeps a failure a failure rather than a
+ * wedged program: a loop stalled behind the walk clears nothing, so
+ * the point is cleared from a proc of its own and the three replies
+ * still arrive — in the other order.
+ */
+static Srvctx *dirrctx;
+
+static void
+dirrescue(void*)
+{
+	sleep(1500);
+	srvhook(dirrctx, "dirhold", 0);
+	threadexits(nil);
+}
+
+static void
+tdirstall(void)
+{
+	char name[32], *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall t, r;
+	char *w[1];
+	ushort ta, tb, tf, tg[3];
+	int i, ty[3];
+
+	clstage = "dirstall";
+	m = mkmap();
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4, 0)) == nil)
+		return;
+	for(i = 0; i < 20; i++){
+		snprint(name, sizeof name, "obj%.2d", i);
+		mkobj(srvstore(ctx), name, nil, 0, 1);
+	}
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
+		fail("attach: %s", clerr(&r));
+		goto Out;
+	}
+	w[0] = "obj";
+	if(clopenpath(&cl, Froot, Fdir, 1, w, OREAD, &r) != Ropen){
+		fail("open /obj: %s", clerr(&r));
+		goto Out;
+	}
+
+	srvhook(ctx, "dirhold", 3);	/* held before the third entry */
+	memset(&t, 0, sizeof t);
+	t.type = Tread;
+	t.tag = ta = cltag(&cl);
+	t.fid = Fdir;
+	t.offset = 0;
+	t.count = 4096;
+	clput(&cl, &t);
+	sleep(200);			/* it is now held inside the walk */
+	t.tag = tb = cltag(&cl);
+	clput(&cl, &t);
+	sleep(200);			/* ... and this one is queued behind it */
+
+	dirrctx = ctx;
+	if(proccreate(dirrescue, nil, 8192) < 0)
+		sysfatal("proccreate: %r");
+	memset(&t, 0, sizeof t);
+	t.type = Tflush;
+	t.tag = tf = cltag(&cl);
+	t.oldtag = tb;
+	clput(&cl, &t);
+	for(i = 0; i < 3; i++){
+		if(clget(&cl, &r) < 0){
+			fail("only %d of the three replies arrived", i);
+			goto Out;
+		}
+		tg[i] = r.tag;
+		ty[i] = r.type;
+		cltagfree(&cl, r.tag);
+	}
+	istrue("the flushed sibling is answered while the read is held",
+		tg[0] == tb && ty[0] == Rerror);
+	istrue("and its Rflush comes after it",
+		tg[1] == tf && ty[1] == Rflush);
+	istrue("the held read is the last of the three",
+		tg[2] == ta && ty[2] == Rread);
+	clclunk(&cl, Fdir, &r);
+Out:
+	srvhook(ctx, "dirhold", 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * A flushed directory OPEN holds nothing back.
  *
  * The open takes one of store.md §9's `objsnapmax' snapshots and
@@ -1248,6 +1359,116 @@ tdiropenflush(void)
 		fail("the second open after a flushed one: %s", clerr(&r));
 	clclunk(&cl, Fdir2, &r);
 	clclunk(&cl, Fdir3, &r);
+	clclunk(&cl, Fdir, &r);
+Out:
+	srvhook(ctx, "objexit", 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
+ * A flushed SECOND Topen leaves the FIRST open's snapshot alone.
+ *
+ * Two Topens can be outstanding on one /obj fid: lib9p refuses the
+ * second from Fid.omode, which its `ropen' sets only once the first
+ * has answered, and this row's open is offloaded to a queue.  The
+ * second waits on that queue — one proc — so flushing it is the
+ * loop-side step 7, which calls this fid's flush hook with a request
+ * that installed nothing.  A hook keyed to the message type alone
+ * would give the FIRST open's snapshot back there, and the fid would
+ * open with nothing on it: every Tread answering `not built'.
+ *
+ * The listing read afterwards is what says the snapshot survived.
+ */
+static void
+tdiropen2(void)
+{
+	char buf[16*1024], name[32], *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall t, r;
+	char *w[1];
+	vlong off;
+	long n;
+	ushort ta, tb, tf;
+	int i;
+
+	clstage = "diropen2";
+	m = mkmap();
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4, 0)) == nil)
+		return;
+	for(i = 0; i < 10; i++){
+		snprint(name, sizeof name, "obj%.2d", i);
+		mkobj(srvstore(ctx), name, nil, 0, 1);
+	}
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
+		fail("attach: %s", clerr(&r));
+		goto Out;
+	}
+	w[0] = "obj";
+	if(clwalk(&cl, Froot, Fdir, 1, w, &r) != Rwalk){
+		fail("walk to /obj: %s", clerr(&r));
+		goto Out;
+	}
+
+	/* the first open, held at its exit with its snapshot installed */
+	srvhook(ctx, "objexit", 1);
+	memset(&t, 0, sizeof t);
+	t.type = Topen;
+	t.tag = ta = cltag(&cl);
+	t.fid = Fdir;
+	t.mode = OREAD;
+	clput(&cl, &t);
+	sleep(200);			/* it is now held at its exit */
+	t.tag = tb = cltag(&cl);
+	clput(&cl, &t);
+	sleep(200);			/* ... and the second is queued behind it */
+
+	/* the second is flushed while it is still queued: step 7 on the loop */
+	memset(&t, 0, sizeof t);
+	t.type = Tflush;
+	t.tag = tf = cltag(&cl);
+	t.oldtag = tb;
+	clput(&cl, &t);
+	checks++;
+	if(clgettag(&cl, tb, &r) != Rerror
+	|| strcmp(r.ename, "interrupted") != 0)
+		fail("the second open, flushed while queued: type %d %s",
+			r.type, clerr(&r));
+	cltagfree(&cl, tb);
+	checks++;
+	if(clget(&cl, &r) != Rflush || r.tag != tf)
+		fail("the Rflush after it: type %d tag %ud", r.type, r.tag);
+	cltagfree(&cl, tf);
+	srvhook(ctx, "objexit", 0);
+	checks++;
+	if(clgettag(&cl, ta, &r) != Ropen)
+		fail("the first open: %s", clerr(&r));
+	cltagfree(&cl, ta);
+
+	/* the first open's snapshot is still there, and still lists */
+	n = 0;
+	off = 0;
+	for(i = 0; i < 64; i++){
+		if(clread(&cl, Fdir, off, 4096, &r) != Rread){
+			fail("the listing after the flushed second open: %s",
+				clerr(&r));
+			goto Out;
+		}
+		if(r.count == 0)
+			break;
+		if(n + r.count > sizeof buf)
+			break;
+		memmove(buf+n, r.data, r.count);
+		n += r.count;
+		off += r.count;
+	}
+	wholedir("the first open's listing is whole", buf, n, 10);
 	clclunk(&cl, Fdir, &r);
 Out:
 	srvhook(ctx, "objexit", 0);
@@ -2319,7 +2540,7 @@ Out:
 static void
 tscrubctl(void)
 {
-	char buf[16*1024], name[32], line[64], *m;
+	char buf[16*1024], name[32], line[64], val[64], *m;
 	uchar oid[Oidmax];
 	Objinfo oi;
 	Srvctx *ctx;
@@ -2423,6 +2644,32 @@ tscrubctl(void)
 		sleep(20);
 	clclunk(&cl, Ffile, &r);
 	clclunk(&cl, Froot2, &r);
+
+	/*
+	 * A pass parked at the END of its run, with `scrub stop' raised
+	 * over it.  The pass has walked its index and is held at §13's
+	 * jobhold point with its record still listed, so the job the next
+	 * `scrub start' asks for is neither running nor stopping: it is
+	 * over.  jobproc gives `scrubbing' back before it parks for
+	 * exactly that, and a `start' refused `scrub stopping' here would
+	 * be naming a pass that had already finished.
+	 */
+	srvhook(ctx, "jobhold", 1);
+	if(clwrite(&cl, Fctl, 0, "scrub start rate=1000000", &r) != Rwrite)
+		fail("a scrub whose walk ends at the hold: %s", clerr(&r));
+	if(jobparked(&cl, "done", val, sizeof val) == nil)
+		fail("the pass never reached its hold");
+	sleep(200);			/* and is past its reclaim walk */
+	if(clwrite(&cl, Fctl, 0, "scrub stop", &r) != Rwrite)
+		fail("scrub stop over a parked pass: %s", clerr(&r));
+	checks++;
+	if(clwrite(&cl, Fctl, 0, "scrub start", &r) != Rwrite)
+		fail("a scrub start over a pass that has finished: %s",
+			clerr(&r));
+	srvhook(ctx, "jobhold", 0);
+	for(i = 0; i < 400 && jobrunning(&cl); i++)
+		sleep(20);
+	istrue("the passes over that index ended", !jobrunning(&cl));
 
 	/* fill the job cap, so that the next `scrub start' is refused */
 	srvhook(ctx, "jobhold", 1);
@@ -2750,6 +2997,13 @@ tshutdown(void)
 	w[0] = "obj";
 	if(clopenpath(&cl, Froot, Fdir, 1, w, OREAD, &r) != Ropen)
 		fail("open /obj: %s", clerr(&r));
+	/*
+	 * The job the shutdown is about to wait for, read while the pass
+	 * is still holding it.  The same count after clstop is taken once
+	 * jobwait has returned and so cannot be anything but 0; this is
+	 * the reading that can.
+	 */
+	eqv("the running pass holds a job", srvjobcount(ctx), 1);
 Out:
 	clstop(&cl);			/* the loop ends; the shutdown runs */
 	eqv("the store was closed once", freedseen, 1);
@@ -2776,7 +3030,9 @@ threadmain(int argc, char **argv)
 	tdir();
 	tdircursor();
 	tdirflush();
+	tdirstall();
 	tdiropenflush();
+	tdiropen2();
 	tsnaprefuse();
 	tscrub();
 	tlostslot();

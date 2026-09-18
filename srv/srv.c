@@ -420,7 +420,10 @@ jobwait(Srvctx *c)
  * Nothing new is taken on from here — the loop has ended and
  * srvjobstart refuses — and the §13 points that can hold a request are
  * cleared first, so a request left holding cannot hold the drain up.
- * The cell point goes with them: its cells are the file table's, which
+ * The same clearing is what frees a pass parked at `jobhold' before
+ * jobwait reaches it, which matters more there: that wait is unbounded
+ * by design, because §9 forbids closing the store while a pass is
+ * still inside the engine (srv.h).  The cell point goes with them: its cells are the file table's, which
  * is the program's and not this context's, so a context that ends
  * without clearing them would leave them to the next server started in
  * the same program.
@@ -432,6 +435,14 @@ jobwait(Srvctx *c)
  * may call the engine, and before the store closes, because that is
  * the whole point of it.  It runs before `closed' is set for the same
  * reason: that flag is what tells the hooks the engine has gone.
+ *
+ * A stage that step 7 stripped from its fid is in no fid's slot to be
+ * found by that sweep: the flush hook may make no engine call, so it
+ * parks the handle for obj.c's drain instead (dat.h).  srvstagedrain
+ * therefore runs behind the sweep and still before `closed', which is
+ * the last moment §9 allows the release; what a drain after that point
+ * would leave is memory the process frees and an engine stage nothing
+ * can give back.
  *
  * It cannot deadlock against a clunk: srvfidsclose sweeps with the
  * registry lock held and a hook may call the engine but never the
@@ -457,6 +468,7 @@ srvshutdown(Srvctx *c)
 	srvqdrain(c);
 	jobwait(c);
 	srvfidsclose(c);
+	srvstagedrain(c);		/* the last moment §9 allows one */
 	c->closed = 1;
 	srvqfree(c);
 	if(c->store != nil){

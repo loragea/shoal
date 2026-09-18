@@ -144,7 +144,15 @@ struct Srvcfg
 	long	maplen;
 	int	nqueue;		/* -q; 0 takes Nqueuedflt */
 	int	noflush;	/* -w, store.md §3.2, reported in /status */
-	Storecfg store;		/* the engine's; spawn is filled in here */
+	/*
+	 * The engine's; spawn is filled in here.  Two of its stage fields
+	 * are read by this library as well: `stagems' is how long a stage
+	 * this server holds may be idle, and `stagemax' is the bound the
+	 * object rows apply to a client write — over checksum blocks
+	 * rather than over §3.6's reserved grains, which store.md §14(37)
+	 * records.  `stagetot' is the engine's alone.
+	 */
+	Storecfg store;
 };
 
 /*
@@ -245,8 +253,41 @@ int	srvjobcount(Srvctx*);	/* jobs held: what the shutdown waits for */
  *	objhold	n != 0 holds every queued object request at its check
  *		point, so a test can have a request that is running and
  *		one that is still queued at a known moment.
+ *	objprelook
+ *		n != 0 holds a queued object write between §5.4 step 3's
+ *		stage and the look that follows it.  A step 7 that lands
+ *		in this window — a Tflush of another request on the same
+ *		fid, or the idle sweep — takes the fid's stage before the
+ *		handler has looked at it, which is what the look is for:
+ *		the write is answered `shoalsrv: staged update discarded'
+ *		and commits nothing (store.md §14(37)).
+ *	objstage
+ *		n != 0 holds a queued object request between §5.4 step 3's
+ *		stage and the commit of it: after the look that says the
+ *		fid's stage is still this handler's and before the engine
+ *		call that publishes it.  That is the window a request owns
+ *		a stage it has finished looking at, so it is where a test
+ *		drives step 7 — a Tflush of another request on the same
+ *		fid — against a commit that is about to happen anyway.
+ *	objlook	n != 0 holds a queued object request AT that look, before
+ *		it takes the fid's state lock and the stage list's — a
+ *		request parked under either of those wedges the service
+ *		loop or stalls every other queue (obj.c).  What holds the
+ *		sweep off the stage across the park is the stage's own
+ *		`busy' mark, a handler between two steps of one operation
+ *		being no absence of arrivals (store.md §3.6), so this is
+ *		where a test drives the idle sweep against a stage a
+ *		handler is still inside — and where it drives a step 7 for
+ *		another request on the same fid against one.
+ *	objarm	n != 0 holds the open that the stage point stages on
+ *		between the stage and the engine handle it arms it with.
+ *		The handle is taken from the engine with no lock held, so
+ *		a step 7 for another request on the same fid can strip the
+ *		stage in that window — which is what the arm has to find
+ *		rather than store a handle nothing would reach (obj.c).
  *	objexit	n != 0 holds every queued request that has reached the
- *		other end of its handler — a ctl verb run on an oid's
+ *		other end of its handler — an object read or write on
+ *		/obj/<oid> or /meta/<oid>, a ctl verb run on an oid's
  *		queue, and the /obj and /meta directory open and read on
  *		the reserved one — after its engine call and before the
  *		exit, so a test can flush a request whose work is done and
@@ -292,14 +333,17 @@ int	srvjobcount(Srvctx*);	/* jobs held: what the shutdown waits for */
  *		gave up with are read from /jobs, and /jobs lists a pass
  *		only while it is running or queued, so this is where a
  *		test reads what a pass finished with instead of racing the
- *		unlink for it.  This is the one point whose park the
- *		shutdown WAITS for rather than steps over: the wait for
- *		the jobs is unbounded, because store.md §9 forbids closing
- *		the store while a pass is still inside the engine, and the
- *		shutdown clears the point before that wait.  So a program
- *		that raises jobhold again after the shutdown has begun
- *		parks a pass the shutdown then waits on for good; a
- *		program clears it before it stops the server.
+ *		unlink for it.  This point and reclaimhold below are the
+ *		two whose park the shutdown WAITS for rather than steps
+ *		over — both park a pass proc, which holds one of the jobs
+ *		— and the hazard is the same for each: the wait for the
+ *		jobs is unbounded, because store.md §9 forbids closing the
+ *		store while a pass is still inside the engine, and the
+ *		shutdown clears every point before that wait.  So a
+ *		program that raises either of them again after the
+ *		shutdown has begun parks a pass the shutdown then waits on
+ *		for good; a program clears them before it stops the
+ *		server.
  *	slotfail
  *		the one point here that refuses rather than holds: n != 0
  *		makes a walk over this instance's own index treat its n-1'th
@@ -312,6 +356,16 @@ int	srvjobcount(Srvctx*);	/* jobs held: what the shutdown waits for */
  *		and a walk broken off that way cannot be told from one
  *		whose store has gone.  The two walks are separate cases,
  *		so the one number serves both.
+ *	dirhold	n != 0 holds the /obj and /meta directory read inside its
+ *		entry walk, before its n-1'th entry and with the entries
+ *		before it already converted.  That walk is the one stretch
+ *		of a queued handler that runs over what the fid holds with
+ *		the fid's state lock NOT held (enum.c), so it is where a
+ *		test drives the service loop at a fid a queue proc is
+ *		part-way through a listing of: a Tflush of a sibling
+ *		request queued on the same fid, which the loop performs
+ *		step 7 for and must answer without waiting for the walk.
+ *		Set to n+1, like slotfail.
  *	reclaimhold
  *		n != 0 holds the tombstone reclaim walk that rides on a
  *		scrub before its n-1'th entry, with the entries before
@@ -320,7 +374,8 @@ int	srvjobcount(Srvctx*);	/* jobs held: what the shutdown waits for */
  *		walk, and it is paced by nothing and asks no queue.  So it
  *		is where a test raises `scrub stop', or takes the server
  *		down, over a walk that has counted a prefix of the
- *		snapshot.  Set to n+1, like slotfail.
+ *		snapshot.  Set to n+1, like slotfail.  It parks a pass
+ *		proc, so it carries jobhold's hazard above entire.
  *	flushhold
  *		n != 0 holds a Tflush of a pooled request between the
  *		lookup that found it and the flush itself, which is the
@@ -355,11 +410,12 @@ void	srvhook(Srvctx*, char *name, uvlong n);
  * Where a new point goes, and what the shutdown does with it.
  *
  * srvholdclear, which the shutdown runs before it drains, clears the
- * whole of srvhook's set and nothing else: objhold, objexit,
- * flushhold, mapopen, walkhold, anyexit, step7, jobhold, slotfail
- * and reclaimhold.  A HOLD therefore
- * belongs in srvhook — a program that set a point and stopped watching
- * must not be able to hold the store's close.  (The shutdown also
+ * whole of srvhook's set and nothing else: objhold, objprelook,
+ * objstage, objlook, objarm, objexit, flushhold, mapopen, walkhold,
+ * anyexit, step7, jobhold, slotfail, reclaimhold and dirhold.  A HOLD
+ * therefore belongs in srvhook — a program that set a point and
+ * stopped watching must not be able to hold the store's close.  (The
+ * shutdown also
  * turns srvcellpoint off, by its own call and for its own reason: the
  * file table those cells are in outlives the context that was given
  * them.)  Clearing a point is not the same as reaching the proc
@@ -430,6 +486,38 @@ void	srvcellpoint(Srvctx*, int on);
  * the count is the only bound a program that forgets it gets.
  */
 void	srvendpoint(Srvctx*, uvlong ms);
+
+/*
+ * The stage point, over the per-fid staged operation layer-a §5.4 step
+ * 3 creates and §5.4.1 step 7 discards.  With it on, an open of
+ * /obj/<oid> for writing leaves a stage on the fid — one that stages
+ * nothing — so that the lifetime rules can be driven on a fid holding
+ * one while no request is in flight: the clunk's discard, the
+ * shutdown's discard before the store closes, the idle sweep, and the
+ * `disk full' a second stage on one fid is refused with.  No client
+ * operation leaves a stage behind, because each gives its own back
+ * inside its request; the stage that outlives its request is §5.5's
+ * op=full, whose surface is not built.
+ *
+ * srvstagecount answers how many stages the live fids hold, how many
+ * have been given back and how many of those found the store still
+ * open — which every one of them must, since releasing an engine stage
+ * is an engine call.  Like srvauxpoint and unlike the srvhook holds,
+ * the shutdown does not clear this point: it is per context, and what
+ * it is about is what the shutdown itself does with a fid's state.
+ *
+ * srvstagepend answers how many engine handles have been parked for
+ * obj.c's drain, which is where the flush hook leaves the one call it
+ * may not make.  srvstagependfull makes that park REFUSE, which is the
+ * path a failing allocation would take: the hook must still make no
+ * engine call, so the handle goes back on the fid and the clunk or the
+ * shutdown releases it.  It is a point like the one above and the
+ * shutdown does not clear it either.
+ */
+void	srvstagepoint(Srvctx*, int on);
+void	srvstagependfull(Srvctx*, int on);
+void	srvstagecount(Srvctx*, uvlong *live, uvlong *done, uvlong *openat);
+uvlong	srvstagepend(Srvctx*);
 
 void	srvauxpoint(Srvctx*, int on);
 void	srvauxcount(Srvctx*, uvlong *flushed, uvlong *closed, uvlong *freed);

@@ -598,6 +598,32 @@ srvreclaimhold(Srvctx *c, uvlong i)
 }
 
 /*
+ * The point inside the /obj and /meta directory read's entry walk
+ * (enum.c), which is the one stretch of a queued handler that runs
+ * over the fid's state with the fid's state lock NOT held.  n != 0
+ * parks the read before its n-1'th entry, with the entries before it
+ * already converted, so a test can drive the service loop at a fid a
+ * queue proc is part-way through a listing of — a Tflush of a sibling
+ * request on that same fid, which the loop performs step 7 for.  Set
+ * to n+1, like slotfail; the hold ends on this queue's flush flag as
+ * the other request holds do, so the read itself stays flushable.
+ */
+void
+srvdirhold(Req *r, uvlong i)
+{
+	Qreq *qr;
+	uvlong n;
+
+	if((qr = r->aux) == nil)
+		return;
+	qlock(&qr->ctx->holdlk);
+	n = qr->ctx->dirhold;
+	qunlock(&qr->ctx->holdlk);
+	if(n != 0 && i == n-1)
+		qhold(qr->ctx, qr, &qr->ctx->dirhold);
+}
+
+/*
  * The third point, at a queued walk's commit: the moment a walk that
  * moves its fid has given the old state back and is about to write
  * the new one.  It is where the service loop is concurrent with the
@@ -613,6 +639,32 @@ srvqwalkhold(Req *r)
 	if((qr = r->aux) == nil)
 		return;
 	qhold(qr->ctx, qr, &qr->ctx->walkhold);
+}
+
+/*
+ * A point of the context's, named by the field it is set in, held by
+ * the queue proc that is carrying this request: the park and its two
+ * exits — the point cleared, or this queue's flush flag raised — are
+ * this file's, and which windows are worth a point is the handler's
+ * (obj.c holds two of the object write path's).  A request answered on
+ * the service loop carries no Qreq and cannot be held.
+ *
+ * A background unit is not held here either, although it carries a
+ * Qreq: srvqjob's handler is the caller's own function and calls
+ * nothing in this file, and the flush flag that is one of the two
+ * exits above belongs to a tag — which a unit with no tag can neither
+ * raise nor be named by.  A point that parked one would therefore have
+ * only the clearing to wake it, which is what the shutdown does before
+ * it waits (srv.h).
+ */
+void
+srvqhold(Req *r, uvlong *pt)
+{
+	Qreq *qr;
+
+	if((qr = r->aux) == nil)
+		return;
+	qhold(qr->ctx, qr, pt);
 }
 
 /*
@@ -648,12 +700,22 @@ srvqexit(Req *r)
  *
  * Which halves exist today, and where the rest hook in:
  *
- *	discard the stage — nothing is staged here.  The stage belongs
- *		to a fid's write path (lib/shoal.h's stageopen and
- *		stagediscard), which is the object-I/O surface; that
- *		surface fills the flushed fid's auxflush cell (dat.h) and
- *		this function calls it, so the discard is added without
- *		touching this file.
+ *	discard the stage — the flushed fid's auxflush cell, which the
+ *		object-I/O surface fills with the discard of whatever that
+ *		fid staged (obj.c, dat.h's Sstage).  It is the FID's stage
+ *		and not this request's: a stage can span several Twrites,
+ *		so a Tflush of the next queued write on a staging fid
+ *		discards it too, and the handler that staged it finds it
+ *		gone at its next look.  The engine's own half of the
+ *		release (lib/shoal.h's stagediscard) hangs off that cell,
+ *		so nothing here had to change for it — and is not made
+ *		from the cell either: the cell reaches the handle under
+ *		the context's leaf lock, so it parks the handle and
+ *		obj.c's drain makes the call outside every lock (dat.h's
+ *		Sstage).  A hook MAY call the engine — the enumeration's
+ *		makes one of store.md §9's three from both call sites
+ *		below — so it is where this one would be made and not
+ *		that it is one.
  *	clear the sync state — this instance has no peers: there is no
  *		outbound peer client in this wave, so no candidate was
  *		ever told anything and the dirty set (lib/shoal.h's
@@ -670,6 +732,20 @@ srvqexit(Req *r)
  * has filled its cell, because the call site is the contract: the
  * halves are added to this function, not to the handlers.
  */
+/*
+ * §13's point, wherever step 7 parks: on the loop it ends on its own
+ * deadline, because the shutdown that would clear it runs on the loop
+ * it is parking (srv.h).
+ */
+static void
+holdstep7(Srvctx *c, int onloop)
+{
+	if(onloop)
+		holdms(c, &c->step7hold);
+	else
+		qhold(c, nil, &c->step7hold);
+}
+
 void
 srvstep7(Req *r, int onloop)
 {
@@ -678,6 +754,28 @@ srvstep7(Req *r, int onloop)
 
 	if(r->fid == nil || (f = r->fid->aux) == nil)
 		return;
+	c = r->srv->aux;
+	/*
+	 * A fid with no flush cell has nothing here to do, and this runs
+	 * on the SERVICE LOOP for a request that was still queued — where
+	 * the state lock is a lock queue procs hold across work of their
+	 * own, and the loop must block on nothing a queue proc needs
+	 * (dat.h).  So the cell is read before the lock and the lock taken
+	 * only when there is a call to make under it; the read under the
+	 * lock is still what decides, so a cell cleared in between calls
+	 * nothing.  A cell INSTALLED in between is missed, which is the
+	 * race the lock leaves in any case — a flush that landed a moment
+	 * earlier misses it too, and the handler that installed it is the
+	 * one that gives it back.
+	 *
+	 * The point parks either way: with no cell there is no state for a
+	 * test to drive a clunk or a walk against, so the park outside the
+	 * lock is the same park.
+	 */
+	if(f->auxflush == nil){
+		holdstep7(c, onloop);
+		return;
+	}
 	/*
 	 * Under the FID'S STATE lock, over the read of the cell and the
 	 * call through it.  lib9p's own reference keeps the Fid alive
@@ -703,7 +801,6 @@ srvstep7(Req *r, int onloop)
 	 * every request in flight before it closes the store (D16), and a
 	 * request in flight is what this runs for.
 	 */
-	c = r->srv->aux;
 	/*
 	 * The hold is inside the state lock, which is what a test drives a
 	 * clunk or a moving walk of this fid against, and outside the
@@ -714,10 +811,7 @@ srvstep7(Req *r, int onloop)
 	 * same deadline the flush hold does.
 	 */
 	qlock(&f->lk);
-	if(onloop)
-		holdms(c, &c->step7hold);
-	else
-		qhold(c, nil, &c->step7hold);
+	holdstep7(c, onloop);
 	if(f->auxflush != nil)
 		f->auxflush(f, r);
 	qunlock(&f->lk);
@@ -839,6 +933,14 @@ srvhook(Srvctx *c, char *name, uvlong n)
 	qlock(&c->holdlk);
 	if(strcmp(name, "objhold") == 0)
 		c->hold = n;
+	else if(strcmp(name, "objprelook") == 0)
+		c->prelookhold = n;
+	else if(strcmp(name, "objstage") == 0)
+		c->stagehold = n;
+	else if(strcmp(name, "objlook") == 0)
+		c->lookhold = n;
+	else if(strcmp(name, "objarm") == 0)
+		c->armhold = n;
 	else if(strcmp(name, "objexit") == 0)
 		c->exithold = n;
 	else if(strcmp(name, "flushhold") == 0)
@@ -857,6 +959,8 @@ srvhook(Srvctx *c, char *name, uvlong n)
 		c->slotfail = n;
 	else if(strcmp(name, "reclaimhold") == 0)
 		c->reclaimhold = n;
+	else if(strcmp(name, "dirhold") == 0)
+		c->dirhold = n;
 	qunlock(&c->holdlk);
 }
 
@@ -876,6 +980,10 @@ srvholdclear(Srvctx *c)
 {
 	qlock(&c->holdlk);
 	c->hold = 0;
+	c->prelookhold = 0;
+	c->stagehold = 0;
+	c->lookhold = 0;
+	c->armhold = 0;
 	c->exithold = 0;
 	c->flushhold = 0;
 	c->mapopen = 0;
@@ -885,6 +993,7 @@ srvholdclear(Srvctx *c)
 	c->jobhold = 0;
 	c->slotfail = 0;
 	c->reclaimhold = 0;
+	c->dirhold = 0;
 	qunlock(&c->holdlk);
 }
 

@@ -8,6 +8,7 @@ OFILES=\
 	enum.$O\
 	err.$O\
 	job.$O\
+	obj.$O\
 	queue.$O\
 	srv.$O\
 	status.$O\

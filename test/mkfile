@@ -21,6 +21,7 @@ TESTS=\
 	peeropstest\
 	srvtest\
 	srvenumtest\
+	srviotest\
 
 LIB=../lib/libshoal.a$O
 SRVLIB=../srv/libshoalsrv.a$O
@@ -36,7 +37,7 @@ all:V:	$PROGS
 $O.%:	%.$O $LIB
 	$LD $LDFLAGS -o $target $prereq
 
-# The two programs that drive the 9P surface link the server library
+# The three programs that drive the 9P surface link the server library
 # too and are libthread programs; every other test's link line is
 # unchanged.
 $O.srvtest:	srvtest.$O $SRVLIB $LIB
@@ -50,6 +51,12 @@ $O.srvenumtest:	srvenumtest.$O $SRVLIB $LIB
 
 srvenumtest.$O:	srvenumtest.c srv9p.h ../srv/srv.h $HFILES
 	$CC $CFLAGS srvenumtest.c
+
+$O.srviotest:	srviotest.$O $SRVLIB $LIB
+	$LD $LDFLAGS -o $target $prereq
+
+srviotest.$O:	srviotest.c srv9p.h ../srv/srv.h $HFILES
+	$CC $CFLAGS srviotest.c
 
 %.$O:	%.c $HFILES
 	$CC $CFLAGS $stem.c

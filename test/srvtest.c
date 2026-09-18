@@ -242,6 +242,83 @@ mkobj(Store *s, char *name, void *data, long n, uvlong ver)
 		fail("objwrite %s: %r", name);
 }
 
+/*
+ * What a role=client operation on this id is answered with.  §5.1 and
+ * §5.4 step 1 serve a client only from the object's serving primary,
+ * and this map places with two instances on one node, so which of them
+ * an id lands on is HRW's answer (§4.3) and not this case's: an id
+ * placed elsewhere is layer-a §2.6's `not primary' with that iid in
+ * the detail, and one placed here is served.
+ */
+static char*
+clientwant(Srvctx *ctx, char *oid, char *buf, int nbuf)
+{
+	Cinst *p;
+
+	p = mapprimary(srvmap(ctx), oid);
+	if(p != nil && strcmp(p->iid, srviid(ctx)) == 0)
+		return "ok";
+	snprint(buf, nbuf, "not primary: %s", p != nil ? p->iid : "");
+	return buf;
+}
+
+/*
+ * Two ids the map places differently: one this instance is the serving
+ * primary for and one it is not.  A case that runs a role=client row
+ * against both takes both of clientwant's answers, which is what makes
+ * the row's `ok' half a driven path rather than an assumption about
+ * where blake2s happens to send one name.  `pfx' is so that a case
+ * wanting ids for a create and ids for an existing object gets two
+ * disjoint pairs.  Both nil on failure, which is a failed check.
+ */
+static void
+placeids(Srvctx *ctx, char *pfx, char **mine, char **theirs)
+{
+	char name[32];
+	Cinst *p;
+	int i;
+
+	*mine = *theirs = nil;
+	for(i = 0; i < 64 && (*mine == nil || *theirs == nil); i++){
+		snprint(name, sizeof name, "%s%d", pfx, i);
+		if((p = mapprimary(srvmap(ctx), name)) == nil)
+			continue;
+		if(strcmp(p->iid, srviid(ctx)) == 0){
+			if(*mine == nil)
+				*mine = strdup(name);
+		}else if(*theirs == nil)
+			*theirs = strdup(name);
+	}
+	checks++;
+	if(*mine == nil || *theirs == nil){
+		fail("the map places every `%s' id the same way: no case to"
+			" drive", pfx);
+		free(*mine);
+		free(*theirs);
+		*mine = *theirs = nil;
+	}
+}
+
+/* how many directory entries a read answered */
+static int
+dirents(char *p, long n)
+{
+	Dir dir;
+	char *ep;
+	int m, k;
+
+	k = 0;
+	ep = p + n;
+	while(p < ep){
+		m = convM2D((uchar*)p, ep-p, &dir, p+BIT16SZ);
+		if(m <= BIT16SZ)
+			break;
+		p += m;
+		k++;
+	}
+	return k;
+}
+
 static int
 objinfoof(Store *s, char *name, Objinfo *oi)
 {
@@ -629,8 +706,14 @@ tmatrix(void)
 /*
  * The same matrix over the three operations that are not walk and
  * open: §2.4's create in /obj, remove of /obj/<oid> and wstat of one.
- * Each is gated on the row's write column and then answers the local
- * `not built', because §2.4's content is the object-I/O surface's.
+ * Each is gated on the row's write column; what a role=client
+ * operation is then answered is §2.4's own and depends on where the
+ * map places the id (clientwant), while the other two roles never
+ * reach the content at all.  Each operation therefore runs on an id
+ * this instance is the serving primary for and on one it is not, so
+ * both of clientwant's answers are on the wire.  The roles run in
+ * reverse order because the client's half may remove the object the
+ * other two walk to.
  */
 static void
 tmodes(void)
@@ -647,59 +730,89 @@ tmodes(void)
 	 * `alpha' are not.
 	 */
 	static char *want[3] = {
-		"shoalsrv: not built",
+		nil,			/* clientwant's, per id */
 		"permission denied",
 		"permission denied",
 	};
-	char what[64], *m;
+	char what[96], buf[64], *m, *mine, *theirs, *newmine, *newtheirs;
+	char *id, *newid;
 	Srvctx *ctx;
 	Dev *d;
 	Cl cl;
 	Fcall r;
 	Dir dir;
-	int role;
+	int role, k;
 
 	clstage = "modes";
 	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
 	d = newdisk();
 	if((ctx = startsrv(d, m, 4)) == nil)
 		return;
-	mkobj(srvstore(ctx), "alpha", nil, 0, 1);
+	/*
+	 * Each operation is run on an id this instance is the serving
+	 * primary for and on one it is not, so the client row takes both
+	 * of clientwant's answers rather than whichever one the hash
+	 * happens to give one name.
+	 */
+	placeids(ctx, "obj", &mine, &theirs);
+	placeids(ctx, "new", &newmine, &newtheirs);
+	if(mine == nil || newmine == nil)
+		goto Out;
+	mkobj(srvstore(ctx), mine, nil, 0, 1);
+	mkobj(srvstore(ctx), theirs, nil, 0, 1);
 	clstart(&cl, ctx, Clmsize);
-	for(role = 0; role < 3; role++){
+	for(role = 2; role >= 0; role--){
 		if(clattach(&cl, Froot, anames[role], &r) != Rattach){
 			fail("attach %s: %s", anames[role],
 				r.type == Rerror ? r.ename : "?");
 			continue;
 		}
-		/* Tcreate in /obj */
-		if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk)
-			fail("walk /obj: %s", clerr(&r));
-		clcreate(&cl, Ffile, "newobj", 0666, OWRITE, &r);
-		snprint(what, sizeof what, "create in /obj as %s", anames[role]);
-		clerris(what, &r, want[role]);
-		clclunk(&cl, Ffile, &r);
+		for(k = 0; k < 2; k++){
+			id = k == 0 ? mine : theirs;
+			newid = k == 0 ? newmine : newtheirs;
+			/* Tcreate in /obj */
+			if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk)
+				fail("walk /obj: %s", clerr(&r));
+			clcreate(&cl, Ffile, newid, 0666, OWRITE, &r);
+			snprint(what, sizeof what, "create %s in /obj as %s",
+				newid, anames[role]);
+			clerris(what, &r, role == 0 ?
+				clientwant(ctx, newid, buf, sizeof buf) :
+				want[role]);
+			clclunk(&cl, Ffile, &r);
 
-		/*
-		 * Twstat and Tremove on /obj/<oid>.  A Tremove clunks its fid
-		 * whether or not it removes anything, so Ffile2 is free again
-		 * for the next role's walk.
-		 */
-		if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk
-		|| clwalk1(&cl, Ffile, Ffile2, "alpha", &r) != Rwalk)
-			fail("walk /obj/alpha: %s", clerr(&r));
-		nulldir(&dir);
-		dir.length = 4096;
-		clwstat(&cl, Ffile2, &dir, &r);
-		snprint(what, sizeof what, "wstat /obj/alpha as %s", anames[role]);
-		clerris(what, &r, want[role]);
-		clremove(&cl, Ffile2, &r);
-		snprint(what, sizeof what, "remove /obj/alpha as %s", anames[role]);
-		clerris(what, &r, want[role]);
-		clclunk(&cl, Ffile, &r);
+			/*
+			 * Twstat and Tremove on /obj/<oid>.  A Tremove clunks
+			 * its fid whether or not it removes anything, so Ffile2
+			 * is free again for the next walk.
+			 */
+			if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk
+			|| clwalk1(&cl, Ffile, Ffile2, id, &r) != Rwalk)
+				fail("walk /obj/%s: %s", id, clerr(&r));
+			nulldir(&dir);
+			dir.length = 4096;
+			clwstat(&cl, Ffile2, &dir, &r);
+			snprint(what, sizeof what, "wstat /obj/%s as %s", id,
+				anames[role]);
+			clerris(what, &r, role == 0 ?
+				clientwant(ctx, id, buf, sizeof buf) :
+				want[role]);
+			clremove(&cl, Ffile2, &r);
+			snprint(what, sizeof what, "remove /obj/%s as %s", id,
+				anames[role]);
+			clerris(what, &r, role == 0 ?
+				clientwant(ctx, id, buf, sizeof buf) :
+				want[role]);
+			clclunk(&cl, Ffile, &r);
+		}
 		clclunk(&cl, Froot, &r);
 	}
 	clstop(&cl);
+Out:
+	free(mine);
+	free(theirs);
+	free(newmine);
+	free(newtheirs);
 	srvfree(ctx);
 	devclose(d);
 	free(m);
@@ -1456,18 +1569,21 @@ Out:
 /*
  * The object rows' gate, layer-a §2.1 and §6.4: the operator rule and
  * its reserved-id exemption, and the fence with the one read §2.1 lets
- * through it.  Every answer below that is not a refusal is the local
- * `not built', because §2.4's content is the object-I/O surface's.
+ * through it.  What the gate lets through is §2.4's content, which
+ * answers it: this case is about which operations reach that far, and
+ * srviotest is about what they do when they get there.
  */
 static void
 tobjgate(void)
 {
-	char *m;
+	char cbuf[64], what[96], *m, *mine, *theirs, *newmine, *newtheirs;
+	char *id, *newid;
 	Srvctx *ctx;
 	Dev *d;
 	Cl cl;
 	Fcall r;
 	char *w[2];
+	int k;
 
 	clstage = "objgate";
 	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
@@ -1476,6 +1592,17 @@ tobjgate(void)
 		return;
 	mkobj(srvstore(ctx), "alpha", nil, 0, 1);
 	mkobj(srvstore(ctx), "shoal.map.7", nil, 0, 1);
+	/* the client half below runs on one id placed here and one not */
+	placeids(ctx, "obj", &mine, &theirs);
+	placeids(ctx, "new", &newmine, &newtheirs);
+	if(mine == nil || newmine == nil){
+		srvfree(ctx);
+		devclose(d);
+		free(m);
+		return;
+	}
+	mkobj(srvstore(ctx), mine, nil, 0, 1);
+	mkobj(srvstore(ctx), theirs, nil, 0, 1);
 	clstart(&cl, ctx, Clmsize);
 	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
 		fail("attach admin: %s", clerr(&r));
@@ -1490,7 +1617,7 @@ tobjgate(void)
 		"permission denied");
 	/* … except for §1.1's reserved ids, which it may create and write */
 	clcreate(&cl, Ffile, "shoal.map.8", 0666, OWRITE, &r);
-	clerris("admin create of a reserved id", &r, "shoalsrv: not built");
+	clerris("admin create of a reserved id", &r, "ok");
 	clclunk(&cl, Ffile, &r);
 
 	w[0] = "obj";
@@ -1500,21 +1627,26 @@ tobjgate(void)
 	clopen(&cl, Ffile, OWRITE, &r);
 	clerris("admin open of an unreserved object for writing", &r,
 		"permission denied");
-	clopen(&cl, Ffile, OREAD, &r);
-	clerris("admin open of an unreserved object for reading", &r,
-		"shoalsrv: not built");
-	/* ORCLOSE is the remove §2.1 refuses, one message earlier */
-	clopen(&cl, Ffile, OREAD|ORCLOSE, &r);
+	/*
+	 * ORCLOSE is the remove §2.1 refuses, one message earlier — asked
+	 * on a fid of its own, because an open that succeeds leaves the
+	 * fid open and 9P admits no second open of one.
+	 */
+	if(clwalk(&cl, Froot, Ffile2, 2, w, &r) != Rwalk)
+		fail("walk /obj/alpha again: %s", clerr(&r));
+	clopen(&cl, Ffile2, OREAD|ORCLOSE, &r);
 	clerris("admin open of an unreserved object for reading with ORCLOSE",
 		&r, "permission denied");
+	clclunk(&cl, Ffile2, &r);
+	clopen(&cl, Ffile, OREAD, &r);
+	clerris("admin open of an unreserved object for reading", &r, "ok");
 	clclunk(&cl, Ffile, &r);
 
 	w[1] = "shoal.map.7";
 	if(clwalk(&cl, Froot, Ffile, 2, w, &r) != Rwalk)
 		fail("walk /obj/shoal.map.7: %s", clerr(&r));
 	clopen(&cl, Ffile, OWRITE, &r);
-	clerris("admin open of a reserved object for writing", &r,
-		"shoalsrv: not built");
+	clerris("admin open of a reserved object for writing", &r, "ok");
 	clclunk(&cl, Ffile, &r);
 
 	/* the fence, and §2.1's sole exemption from it */
@@ -1529,18 +1661,19 @@ tobjgate(void)
 	w[1] = "shoal.map.7";
 	if(clwalk(&cl, Froot, Ffile, 2, w, &r) != Rwalk)
 		fail("walk /obj/shoal.map.7 while fenced: %s", clerr(&r));
-	clopen(&cl, Ffile, OREAD, &r);
-	clerris("fenced admin read of a reserved id", &r,
-		"shoalsrv: not built");
-	clopen(&cl, Ffile, OWRITE, &r);
+	if(clwalk(&cl, Froot, Ffile2, 2, w, &r) != Rwalk)
+		fail("walk /obj/shoal.map.7 again: %s", clerr(&r));
+	clopen(&cl, Ffile2, OWRITE, &r);
 	clerris("fenced admin write of a reserved id", &r, "fenced");
+	clclunk(&cl, Ffile2, &r);
+	clopen(&cl, Ffile, OREAD, &r);
+	clerris("fenced admin read of a reserved id", &r, "ok");
 	clclunk(&cl, Ffile, &r);
 	w[0] = "meta";
 	if(clwalk(&cl, Froot, Ffile, 2, w, &r) != Rwalk)
 		fail("walk /meta/shoal.map.7 while fenced: %s", clerr(&r));
 	clopen(&cl, Ffile, OREAD, &r);
-	clerris("fenced admin read of a reserved id through /meta", &r,
-		"shoalsrv: not built");
+	clerris("fenced admin read of a reserved id through /meta", &r, "ok");
 	clclunk(&cl, Ffile, &r);
 	w[0] = "obj";
 	w[1] = "alpha";
@@ -1593,22 +1726,31 @@ tobjgate(void)
 		fail("attach client: %s", clerr(&r));
 		goto Out;
 	}
-	if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk)
-		fail("walk /obj as client: %s", clerr(&r));
-	clcreate(&cl, Ffile, "brandnew", 0666, OWRITE, &r);
-	clerris("client create of an id that is not reserved", &r,
-		"shoalsrv: not built");
-	clclunk(&cl, Ffile, &r);
-	w[1] = "alpha";
-	if(clwalk(&cl, Froot, Ffile, 2, w, &r) != Rwalk)
-		fail("walk /obj/alpha as client: %s", clerr(&r));
-	clopen(&cl, Ffile, OWRITE, &r);
-	clerris("client open of an object for writing", &r,
-		"shoalsrv: not built");
-	clclunk(&cl, Ffile, &r);
+	w[0] = "obj";
+	for(k = 0; k < 2; k++){
+		id = k == 0 ? mine : theirs;
+		newid = k == 0 ? newmine : newtheirs;
+		if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk)
+			fail("walk /obj as client: %s", clerr(&r));
+		clcreate(&cl, Ffile, newid, 0666, OWRITE, &r);
+		snprint(what, sizeof what, "client create of %s", newid);
+		clerris(what, &r, clientwant(ctx, newid, cbuf, sizeof cbuf));
+		clclunk(&cl, Ffile, &r);
+		w[1] = id;
+		if(clwalk(&cl, Froot, Ffile, 2, w, &r) != Rwalk)
+			fail("walk /obj/%s as client: %s", id, clerr(&r));
+		clopen(&cl, Ffile, OWRITE, &r);
+		snprint(what, sizeof what, "client open of %s for writing", id);
+		clerris(what, &r, clientwant(ctx, id, cbuf, sizeof cbuf));
+		clclunk(&cl, Ffile, &r);
+	}
 	clclunk(&cl, Froot, &r);
 Out:
 	clstop(&cl);
+	free(mine);
+	free(theirs);
+	free(newmine);
+	free(newtheirs);
 	srvfree(ctx);
 	devclose(d);
 	free(m);
@@ -1620,9 +1762,8 @@ Out:
  * through /obj or /meta, every /repl and /rpc operation" — and the
  * operator fence can go on while a fid is open.  So a Tread and a
  * Twrite are gated by the row exactly as an open is, and the two
- * channel rows are gated at all.  The write that the fence refuses
- * here is one that succeeds without it: the cell point gives
- * /obj/<oid> a write cell, since §2.4's own is not built.
+ * channel rows are gated at all.  The write the fence refuses here is
+ * one that succeeds without it, which is §2.4's own write cell.
  */
 static void
 tiogate(void)
@@ -1641,7 +1782,6 @@ tiogate(void)
 		return;
 	mkobj(srvstore(ctx), "alpha", nil, 0, 1);
 	mkobj(srvstore(ctx), "shoal.map.7", nil, 0, 1);
-	srvcellpoint(ctx, 1);
 	clstart(&cl, ctx, Clmsize);
 	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
 		fail("attach admin: %s", clerr(&r));
@@ -1669,8 +1809,7 @@ tiogate(void)
 	if(clopenpath(&cl, Froot, Ffile2, 2, w, OREAD, &r) != Ropen)
 		fail("open /obj/alpha for reading: %s", clerr(&r));
 	clread(&cl, Ffile2, 0, 16, &r);
-	clerris("an admin read of an object while unfenced", &r,
-		"shoalsrv: not built");
+	clerris("an admin read of an object while unfenced", &r, "ok");
 
 	if(clwrite(&cl, Fctl, 0, "fence on", &r) != Rwrite)
 		fail("fence on: %s", clerr(&r));
@@ -1698,7 +1837,6 @@ tiogate(void)
 	clclunk(&cl, Ffile2, &r);
 	clclunk(&cl, Froot2, &r);
 Out:
-	srvcellpoint(ctx, 0);
 	clstop(&cl);
 	srvfree(ctx);
 	devclose(d);
@@ -1762,8 +1900,7 @@ tdown(char *status, char *up)
 	if(clwalk(&cl, Froot, Ffile, 2, w, &r) != Rwalk)
 		fail("walk /obj/alpha as admin: %s", clerr(&r));
 	clopen(&cl, Ffile, OREAD, &r);
-	clerris("an admin read on the same instance", &r,
-		"shoalsrv: not built");
+	clerris("an admin read on the same instance", &r, "ok");
 	clclunk(&cl, Ffile, &r);
 
 	/*
@@ -1902,9 +2039,16 @@ Out:
  * back, and once /obj is enumerated the state a failed create dropped
  * would be that fid's own listing snapshot.
  *
- * The cell point's create cell is both halves -- it refuses a name
- * §1.1 forbids and retargets on any other -- and the fid-state point
- * counts the hooks.
+ * The create cell here is /obj's own (§2.4's create): it refuses a
+ * name §1.1 forbids and retargets the fid on any other, and the
+ * fid-state point is what counts the hooks.
+ *
+ * Both of its refusals are driven, because they are on opposite sides
+ * of the queue: a name §1.1 forbids is refused on the service loop,
+ * before the request is pushed at all, while `object exists' is
+ * refused by the unit that runs on the object's queue -- which is the
+ * one that goes on to retarget the fid, so it is the one whose
+ * give-back can be too early.
  */
 static void
 tcreategive(void)
@@ -1921,8 +2065,8 @@ tcreategive(void)
 	d = newdisk();
 	if((ctx = startsrv(d, m, 4)) == nil)
 		return;
+	mkobj(srvstore(ctx), "shoal.map.7", nil, 0, 1);
 	srvauxpoint(ctx, 1);
-	srvcellpoint(ctx, 1);
 	clstart(&cl, ctx, Clmsize);
 	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
 		fail("attach: %s", clerr(&r));
@@ -1941,6 +2085,13 @@ tcreategive(void)
 	eqv("a failed create closes nothing of the fid's", nc, 0);
 	eqv("a failed create frees nothing of the fid's", nf, 0);
 
+	clcreate(&cl, Ffile, "shoal.map.7", 0666, OWRITE, &r);
+	clerris("a create of an id this store holds live", &r,
+		"object exists");
+	srvauxcount(ctx, nil, &nc, &nf);
+	eqv("a create the queue refused closes nothing of the fid's", nc, 0);
+	eqv("a create the queue refused frees nothing of the fid's", nf, 0);
+
 	clcreate(&cl, Ffile, "shoal.map.9", 0666, OWRITE, &r);
 	checks++;
 	if(r.type != Rcreate)
@@ -1955,11 +2106,238 @@ tcreategive(void)
 	eqv("the clunk behind it had nothing left to free", nf, 1);
 	clclunk(&cl, Froot, &r);
 Out:
-	srvcellpoint(ctx, 0);
 	clstop(&cl);
 	srvfree(ctx);
 	devclose(d);
 	free(m);
+}
+
+/*
+ * A Tcreate on a fid that is mid-listing, which is where the /obj
+ * row's two halves meet on one fid: the directory open installs the
+ * listing's snapshot as the fid's state (enum.c), and the create cell
+ * gives the fid's state back as it moves the fid onto the object it
+ * created (obj.c).  One fid cannot hold both, and the state a create
+ * would drop here is the listing the client is part-way through.
+ *
+ * For a fid whose open has ANSWERED, 9P settles it a message earlier:
+ * lib9p refuses a Tcreate on an open fid from Fid.omode, with its own
+ * string, before any cell of this row is reached.  That is what this
+ * case pins, together with the listing carrying on from exactly where
+ * it was.  The name it creates is a reserved one, which is the name
+ * this role may create (§2.1): a name the gate would have refused
+ * anyway would make the check pass for the wrong reason.
+ *
+ * lib9p's guard does not reach a create pipelined behind an open that
+ * has not answered yet, because the /obj open is offloaded and omode
+ * is set only when it answers; the two cells refuse the second
+ * themselves there, and tpipeopen below is that case.
+ *
+ * A create on another fid of the same directory is the case that IS
+ * allowed, and it moves neither the cursor nor the snapshot -- the
+ * snapshot was taken at the open, so what a later create adds is not
+ * in it (store.md §9).
+ */
+static void
+tdircreate(void)
+{
+	static char *ids[3] = {"dira", "dirb", "dirc"};
+	char buf[8192], *m;
+	char *w[1];
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall r;
+	Dir dir;
+	vlong off;
+	long one;
+	int i, nent;
+
+	clstage = "dircreate";
+	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4)) == nil)
+		return;
+	for(i = 0; i < nelem(ids); i++)
+		mkobj(srvstore(ctx), ids[i], nil, 0, 1);
+	w[0] = "obj";
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
+		fail("attach: %s", clerr(&r));
+		goto Out;
+	}
+	/*
+	 * What one entry takes on the wire, measured on a fid of its own
+	 * rather than computed, so that the read below stops inside the
+	 * listing whatever an entry carries.  The three ids are the same
+	 * length, so any of them is the measure.
+	 */
+	one = 0;
+	if(clopenpath(&cl, Froot, Ffile2, 1, w, OREAD, &r) != Ropen)
+		fail("open /obj to measure an entry: %s", clerr(&r));
+	else if(clread(&cl, Ffile2, 0, 4096, &r) == Rread && r.count > 0)
+		one = convM2D((uchar*)r.data, r.count, &dir, buf);
+	clclunk(&cl, Ffile2, &r);
+	checks++;
+	if(one <= BIT16SZ){
+		fail("no /obj entry to measure");
+		goto Out;
+	}
+
+	if(clopenpath(&cl, Froot, Ffile, 1, w, OREAD, &r) != Ropen){
+		fail("open /obj: %s", clerr(&r));
+		goto Out;
+	}
+	if(clread(&cl, Ffile, 0, one, &r) != Rread){
+		fail("the first read of /obj: %s", clerr(&r));
+		goto Out;
+	}
+	off = r.count;
+	nent = dirents(r.data, r.count);
+	eqv("the first read stops inside the listing", nent, 1);
+
+	clcreate(&cl, Ffile, "shoal.map.9", 0666, OWRITE, &r);
+	clerris("a create on a fid that is mid-listing", &r,
+		"9P protocol botch");
+
+	/* the snapshot and the cursor are where the create found them */
+	for(;;){
+		if(clread(&cl, Ffile, off, 4096, &r) != Rread){
+			fail("the listing after the refused create: %s",
+				clerr(&r));
+			goto Out;
+		}
+		if(r.count == 0)
+			break;
+		nent += dirents(r.data, r.count);
+		off += r.count;
+	}
+	eqv("the listing carries on over the refused create", nent,
+		nelem(ids));
+	clclunk(&cl, Ffile, &r);
+
+	/* the create this row does answer is one on a fid of its own */
+	if(clwalk(&cl, Froot, Ffile, 1, w, &r) != Rwalk)
+		fail("walk /obj for the create: %s", clerr(&r));
+	clcreate(&cl, Ffile, "shoal.map.9", 0666, OWRITE, &r);
+	checks++;
+	if(r.type != Rcreate)
+		fail("a create on a fid that is not listing: %s", clerr(&r));
+	clclunk(&cl, Ffile, &r);
+	clclunk(&cl, Froot, &r);
+Out:
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
+ * A Topen and a Tcreate pipelined on ONE /obj fid, which is the seam
+ * 9P leaves open for this server.  lib9p refuses each of them on an
+ * open fid from Fid.omode, and its `ropen' sets that field only once
+ * the open has ANSWERED — while the /obj open is offloaded to a queue
+ * (srv/enum.c), so a second message sent before that answer passes the
+ * guard and both cells run, on two queue procs at once.
+ *
+ * One fid cannot hold a listing's snapshot and be the created object's
+ * at the same time, so exactly one of the two may win and the other is
+ * refused with lib9p's own `9P protocol botch' — the string lib9p
+ * itself answers wherever it can see the conflict, so a client cannot
+ * tell the two refusals apart.  WHICH of them wins is the two procs'
+ * race and is not the server's to settle; what this case asserts is
+ * that one answer is the operation and the other is the refusal, in
+ * both wire orders.
+ *
+ * §13's `objhold' point is what pipelines them: it parks every queued
+ * request at the head of its handler, so the first is held inside the
+ * pool while the second is sent, and clearing it starts both.
+ */
+static void
+pipeopen(char *what, int createfirst)
+{
+	char *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall t, r;
+	char *w[1];
+	ushort to, tc;
+	int i, ok, botch;
+
+	clstage = what;
+	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4)) == nil)
+		return;
+	mkobj(srvstore(ctx), "alpha", nil, 0, 1);
+	w[0] = "obj";
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
+		fail("%s: attach: %s", what, clerr(&r));
+		goto Out;
+	}
+	if(clwalk(&cl, Froot, Ffile, 1, w, &r) != Rwalk){
+		fail("%s: walk /obj: %s", what, clerr(&r));
+		goto Out;
+	}
+	srvhook(ctx, "objhold", 1);
+	to = cltag(&cl);
+	tc = cltag(&cl);
+	for(i = 0; i < 2; i++){
+		memset(&t, 0, sizeof t);
+		t.fid = Ffile;
+		if((i == 0) == (createfirst != 0)){
+			t.type = Tcreate;
+			t.tag = tc;
+			t.name = "shoal.map.9";
+			t.perm = 0666;
+			t.mode = OWRITE;
+		}else{
+			t.type = Topen;
+			t.tag = to;
+			t.mode = OREAD;
+		}
+		clput(&cl, &t);
+		sleep(200);		/* it is parked at the point */
+	}
+	srvhook(ctx, "objhold", 0);
+
+	ok = botch = 0;
+	clgettag(&cl, to, &r);
+	if(r.type == Ropen)
+		ok++;
+	else if(r.type == Rerror && strcmp(r.ename, "9P protocol botch") == 0)
+		botch++;
+	else
+		fail("%s: the open answered: %s", what, clerr(&r));
+	cltagfree(&cl, to);
+	clgettag(&cl, tc, &r);
+	if(r.type == Rcreate)
+		ok++;
+	else if(r.type == Rerror && strcmp(r.ename, "9P protocol botch") == 0)
+		botch++;
+	else
+		fail("%s: the create answered: %s", what, clerr(&r));
+	cltagfree(&cl, tc);
+	eqv("exactly one of the two pipelined requests succeeded", ok, 1);
+	eqv("and the other is lib9p's own botch", botch, 1);
+
+	clclunk(&cl, Ffile, &r);
+	clclunk(&cl, Froot, &r);
+Out:
+	srvhook(ctx, "objhold", 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+static void
+tpipeopen(void)
+{
+	pipeopen("pipeopen: open then create", 0);
+	pipeopen("pipeopen: create then open", 1);
 }
 
 /*
@@ -3459,6 +3837,7 @@ threadmain(int argc, char **argv)
 	USED(argc);
 	USED(argv);
 	quotefmtinstall();		/* the FAIL lines quote what they got */
+	clwatchms = 120*1000;		/* this program's own budget */
 	clwatchon();
 
 	tstartup();
@@ -3479,6 +3858,8 @@ threadmain(int argc, char **argv)
 	tdown("out", "yes");
 	tfidstate();
 	tcreategive();
+	tdircreate();
+	tpipeopen();
 	tfidwalk();
 	tflush();
 	tstep7fid();

@@ -92,6 +92,7 @@ Sfile srvfiles[Nfile] =
 	.gate	= objgate,
 	.open	= srvobjdiropen,
 	.read	= srvobjdirread,
+	.create	= srvobjcreate,
 },
 [Qmeta] = {
 	.name	= "meta",
@@ -179,6 +180,11 @@ Sfile srvfiles[Nfile] =
 	.rd	= Aall,
 	.wr	= Aclient|Aadmin,
 	.gate	= objgate,
+	.read	= srvobjread,
+	.write	= srvobjwrite,
+	.open	= srvobjopen,
+	.remove	= srvobjremove,
+	.wstat	= srvobjwstat,
 },
 [Qmetafile] = {
 	.name	= nil,
@@ -187,6 +193,8 @@ Sfile srvfiles[Nfile] =
 	.rd	= Aall,
 	.wr	= 0,
 	.gate	= objgate,
+	.render	= srvmetatext,
+	.open	= srvmetaopen,
 },
 };
 
@@ -268,8 +276,9 @@ objgate(Srvctx *c, Sfid *f, Req *r, int op)
 		 * reserved, so an OREAD|ORCLOSE open admitted as a read would
 		 * be that remove arranged one message ahead.  (§2.4 refuses
 		 * ORCLOSE on an object outright, with `bad open mode'; that
-		 * belongs to the rows' open cell, which is not built, and
-		 * this rule does not wait for it.)
+		 * is the rows' open cell, and this gate runs first — so the
+		 * operator is told `permission denied' and everyone else the
+		 * mode is what is wrong.)
 		 */
 		m = r->ifcall.mode;
 		wr = (m&OMASK) == OWRITE || (m&OMASK) == ORDWR
@@ -679,20 +688,13 @@ srvauxlate(Srvctx *c)
  *
  *	[Qctl].read	answers fixed bytes.  /ctl also renders at open,
  *			so a read of it says which of the two serves it.
- *	[Qobjfile].write
- *			answers an Rwrite counting the bytes, so a write
- *			the fence refuses is distinguishable from one no
- *			cell would have taken anyway.
- *	[Qobj].create	retargets the directory fid onto the named object
- *			and answers Rcreate, giving the fid's state back
- *			with srvfidgive first, which is what a create cell
- *			owes the fid it moves (dat.h).  Nothing is created
- *			in the store — the create body is §2.4's — so the
- *			qid it answers is the object row's own and says
- *			nothing about an object.  A name §1.1 forbids is
- *			refused with `bad object name', and that refusal is
- *			what a failed create looks like here: the fid does
- *			not move, so it gives nothing back.
+ *
+ * It filled two more until §2.4's own cells were built: a write on
+ * /obj/<oid> and a create in /obj, which are now obj.c's and carry the
+ * rules this point stood in for — the gate before a write, and the
+ * state a create gives back before it moves the fid.  A row whose cell
+ * is built is not one this point may overlay, because clearing it
+ * writes nil and the row would lose its own cell with the stand-in.
  *
  * The cells are the table's and the table is the program's, so this
  * point is global rather than per-context: a T1 program sets it,
@@ -712,42 +714,11 @@ cellread(Req *r)
 	respond(r, nil);
 }
 
-static void
-cellwrite(Req *r)
-{
-	r->ofcall.count = r->ifcall.count;
-	respond(r, nil);
-}
-
-static void
-cellcreate(Req *r)
-{
-	Sfid *f;
-	int n;
-
-	f = r->fid->aux;
-	n = strlen(r->ifcall.name);
-	if(!srvoidok((uchar*)r->ifcall.name, n)){
-		respond(r, Ebadname);
-		return;
-	}
-	srvfidgive(f);
-	f->file = Qobjfile;
-	memmove(f->oid, r->ifcall.name, n);
-	f->oidlen = n;
-	srvfileqid(Qobjfile, &r->ofcall.qid);
-	f->qidpath = r->ofcall.qid.path;
-	f->qidvers = r->ofcall.qid.vers;
-	respond(r, nil);
-}
-
 void
 srvcellpoint(Srvctx *c, int on)
 {
 	qlock(&c->holdlk);
 	srvfiles[Qctl].read = on ? cellread : nil;
-	srvfiles[Qobjfile].write = on ? cellwrite : nil;
-	srvfiles[Qobj].create = on ? cellcreate : nil;
 	qunlock(&c->holdlk);
 }
 
@@ -1035,6 +1006,7 @@ walkq(Req *r)
 		srvqdone(r, nil);
 		return;
 	}
+	srvstagesweep(r->srv->aux);
 	dowalk(r);
 }
 
@@ -1340,6 +1312,7 @@ statq(Req *r)
 	}
 	c = r->srv->aux;
 	f = r->fid->aux;
+	srvstagesweep(c);
 	if(objstat(c->store, f->oid, f->oidlen, &oi) < 0){
 		srvqdone(r, srverr(buf, sizeof buf));
 		return;
