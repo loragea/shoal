@@ -2022,6 +2022,13 @@ Out:
  * The create cell here is /obj's own (§2.4's create): it refuses a
  * name §1.1 forbids and retargets the fid on any other, and the
  * fid-state point is what counts the hooks.
+ *
+ * Both of its refusals are driven, because they are on opposite sides
+ * of the queue: a name §1.1 forbids is refused on the service loop,
+ * before the request is pushed at all, while `object exists' is
+ * refused by the unit that runs on the object's queue -- which is the
+ * one that goes on to retarget the fid, so it is the one whose
+ * give-back can be too early.
  */
 static void
 tcreategive(void)
@@ -2038,6 +2045,7 @@ tcreategive(void)
 	d = newdisk();
 	if((ctx = startsrv(d, m, 4)) == nil)
 		return;
+	mkobj(srvstore(ctx), "shoal.map.7", nil, 0, 1);
 	srvauxpoint(ctx, 1);
 	clstart(&cl, ctx, Clmsize);
 	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
@@ -2056,6 +2064,13 @@ tcreategive(void)
 	srvauxcount(ctx, nil, &nc, &nf);
 	eqv("a failed create closes nothing of the fid's", nc, 0);
 	eqv("a failed create frees nothing of the fid's", nf, 0);
+
+	clcreate(&cl, Ffile, "shoal.map.7", 0666, OWRITE, &r);
+	clerris("a create of an id this store holds live", &r,
+		"object exists");
+	srvauxcount(ctx, nil, &nc, &nf);
+	eqv("a create the queue refused closes nothing of the fid's", nc, 0);
+	eqv("a create the queue refused frees nothing of the fid's", nf, 0);
 
 	clcreate(&cl, Ffile, "shoal.map.9", 0666, OWRITE, &r);
 	checks++;
