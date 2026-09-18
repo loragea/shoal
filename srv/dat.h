@@ -620,7 +620,6 @@ struct Sstage
 	 */
 	uvlong	flen;
 	int	force;
-	ulong	ngrain;		/* against §3.6's per-fid bound */
 	vlong	last;		/* nsec of the last arrival */
 	int	busy;		/* a handler is inside a step on it */
 	int	dead;		/* the sweep expired it, or step 7 took it */

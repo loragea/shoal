@@ -199,7 +199,6 @@ stagestrip(Srvctx *c, Sstage *s, Stage **gp)		/* under stagelk */
 	s->released = 1;
 	*gp = s->g;
 	s->g = nil;
-	s->ngrain = 0;
 	c->nstagedone++;
 	if(c->store == nil || c->closed)
 		return 0;
@@ -498,7 +497,6 @@ stagenew(Srvctx *c, Sfid *f, int kind, uchar *oid, int oidlen, uvlong ver,
 	s->ver = ver;
 	s->wepoch = wepoch;
 	s->off = off;
-	s->ngrain = stagegrains(c, off, n);
 	s->last = nsec();
 	s->busy = 1;
 	/*
