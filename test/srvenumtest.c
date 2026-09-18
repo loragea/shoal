@@ -1492,6 +1492,97 @@ Out:
 }
 
 /*
+ * What `scrub start' and `scrub stop' do to a pass that is running,
+ * and what a REFUSED `scrub start' leaves behind.
+ *
+ * `scrubbing' is raised before jobstart is called, because raising it
+ * afterwards would race the pass proc's own clearing of it — so every
+ * way jobstart can refuse has to put it back.  It cannot be driven
+ * through the shutdown (the loop has ended by then and no ctl write
+ * can reach the verb), so the cap of store.md §14(30) is what refuses
+ * here: twelve passes parked at §13's jobhold point, and the `scrub
+ * start' behind them.  A flag left raised makes every later `scrub
+ * start' answer success and start nothing.
+ */
+static void
+tscrubctl(void)
+{
+	char buf[16*1024], name[32], line[64], *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall r;
+	int i;
+
+	clstage = "scrubctl";
+	m = mkmap();
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4, 0)) == nil)
+		return;
+	for(i = 0; i < 40; i++){
+		snprint(name, sizeof name, "obj%.2d", i);
+		mkobj(srvstore(ctx), name, nil, 0, 1);
+	}
+	clstart(&cl, ctx, Clmsize);
+	if(!adminctl(&cl, "role=admin"))
+		goto Out;
+
+	/* a rate low enough that the pass is certainly still walking */
+	if(clwrite(&cl, Fctl, 0, "scrub start rate=1", &r) != Rwrite){
+		fail("scrub start: %s", clerr(&r));
+		goto Out;
+	}
+	if(slurpfile(&cl, Ffile, "jobs", buf, sizeof buf) > 0)
+		eqv("a pass is listed at /jobs", nlines(buf, "job="), 1);
+	if(clwrite(&cl, Fctl, 0, "scrub start", &r) != Rwrite)
+		fail("a second scrub start: %s", clerr(&r));
+	if(slurpfile(&cl, Ffile, "jobs", buf, sizeof buf) > 0)
+		eqv("a second scrub start puts no second pass over one index",
+			nlines(buf, "job="), 1);
+
+	/* and `scrub stop' is read by the pass between objects */
+	if(clwrite(&cl, Fctl, 0, "scrub stop", &r) != Rwrite)
+		fail("scrub stop: %s", clerr(&r));
+	for(i = 0; i < 150 && jobrunning(&cl); i++)
+		sleep(20);
+	istrue("a running pass stops when it is told to", !jobrunning(&cl));
+
+	/* fill the job cap, so that the next `scrub start' is refused */
+	srvhook(ctx, "jobhold", 1);
+	for(i = 0; i < 12; i++){
+		snprint(line, sizeof line, "forget peer%.2d", i);
+		if(clwrite(&cl, Fctl, 0, line, &r) != Rwrite)
+			fail("%#q: %s", line, clerr(&r));
+	}
+	clwrite(&cl, Fctl, 0, "scrub start", &r);
+	clerris("a scrub start with no job to be had", &r,
+		"shoalsrv: too many jobs");
+	srvhook(ctx, "jobhold", 0);
+	for(i = 0; i < 400 && jobrunning(&cl); i++)
+		sleep(20);
+	istrue("the passes holding the cap ended", !jobrunning(&cl));
+
+	/* the refusal left nothing latched: this one really starts */
+	if(clwrite(&cl, Fctl, 0, "scrub start rate=1", &r) != Rwrite)
+		fail("scrub start after a refused one: %s", clerr(&r));
+	if(slurpfile(&cl, Ffile, "jobs", buf, sizeof buf) > 0)
+		eqv("a scrub start after a refused one starts a pass",
+			nlines(buf, "job=scrub"), 1);
+	else
+		fail("a scrub start after a refused one started nothing");
+	if(clwrite(&cl, Fctl, 0, "scrub stop", &r) != Rwrite)
+		fail("final scrub stop: %s", clerr(&r));
+	for(i = 0; i < 400 && jobrunning(&cl); i++)
+		sleep(20);
+Out:
+	srvhook(ctx, "jobhold", 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * /jobs lists every pass, and the passes are bounded.
  *
  * layer-a §2.2 wants "one line per running or queued background job",
@@ -1723,6 +1814,7 @@ threadmain(int argc, char **argv)
 	tqjobcount();
 	treclaim();
 	tforget();
+	tscrubctl();
 	tjobs();
 	tdrop();
 	tshutdown();

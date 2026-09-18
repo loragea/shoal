@@ -579,13 +579,15 @@ ratearg(char *s, ulong *rate)
 char*
 srvctlscrub(Srvctx *c, Sfid *f, int argc, char **argv)
 {
+	char *e;
 	ulong rate;
-	int i, start, stop;
+	int i, start, stop, wasstop;
 
 	USED(f);
 	i = 0;
 	start = stop = 0;
 	rate = 0;
+	wasstop = 0;
 	if(i < argc && strcmp(argv[i], "start") == 0){
 		start = 1;
 		i++;
@@ -608,13 +610,32 @@ srvctlscrub(Srvctx *c, Sfid *f, int argc, char **argv)
 	if(start && c->scrubbing)
 		start = 0;
 	if(start){
+		wasstop = c->scrubstop;
 		c->scrubbing = 1;
 		c->scrubstop = 0;
 	}
 	unlock(&c->joblk);
 	if(!start)
 		return nil;
-	return jobstart(c, "scrub", scrubpass, nil);
+	if((e = jobstart(c, "scrub", scrubpass, nil)) == nil)
+		return nil;
+	/*
+	 * The flag is raised above, before it is known that a pass will
+	 * run, because raising it after the proc exists would race the
+	 * proc's own clearing of it.  So a jobstart that refuses — the
+	 * shutdown, the job cap, no memory — has to put it back: a flag
+	 * left raised makes every later `scrub start' answer success and
+	 * start nothing, which is the silent half of the failure.  The
+	 * stop flag goes back with it, so the refused line has changed
+	 * nothing about the pass; a `rate=' on the same line stands,
+	 * since it is what the NEXT pass starts at and this line's
+	 * refusal does not unsay it.
+	 */
+	lock(&c->joblk);
+	c->scrubbing = 0;
+	c->scrubstop = wasstop;
+	unlock(&c->joblk);
+	return e;
 }
 
 /*
