@@ -30,23 +30,12 @@
  * Of §2.2's field list, `epoch=' is normative — §8.6's monitor rebuild
  * reads it — and the rest SHOULD be present.  Four of them are not
  * rendered here and their absence is deliberate rather than an
- * oversight: `chunk=' is the smallest peer msize less headers, and
- * `underrep=', `strays=' and `marks=' count objects against peers and
- * against the stale ledger's marks on this instance.  This wave has no
- * peer client and no monitor client, so there is no peer msize to take
- * the smallest of and no reconcile pass to have counted the rest; a
- * zero would be a measurement this instance has not made.  store.md
- * §14(23) records the omission.  Three fields beyond §2.2's list are
- * rendered because something here has no other place to report them:
- * the open enumeration-snapshot count, which store.md §9 makes the
- * server's half of `objsnap=', the queue pool's depth, which §7 asks
- * /status to report so saturation is visible rather than folklore —
- * Reqqueue keeps no count, so these are the server's own — and
- * `diverged=', the count of §1.3's repairs this process has applied
- * (peer.c).  §1.3 requires a repair to be "reported in /status" and
- * names no field, so the name is this server's; the count is in
- * memory and per process, and store.md §14(15) has why the durable
- * half of the same record is not built.
+ * oversight: this wave has no peer client and no monitor client, so
+ * there is nothing to measure them against and a zero would be a
+ * measurement this instance has not made.  Fields beyond §2.2's list
+ * are rendered where something here has no other place to report
+ * them.  store.md §14(23) owns both lists and says which field is
+ * which and why; the render below is what it describes.
  */
 char*
 srvstatustext(Srvctx *c, Sfid *f, Text *t)

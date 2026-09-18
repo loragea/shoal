@@ -5296,12 +5296,17 @@ other files cite, so a gap is cheaper than a renumbering.
     None of the four can be computed without the peers and the
     reconcile pass §14(18) says are not built, and a zero would be a
     measurement this instance has not made. *Not made:* they are
-    absent from the file rather than present and wrong. Two fields
+    absent from the file rather than present and wrong. Three fields
     beyond §2.2's list are present because nothing else reports them:
-    `objsnapopen=`, which §9 makes the server's half of `objsnap=`,
-    and the queue pool's `queues=`, `qdepth=`, `qpushed=` and
+    `objsnapopen=`, which §9 makes the server's half of `objsnap=`;
+    the queue pool's `queues=`, `qdepth=`, `qpushed=` and
     `qdone=`, which §7 asks `/status` to report and which `Reqqueue`
-    does not count for itself. `queues=` is the size of the hash the
+    does not count for itself; and `diverged=`, the count of layer-a
+    §1.3's repairs this process has applied, which §1.3 requires to be
+    "reported in `/status`" without naming a field, so the name is
+    this server's. §14(15) has the rest of that record: the count is
+    in memory and per process, and the durable `/lost kind=diverged`
+    line is the open half. `queues=` is the size of the hash the
     object ids land in — the ceiling §7 is about — and does not count
     the one reserved queue an operation that names no object is
     offloaded to; the other three count every request the pool took
