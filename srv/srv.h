@@ -243,6 +243,14 @@ void	srvcount(Srvctx*, uvlong *pushed, uvlong *done);
  *	objhold	n != 0 holds every queued object request at its check
  *		point, so a test can have a request that is running and
  *		one that is still queued at a known moment.
+ *	objstage
+ *		n != 0 holds a queued object request between §5.4 step 3's
+ *		stage and the commit of it: after the look that says the
+ *		fid's stage is still this handler's and before the engine
+ *		call that publishes it.  That is the window a request owns
+ *		a stage it has not finished with, so it is where a test
+ *		drives step 7 — a Tflush of another request on the same
+ *		fid — against a commit that is about to happen.
  *	objexit	n != 0 holds every queued object request at the other
  *		end of its handler: after the engine call and before the
  *		exit, so a test can flush a request whose work is done
@@ -310,7 +318,7 @@ void	srvhook(Srvctx*, char *name, uvlong n);
  * Where a new point goes, and what the shutdown does with it.
  *
  * srvholdclear, which the shutdown runs before it drains, clears the
- * whole of srvhook's set and nothing else: objhold, objexit,
+ * whole of srvhook's set and nothing else: objhold, objstage, objexit,
  * flushhold, mapopen, walkhold, anyexit and step7.  A HOLD therefore
  * belongs in srvhook — a program that set a point and stopped watching
  * must not be able to hold the store's close.  (The shutdown also

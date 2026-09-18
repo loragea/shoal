@@ -490,6 +490,24 @@ srvqwalkhold(Req *r)
 }
 
 /*
+ * The point between a staged update and its commit: after §5.4 step
+ * 3's stage and the look that says it is still live, and before the
+ * engine call that publishes it.  It is the window in which the fid's
+ * stage belongs to a handler that has not finished with it, so it is
+ * where a test drives step 7 — a Tflush of another request on the same
+ * fid — against a commit that is about to happen.
+ */
+void
+srvqstagehold(Req *r)
+{
+	Qreq *qr;
+
+	if((qr = r->aux) == nil)
+		return;
+	qhold(qr->ctx, qr, &qr->ctx->stagehold);
+}
+
+/*
  * The second point, at the other end of a handler: after its engine
  * call and before its exit, so a test can flush a request whose work
  * is already done and watch it leave through srvqdone all the same.
@@ -716,6 +734,8 @@ srvhook(Srvctx *c, char *name, uvlong n)
 	qlock(&c->holdlk);
 	if(strcmp(name, "objhold") == 0)
 		c->hold = n;
+	else if(strcmp(name, "objstage") == 0)
+		c->stagehold = n;
 	else if(strcmp(name, "objexit") == 0)
 		c->exithold = n;
 	else if(strcmp(name, "flushhold") == 0)
@@ -747,6 +767,7 @@ srvholdclear(Srvctx *c)
 {
 	qlock(&c->holdlk);
 	c->hold = 0;
+	c->stagehold = 0;
 	c->exithold = 0;
 	c->flushhold = 0;
 	c->mapopen = 0;

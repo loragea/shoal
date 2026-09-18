@@ -388,14 +388,17 @@ extern int nsrvctls;
  *	A CLIENT operation on /obj/<oid> — a write, a create, a truncate
  *	or a remove — stages at §5.4 step 3 and gives the stage back at
  *	step 6 or step 7, inside the one request.  What it holds is the
- *	key step 3 chose and, for a write, this stage's own copy of the
- *	bytes: the Req's buffer is the request's and a stage may outlive
- *	it.  The commit is an engine call that stages and publishes in
- *	one (objwrite and friends), so a discard that lands while that
- *	call is in flight does not unmake it — layer-a §5.4.1's "MAY or
- *	MAY NOT have been applied" — and what the handler owes is not to
- *	commit AFTER a discard, which is what the look before the call
- *	is for.
+ *	key step 3 chose and nothing else: the bytes of a write stay the
+ *	Req's, and the commit reads them from it.  They can, because such
+ *	a stage never outlives its request and lib9p holds the Req's
+ *	buffer until the handler responds — and they must, because a
+ *	stage that owned them would take a commit's argument with it when
+ *	step 7 discarded the stage under the call.  The commit is an
+ *	engine call that stages and publishes in one (objwrite and
+ *	friends), so a discard that lands while that call is in flight
+ *	does not unmake it — layer-a §5.4.1's "MAY or MAY NOT have been
+ *	applied" — and what the handler owes is not to commit AFTER a
+ *	discard, which is what the look before the call is for.
  *
  *	An op=full or op=create on a /repl fid (§5.5, store.md §3.6)
  *	stages across MANY Twrites and the handle holds the engine's
@@ -451,8 +454,6 @@ struct Sstage
 	uvlong	ver;		/* the key §5.4 step 3 chose */
 	uvlong	wepoch;
 	uvlong	off;
-	uchar	*a;		/* the staged bytes, this stage's copy */
-	long	n;
 	ulong	ngrain;		/* against §3.6's per-fid bound */
 	vlong	last;		/* nsec of the last arrival */
 	int	busy;		/* a handler is inside a step on it */
@@ -516,6 +517,7 @@ struct Srvctx
 
 	QLock	holdlk;
 	uvlong	hold;		/* srvhook("objhold") */
+	uvlong	stagehold;	/* srvhook("objstage") */
 	uvlong	exithold;	/* srvhook("objexit") */
 	uvlong	flushhold;	/* srvhook("flushhold") */
 	uvlong	mapopen;	/* srvhook("mapopen") */

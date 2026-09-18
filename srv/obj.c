@@ -156,9 +156,10 @@ stageunlink(Srvctx *c, Sstage *s)
 
 /*
  * Release what a stage holds; the memory of the handle itself is the
- * owner's and goes elsewhere.  What it holds is the copy of the bytes
- * a client write staged and — for the op=full stage of the replication
- * surface — the engine handle, whose discard is an engine call and so
+ * owner's and goes elsewhere.  A client stage holds only the key it
+ * chose — the bytes of a write are the Req's throughout (dat.h) — so
+ * what there is to release is the engine handle of the op=full stage
+ * of the replication surface, whose discard is an engine call and so
  * MUST happen while the store is still open (dat.h's auxclose,
  * store.md §9).
  *
@@ -170,7 +171,6 @@ static void
 stagerelease(Srvctx *c, Sstage *s)
 {
 	Stage *g;
-	uchar *a;
 	int open;
 
 	qlock(&c->stagelk);
@@ -182,16 +182,12 @@ stagerelease(Srvctx *c, Sstage *s)
 	s->released = 1;
 	g = s->g;
 	s->g = nil;
-	a = s->a;
-	s->a = nil;
-	s->n = 0;
 	s->ngrain = 0;
 	open = c->store != nil && !c->closed;
 	c->nstagedone++;
 	if(open)
 		c->nstageopen++;
 	qunlock(&c->stagelk);
-	free(a);
 	if(g != nil && open)
 		stagediscard(g);
 }
@@ -306,15 +302,19 @@ srvstagesweep(Srvctx *c)
  * one is refused `disk full', which is §3.6's refusal for its per-fid
  * bound; so is an update covering more grains than that bound allows.
  *
- * a/n are copied, because the staged bytes outlive the Req's buffer on
- * any path that keeps a stage past its request.  The key is chosen
- * here rather than at the commit because §5.4 step 3 computes it
- * before the replication round, and spanning that round is what the
- * stage is for.
+ * The bytes of a write are NOT copied here: they stay the Req's, and
+ * the commit reads them from it.  A client stage lives inside its one
+ * request — it is created at §5.4 step 3 and given back at step 6 or
+ * step 7 — so the Req's buffer outlives it, while a stage that step 7
+ * discarded under a commit would otherwise take the commit's argument
+ * with it.  `n' is still wanted here, for the grains the update covers
+ * against §3.6's bound.  The key is chosen here rather than at the
+ * commit because §5.4 step 3 computes it before the replication round,
+ * and spanning that round is what the stage is for.
  */
 static Sstage*
 stagenew(Srvctx *c, Sfid *f, int kind, uchar *oid, int oidlen, uvlong ver,
-	uvlong wepoch, void *a, long n, uvlong off, char **err)
+	uvlong wepoch, long n, uvlong off, char **err)
 {
 	Sstage *s, *old;
 
@@ -337,15 +337,6 @@ stagenew(Srvctx *c, Sfid *f, int kind, uchar *oid, int oidlen, uvlong ver,
 	s->ngrain = stagegrains(c, off, n);
 	s->last = nsec();
 	s->busy = 1;
-	if(n > 0){
-		if((s->a = malloc(n)) == nil){
-			free(s);
-			*err = Eoom;
-			return nil;
-		}
-		memmove(s->a, a, n);
-		s->n = n;
-	}
 	/*
 	 * A stage the sweep expired, or one step 7 discarded, is still in
 	 * the slot: §3.6 has neither free the handle, because the handle
@@ -368,14 +359,12 @@ stagenew(Srvctx *c, Sfid *f, int kind, uchar *oid, int oidlen, uvlong ver,
 		 * §2.6 condition and does not pretend to be one.
 		 */
 		qunlock(&f->lk);
-		free(s->a);
 		free(s);
 		*err = Efidstate;
 		return nil;
 	}
 	if(old != nil && !old->dead && !old->released){
 		qunlock(&f->lk);
-		free(s->a);
 		free(s);
 		*err = Ediskfull;
 		return nil;
@@ -693,7 +682,7 @@ objwriteq(Req *r)
 		return;
 	}
 	if((s = stagenew(c, f, Stwrite, f->oid, f->oidlen, oi.ver+1,
-		c->map->epoch, r->ifcall.data, n, off, &e)) == nil){
+		c->map->epoch, n, off, &e)) == nil){
 		srvqdone(r, e);
 		return;
 	}
@@ -707,7 +696,16 @@ objwriteq(Req *r)
 		srvqdone(r, Estagegone);
 		return;
 	}
-	if(objwrite(c->store, s->oid, s->oidlen, s->a, s->n, s->off,
+	srvqstagehold(r);
+	/*
+	 * The bytes are the Req's and the key is the stage's.  lib9p keeps
+	 * the Req's buffer until this handler responds, so a step 7 that
+	 * lands between the look above and this call takes the stage and
+	 * leaves the argument standing — layer-a §5.4.1's "MAY or MAY NOT
+	 * have been applied" for a commit already in flight, rather than a
+	 * commit of no bytes at all.
+	 */
+	if(objwrite(c->store, s->oid, s->oidlen, r->ifcall.data, n, s->off,
 		s->ver, s->wepoch, nil, 0) < 0){
 		stagedone(f, s);
 		srvqexit(r);
@@ -788,7 +786,7 @@ objopenq(Req *r)
 	}
 	if((r->ifcall.mode & OTRUNC) != 0 && oi.len != 0){
 		if((s = stagenew(c, f, Sttrunc, f->oid, f->oidlen, oi.ver+1,
-			c->map->epoch, nil, 0, 0, &e)) == nil){
+			c->map->epoch, 0, 0, &e)) == nil){
 			srvqdone(r, e);
 			return;
 		}
@@ -822,7 +820,7 @@ objopenq(Req *r)
 	f->qidvers = q.vers;
 	r->ofcall.qid = q;
 	if(stagepointon(c) && (r->ifcall.mode&3) != OREAD)
-		if((s = stagenew(c, f, Stpoint, f->oid, f->oidlen, 0, 0, nil,
+		if((s = stagenew(c, f, Stpoint, f->oid, f->oidlen, 0, 0,
 			0, 0, &e)) != nil)
 			s->busy = 0;
 	srvqdone(r, nil);
@@ -889,7 +887,7 @@ objremoveq(Req *r)
 		return;
 	}
 	if((s = stagenew(c, f, Stremove, f->oid, f->oidlen, oi.ver+1,
-		c->map->epoch, nil, 0, 0, &e)) == nil){
+		c->map->epoch, 0, 0, &e)) == nil){
 		srvqdone(r, e);
 		return;
 	}
@@ -970,7 +968,7 @@ objwstatq(Req *r)
 		return;
 	}
 	if((s = stagenew(c, f, Sttrunc, f->oid, f->oidlen, oi.ver+1,
-		c->map->epoch, nil, 0, 0, &e)) == nil){
+		c->map->epoch, 0, 0, &e)) == nil){
 		srvqdone(r, e);
 		return;
 	}

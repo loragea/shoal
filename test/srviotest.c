@@ -1425,6 +1425,125 @@ Out:
 }
 
 /*
+ * The other side of step 7's discard: what it must NOT take.  A write
+ * that is past §5.4 step 3 and about to commit holds the fid's stage,
+ * and a Tflush of a second write QUEUED on that same fid runs step 7
+ * on the service loop and discards it — the stage is the fid's, and
+ * that is the rule.  The running write was never flushed, so §5.4.1's
+ * licence to have applied the update or not does not cover it: it must
+ * still commit the bytes its client sent.  The objstage point is what
+ * holds it in exactly that window (srv.h).
+ */
+static void
+tstagecommit(void)
+{
+	char buf[64], *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall t, r;
+	uvlong live, np, np2, nd;
+	ushort ta, tb, tf;
+	int i, n;
+
+	clstage = "stagecommit";
+	m = mkmap(Palone, Tblksz, Tobjmax, Tuuid);
+	d = newdisk(Tnslots);
+	if((ctx = startsrv(d, m, 0, 0)) == nil)
+		return;
+	mkobj(srvstore(ctx), "alpha", "orig!", 5);
+
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, Nclient, &r) != Rattach){
+		fail("attach: %s", clerr(&r));
+		goto Out;
+	}
+	if(clwalkobj(&cl, Froot, Ffile, "obj", "alpha", &r) != Rwalk
+	|| clopen(&cl, Ffile, ORDWR, &r) != Ropen){
+		fail("open /obj/alpha: %s", clerr(&r));
+		goto Out;
+	}
+	/* the first write stages, then waits between the stage and the commit */
+	srvhook(ctx, "objstage", 1);
+	memset(&t, 0, sizeof t);
+	t.type = Twrite;
+	t.tag = ta = cltag(&cl);
+	t.fid = Ffile;
+	t.offset = 0;
+	t.data = "NEW!!";
+	t.count = 5;
+	clput(&cl, &t);
+	for(i = 0; i < 400; i++){
+		srvstagecount(ctx, &live, nil, nil);
+		if(live == 1)
+			break;
+		sleep(5);
+	}
+	eqv("the running write holds the fid's stage", live, 1);
+	sleep(100);			/* ... and has reached the hold */
+
+	/*
+	 * The second write and the Tflush of it are read by the service
+	 * loop in the order they were sent, and the loop is what queues the
+	 * second one, so no wait is needed between them: by the time the
+	 * flush is read the write it names is on the queue behind the
+	 * request that is held.
+	 */
+	srvcount(ctx, &np, &nd);
+	t.tag = tb = cltag(&cl);
+	clput(&cl, &t);
+	for(i = 0; i < 400; i++){
+		srvcount(ctx, &np2, &nd);
+		if(np2 > np)
+			break;
+		sleep(5);
+	}
+	memset(&t, 0, sizeof t);
+	t.type = Tflush;
+	t.tag = tf = cltag(&cl);
+	t.oldtag = tb;
+	clput(&cl, &t);
+	if(clgettag(&cl, tb, &r) < 0)
+		fail("no answer for the flushed write");
+	else
+		eqs("the flushed queued write", clerr(&r), "interrupted");
+	cltagfree(&cl, tb);
+	if(clgettag(&cl, tf, &r) < 0)
+		fail("no Rflush");
+	else{
+		checks++;
+		if(r.type != Rflush)
+			fail("the Rflush after it: %s", clerr(&r));
+	}
+	cltagfree(&cl, tf);
+
+	srvhook(ctx, "objstage", 0);
+	if(clgettag(&cl, ta, &r) < 0)
+		fail("no answer for the running write");
+	else{
+		checks++;
+		if(r.type != Rwrite)
+			fail("the write that was not flushed: %s", clerr(&r));
+		else
+			eqv("... answers the count it took", r.count, 5);
+	}
+	cltagfree(&cl, ta);
+	n = clslurp(&cl, Ffile, buf, sizeof buf - 1);
+	if(n < 0)
+		n = 0;
+	buf[n] = 0;
+	eqs("a write step 7 did not name commits its own bytes", buf, "NEW!!");
+	clclunk(&cl, Ffile, &r);
+	clclunk(&cl, Froot, &r);
+Out:
+	srvhook(ctx, "objstage", 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * D16's shutdown: a fid holding a stage when the connection drops has
  * it discarded by the shutdown's sweep, BEFORE the store closes —
  * store.md §9 allows nothing but the snapshot calls afterwards, so a
@@ -1584,6 +1703,7 @@ threadmain(int argc, char **argv)
 	tstage();
 	tstagesweep();
 	tstageflush();
+	tstagecommit();
 	tstageclose();
 	tqueued();
 
