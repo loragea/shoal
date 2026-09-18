@@ -5169,9 +5169,8 @@ name a half that is not built; each says which.
     made:* layer-a is unchanged and this is a build that does not yet
     conform to it. Items 19 to 23, 30 and 31 are the consequences
     that are visible on the wire, and `/repl`, `/rpc` and `/advert`
-    are files
-    that exist, gate by role, and refuse with `shoalsrv: not built`
-    (§14(29)).
+    are files that exist, gate by role, and refuse with
+    `shoalsrv: not built` (§14(29)).
 
 19. **§6.4 F1's lease fence is inert while the map is static.** F1
     fences an instance that has not refreshed its map within
@@ -5350,13 +5349,14 @@ name a half that is not built; each says which.
     and the remove and wstat that reach the same gate — rather than
     the open alone. A `Twalk`, a `Tstat` and a `Tclunk` run no gate,
     so F1's "every operation" reaches as far as the gate does and no
-    further. The other two rules are not theirs — the operator rule is about an
-    object's name, and F3's `down` is about `role=client` I/O, which
-    neither row admits.
+    further. The other two rules are not theirs — the operator rule
+    is about an object's name, and F3's `down` is about `role=client`
+    I/O, which neither row admits.
 
     A `role=client` create of a reserved id is §1.1's `reserved
-    name`, which the create body answers after this gate has passed
-    the name (§14(30)).
+    name`, and the create body is what answers it: the gate's
+    operator rule asks about `role=admin` alone, so a client's create
+    passes the gate and is refused on the name below it (§2.1, §2.6).
 
 25. **An attach specifier missing a required attribute answers `bad
     aname`.** §2.1 makes `epoch` REQUIRED for `role=client` and
@@ -5426,13 +5426,17 @@ name a half that is not built; each says which.
     the content is. A `Tread` and a `Twrite` have no role gate of
     their own — 9P settles the role at the open, which is where
     §2.1's matrix is applied — and the row's gate runs on them as it
-    does on an open (§14(24)). `/obj` and `/meta` directory reads, `/repl`,
-    `/rpc`, `/advert`, `/dirty`, `/stale`, `/tombs`, `/lost`,
-    `/jobs` and every ctl verb but `fence` and `verify` answer it
-    today; the object rows' own operations no longer do (§14(30)). A caller sees it only where those gates pass: a
-    `role=admin` create or write of an id that is not reserved never
-    reaches it, because §2.1 makes that `permission denied`
-    (§14(24)), and neither does anything F3 or the fence refuses.
+    does on an open (§14(24)). The `/obj` and `/meta` directories'
+    reads, removes and wstats — no cell of either row answers a
+    `Tremove` or a `Twstat` of the directory itself, which §2.4 does
+    not define — `/repl`, `/rpc`, `/advert`, `/dirty`, `/stale`,
+    `/tombs`, `/lost`, `/jobs` and every ctl verb but `fence` and
+    `verify` answer it today; the object rows' own operations no
+    longer do (§14(30)). A caller sees it only where those gates
+    pass: a `role=admin` create or write of an id that is not
+    reserved never reaches it, because §2.1 makes that `permission
+    denied` (§14(24)), and neither does anything F3 or the fence
+    refuses.
 
     The same marking is what keeps §5.4.1's `interrupted` apart from
     the device's. A flushed request is answered `interrupted`, the
@@ -5440,9 +5444,10 @@ name a half that is not built; each says which.
     device call aborted by a note with no `Tflush` behind it is an
     error this server did not anticipate like any other, so it is
     answered `shoalsrv: interrupted`. §7 unwinds both into the whole
-    of step 7 — what the request had staged is discarded either way —
-    but only the queue's flush flag says a request was flushed, and
-    the two answers keep that distinction where a client can see it.
+    of step 7 — what the request had staged is discarded either
+    way — but only the queue's flush flag says a request was
+    flushed, and the two answers keep that distinction where a
+    client can see it.
 
 30. **The write path with no peers: one placement member acks alone,
     and any other member is `degraded`.** layer-a §5.4 step 4 sends
@@ -5459,10 +5464,12 @@ name a half that is not built; each says which.
     the primary may proceed; there is no monitor client, so that
     round trip cannot be made and step 5a's own rule sends the
     operation to step 7 — `degraded` (§6.5), whatever `mincopies`
-    says. A mirror whose peer is `up=no` therefore refuses every
-    client write, create, truncate and remove until the monitor
-    client exists, and reads are unaffected because they are not on
-    that path. T1 maps use `replicas=1` for that reason.
+    says. A placement with any member other than this instance
+    therefore refuses every client write, create, truncate and remove
+    until the monitor client exists: liveness is not consulted, so a
+    mirror whose peer is `up=no` and a healthy `replicas=2` pair are
+    refused alike. Reads are unaffected, not being on that path. T1
+    maps use `replicas=1` for that reason.
 
     The four client mutations take that path; an operator's write of
     a reserved `shoal.` id (§2.1) does not, being §8.6's rebuild path
