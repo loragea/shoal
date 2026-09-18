@@ -39,8 +39,10 @@ enum
 };
 
 static char*	ctlfence(Srvctx*, Sfid*, int, char**);
+static char*	ctlnewmonid(Srvctx*, Sfid*, int, char**);
 static char*	ctlnotbuilt(Srvctx*, Sfid*, int, char**);
 static void	ctlverify(Req*);
+static void	ctldrop(Req*);
 
 /*
  * One row per verb, one field per line: a verb is built by naming the
@@ -104,7 +106,7 @@ Sctl srvctls[] =
 	.fenced	= 1,
 	.nargmin= 1,
 	.nargmax= 1,
-	.fn	= ctlnotbuilt,
+	.qfn	= ctldrop,
 },
 {
 	.verb	= "verify",
@@ -120,7 +122,7 @@ Sctl srvctls[] =
 	.fenced	= 0,
 	.nargmin= 0,
 	.nargmax= 2,
-	.fn	= ctlnotbuilt,
+	.fn	= srvctlscrub,
 },
 {
 	.verb	= "forget",
@@ -128,7 +130,7 @@ Sctl srvctls[] =
 	.fenced	= 1,
 	.nargmin= 1,
 	.nargmax= 1,
-	.fn	= ctlnotbuilt,
+	.fn	= srvctlforget,
 },
 {
 	.verb	= "fence",
@@ -144,7 +146,7 @@ Sctl srvctls[] =
 	.fenced	= 0,
 	.nargmin= 1,
 	.nargmax= 1,
-	.fn	= ctlnotbuilt,
+	.fn	= ctlnewmonid,
 },
 };
 int nsrvctls = nelem(srvctls);
@@ -200,6 +202,130 @@ ctlfence(Srvctx *c, Sfid *f, int argc, char **argv)
 		return nil;
 	}
 	return Ebadctl;
+}
+
+/*
+ * The error a verb answers when an engine call failed.  A `fn' row's
+ * answer goes on the wire as it stands, so the mapping of §3.7 is
+ * applied here rather than left to the caller — and the string has to
+ * outlive the call, which is what the static is for: `fn' rows run on
+ * the service loop and nowhere else (dat.h), so this buffer has one
+ * writer.
+ */
+static char ctlerrbuf[ERRMAX];
+
+static char*
+ctlerr(void)
+{
+	return srverr(ctlerrbuf, sizeof ctlerrbuf);
+}
+
+/*
+ * §2.5's `newmonid <hex32>': replace this instance's pinned monid
+ * (§6.3), so that its next refresh may adopt a map carrying the new
+ * value.  It is available while fenced, because a monid mismatch is
+ * precisely what keeps refresh failing.
+ *
+ * The value is made durable before it is reported: monidpin is §2.2's
+ * publisher, durable before the value is acted on, and /status's
+ * `monid=' is this server's report of what it has pinned.  The
+ * argument is exactly 32 hex digits — §3.2's form — and anything else
+ * is `bad ctl', which is the only error §2.5's row carries.
+ *
+ * §2.5 also says the verb MUST be logged.  This server has no
+ * operator log to write it to — there is no monitor client and no
+ * log file in this build — so the record of it is /status's `monid='
+ * itself, which changes with the pin.  store.md §14(32) records the
+ * gap.
+ */
+static char*
+ctlnewmonid(Srvctx *c, Sfid *f, int argc, char **argv)
+{
+	uchar id[16];
+	int i, j, v, ch;
+
+	USED(f);
+	USED(argc);
+	if(strlen(argv[0]) != Monidlen)
+		return Ebadctl;
+	for(i = 0; i < 16; i++){
+		id[i] = 0;
+		for(j = 0; j < 2; j++){
+			ch = argv[0][2*i+j];
+			if(ch >= '0' && ch <= '9')
+				v = ch - '0';
+			else if(ch >= 'a' && ch <= 'f')
+				v = ch - 'a' + 10;
+			else if(ch >= 'A' && ch <= 'F')
+				v = ch - 'A' + 10;
+			else
+				return Ebadctl;
+			id[i] = (id[i]<<4) | v;
+		}
+	}
+	if(monidpin(c->store, id) < 0)
+		return ctlerr();
+	strecpy(c->monid, c->monid + sizeof c->monid, argv[0]);
+	return nil;
+}
+
+/*
+ * §2.5's `drop <oid>': delete a local copy with no tombstone (§7.4).
+ * It is object work, so it runs on the oid's queue like every other
+ * operation on that object — objdrop is one durable step and the
+ * queue is what orders it against the object's reads and writes.
+ *
+ * §7.4's drop guard is the caller's whole responsibility: "The holder
+ * MUST verify, against its own current map, that it is not in P(o);
+ * if it is, it MUST answer `still placed'."  The engine holds no map
+ * and makes no such check (lib/shoal.h), so it is made here, against
+ * the map this instance adopted at start-up — which, with no monitor
+ * client, is the only map it will ever have (store.md §14(18)): the
+ * refusal is therefore as current as this instance's placement is.
+ * It is made before the drop and under the object's queue, so nothing
+ * of this object's can pass between the check and the removal.
+ *
+ * The guard is against P(oid) and not against primaryship: §7.4 bars
+ * a holder that is in the placement set at all, which is what keeps a
+ * drop from taking the last copy.
+ */
+static void
+ctldrop(Req *r)
+{
+	char buf[ERRMAX], name[Oidmax+1];
+	Cinst *pl[Maxplace];
+	Srvctx *c;
+	Qreq *qr;
+	int i, n;
+
+	if(srvqcheck(r)){
+		srvqdone(r, nil);
+		return;
+	}
+	c = r->srv->aux;
+	qr = r->aux;
+	memmove(name, qr->oid, qr->oidlen);
+	name[qr->oidlen] = 0;
+	if((n = mapplace(c->map, name, pl, nelem(pl))) < 0){
+		rerrstr(buf, sizeof buf);
+		srvqdone(r, buf);
+		return;
+	}
+	if(n > nelem(pl))		/* mapparse bounds replicas by Maxplace */
+		n = nelem(pl);
+	for(i = 0; i < n; i++)
+		if(pl[i] == c->self){
+			srvqdone(r, Estillplaced);
+			return;
+		}
+	if(objdrop(c->store, qr->oid, qr->oidlen) < 0){
+		srvqexit(r);
+		srvrerror(r);
+		return;
+	}
+	srvqexit(r);
+	r->ofcall.count = r->ifcall.count;
+	srvqdone(r, nil);
 }
 
 /*

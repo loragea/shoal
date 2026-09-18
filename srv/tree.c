@@ -90,6 +90,8 @@ Sfile srvfiles[Nfile] =
 	.rd	= Aadmin,
 	.wr	= Aclient|Aadmin,
 	.gate	= objgate,
+	.open	= srvobjdiropen,
+	.read	= srvobjdirread,
 },
 [Qmeta] = {
 	.name	= "meta",
@@ -99,6 +101,8 @@ Sfile srvfiles[Nfile] =
 	.rd	= Aadmin,
 	.wr	= 0,
 	.gate	= objgate,
+	.open	= srvobjdiropen,
+	.read	= srvobjdirread,
 },
 [Qrepl] = {
 	.name	= "repl",
@@ -122,6 +126,8 @@ Sfile srvfiles[Nfile] =
 	.walk	= Arepl,
 	.rd	= Arepl,
 	.wr	= 0,
+	.render	= srvadverttext,
+	.open	= srvopenq,
 },
 [Qdirty] = {
 	.name	= "dirty",
@@ -129,6 +135,8 @@ Sfile srvfiles[Nfile] =
 	.walk	= Aadmin,
 	.rd	= Aadmin,
 	.wr	= 0,
+	.render	= srvdirtytext,
+	.open	= srvopenq,
 },
 [Qstale] = {
 	.name	= "stale",
@@ -136,6 +144,7 @@ Sfile srvfiles[Nfile] =
 	.walk	= Aadmin,
 	.rd	= Aadmin,
 	.wr	= 0,
+	.render	= srvstaletext,
 },
 [Qtombs] = {
 	.name	= "tombs",
@@ -143,6 +152,8 @@ Sfile srvfiles[Nfile] =
 	.walk	= Aadmin,
 	.rd	= Aadmin,
 	.wr	= 0,
+	.render	= srvtombstext,
+	.open	= srvopenq,
 },
 [Qlost] = {
 	.name	= "lost",
@@ -150,6 +161,8 @@ Sfile srvfiles[Nfile] =
 	.walk	= Aadmin,
 	.rd	= Aadmin,
 	.wr	= 0,
+	.render	= srvlosttext,
+	.open	= srvopenq,
 },
 [Qjobs] = {
 	.name	= "jobs",
@@ -157,6 +170,7 @@ Sfile srvfiles[Nfile] =
 	.walk	= Aadmin,
 	.rd	= Aadmin,
 	.wr	= 0,
+	.render	= srvjobstext,
 },
 [Qobjfile] = {
 	.name	= nil,
@@ -1221,9 +1235,11 @@ srvopentext(Req *r)
  * is the caller the pool's counting has to survive.
  *
  * /map is the row that takes it because its render reads nothing an
- * offload would change; the rows that will really need one — the /obj
- * directory's read and the status files whose renders take an engine
- * snapshot — are not built.
+ * offload would change, which is what makes it drivable from either
+ * side on demand.  The rows that really need the path take it in
+ * earnest and not from a point: the /obj and /meta directories' open
+ * and read, and /dirty, /lost, /tombs and /advert, whose renders take
+ * an engine snapshot (enum.c).
  */
 static void
 mapopenq(Req *r)

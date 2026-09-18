@@ -291,6 +291,74 @@ srvqpush(Srvctx *c, uchar *oid, int oidlen, Req *r, void (*f)(Req*))
 		srvqgo(c, r);
 }
 
+static void
+qjobrun(Req *r)
+{
+	Qjob *j;
+
+	j = (Qjob*)r;		/* the Req is Qjob's first member (dat.h) */
+	j->fn(j->arg);
+	qlock(&j->lk);
+	j->done = 1;
+	rwakeup(&j->rz);
+	qunlock(&j->lk);
+}
+
+/*
+ * The pool's entry for a caller that is not a request: the background
+ * passes, which run work on an object's queue because the queue is
+ * that object's ordering point (§5.4 step 2) and a mutation or a read
+ * outside it is ordered against nothing.
+ *
+ * THE RULE, which is why this is an entry point of its own and not a
+ * Req threaded through srvqprep: a non-Req caller never enters
+ * `respond'.  It has no tag, so nothing can flush it; it is not in
+ * lib9p's Req pool, so it holds no reference to the Srv and no pool
+ * freed it; and its Req is the caller's stack.  respond on such a Req
+ * would compute an Rmsg type from an ifcall that was never filled,
+ * free a stack address, and drop a reference the caller never took.
+ * So this path allocates nothing — the Qreq rides in the Qjob — and
+ * there is no failure for it to answer: it returns once the work has
+ * run.  The completion the pool is owed is given back here through
+ * srvqended, which is the count srvdestroyreq takes for a real Req;
+ * until it is given back, the shutdown's drain counts this unit as in
+ * flight, which is what makes the store outlive it (D16).
+ */
+int
+srvqjob(Srvctx *c, uchar *oid, int oidlen, void (*fn)(void*), void *arg)
+{
+	Qjob j;
+
+	memset(&j, 0, sizeof j);
+	j.r.srv = srv9p(c);
+	j.fn = fn;
+	j.arg = arg;
+	j.rz.l = &j.lk;
+	j.qr.ctx = c;
+	j.qr.f = qjobrun;
+	j.qr.q = c->q[oidhash(oid, oidlen) % c->nq];
+	if(oidlen > 0 && oidlen <= Oidmax){
+		memmove(j.qr.oid, oid, oidlen);
+		j.qr.oidlen = oidlen;
+	}
+	/*
+	 * Counted where srvqprep counts a request's: at the arming, so
+	 * that the push and the completion below are the same unit to the
+	 * drain (srvqdrain) and to /status's depth.
+	 */
+	lock(&c->cntlk);
+	c->npush++;
+	unlock(&c->cntlk);
+	j.r.aux = &j.qr;
+	srvqgo(c, &j.r);
+	qlock(&j.lk);
+	while(!j.done)
+		rsleep(&j.rz);
+	qunlock(&j.lk);
+	srvqended(&j.qr);
+	return 0;
+}
+
 /*
  * Srv.flush.  layer-a §5.4.1: a Tflush naming a pending object
  * operation MUST be answered with Rflush, because devmnt sends one on
@@ -469,6 +537,64 @@ void
 srvqanyexit(Srvctx *c)
 {
 	qhold(c, nil, &c->anyexit);
+}
+
+/*
+ * The point at the end of a background pass, which is not a request
+ * and has no queue: a pass is parked here with its record still on the
+ * job list, so that what it finished with is readable at /jobs rather
+ * than raced against the unlink.  It holds a pass proc, so the
+ * shutdown's srvholdclear reaches it before jobwait.
+ */
+void
+srvjobhold(Srvctx *c)
+{
+	qhold(c, nil, &c->jobhold);
+}
+
+/*
+ * The one point here that refuses rather than holds: whether this read
+ * of an index walk's n'th unit is to be treated as having failed — the
+ * scrub pass's read of an index slot (job.c) and the directory read's
+ * of a snapshot position (enum.c) both ask.  It is the only way to
+ * break such a walk off part-way while the store underneath it stays
+ * healthy — the engine's own way of refusing an index read is to be
+ * condemned, which refuses every other call the walk would make as
+ * well, so a walk broken off that way cannot be told from one whose
+ * store has gone.  Set to n+1; 0 is off, and srvholdclear turns it off
+ * with the rest.
+ */
+int
+srvslotfail(Srvctx *c, uvlong slot)
+{
+	uvlong n;
+
+	qlock(&c->holdlk);
+	n = c->slotfail;
+	qunlock(&c->holdlk);
+	return n != 0 && slot == n-1;
+}
+
+/*
+ * The point inside the tombstone reclaim walk (job.c), which nothing
+ * else here can stop part-way: the scrub that carries it is already
+ * past its index walk when the walk begins, and the walk itself is
+ * paced by nothing and asks no queue.  n != 0 parks it before its
+ * n-1'th entry, with the entries before that one counted, so a test
+ * can raise `scrub stop' or take the server down over a walk that
+ * has counted a prefix of the snapshot.  Set to n+1, like slotfail; 0
+ * is off, and srvholdclear turns it off with the rest.
+ */
+void
+srvreclaimhold(Srvctx *c, uvlong i)
+{
+	uvlong n;
+
+	qlock(&c->holdlk);
+	n = c->reclaimhold;
+	qunlock(&c->holdlk);
+	if(n != 0 && i == n-1)
+		qhold(c, nil, &c->reclaimhold);
 }
 
 /*
@@ -725,6 +851,12 @@ srvhook(Srvctx *c, char *name, uvlong n)
 		c->anyexit = n;
 	else if(strcmp(name, "step7") == 0)
 		c->step7hold = n;
+	else if(strcmp(name, "jobhold") == 0)
+		c->jobhold = n;
+	else if(strcmp(name, "slotfail") == 0)
+		c->slotfail = n;
+	else if(strcmp(name, "reclaimhold") == 0)
+		c->reclaimhold = n;
 	qunlock(&c->holdlk);
 }
 
@@ -750,6 +882,9 @@ srvholdclear(Srvctx *c)
 	c->walkhold = 0;
 	c->anyexit = 0;
 	c->step7hold = 0;
+	c->jobhold = 0;
+	c->slotfail = 0;
+	c->reclaimhold = 0;
 	qunlock(&c->holdlk);
 }
 

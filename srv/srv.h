@@ -229,12 +229,14 @@ void	srvshutdown(Srvctx*);
 int	srvjobstart(Srvctx*);
 void	srvjobend(Srvctx*);
 int	srvstopping(Srvctx*);
+/* srvjobcount, below, is how many are held right now */
 
 /* what a caller and the tests read back */
 Store*	srvstore(Srvctx*);
 Cmap*	srvmap(Srvctx*);
 char*	srviid(Srvctx*);
 void	srvcount(Srvctx*, uvlong *pushed, uvlong *done);
+int	srvjobcount(Srvctx*);	/* jobs held: what the shutdown waits for */
 
 /*
  * store.md §13's -X shape, for this library's own points: inert until
@@ -243,10 +245,17 @@ void	srvcount(Srvctx*, uvlong *pushed, uvlong *done);
  *	objhold	n != 0 holds every queued object request at its check
  *		point, so a test can have a request that is running and
  *		one that is still queued at a known moment.
- *	objexit	n != 0 holds every queued object request at the other
- *		end of its handler: after the engine call and before the
- *		exit, so a test can flush a request whose work is done
- *		and require it to leave through srvqdone all the same.
+ *	objexit	n != 0 holds every queued request that has reached the
+ *		other end of its handler — a ctl verb run on an oid's
+ *		queue, and the /obj and /meta directory open and read on
+ *		the reserved one — after its engine call and before the
+ *		exit, so a test can flush a request whose work is done and
+ *		require it to leave through srvqdone all the same.  For
+ *		the two directory cells that is the only place a flush
+ *		can land after the work: the open's snapshot is taken and
+ *		installed by then, and the read's cursor is committed, so
+ *		this is the point that drives the give-back a flushed open
+ *		owes (enum.c) and the rewind a flushed read leaves behind.
  *	mapopen	1 offloads a Topen of /map to the reserved queue
  *		srvqpushany uses and holds it there until the point is
  *		cleared; 2 prepares that open for a queue and then
@@ -276,6 +285,42 @@ void	srvcount(Srvctx*, uvlong *pushed, uvlong *done);
  *		which the service loop is making and unmaking fids on the
  *		same registry, so it is where a test drives an attach
  *		against a walk.
+ *	jobhold	n != 0 holds a background pass at the end of its run:
+ *		after its walk, while its record is still on the job list
+ *		and still holds the job the shutdown waits on, and before
+ *		the proc unlinks it.  A pass's counters and the error it
+ *		gave up with are read from /jobs, and /jobs lists a pass
+ *		only while it is running or queued, so this is where a
+ *		test reads what a pass finished with instead of racing the
+ *		unlink for it.  This is the one point whose park the
+ *		shutdown WAITS for rather than steps over: the wait for
+ *		the jobs is unbounded, because store.md §9 forbids closing
+ *		the store while a pass is still inside the engine, and the
+ *		shutdown clears the point before that wait.  So a program
+ *		that raises jobhold again after the shutdown has begun
+ *		parks a pass the shutdown then waits on for good; a
+ *		program clears it before it stops the server.
+ *	slotfail
+ *		the one point here that refuses rather than holds: n != 0
+ *		makes a walk over this instance's own index treat its n-1'th
+ *		read as having failed — the scrub pass's read of index slot
+ *		n-1, and the /obj and /meta directory read's objsnapent of
+ *		snapshot position n-1.  It is how such a walk is broken off
+ *		part-way with the store under it still healthy — the
+ *		engine's own way of refusing an index read is to be
+ *		condemned, which refuses the rest of the walk's calls too,
+ *		and a walk broken off that way cannot be told from one
+ *		whose store has gone.  The two walks are separate cases,
+ *		so the one number serves both.
+ *	reclaimhold
+ *		n != 0 holds the tombstone reclaim walk that rides on a
+ *		scrub before its n-1'th entry, with the entries before
+ *		that one already counted.  Nothing else can stop that walk
+ *		part-way: it starts only once the scrub is past its index
+ *		walk, and it is paced by nothing and asks no queue.  So it
+ *		is where a test raises `scrub stop', or takes the server
+ *		down, over a walk that has counted a prefix of the
+ *		snapshot.  Set to n+1, like slotfail.
  *	flushhold
  *		n != 0 holds a Tflush of a pooled request between the
  *		lookup that found it and the flush itself, which is the
@@ -311,7 +356,8 @@ void	srvhook(Srvctx*, char *name, uvlong n);
  *
  * srvholdclear, which the shutdown runs before it drains, clears the
  * whole of srvhook's set and nothing else: objhold, objexit,
- * flushhold, mapopen, walkhold, anyexit and step7.  A HOLD therefore
+ * flushhold, mapopen, walkhold, anyexit, step7, jobhold, slotfail
+ * and reclaimhold.  A HOLD therefore
  * belongs in srvhook — a program that set a point and stopped watching
  * must not be able to hold the store's close.  (The shutdown also
  * turns srvcellpoint off, by its own call and for its own reason: the

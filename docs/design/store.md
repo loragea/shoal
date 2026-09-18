@@ -2377,9 +2377,11 @@ hash, for exactly such a request — a queue of its own, so that
 offloading one neither waits behind an object's operations nor
 reorders them against each other. It is otherwise an ordinary push:
 counted in the depth, flushable, and unwound through the same single
-exit. Nothing on the served surface uses it yet — the renders and the
-`/obj` directory read that will need it are not built — so today it
-carries only what the server's own test point puts there.
+exit. Six rows of the served surface push to it: the `/dirty`,
+`/lost`, `/tombs` and `/advert` opens, each of which renders its file
+out of engine state, and the `/obj` and `/meta` directory opens and
+reads, which take a §9 snapshot and walk it. The server's own test
+point puts work there too.
 
 **The pool size is a ceiling, not just a collision parameter.** A
 queue proc runs one pushed request at a time, and a client write
@@ -2691,8 +2693,10 @@ already there:
 **What the engine builds, and what the server still owes.** The
 engine holds the per-object primitives and the durable state; the
 pass that drives them — the proc, its rate limit, the queue it pushes
-through and the peer fetch — is the server's, and is not built yet;
-it lands with the server's 9P export. The primitives are:
+through and the peer fetch — is the server's. All of it but the peer
+fetch is built: `srv/job.c` runs the pass from layer-a §2.5's `scrub`
+verb, in a proc holding one of the server's background jobs, and
+paces itself over the bytes it hashes (§14(31)). The primitives are:
 
 - **verify** one object, as above, mutating nothing.
 - **scrub** one object: verify, then the one durable transition that
@@ -2775,7 +2779,8 @@ A corrupt copy loses arbitration against everything including absence
 (layer-a §1.3), which the server enforces by refusing to advertise
 it.
 
-**Scrub runs inside the queues.** *This is the half the server builds.*
+**Scrub runs inside the queues.** *This is the half the server
+builds, and it is built (§14(31)).*
 A background proc walks slots in order, but it does not read grains
 itself: for each object it pushes one verify request onto that
 object's `Reqqueue` and waits for the answer, exactly as a client
@@ -3383,13 +3388,16 @@ render, and so is clamping the requested `n=` to the negotiated
 §6's tombstone reclaim is the enumeration's first caller, and it is
 the caller's walk rather than the engine's: the engine holds no
 `tombdays` policy, because layer-a §3.1 makes `tombdays` a map-header
-attribute. The caller opens a `/tombs` snapshot, tests each entry's
+attribute. The caller opens a `/tombs` snapshot and tests each entry's
 `mtime` against its own cutoff and the entry's `wepoch` against its
-own map epoch, and discards by the entry's **own key** rather than by
-its slot — which is what makes the walk safe under concurrent
-mutation, since §6's receiver checks then refuse a record that is not
-the one the walk inspected instead of removing whatever the slot came
-to hold.
+own map epoch. It **counts** what passes both and removes nothing
+(§14(31)): layer-a §1.5's third condition has nothing to answer it
+while there is no peer client. The discard is addressed by the
+entry's **own key** and not by its slot — that is what `objdiscard`
+takes and what §6's receiver checks enforce, so a discard refuses a
+record that is not the one the walk inspected instead of removing
+whatever the slot came to hold — and it is what the walk will use
+when the replication surface brings condition 1.
 
 ## 10. The monitor's map slot store
 
@@ -4268,7 +4276,7 @@ T1 formats a **small geometry** — a partition image of a few MiB with
 over one header sector, not over the whole store, and the cases that
 need `nslots = 2^20` are T2's.
 
-**What T1 covers today.** Fifteen programs. All but `maptest`, which
+**What T1 covers today.** Seventeen programs. All but `maptest`, which
 is pure text and reaches no device at all, run against the simulated
 disk except where a file-backed device is the point:
 `csumtest` (layer-a §1.4's block digests and object checksums against
@@ -4532,16 +4540,29 @@ and dropping and re-creating them behind itself, over a store
 formatted with more than `Listchunk` slots so that a page is more
 than one hold).
 
-Against the list below that is T1.1–T1.26 and T1.28–T1.33. One case
-is not covered and waits on something this store does not have yet:
-**T1.27** waits on the server's `Reqqueue` pool (§7), which is what it
-is about — the engine's own scrub and cursor take the same `qlstate`
-snapshot every other call takes and hold no lock across a verify, but
-*that a scrubber pushes through the object's queue rather than reading
-grains beside it* is a property of the server, and there is no server
-to hold it wrong yet. T1.21 is covered for the orderings and the
+Two more drive the 9P surface rather than the engine, over
+`test/srv9p.h`'s in-process client (`AGENTS.md`): `srvtest` (layer-a
+§2's framework — start-up and identity, §2.1's attach and role
+matrix, §2.2's tree, §2.3's qids, the render-at-open files, §2.5's
+ctl gates, §5.4.1's `Tflush` and step 7, the per-fid state hooks, and
+D16's shutdown order) and `srvenumtest` (what that framework carries:
+§2.5's `scrub`, `forget`, `drop` and `newmonid`, §2.2's `/dirty`,
+`/stale`, `/tombs`, `/lost`, `/advert` and `/jobs`, the `/obj` and
+`/meta` directory reads over a §9 snapshot with entries going
+live→tomb mid-read, D20's retry and the `objsnapmax` refusal, §7.5's
+scrub pass with T1.27 below, and §9's tombstone reclaim at both sides
+of its cutoff). The split is by layer and not by size: a failure in
+one says which half broke.
+
+Against the list below that is T1.1–T1.33. Three of those rows are
+covered at less than their full width, and each says so in its own
+place below as well. **T1.21** is covered for the orderings and the
 fields, but drives the four publish triggers in sequence rather than
-from concurrent procs. **T1.15** is covered at T1's geometry and not
+from concurrent procs. **T1.27** is covered at the property its
+argument rests on — the unit of scrub work is pushed to the object's
+`Reqqueue` — and not at the race, which needs a client write path to
+issue the racing commit with and the server has none. **T1.15** is
+covered at T1's geometry and not
 at the scale its row names: `enumtest` walks a snapshot of 1500
 entries over 4096 slots while four procs create, delete and discard
 beside it, and reads `/dirty` under the same churn, which is the shape
@@ -4784,9 +4805,18 @@ what would close it.
   object while a commit on the same object frees that grain and
   another object stages into it; the scrub must not flag the object
   `corrupt`. *Mutation:* have the scrubber read grains directly
-  instead of pushing through the object's `Reqqueue`. Not covered:
-  the `Reqqueue` pool is the server's (§7) and is not built, so
-  neither is the thing this test discriminates between.
+  instead of pushing through the object's `Reqqueue`. Covered in
+  `srvenumtest` at the property the row rests on rather than at the
+  race: with §13's `objhold` point set, a client's `verify <oid>`
+  parks inside that oid's queue, and the pass's `/jobs` `done=` stops
+  at that object's slot with slots still ahead of it and moves again
+  only when the hold is cleared. That property and the mutation above
+  are the whole of this row's coverage: the mutation makes the case
+  fail and the queue push makes it pass, which is what a scrubber
+  reading beside the queue would and would not do. The commit racing
+  the read is not driven at all — issuing one needs a client write
+  path, and the server has none — so the row stays open at the race
+  until something can.
 - **T1.28 the online rebuild walk (§8, D18).** A store with a slot §5
   step 10 condemned, walked while it serves: the rebuilt bitmap
   equals a full scan of the live maps read off the media, `grainleak`
@@ -4978,16 +5008,16 @@ would be a wire change.
 
 *Policy, but read it before implementing anything.*
 
-Twenty-nine places where layer-a is silent, self-defeating, or
+Thirty-three places where layer-a is silent, self-defeating, or
 contradicted by the measurements or by the platform. Each entry
 states the tension, its resolution, and where the argument for it
 lives; nothing here repeats an argument made in a section above.
 Items 1–5, 8, 9, 11, 12, 13, 14 and 26 are amendments **made** to
-`docs/design/layer-a.md`; items 6, 7, 15, 17, 18–25 and 27–29 are
+`docs/design/layer-a.md`; items 6, 7, 15, 17, 18–25 and 27–33 are
 recorded here and not made there; items 10 and 16 are **proposals** rather
 than amendments, because they touch the wire.
 
-Items 18 to 29 are the object server's, and they describe what
+Items 18 to 33 are the object server's, and they describe what
 `srv/libshoalsrv.a` and `cmd/shoalsrv` **do today**. Several of them
 name a half that is not built; each says which.
 
@@ -5129,6 +5159,22 @@ name a half that is not built; each says which.
     beyond `oid=` and `kind=` is implementation policy there, so the
     omission is the smaller of the two departures.
 
+    **`kind=` reads `corrupt` on every line that carries an `oid=`.**
+    §2.2's three values are not three states of one flag. `corrupt`
+    is layer-a §7.5's local verification failure, which is the only
+    one an instance decides by itself; `lost` is §7.5(4)'s "no peer
+    holds a verifying copy" and `diverged` is §1.3's equal key with
+    differing content, and both are verdicts about what peers hold.
+    This build has no peer client (§14(18)), so neither has been
+    reached, and the engine's flags say nothing about them: a slot
+    joins the lost list only when it is bad or carries `Icorrupt`
+    (§8), and the one path that sets either on an entry with an oid
+    sets both. *Not made:* an oid-bearing line renders `corrupt`
+    unconditionally, and the two peer verdicts land with the
+    replication surface. A condemned slot's line keeps `kind=lost`,
+    which is §9's wording for it and is §7.5(4)'s meaning with
+    nothing left to ask about: the copy cannot be read at all.
+
 16. **layer-a §5.5 requires the resulting-`csum` check but not that
     it precede the update.** §5.5 has the receiver "compute its own
     and MUST fail with `checksum mismatch` if they differ" and fixes
@@ -5168,9 +5214,13 @@ name a half that is not built; each says which.
     currency check is made and no stale mark is registered. *Not
     made:* layer-a is unchanged and this is a build that does not yet
     conform to it. Items 19 to 23 are the consequences that are
-    visible on the wire, and `/repl`, `/rpc` and `/advert` are files
-    that exist, gate by role, and refuse with `shoalsrv: not built`
-    (§14(29)).
+    visible on the wire. `/repl` and `/rpc` are files that exist,
+    gate by role, and refuse with `shoalsrv: not built` (§14(29)).
+    `/advert` is built: it renders this instance's own inventory in
+    §7.2's line grammar, live and tomb, for a peer to read. Nothing
+    sends it, because §7.2's sender — and its rate limit — is the
+    peer client this item is about; what is built is the readable
+    half.
 
 19. **§6.4 F1's lease fence is inert while the map is static.** F1
     fences an instance that has not refreshed its map within
@@ -5391,9 +5441,12 @@ name a half that is not built; each says which.
     name`.** §2.5 answers a known verb with bad arguments `bad ctl`;
     §2.6 makes `bad object name` the answer to "any operation naming
     an oid that violates §1.1". *Not made:* the more specific string
-    wins, so `verify` and every later verb that names an object
-    answer `bad object name` for an id §1.1 forbids and `bad ctl` for
-    every other argument fault, including the wrong number of them.
+    wins, so `verify` and `drop` — and every later verb that names an
+    object — answer `bad object name` for an id §1.1 forbids and `bad
+    ctl` for every other argument fault, including the wrong number
+    of them. §2.5's error column for `verify` and `drop` lists `bad
+    ctl` and not `bad object name`, so a client reading that column
+    alone would not expect the more specific one.
 
 28. **A multi-element walk cannot carry a §2.6 error.** §2.6 makes
     `no such object` the answer to a walk of an id nothing holds, and
@@ -5424,11 +5477,12 @@ name a half that is not built; each says which.
     the content is. A `Tread` and a `Twrite` have no role gate of
     their own — 9P settles the role at the open, which is where
     §2.1's matrix is applied — and the row's gate runs on them as it
-    does on an open (§14(24)). `/obj` and `/meta` directory reads, `/repl`,
-    `/rpc`, `/advert`, `/dirty`, `/stale`, `/tombs`, `/lost`,
-    `/jobs`, the object rows' open, read, write, create, remove and
-    wstat, and every ctl verb but `fence` and `verify` answer it
-    today. A caller sees it only where those gates pass: a
+    does on an open (§14(24)). `/repl` and `/rpc`, the object rows'
+    open, read, write, create, remove and wstat, and the ctl verbs
+    `pull`, `push`, `reconcile`, `advert`, `refresh` and `register`
+    answer it today; the status files, the `/obj` and `/meta`
+    directory reads and the other ctl verbs are built and answer
+    their own. A caller sees it only where those gates pass: a
     `role=admin` create or write of an id that is not reserved never
     reaches it, because §2.1 makes that `permission denied`
     (§14(24)), and neither does anything F3 or the fence refuses.
@@ -5442,6 +5496,179 @@ name a half that is not built; each says which.
     of step 7 — what the request had staged is discarded either way —
     but only the queue's flush flag says a request was flushed, and
     the two answers keep that distinction where a client can see it.
+
+30. **`forget` is background work, which §2.5 does not say it is.**
+    layer-a §2.5 marks `scrub` as starting a job and says nothing of
+    the kind about `forget <iid>`, whose plain reading is that the
+    records are gone when the `Rwrite` comes back. Each record it
+    discards is one `dirtydel`, which is one durable commit (§2.6),
+    and the dirty region holds as many records as the disk was
+    formatted for — so a `forget` answered on the service loop parks
+    that loop for that many commits, and layer-a §5.4.1 requires a
+    `Tflush` to be answerable throughout. It cannot be a queued row
+    either: a queued row's `argv[0]` is an oid the framework hashes,
+    and `forget`'s is an instance id. *Not made:* the verb answers
+    success once the pass is accepted, in §2.5's own words for the
+    verbs that do start work, and `/jobs` carries a `job=forget` line
+    until the records are gone. An operator who reads `/dirty`
+    immediately after the `Rwrite` may still see them. What the verb
+    achieves is the discard alone: §7.1 has it mark the peer
+    `fullsync`, the engine has no setter for that flag, and §9
+    records that nothing clears it and that a peer is registered with
+    it already set — so the coarse half of §7.1's meaning is in force
+    for every peer before the verb runs.
+
+    Being a pass gives `forget` no bound of its own: `scrub` is kept
+    to one pass per index by a flag, but `forget <iid>` names a peer,
+    and a client could write it once per id it can spell — each write
+    a proc holding a dirty snapshot and one of the jobs the shutdown
+    waits on. *Not made:* **twelve passes may run at once**, counted
+    over both verbs, and a verb that would start a thirteenth is
+    refused with the local `shoalsrv: too many jobs` rather than
+    accepted. §2.5's error column for these verbs names `fenced` and
+    `bad ctl` and neither covers this, so the refusal is a local
+    string (§14(29)); the number is implementation policy. `/jobs`
+    renders **every** job on the list, which §2.2's "one line per
+    running or queued background job" requires and which the cap
+    bounds the cost of.
+
+    A pass has no client to answer and this build has no operator log,
+    so a walk that broke off — a failed index read, a failed
+    `dirtydel`, a snapshot that would not open, an object whose grains
+    would not read — reported success by saying nothing. *Not made:* a
+    pass records what it gave up with, and `/jobs` renders it as a
+    trailing **`err=<string>`** on that job's line, present only when
+    there is one and last on the line because the string may hold
+    spaces. §2.2 makes `/jobs`'s format implementation policy beyond
+    its being one record per line, so the field is policy entire. The
+    same record is what says the walk's answer is not a whole index's:
+    §9's reclaim walk runs only at the end of a scrub that walked
+    every slot, was not stopped and recorded no error, because
+    `reclaimable=` over a prefix of the index — or over an index the
+    pass could not read all of — is indistinguishable from
+    `reclaimable=` over the whole of it.
+
+    A **per-object** read failure is a failure of the pass and not the
+    end of it: the scrub records it and walks on, since one object
+    that would not read says nothing about the next and stopping would
+    leave the rest of the index unverified as well. That is the one
+    way a pass reaches the end of its walk carrying an `err=`, and it
+    is why the reclaim's gate tests the error as well as the slot
+    count. An object that has merely **gone** between the index read
+    and the queue is not a failure at all: the walk reads the index
+    outside every queue and its unit is ordered behind whatever that
+    queue held, so a delete or a drop in between is the ordering
+    working. The engine's two answers for such an id — `no such
+    object` and `object deleted` — are told apart from a read failure
+    by the string, and `/jobs` counts them at **`skipped=<n>`**
+    (policy, like the rest of the line).
+
+31. **The scrub's pace is this server's, and it carries the reclaim
+    walk (§8, §9; layer-a §2.5, §7.5).** layer-a §7.5 leaves
+    `scrubdays` and the rate to the implementation and sizes its own
+    example at "a default near 14 days ... ~4 MiB/s on a 4 TB disk".
+    *Not made:* `scrub rate=<n>` is in KiB/s as §2.5 says, the
+    default is 4096 KiB/s so that an operator who sets nothing gets
+    layer-a's own sizing, and the pace is over the bytes hashed —
+    each object charged its own `len` plus a 1 KiB floor, because an
+    object of no bytes still costs a queue push and an index read.
+    `scrub` with neither `start` nor `stop` changes nothing and
+    succeeds; a `start` while a pass runs is accepted and starts
+    nothing, since the job asked for is already running; the two
+    words are read in §2.5's own order and each at most once, so a
+    line that reorders or repeats them is `bad ctl`.
+
+    A `start` while a pass is **stopping** — told to stop and not yet
+    wound down — is refused instead, with the local `shoalsrv: scrub
+    stopping` (§14(29)), because the job asked for is not running and
+    is not going to be: that pass reads the flag between two objects
+    and gives up. *Considered and rejected:* clearing the stop flag so
+    that the pass carries on, which races the pass's own read of it —
+    told before, it walks on; told after, it has already broken off —
+    and a verb whose effect turns on that race cannot be described to
+    a client. The `rate=` on a refused line stands, as it does for the
+    other refusals.
+
+    §9's tombstone reclaim runs at the end of a pass that was not
+    stopped, and has no verb of its own: §2.5 fixes the ctl grammar
+    and has no verb for it, so adding one would be a wire change
+    (§13's own argument for `-X` being a flag), and `scrub` is the
+    only verb §2.5 gives an instance for walking its own index on a
+    schedule.
+
+    **The walk counts and discards nothing.** layer-a §1.5 licenses a
+    discard only when **all three** of its conditions hold. Two are
+    local and are what the walk tests: condition 2, `tombdays` of
+    retention since the entry's `mtime`, read from the map header
+    (§3.1) because the engine does not hold it; and condition 3, the
+    map epoch strictly above the entry's `wepoch`. Condition 1, full
+    confirmation from every instance in the map whose `status` is not
+    `dead`, is **open**: this build has no outbound peer client
+    (§14(18)), so no instance has confirmed anything and condition 1
+    blocks every discard. §1.5 names discarding on 2 and 3 alone as
+    the first draft's unsound rule and the resurrection hole it
+    leaves — a holder absent since before the delete returns with the
+    live copy, and absence loses arbitration (§1.3). *Not made:* the
+    walk reports instead. `/jobs` carries `reclaimable=<n>`, the
+    tombstones past conditions 2 and 3, which is the number of
+    discards the replication surface will have to confirm; every
+    record stays where it is, and `/tombs` still lists it.
+
+    A reclaim walk that is itself cut short — `scrub stop`, or the
+    shutdown, read between its entries — has counted a prefix of the
+    snapshot, and nothing else on the line says so: `done=` and
+    `total=` belong to the index walk and read `done=T/T` by then.
+    *Not made:* such a walk records `shoalsrv: stopped` through the
+    same `err=` §14(30) gives a pass that gave up, so `reclaimable=`
+    is read beside an error rather than as the whole store's answer.
+    The count it did reach is left on the line, since a prefix marked
+    as one is worth more to an operator than no number at all. One
+    string covers both causes: what has to be known is that the
+    number is a prefix, not which of the two cut it short.
+
+    The walk
+    reads the tombstones through a §9 snapshot of its own and holds it
+    for its whole run, so it occupies one of `objsnapmax`'s slots and
+    `/status`'s `objsnapopen=` counts it: an operator who watches that
+    field climb by one while a scrub is ending is watching the
+    reclaim, not a client. When that
+    surface lands it adds condition 1 and §1.5's execution — `op=
+    discard` to every confirming instance, this instance's own record
+    removed last — and every discard then goes through that oid's
+    queue, as the scrub's own reads do.
+
+32. **`newmonid` cannot replace a pinned `monid`, and nothing logs
+    it (layer-a §2.5, §6.3).** §2.5 has the verb *replace* this
+    instance's pinned `monid` and MUST log it. The engine's publisher
+    for that value is `monidpin`, which pins a value on a store that
+    has none and refuses a **different** one on a store that has
+    (§2.2); every serving instance has one, since start-up pins the
+    map's. *Not made:* the verb is built as far as that call reaches
+    — the spelling, §2.5's gates, the durable publish and `/status`'s
+    `monid=` — and a value that differs from the pinned one is
+    refused with the engine's own words, which carry no layer-a §2.6
+    prefix. What §2.5 asks for needs a re-pin in `lib/` that does not
+    exist. The log is the second half of the gap: this build has no
+    operator log at all, so the record of the verb is the change to
+    `/status`'s `monid=`.
+
+33. **A directory read's cursor is the server's, behind lib9p's own
+    offset guard (§9).** §9 addresses a snapshot's entries by
+    position so that a server can map a `Tread` offset onto an entry
+    and restart from 0 on a re-read. lib9p's `dirread9p` cannot do
+    that here: it regenerates entry *n* per `Tread` from the
+    generator's index, and §9's two *gone* conditions mean the *n*'th
+    entry is not the entry it was, so a listing addressed by entry
+    number would skip or repeat around a discarded one. *Not made:*
+    the `/obj` and `/meta` rows carry their own (offset, position)
+    pair on the fid. lib9p refuses a directory read at an offset that
+    is neither 0 nor where the fid left off before the row's read
+    cell is reached (`/sys/src/lib9p/srv.c`'s `bad offset`, against
+    its own `Fid.diroffset`), so the cursor's own refusal is behind
+    that guard on the wire — reachable only where the two can
+    disagree, which is a read this server answered `interrupted`
+    after it had advanced the cursor. The cursor keeps the offset the
+    previous read started at and rewinds to it for exactly that case.
 
 ## 15. Alternatives considered
 

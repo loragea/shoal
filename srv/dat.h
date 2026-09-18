@@ -9,6 +9,8 @@ typedef struct Sfid Sfid;
 typedef struct Sfile Sfile;
 typedef struct Sctl Sctl;
 typedef struct Qreq Qreq;
+typedef struct Qjob Qjob;
+typedef struct Sjob Sjob;
 
 /*
  * layer-a §2.2's tree, one entry per file, in the order it is listed
@@ -157,32 +159,36 @@ enum
  * order under the registry lock, which is where the shutdown's own
  * sweep runs them, so the two cannot both close one state.
  *
- * The rows this file leaves unnamed above, by the same rule.  The
- * /meta directory row's open and read cells — and the aux a fid of
- * that row carries while it is a directory fid, which is that read's
- * snapshot — are the enumeration's too: it lists the same objects
- * under a second name.  The five status files —
- * /dirty, /stale, /tombs, /lost and /jobs — are render-at-open text
- * like /status and /map, and each belongs with the state it reports:
- * /dirty and /stale with the dirty set and the stale marks (layer-a
- * §7.1), /tombs with the enumeration, since it is that listing over
- * tombstones (§7.2), /lost with scrub and repair (§7.5), /jobs with
- * whatever starts background passes.  /repl and /rpc are the peer
- * channels: their read and write cells, and the per-fid state a
- * multi-request op stages, belong with the replication surface
- * (§5.5, §5.6), and /advert's read cell — or its render cell, if that
- * advertisement is composed once at open — is that surface's bulk
- * advertisement.  The two channels' gate is already filled, because
- * the fence is this file's (tree.c's chgate); /advert has none,
- * because F1's list names /repl and /rpc alone.
+ * The /meta directory row's open and read cells — and the aux a fid
+ * of that row carries while it is a directory fid — are the
+ * enumeration's too, and are the same two cells: it lists the same
+ * objects under a second name.  Both rows are built (enum.c).
+ *
+ * The six files that report state — /dirty, /stale, /tombs, /lost,
+ * /advert and /jobs — are render-at-open text like /status and /map
+ * and are built: /dirty, /stale and /lost in status.c beside the
+ * other two, /tombs and /advert in enum.c, because each is that same
+ * index snapshot rendered over a different set of states (layer-a
+ * §7.2's line grammar), and /jobs in job.c, which is what starts the
+ * background passes it lists.  The four whose render reaches the
+ * engine — /dirty, /lost, /tombs and /advert — fill an open cell that
+ * puts the render on the reserved queue; /stale reads the adopted map
+ * and /jobs the job list, so both stay on the service loop.
+ *
+ * /repl and /rpc are the peer channels: their read and write cells,
+ * and the per-fid state a multi-request op stages, belong with the
+ * replication surface (§5.5, §5.6) and are not built.  Their gate is
+ * already filled, because the fence is this file's (tree.c's chgate);
+ * /advert has none, because F1's list names /repl and /rpc alone.
  *
  * The srvctls table below says the same for the verbs: a verb is
  * built by filling its row's fn or qfn, and the body of work that
- * verb names owns that cell — `pull', `push', `reconcile', `advert',
- * `drop' and `forget' with replication, `verify' with object I/O,
- * `scrub' with the scrub pass, and `refresh', `register' and
- * `newmonid' with the monitor client.  `fence' is this file's and is
- * built.
+ * verb names owns that cell.  `fence' and `newmonid' are ctl.c's and
+ * `drop' is too, under the oid's queue; `verify' is object I/O's and
+ * is built; `scrub' and `forget' are job.c's, and each starts a pass
+ * /jobs lists.  `pull', `push', `reconcile', `advert', `refresh' and
+ * `register' wait on the peer and monitor clients, so their rows hold
+ * ctlnotbuilt and gate without a body (store.md §14(18)).
  */
 struct Sfile
 {
@@ -340,6 +346,36 @@ struct Qreq
 };
 
 /*
+ * One unit of work a caller that is NOT a request runs on a queue —
+ * the background passes' entry to the pool, srvqjob (queue.c).  The
+ * Req is the pool's to carry and so comes first; the Qreq beside it is
+ * this unit's own, because the push path allocates nothing.
+ *
+ * What such a unit is not.  It has no tag, so no Tflush can name it
+ * and reqqueueflush cannot reach it; it is not in lib9p's Req pool, so
+ * it takes no reference to the Srv and lib9p never frees it.  It
+ * therefore never enters respond, and its handler is a plain function
+ * of the caller's rather than a Req handler: it MUST NOT respond, MUST
+ * NOT leave through srvqdone, and MUST NOT be flushed.  srvqjob is
+ * what leaves through srvqended instead, which is the completion the
+ * pool is owed and srvdestroyreq would have taken for a real request.
+ *
+ * `done' and the two beside it are the caller's wait: the queue's proc
+ * marks it and wakes the caller, which is what holds this structure —
+ * the caller's own stack — alive for as long as the queue is in it.
+ */
+struct Qjob
+{
+	Req	r;		/* the pool carries this; keep it first */
+	Qreq	qr;		/* this unit's own: no malloc on the push */
+	QLock	lk;
+	Rendez	rz;
+	int	done;
+	void	(*fn)(void*);
+	void	*arg;
+};
+
+/*
  * One ctl verb, layer-a §2.5.  The table is extended by adding rows;
  * a row is gated before it runs, in §2.5's order — the role, then the
  * fence, then the arguments — so a verb whose body is not built still
@@ -362,6 +398,47 @@ struct Qreq
  * at least one argument — so it is a check on a row added wrong, not
  * a path a client can drive.
  */
+/*
+ * One background pass, as /jobs reports it (layer-a §2.2: "one line
+ * per running or queued background job").  A pass is a proc of its
+ * own holding one of srv.h's jobs for its whole run, so the shutdown
+ * waits for it; this record is what the pass is visible as while it
+ * runs, and it is on Srvctx.jobs from the moment the verb that starts
+ * it is accepted — §2.5 has such a verb "return success once the job
+ * is accepted", so the line is there before the proc has run a step,
+ * which is what `queued' means in it.
+ *
+ * The counters and `err' are the pass's own to write and /jobs' to
+ * read under Srvctx.joblk.  Nothing outside a line of /jobs consumes
+ * them: §2.2 makes that file's format implementation policy beyond
+ * its being one record per line.
+ *
+ * `err' is what a pass gave up with, and it is the only record of it:
+ * a pass has no client to answer and no log to write to, so a walk
+ * that broke off silently was a walk that reported success.  The
+ * first failure wins, since it is the one that stopped the walk where
+ * a walk stops at all — an object that would not read does not stop
+ * one — and `err' is also what says the walk's answer is not a whole
+ * index's: the reclaim that rides on a scrub runs only over a walk
+ * that completed and recorded none (store.md §14(30)).
+ */
+struct Sjob
+{
+	Sjob	*next;
+	Srvctx	*ctx;
+	char	*verb;		/* the ctl verb that started it */
+	void	(*fn)(Sjob*);
+	int	running;	/* the proc has started: `queued' until then */
+	uvlong	done;		/* index slots walked */
+	uvlong	total;		/* index slots to walk */
+	uvlong	bad;		/* objects the pass found mismatching */
+	uvlong	skipped;	/* ... gone between the index and the queue */
+	uvlong	reclaimable;	/* tombstones past layer-a §1.5's local two */
+	uvlong	dropped;	/* dirty records `forget' discarded */
+	char	arg[Iidlen+1];	/* `forget's peer, an instance id (§3.3) */
+	char	err[ERRMAX];	/* what the pass gave up with, or empty */
+};
+
 struct Sctl
 {
 	char	*verb;
@@ -433,6 +510,9 @@ struct Srvctx
 	uvlong	walkhold;	/* srvhook("walkhold") */
 	uvlong	anyexit;	/* srvhook("anyexit") */
 	uvlong	step7hold;	/* srvhook("step7") */
+	uvlong	jobhold;	/* srvhook("jobhold") */
+	uvlong	slotfail;	/* srvhook("slotfail") */
+	uvlong	reclaimhold;	/* srvhook("reclaimhold") */
 	uvlong	endhold;	/* srvendpoint: ms held in srvqended */
 
 	/*
@@ -442,6 +522,17 @@ struct Srvctx
 	 */
 	Lock	joblk;
 	int	njob;
+	/*
+	 * The passes /jobs lists, and the scrubber's own policy: the
+	 * rate `scrub rate=' sets, in KiB/s, and the flag `scrub stop'
+	 * raises, which a running pass tests between objects exactly as
+	 * it tests srvstopping.  `scrubbing' is what keeps a second
+	 * `scrub start' from putting two passes over one index.
+	 */
+	Sjob	*jobs;
+	int	scrubbing;
+	int	scrubstop;
+	ulong	scrubrate;
 	int	stopping;	/* the shutdown has begun: no new jobs */
 	int	served;		/* a service loop was started over this context */
 	int	released;	/* lib9p has let go of the Srv (Srv.free) */

@@ -5,7 +5,9 @@ LIB=libshoalsrv.a$O
 OFILES=\
 	attach.$O\
 	ctl.$O\
+	enum.$O\
 	err.$O\
+	job.$O\
 	queue.$O\
 	srv.$O\
 	status.$O\
