@@ -75,8 +75,15 @@ oidstr(char *buf, uchar *oid, int oidlen)
 }
 
 /*
- * §3.6's per-fid bound, in grains, applied to whatever a fid stages.
- * The engine reads a zero as "the default" and so does this.
+ * What one accepted client write may cover, in CHECKSUM BLOCKS.  It is
+ * not §3.6's quantity: §3.6's stagemax bounds the grains a /repl fid
+ * holds reserved, and a client write reserves none — it stages a key
+ * and commits from the Req's buffer.  This server's own policy shares
+ * the configured value because the two bound the same appetite for one
+ * operation, and store.md §14(33) records that.  The process-wide
+ * stagetot bounds reservations, so it is the engine's alone until the
+ * /repl surface makes stages that hold them.  The engine reads a zero
+ * as "the default" and so does this.
  */
 static ulong
 stagemaxof(Srvctx *c)

@@ -144,7 +144,15 @@ struct Srvcfg
 	long	maplen;
 	int	nqueue;		/* -q; 0 takes Nqueuedflt */
 	int	noflush;	/* -w, store.md §3.2, reported in /status */
-	Storecfg store;		/* the engine's; spawn is filled in here */
+	/*
+	 * The engine's; spawn is filled in here.  Two of its stage fields
+	 * are read by this library as well: `stagems' is how long a stage
+	 * this server holds may be idle, and `stagemax' is the bound the
+	 * object rows apply to a client write — over checksum blocks
+	 * rather than over §3.6's reserved grains, which store.md §14(33)
+	 * records.  `stagetot' is the engine's alone.
+	 */
+	Storecfg store;
 };
 
 /*

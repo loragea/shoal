@@ -5528,6 +5528,21 @@ name a half that is not built; each says which.
     fid — which is the replication surface's case, where a chunk's
     offset is the sender's and shortening would publish a hole.
 
+    **The quantity bounded is not §3.6's.** §3.6's `stagemax` bounds
+    the grains a `/repl` fid holds RESERVED, and a client `Twrite`
+    reserves none: it stages the key §5.4 step 3 chose and commits
+    from the request's own buffer, so the stage of a client write
+    holds no grain at all. What the 9P server bounds with that same
+    configured number is the count of **checksum blocks one accepted
+    write may cover** — its own policy, named as such, sharing the
+    value because the two bound the same appetite for one operation.
+    The process-wide `stagetot` bounds reservations and so has
+    nothing yet to bound in this server: it is the engine's, enforced
+    in the store over the handles `stageopen` makes, and it and
+    `/status`'s `staged=<grains>` become live together with the
+    `/repl` surface (§5.5) whose stages reserve. `/status` carries no
+    `staged=` row until then.
+
 34. **A `Twstat` that sets a field other than `length` carries no
     §2.6 string.** §2.4 requires every other settable field to be
     rejected and names a condition for one of them alone —
