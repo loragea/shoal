@@ -5008,7 +5008,7 @@ would be a wire change.
 
 *Policy, but read it before implementing anything.*
 
-Forty-eight places where layer-a is silent, self-defeating, or
+Forty-six places where layer-a is silent, self-defeating, or
 contradicted by the measurements or by the platform. Each entry
 states the tension, its resolution, and where the argument for it
 lives; nothing here repeats an argument made in a section above.
@@ -5017,9 +5017,11 @@ Items 1–5, 8, 9, 11, 12, 13, 14 and 26 are amendments **made** to
 are recorded here and not made there; items 10 and 16 are **proposals**
 rather than amendments, because they touch the wire.
 
-Items 18 to 48 are the object server's, and they describe what
-`srv/libshoalsrv.a` and `cmd/shoalsrv` **do today**. Several of them
-name a half that is not built; each says which.
+Items 18 to 38 and 41 to 48 are the object server's, and they
+describe what `srv/libshoalsrv.a` and `cmd/shoalsrv` **do today**.
+Several of them name a half that is not built; each says which. The
+numbering runs to 48 with no items 39 or 40; the numbers are handles
+other files cite, so a gap is cheaper than a renumbering.
 
 1. **`cur` cannot usefully be durable (layer-a §5.2).** Layer-a
    required currency recorded "durably as `cur=<epoch>`" and, two
@@ -5872,24 +5874,27 @@ name a half that is not built; each says which.
     a lie about a file that is built, on an operation that has
     nothing to return rather than nothing to run.
 
-42. **§5.6's response lifetime and its second-`Twrite` rule
-    contradict each other; both are kept by splitting on whether the
-    response was read.** §5.6 says "a second `Twrite` before the
-    response is read MUST fail with `bad ctl`" and, four paragraphs
-    on, "a buffered response is destroyed by the next `Twrite` on
-    that fid and by the `Tclunk`, and by nothing else". Read
-    literally the second rule can never fire: every `Twrite` that
-    would destroy a response is one the first rule refuses. *Not
-    made; recorded here as this server's reading:* the refusal is
-    about a response **nobody has read** — a `Twrite` while a request
-    is outstanding, or while a prepared response is still
-    undelivered, is `bad ctl` — and the destruction is about one that
-    **has** been read, which the next `Twrite` throws away so the fid
-    can carry the next exchange. A `Tread` after the delivery answers
-    count 0 either way, which is §5.6's own rule and what makes a
-    delivered response invisible rather than absent. Every sentence
-    of §5.6 is then live, and a caller that reads its response before
-    writing again — which is the protocol — sees no difference.
+42. **§5.6's two rules about a second `Twrite` compose, and what
+    "destroyed" means for a response already read.** §5.6 says "a
+    second `Twrite` before the response is read MUST fail with `bad
+    ctl`" and, four paragraphs on, "a buffered response is destroyed
+    by the next `Twrite` on that fid and by the `Tclunk`, and by
+    nothing else". These do not contradict each other: the first
+    governs a response **nobody has read**, the second one that
+    **has** been, and between them they cover every `Twrite` a fid
+    can take. *Not made; recorded here as this server's reading of
+    the composition, which is what it implements:* a `Twrite` while a
+    request is outstanding, or while a prepared response is still
+    undelivered, is `bad ctl`; a `Twrite` after the delivery throws
+    the bytes away and takes the fid for the next exchange; and a
+    `Tread` after the delivery answers count 0, which is §5.6's own
+    rule and what makes a delivered response invisible rather than
+    absent. Destroying an invisible response changes nothing a caller
+    can observe, so the second rule is redundant rather than dead:
+    what it settles is that the server MAY stop holding the bytes,
+    and where the fid's memory goes back. This server holds them from
+    the delivery until that next `Twrite` or the `Tclunk` and no
+    longer.
 
 43. **One `op=full` transfer to a `/repl` fid at a time, and the
     per-fid bound is charged per chunk.** §3.6 has a stage handle
@@ -5898,16 +5903,29 @@ name a half that is not built; each says which.
     objects one fid may have in flight; the per-fid state this server
     keeps is a single slot. *Not made; recorded here as what the
     server does:* a chunk naming a second object while a transfer is
-    staged is refused `disk full`, which is §3.6's own refusal for
-    the per-fid bound, and a sender that wants two transfers at once
-    opens two fids — which §5.5 already has it do per peer and which
-    costs nothing. That single slot is also what makes §3.6's
-    per-**fid** grain bound the engine's per-**handle** one: the store
-    charges `stagemax` against the handle, grain by grain, and refuses
-    the chunk that would pass it with `disk full`, so with one handle
-    to a fid the two are the same bound and the 9P server counts
-    nothing of its own. `stagetot` and `/status`'s `staged=` report the
-    same reservations across the process.
+    staged is refused `disk full`, and a sender that wants two
+    transfers at once opens two fids — which §5.5 already has it do
+    per peer and which costs nothing. `disk full` is a pick from
+    layer-a §2.6's set and not a refusal §3.6 defines for this:
+    what §3.6 and §5.5 bound is the SPACE a fid may hold staged, and
+    neither addresses how many transfers may be in flight on one, so
+    §2.6 has no string that names this refusal exactly. `disk full`
+    is the nearest of the set: what it tells a sender to do — stop
+    pushing here and come back, or come back on another fid — is
+    what this refusal wants from it, and the alternative, `bad ctl`,
+    would blame a header that is well formed.
+
+    That single slot is also what makes §3.6's per-**fid** grain
+    bound the engine's per-**handle** one: the store charges
+    `stagemax` against the handle, grain by grain, and refuses the
+    chunk that would pass it with `disk full`, so with one handle to
+    a fid the two are the same bound. The 9P server keeps no count
+    beside it, with one exception it cannot avoid: the opening chunk
+    of a transfer arrives before any handle exists to charge, so the
+    server weighs that chunk's own grains against `stagemax` itself
+    and answers `disk full` when they already exceed it. Every later
+    chunk is the engine's to charge. `stagetot` and `/status`'s
+    `staged=` report the same reservations across the process.
 
     **What a `force=1` repair records.** §5.5 has a receiver that
     applies one record the event in `/lost` as a divergence, and §1.3
@@ -5978,6 +5996,29 @@ name a half that is not built; each says which.
     sender re-reads `op=meta` and pushes an `op=full`, which is the
     operation for a receiver that holds nothing.
 
+    **One refusal on these paths is outside §5.5's table.** A delta
+    operation whose `(pwepoch, pver)` is exactly the key of a
+    TOMBSTONE passes §5.3's predecessor rule — a tombstone is a
+    record and carries a key — and reaches the engine, which answers
+    `object deleted`. §5.5's receiver rules offer a delta only `out
+    of sequence` and `stale version`. *Not made:* the string is the
+    right one and comes from §2.6's set. The id has a record, the
+    sender's predecessor did match it, and what stops the operation
+    is that the record is a tombstone — which is what `object
+    deleted` says and what neither of §5.5's two would.
+
+    **The split is more lenient than §5.5 spells.** The header line
+    is broken into fields by `tokenize`(2), so tabs and carriage
+    returns separate fields exactly as blanks do — a header written
+    with CRLF line endings parses, the `\r` falling to the rule that
+    eats the blanks — and a value may be quoted rc-style, with
+    `oid='a b'` reaching the field as `a b`. *Not made; recorded here
+    as what the grammar accepts:* the leniency is in the split alone.
+    Every value is validated after it, so a quoted oid with a blank
+    in it is still `bad object name` and a quoted `ver` that is not
+    decimal digits is still `bad ctl`; a sender that writes §5.5's
+    grammar exactly never reaches any of it.
+
 47. **What `op=list` and `op=get` clamp, and what they refuse.** §5.6
     makes `op=list`'s `n=` a maximum the server MUST clamp to the
     negotiated `msize` less `IOHDRSZ`, and says `op=get`'s `n` "MUST
@@ -5995,6 +6036,23 @@ name a half that is not built; each says which.
     the caller cannot tell from the end of the object. The response's
     own `n=` IS short at that end, which is §4's clamp and what the
     caller reads the field for.
+
+    Two corners of the same two rules. A page whose FIRST line alone
+    crosses the budget answers `lines=0 more=1`, which a pager cannot
+    advance past — it is the same answer `n=0` gets, and it is a
+    standstill rather than an error. It is unreachable here: the
+    smallest `msize` an attach may negotiate is `Msizemin`, 8192 plus
+    `IOHDRSZ`, and an advert line over a 128-byte oid is about 300
+    bytes, so the budget holds twenty of the longest line this store
+    can render. And a `Tread` that offers less than the response is
+    long takes what it offered and leaves the rest: the response is
+    marked delivered, so the next `Tread` is the end of data.
+    §5.6's "MUST offer at least the negotiated `msize` less
+    `IOHDRSZ`" is the CALLER's obligation, and this is what breaking
+    it costs — the server neither refuses the short read nor holds
+    the remainder for a second one, because a response is delivered
+    by exactly one `Tread` and a held remainder would be a second
+    lifetime for this fid's state to carry.
 
 48. **§5.5's ordering rules are the sender's, and the receiver
     refuses neither.** §5.5 allows "at most one outstanding operation
