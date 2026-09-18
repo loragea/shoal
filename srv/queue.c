@@ -465,12 +465,28 @@ srvqexit(Req *r)
 void
 srvstep7(Req *r)
 {
+	Srvctx *c;
 	Sfid *f;
 
 	if(r->fid == nil || (f = r->fid->aux) == nil)
 		return;
+	/*
+	 * Under the registry lock, over the read of the cell AND the call
+	 * through it.  lib9p's own reference keeps the Fid alive across
+	 * this, but not what the fid is holding: a clunk or a walk that
+	 * moves the fid runs srvfidgive on the service loop, which clears
+	 * the cells and frees the state, and this runs on a queue proc.
+	 * Without the lock the two interleave into a call through a cell
+	 * whose state has already been freed.  fidgive takes the same lock
+	 * across its own clear-and-free, and auxclose runs under it by the
+	 * documented rule (dat.h), so the three cannot overlap.
+	 */
+	c = r->srv->aux;
+	qlock(&c->fidlk);
+	qhold(c, nil, &c->step7hold);
 	if(f->auxflush != nil)
 		f->auxflush(f, r);
+	qunlock(&c->fidlk);
 }
 
 /*
@@ -599,6 +615,8 @@ srvhook(Srvctx *c, char *name, uvlong n)
 		c->walkhold = n;
 	else if(strcmp(name, "anyexit") == 0)
 		c->anyexit = n;
+	else if(strcmp(name, "step7") == 0)
+		c->step7hold = n;
 	qunlock(&c->holdlk);
 }
 
@@ -619,6 +637,7 @@ srvholdclear(Srvctx *c)
 	c->mapopen = 0;
 	c->walkhold = 0;
 	c->anyexit = 0;
+	c->step7hold = 0;
 	qunlock(&c->holdlk);
 }
 

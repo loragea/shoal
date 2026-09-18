@@ -440,6 +440,15 @@ srvfidsclose(Srvctx *c)
  * auxclose while the store is still there, then auxfree, which may run
  * after it has gone.  gone says the fid itself is ending, so it also
  * leaves the registry.
+ *
+ * The whole of it is under the registry lock, the clearing of the
+ * cells and the freeing of what they named included.  lib9p keeps the
+ * Fid alive while a request holds it, but not what the fid carries:
+ * this runs on the service loop, at a clunk or at a walk that moves
+ * the fid, while a queue proc may be in srvstep7 reading the flush
+ * cell of that same fid or in srvopentext writing its rendered text.
+ * Those two take the same lock, so one give-back cannot free a state
+ * out from under a call that is already in it.
  */
 static void
 fidgive(Sfid *f, int gone)
@@ -447,10 +456,12 @@ fidgive(Sfid *f, int gone)
 	Srvctx *c;
 	void (*fr)(void*);
 	void *a;
+	Text *t;
 
 	c = f->ctx;
-	if(c != nil){
+	if(c != nil)
 		qlock(&c->fidlk);
+	if(c != nil){
 		auxclose1(c, f);
 		if(gone){
 			if(f->prev != nil)
@@ -462,19 +473,21 @@ fidgive(Sfid *f, int gone)
 			f->prev = f->next = nil;
 			f->ctx = nil;
 		}
-		qunlock(&c->fidlk);
 	}
 	fr = f->auxfree;
 	a = f->aux;
+	t = f->text;
 	f->aux = nil;
 	f->auxflush = nil;
 	f->auxclose = nil;
 	f->auxfree = nil;
 	f->auxclosed = 0;
+	f->text = nil;
 	if(fr != nil)
 		fr(a);
-	textfree(f->text);
-	f->text = nil;
+	textfree(t);
+	if(c != nil)
+		qunlock(&c->fidlk);
 }
 
 /*
@@ -1051,26 +1064,35 @@ srvopentext(Req *r)
 	Srvctx *c;
 	Sfid *f;
 	Sfile *file;
+	Text *t;
 
 	c = r->srv->aux;
 	f = r->fid->aux;
 	file = &srvfiles[f->file];
-	if((f->text = textnew()) == nil){
+	if((t = textnew()) == nil){
 		srvqdone(r, "shoalsrv: out of memory");
 		return;
 	}
-	if((e = file->render(c, f, f->text)) != nil){
-		textfree(f->text);
-		f->text = nil;
+	if((e = file->render(c, f, t)) != nil){
+		textfree(t);
 		srvqdone(r, e);
 		return;
 	}
-	if(f->text->err){
-		textfree(f->text);
-		f->text = nil;
+	if(t->err){
+		textfree(t);
 		srvqdone(r, "shoalsrv: out of memory");
 		return;
 	}
+	/*
+	 * Composed into a text of its own and hung on the fid under the
+	 * registry lock: this runs on a queue proc when the row's open was
+	 * offloaded, and fidgive frees whatever the fid holds under that
+	 * same lock on the service loop.
+	 */
+	qlock(&c->fidlk);
+	textfree(f->text);
+	f->text = t;
+	qunlock(&c->fidlk);
 	srvqdone(r, nil);
 }
 

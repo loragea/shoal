@@ -202,7 +202,10 @@ extern Sfile srvfiles[Nfile];
  *		  such request and before it responds.  The store is
  *		  open and the fid lives on: this is where a stage the
  *		  flushed request staged is discarded, not where the
- *		  fid's own state is given back.
+ *		  fid's own state is given back.  It runs on a queue proc
+ *		  while the service loop may be clunking or moving the
+ *		  same fid, which is why the registry lock spans the read
+ *		  of the cell and the call through it.
  *	auxclose  runs before the store closes, and at clunk; it may
  *		  call the engine.  A stage handle MUST be discarded
  *		  here: store.md §9 allows only objsnapent, objsnapcount
@@ -344,8 +347,9 @@ struct Srvctx
 	/*
 	 * The live fids, and the T1 fid-state point over them.  Every
 	 * Sfid is on this list from the attach or walk that made it
-	 * until destroyfid; auxclose runs with fidlk held, so a hook
-	 * may reach the engine but must not reach back in here.
+	 * until destroyfid.  All three hooks run with fidlk held, and so
+	 * does the read of the cell that calls one, so a hook may reach
+	 * the engine but must not reach back in here.
 	 */
 	QLock	fidlk;
 	Sfid	*fids;
@@ -372,6 +376,7 @@ struct Srvctx
 	uvlong	mapopen;	/* srvhook("mapopen") */
 	uvlong	walkhold;	/* srvhook("walkhold") */
 	uvlong	anyexit;	/* srvhook("anyexit") */
+	uvlong	step7hold;	/* srvhook("step7") */
 	uvlong	endhold;	/* srvendpoint: ms held in srvqended */
 
 	/*

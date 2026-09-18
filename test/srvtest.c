@@ -2740,6 +2740,117 @@ tshutdown(void)
 }
 
 /*
+ * A fid's state, between the queue proc discarding it and the service
+ * loop giving it back.  Step 7 reads the flushed fid's flush cell and
+ * calls through it on a queue proc; a clunk, and a walk that moves the
+ * fid, clear those cells and free what they named on the service loop.
+ * lib9p's own reference keeps the Fid alive across both, but not what
+ * the fid is carrying, so the registry lock spans each of them whole.
+ *
+ * The window is forced rather than raced for: the point parks step 7
+ * between the read and the call, and the walk is issued into it.
+ */
+static void
+tstep7fid(void)
+{
+	char *m;
+	uchar data[1024];
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall t, r;
+	uvlong n7, nc, nf;
+	ushort ta, tf, tw;
+
+	clstage = "step7fid";
+	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
+	d = newdisk();
+	if((ctx = startsrv(d, m, 1)) == nil)
+		return;
+	srvauxpoint(ctx, 1);
+	memset(data, 0x66, sizeof data);
+	mkobj(srvstore(ctx), "alpha", data, sizeof data, 1);
+
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach)
+		fail("attach: %s", clerr(&r));
+	if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk){
+		fail("walk /obj: %s", clerr(&r));
+		goto Out;
+	}
+
+	/*
+	 * A self-walk of that directory fid onto an object runs on the
+	 * object's queue, so it is a queued request whose fid the service
+	 * loop can still reach: the fid is a directory and is not open,
+	 * which is what 9P asks of a fid a walk may move.
+	 */
+	srvhook(ctx, "objhold", 1);
+	memset(&t, 0, sizeof t);
+	t.type = Twalk;
+	t.tag = ta = cltag(&cl);
+	t.fid = Ffile;
+	t.newfid = Ffile;
+	t.nwname = 1;
+	t.wname[0] = "alpha";
+	clput(&cl, &t);
+	sleep(200);			/* running, and held */
+
+	srvhook(ctx, "step7", 1);
+	memset(&t, 0, sizeof t);
+	t.type = Tflush;
+	t.tag = tf = cltag(&cl);
+	t.oldtag = ta;
+	clput(&cl, &t);
+	sleep(300);			/* unwinding, and held inside step 7 */
+
+	/* the same fid, moved off the file whose state step 7 is in */
+	memset(&t, 0, sizeof t);
+	t.type = Twalk;
+	t.tag = tw = cltag(&cl);
+	t.fid = Ffile;
+	t.newfid = Ffile;
+	t.nwname = 1;
+	t.wname[0] = "..";
+	clput(&cl, &t);
+	sleep(300);
+	srvauxcount(ctx, &n7, &nc, &nf);
+	eqv("step 7 has not run yet", n7, 0);
+	eqv("and the walk has not closed the state under it", nc, 0);
+	eqv("nor freed it", nf, 0);
+
+	srvhook(ctx, "step7", 0);
+	sleep(300);
+	srvauxcount(ctx, &n7, &nc, &nf);
+	eqv("step 7 ran once", n7, 1);
+	eqv("and only then did the walk close the state", nc, 1);
+	eqv("and free it", nf, 1);
+	eqv("step 7 ran before the reply", srvauxlate(ctx), 0);
+
+	checks++;
+	if(clgettag(&cl, ta, &r) != Rerror || strcmp(r.ename, "interrupted") != 0)
+		fail("the flushed request: type %d %s", r.type, clerr(&r));
+	cltagfree(&cl, ta);
+	checks++;
+	if(clgettag(&cl, tf, &r) != Rflush)
+		fail("the Rflush after it: type %d", r.type);
+	cltagfree(&cl, tf);
+	checks++;
+	if(clgettag(&cl, tw, &r) != Rwalk || r.nwqid != 1)
+		fail("the walk that moved the fid: type %d %s", r.type,
+			clerr(&r));
+	cltagfree(&cl, tw);
+	clclunk(&cl, Ffile, &r);
+Out:
+	srvhook(ctx, "step7", 0);
+	srvhook(ctx, "objhold", 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * srvrun can return while lib9p is still using the context.  A pushed
  * request is counted complete by srvdestroyreq, which lib9p runs from
  * closereq inside respond and therefore BEFORE respond releases the
@@ -2849,6 +2960,7 @@ threadmain(int argc, char **argv)
 	tcreategive();
 	tfidwalk();
 	tflush();
+	tstep7fid();
 	tanyq();
 	tflushrace();
 	terrors();

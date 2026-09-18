@@ -229,6 +229,11 @@ void	srvcount(Srvctx*, uvlong *pushed, uvlong *done);
  *		answers it on the service loop after all.  It is how a
  *		test drives the offload path before a row of the tree
  *		really needs one.
+ *	step7	n != 0 holds a flushed request inside step 7, between the
+ *		read of the flushed fid's cell and the call through it —
+ *		which is under the fid registry's lock, so it is where a
+ *		test drives a clunk or a moving walk of that same fid
+ *		against the queue proc that is discarding its state.
  *	anyexit	n != 0 holds an offloaded request that has found itself
  *		flushed, before it leaves through srvqdone.  Its proc is
  *		then still inside the handler and has not looped round to
