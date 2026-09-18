@@ -1910,6 +1910,16 @@ Out:
  * case asserts is that the transfer still commits: step 7 discards
  * what a fid has STAGED, and this stage's last step was under way
  * before it ran.
+ *
+ * The second half is the same two actors one step EARLIER, against a
+ * final=1 chunk still inside its engine write — `fullhold' rather than
+ * `finalhold'.  The mark a final chunk keeps is kept AT the look, and
+ * the look answers on whether the stage is still the fid's and still
+ * live before it consults that mark (obj.c's srvstagelive), so a chunk
+ * step 7 reached before its look is refused `stage expired' and its
+ * look is the release, exactly as for a chunk that is not the last.
+ * The commit outcome belongs to the window after the look and to no
+ * other (store.md §14(45)).
  */
 static void
 tstagefinal(void)
@@ -2017,6 +2027,43 @@ tstagefinal(void)
 		statstaged(&cl), "0");
 	eqs("and the fid takes a fresh transfer",
 		repler(&cl, Frepl, h0, want, Tblksz), "ok");
+
+	/* the same chunk one step earlier: step 7 before its look */
+	waitidle(ctx, &np0, &nd0);
+	srvhook(ctx, "fullhold", 1);
+	ta2 = pushchunk(&cl, h1, want+Tblksz, Tblksz);
+	waitpush(ctx, np0, 1, &np, &nd);
+	waitheld(ctx, "fullhold", 1);
+	ts = pushchunk(&cl, hs, want, Tblksz);
+	waitpush(ctx, np0, 2, &np, &nd);
+	memset(&tf, 0, sizeof tf);
+	tf.type = Tflush;
+	tf.tag = ft = cltag(&cl);
+	tf.oldtag = ts;
+	clput(&cl, &tf);
+	if(clgettag(&cl, ts, &r) < 0)
+		fail("no answer to the sibling flushed before the look");
+	else
+		eqs("the sibling flushed before the final chunk's look",
+			clerr(&r), "interrupted");
+	cltagfree(&cl, ts);
+	if(clgettag(&cl, ft, &r) != Rflush)
+		fail("no Rflush: %s", clerr(&r));
+	cltagfree(&cl, ft);
+	srvhook(ctx, "fullhold", 0);
+	if(clgettag(&cl, ta2, &r) < 0)
+		fail("no answer to the final chunk step 7 reached first");
+	else
+		eqs("a final=1 chunk step 7 reached before its look",
+			clerr(&r), "shoalsrv: stage expired");
+	cltagfree(&cl, ta2);
+	srvstagecount(ctx, &live, &done, nil);
+	eqv("its look is the release, mark or no mark", live, 0);
+	eqv("... given back once more", done, 2);
+	eqv("and the look left nothing for the drain",
+		srvstagepend(ctx), 0);
+	eqs("so that transfer leaves no reservation behind",
+		statstaged(&cl), "0");
 	free(h0);
 	free(h1);
 	free(hs);
@@ -2024,6 +2071,7 @@ tstagefinal(void)
 	clclunk(&cl, Frepl, &r);
 	clclunk(&cl, Froot, &r);
 Out:
+	srvhook(ctx, "fullhold", 0);
 	srvhook(ctx, "finalhold", 0);
 	clstop(&cl);
 	srvfree(ctx);
