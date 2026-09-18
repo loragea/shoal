@@ -20,6 +20,7 @@ TESTS=\
 	bmrebuildtest\
 	peeropstest\
 	srvtest\
+	srvenumtest\
 	srviotest\
 
 LIB=../lib/libshoal.a$O
@@ -36,14 +37,20 @@ all:V:	$PROGS
 $O.%:	%.$O $LIB
 	$LD $LDFLAGS -o $target $prereq
 
-# srvtest and srviotest drive the 9P surface, so they link the server
-# library too and are libthread programs; every other test's link line
-# is unchanged.
+# The three programs that drive the 9P surface link the server library
+# too and are libthread programs; every other test's link line is
+# unchanged.
 $O.srvtest:	srvtest.$O $SRVLIB $LIB
 	$LD $LDFLAGS -o $target $prereq
 
 srvtest.$O:	srvtest.c srv9p.h ../srv/srv.h $HFILES
 	$CC $CFLAGS srvtest.c
+
+$O.srvenumtest:	srvenumtest.$O $SRVLIB $LIB
+	$LD $LDFLAGS -o $target $prereq
+
+srvenumtest.$O:	srvenumtest.c srv9p.h ../srv/srv.h $HFILES
+	$CC $CFLAGS srvenumtest.c
 
 $O.srviotest:	srviotest.$O $SRVLIB $LIB
 	$LD $LDFLAGS -o $target $prereq

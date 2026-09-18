@@ -21,11 +21,11 @@
  * commit (step 6) and the discard (step 7).  This build has no peer
  * client (store.md §14(18)), so steps 4 and 5 are evaluated from the
  * map alone: a placement of one member acks alone and a placement with
- * any other member answers `degraded', which is §14(30).
+ * any other member answers `degraded', which is §14(34).
  *
  * Not everything step 1 asks can be asked here either.  The currency
  * check (§5.2) needs peers, so no check is ever completed, `cur='
- * renders 0 and §5.1's clause (c) is not evaluated — §14(31) records
+ * renders 0 and §5.1's clause (c) is not evaluated — §14(35) records
  * what that costs.  Primaryship is computed from the static map and IS
  * enforced, for role=client alone: §5.1 and §5.4 are about a client
  * read and a client write, and an operator's access to a reserved
@@ -80,7 +80,7 @@ oidstr(char *buf, uchar *oid, int oidlen)
  * holds reserved, and a client write reserves none — it stages a key
  * and commits from the Req's buffer.  This server's own policy shares
  * the configured value because the two bound the same appetite for one
- * operation, and store.md §14(33) records that.  The process-wide
+ * operation, and store.md §14(37) records that.  The process-wide
  * stagetot bounds reservations, so it is the engine's alone until the
  * /repl surface makes stages that hold them.  The engine reads a zero
  * as "the default" and so does this.
@@ -432,7 +432,7 @@ srvstagesweep(Srvctx *c)
  * one is refused `disk full', which is §3.6's refusal for its per-fid
  * bound.  So is an update covering more grains than that bound
  * allows, which no client path can reach: a client write is SHORTENED
- * to the bound before it gets here (wclamp, store.md §14(33)), and
+ * to the bound before it gets here (wclamp, store.md §14(37)), and
  * the /repl surface whose chunks cannot be shortened is what will
  * (dat.h's Sstage).
  *
@@ -714,7 +714,7 @@ srvstagecount(Srvctx *c, uvlong *live, uvlong *done, uvlong *openat)
 
 /*
  * layer-a §5.4 step 1's admission, less the currency check this build
- * cannot make (store.md §14(31)).  §5.1 and §5.4 are about role=client
+ * cannot make (store.md §14(35)).  §5.1 and §5.4 are about role=client
  * operations: an operator reading or writing a reserved `shoal.' id
  * (§2.1) is not one, and neither is a peer's read.
  *
@@ -751,7 +751,7 @@ admit(Srvctx *c, Sfid *f, uchar *oid, int oidlen, char *buf, int nbuf)
 
 /*
  * §5.4 steps 4 and 5, as far as a build with no peer client can take
- * them (store.md §14(30)).  M is every member of P(o) other than this
+ * them (store.md §14(34)).  M is every member of P(o) other than this
  * instance that has not durably committed the update, which — nothing
  * having been sent to anybody — is every one of them.
  *
@@ -980,7 +980,7 @@ srvobjwrite(Req *r)
  * which is ORCLOSE — §2.4's own MUST, and a bit outside the mask like
  * any other — and OEXEC, which is not a mode §2.4 admits.  §2.4's other mode rule, a write on a fid opened
  * OREAD, is lib9p's to answer and never reaches here (store.md
- * §14(32)).
+ * §14(36)).
  *
  * OTRUNC is a truncate to zero and so is a write: it takes §5.4's path
  * entire, key and all, which is one reason the open is on the object's
@@ -1160,14 +1160,14 @@ srvobjremove(Req *r)
  * layer-a §2.4's truncate and extend: a Twstat with `length' set.  Any
  * other settable field MUST be rejected, and a rename MUST be rejected
  * with `no rename' specifically.  Nothing §2.6 names fits the others,
- * so they carry this server's own string (§3.7, store.md §14(34)).
+ * so they carry this server's own string (§3.7, store.md §14(38)).
  * `type' and `dev' are refused with them.  stat(5) makes them
  * don't-touch on every wstat, so a request that carries a value is
  * asking for something this server will not do — a refusal, not a
  * field to ignore.  `qid' is the third of that set and is not tested
  * here: lib9p refuses a Twstat whose qid differs from the fid's own
  * before Srv.wstat is reached, with its own string, and a qid equal to
- * the fid's sets nothing (store.md §14(34)).
+ * the fid's sets nothing (store.md §14(38)).
  *
  * convM2D leaves a field the client did not set at its null value
  * (nulldir), so what the client asked for is what differs from those.
@@ -1424,7 +1424,7 @@ srvobjcreate(Req *r)
  *		no check can be made at all, so this reads 0 for every
  *		object for as long as this build runs — which is the
  *		honest answer §2.4 provides for rather than a stale one.
- *		store.md §14(31) records it.
+ *		store.md §14(35) records it.
  *	ready=	the same fact said the other way round: an instance that
  *		has completed no currency check is not ready to serve the
  *		object under §5.1's clause (c), so this reads `no'.
@@ -1437,7 +1437,7 @@ srvobjcreate(Req *r)
  *		`-', because §0 makes this one attr=value record and an
  *		attribute with no value at all is not one.  A `-' is no
  *		iid: §3.3's node names carry no `.', so every iid has one
- *		(store.md §14(31)).
+ *		(store.md §14(35)).
  *
  * The placement array is Maxplace long and mapplace answers at most
  * `replicas' members, which §3.2 refuses above Maxplace (lib/map.c),

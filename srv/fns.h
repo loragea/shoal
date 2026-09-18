@@ -49,6 +49,7 @@ int	srvqinit(Srvctx*, int nq);
 Qreq*	srvqprep(Srvctx*, uchar *oid, int oidlen, Req*, void (*)(Req*));
 void	srvqgo(Srvctx*, Req*);
 void	srvqpush(Srvctx*, uchar *oid, int oidlen, Req*, void (*)(Req*));
+int	srvqjob(Srvctx*, uchar *oid, int oidlen, void (*)(void*), void*);
 Qreq*	srvqprepany(Srvctx*, Req*, void (*)(Req*));
 void	srvqpushany(Srvctx*, Req*, void (*)(Req*));
 void	srvqflush(Req*);
@@ -58,6 +59,9 @@ void	srvqhold(Req*, uvlong*);
 void	srvqexit(Req*);
 void	srvqwalkhold(Req*);
 void	srvqanyexit(Srvctx*);
+void	srvjobhold(Srvctx*);
+int	srvslotfail(Srvctx*, uvlong slot);
+void	srvreclaimhold(Srvctx*, uvlong i);
 void	srvqdone(Req*, char *err);
 void	srvqended(Qreq*);
 void	srvqdrain(Srvctx*);
@@ -95,6 +99,22 @@ int	srvaname(Sfid*, char *aname);
 char*	srvstatustext(Srvctx*, Sfid*, Text*);
 char*	srvmaptext(Srvctx*, Sfid*, Text*);
 char*	srvemptytext(Srvctx*, Sfid*, Text*);
+char*	srvdirtytext(Srvctx*, Sfid*, Text*);
+char*	srvstaletext(Srvctx*, Sfid*, Text*);
+char*	srvlosttext(Srvctx*, Sfid*, Text*);
+
+/* enum.c */
+Objsnap* srvsnapopen(Store*, int kinds, char *buf, int nbuf);
+void	srvopenq(Req*);
+void	srvobjdiropen(Req*);
+void	srvobjdirread(Req*);
+char*	srvtombstext(Srvctx*, Sfid*, Text*);
+char*	srvadverttext(Srvctx*, Sfid*, Text*);
+
+/* job.c */
+char*	srvjobstext(Srvctx*, Sfid*, Text*);
+char*	srvctlscrub(Srvctx*, Sfid*, int, char**);
+char*	srvctlforget(Srvctx*, Sfid*, int, char**);
 
 /* ctl.c */
 void	srvctlwrite(Req*);

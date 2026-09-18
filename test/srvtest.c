@@ -582,25 +582,25 @@ tmatrix(void)
 		{"map",	  {"permission denied", "permission denied", nil},
 			  {nil, nil, nil}},
 		{"obj",	  {nil, nil, nil},
-			  {"permission denied", "permission denied", "shoalsrv: not built"}},
+			  {"permission denied", "permission denied", nil}},
 		{"meta",  {nil, nil, nil},
-			  {"permission denied", "permission denied", "shoalsrv: not built"}},
+			  {"permission denied", "permission denied", nil}},
 		{"repl",  {"permission denied", nil, "permission denied"},
 			  {nil, "shoalsrv: not built", nil}},
 		{"rpc",	  {"permission denied", nil, nil},
 			  {nil, "shoalsrv: not built", "shoalsrv: not built"}},
 		{"advert",{"permission denied", nil, "permission denied"},
-			  {nil, "shoalsrv: not built", nil}},
+			  {nil, nil, nil}},
 		{"dirty", {"permission denied", "permission denied", nil},
-			  {nil, nil, "shoalsrv: not built"}},
+			  {nil, nil, nil}},
 		{"stale", {"permission denied", "permission denied", nil},
-			  {nil, nil, "shoalsrv: not built"}},
+			  {nil, nil, nil}},
 		{"tombs", {"permission denied", "permission denied", nil},
-			  {nil, nil, "shoalsrv: not built"}},
+			  {nil, nil, nil}},
 		{"lost",  {"permission denied", "permission denied", nil},
-			  {nil, nil, "shoalsrv: not built"}},
+			  {nil, nil, nil}},
 		{"jobs",  {"permission denied", "permission denied", nil},
-			  {nil, nil, "shoalsrv: not built"}},
+			  {nil, nil, nil}},
 	};
 	static int nwalkable[3] = {3, 6, 11};
 	char buf[8192], *m, *want;
@@ -1198,6 +1198,37 @@ tcellclear(void)
 	free(m);
 }
 
+/*
+ * Which refusal `drop <oid>' answers for an id this store does not
+ * hold.  §7.4's guard runs before the engine's drop, so an id this
+ * instance is in P(o) for is `still placed' and one it is not is `no
+ * such object'.  Which of the two a given id gets is the map's to
+ * say, so the expected string is computed from the same map the
+ * server adopted rather than guessed.
+ *
+ * It is computed with mapplace, which is the function the server's
+ * own guard calls, so this case does not check the placement: it
+ * checks what the verb does on each side of it.  That is deliberate
+ * and not an oversight.  `maptest' is where placement is checked, at
+ * known-answer vectors computed outside this codebase (AGENTS.md), and
+ * a case that recomputed it here would be asserting the server against
+ * itself and would pass whatever mapplace answered.
+ */
+static char*
+droperr(Srvctx *ctx, char *oid)
+{
+	Cinst *pl[Maxplace];
+	int i, n;
+
+	n = mapplace(srvmap(ctx), oid, pl, nelem(pl));
+	if(n > nelem(pl))
+		n = nelem(pl);
+	for(i = 0; i < n; i++)
+		if(strcmp(pl[i]->iid, srviid(ctx)) == 0)
+			return "still placed";
+	return "no such object";
+}
+
 /* §2.5's ctl framework: the four gates over every verb row */
 static void
 tctl(void)
@@ -1213,12 +1244,12 @@ tctl(void)
 		{"push alpha n1.1", "shoalsrv: not built", "fenced"},
 		{"reconcile",	"shoalsrv: not built",	"fenced"},
 		{"advert",	"shoalsrv: not built",	"fenced"},
-		{"drop alpha",	"shoalsrv: not built",	"fenced"},
+		{"drop dropprobe", nil,			"fenced"},
 		{"verify alpha", nil,			nil},
-		{"scrub",	"shoalsrv: not built",	"shoalsrv: not built"},
-		{"forget n1.1",	"shoalsrv: not built",	"fenced"},
+		{"scrub",	nil,			nil},
+		{"forget n1.1",	nil,			"fenced"},
 		{"newmonid 00112233445566778899aabbccddeeff",
-				"shoalsrv: not built",	"shoalsrv: not built"},
+				nil,			nil},
 	};
 	static struct {
 		char	*line;
@@ -1252,6 +1283,9 @@ tctl(void)
 		return;
 	memset(data, 0x5a, sizeof data);
 	mkobj(srvstore(ctx), "alpha", data, sizeof data, 1);
+	for(i = 0; i < nelem(verbs); i++)
+		if(strncmp(verbs[i].line, "drop ", 5) == 0)
+			verbs[i].unfenced = droperr(ctx, verbs[i].line+5);
 	clstart(&cl, ctx, Clmsize);
 
 	/* every verb is refused a non-admin fid (§2.5's role column) */
@@ -1360,7 +1394,7 @@ tctl(void)
 	if(r.type != Rwrite)
 		fail("fence off under an operator fence: %s",
 			r.type == Rerror ? r.ename : "?");
-	clwrite(&cl, Fctl, 0, "drop alpha", &r);
+	clwrite(&cl, Fctl, 0, "pull alpha n1.1", &r);
 	clerris("a fenced-set verb after fence off", &r,
 		"shoalsrv: not built");
 Out:
@@ -1630,10 +1664,18 @@ tobjgate(void)
 	clclunk(&cl, Ffile, &r);
 	if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk)
 		fail("walk /obj while fenced: %s", clerr(&r));
-	/* a listing is not a read of an object, so F1 does not fence it */
-	clopen(&cl, Ffile, OREAD, &r);
-	clerris("fenced admin open of the /obj directory", &r,
-		"shoalsrv: not built");
+	/*
+	 * A listing is not a read of an object, so F1 does not fence it.
+	 * It gets a fid of its own because the open succeeds, and 9P has
+	 * no Tcreate on a fid that is already open.
+	 */
+	if(clwalk1(&cl, Froot, Ffile2, "obj", &r) != Rwalk)
+		fail("walk /obj for a listing while fenced: %s", clerr(&r));
+	clopen(&cl, Ffile2, OREAD, &r);
+	checks++;
+	if(r.type != Ropen)
+		fail("fenced admin open of the /obj directory: %s", clerr(&r));
+	clclunk(&cl, Ffile2, &r);
 	clcreate(&cl, Ffile, "shoal.map.9", 0666, OWRITE, &r);
 	clerris("fenced admin create of a reserved id", &r, "fenced");
 	/*
@@ -1650,8 +1692,9 @@ tobjgate(void)
 	if(clwalk1(&cl, Froot, Ffile, "meta", &r) != Rwalk)
 		fail("walk /meta while fenced: %s", clerr(&r));
 	clopen(&cl, Ffile, OREAD, &r);
-	clerris("fenced admin open of the /meta directory", &r,
-		"shoalsrv: not built");
+	checks++;
+	if(r.type != Ropen)
+		fail("fenced admin open of the /meta directory: %s", clerr(&r));
 	clclunk(&cl, Ffile, &r);
 	if(clwrite(&cl, Fctl, 0, "fence off", &r) != Rwrite)
 		fail("fence off: %s", clerr(&r));

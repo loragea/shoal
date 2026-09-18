@@ -20,7 +20,7 @@
  * What a case asserts is the exact bytes of a reply.
  *
  * The maps are this program's own, because what §5.4 steps 4 and 5
- * answer depends on the placement the map produces (store.md §14(30)):
+ * answer depends on the placement the map produces (store.md §14(34)):
  * a map with one placement member acks alone, and one whose placement
  * holds a member this instance cannot have replicated to answers
  * `degraded'.  T1 maps are therefore replicas=1 unless the case is
@@ -516,7 +516,7 @@ Out:
  * `bad open mode'; so is a mode §2.4 does not admit.  A Twstat rename
  * MUST be `no rename', and every other settable field is refused —
  * with this server's own string, since §2.6 names no condition for it
- * (store.md §14(34)).
+ * (store.md §14(38)).
  */
 static void
 tmodes(void)
@@ -563,7 +563,7 @@ tmodes(void)
 	/*
 	 * §2.4's other mode rule — a write on a fid opened OREAD — never
 	 * reaches this server: lib9p refuses it before Srv.write with its
-	 * own protocol botch (store.md §14(32)).
+	 * own protocol botch (store.md §14(36)).
 	 */
 	if(clopen(&cl, Ffile, OREAD, &r) != Ropen)
 		fail("open /obj/alpha for reading: %s", clerr(&r));
@@ -604,7 +604,7 @@ tmodes(void)
 	 * stat(5) makes `type', `dev' and `qid' don't-touch on every
 	 * Twstat.  The first two are this row's to refuse; a qid that
 	 * differs from the fid's own is lib9p's, answered in its words
-	 * before Srv.wstat (store.md §14(34)).
+	 * before Srv.wstat (store.md §14(38)).
 	 */
 	nulldir(&dir);
 	dir.type = 1;
@@ -917,7 +917,7 @@ Out:
  * §2.4's /meta/<oid>.  It renders at open like every other status file
  * (§2.2), on the object's queue because it reads the object's record;
  * `blksz=' is the geometry's and `cur=' is 0, which is what an
- * instance that can complete no currency check has (store.md §14(31)).
+ * instance that can complete no currency check has (store.md §14(35)).
  */
 static void
 tmeta(void)
@@ -1056,7 +1056,7 @@ Out:
  * This instance is status=out and the other is dead, so no node places
  * at all: P(o) is empty and the object has no serving primary.  Both
  * fields render `-' rather than an attribute with no value, which §0's
- * one attr=value record per line does not admit (store.md §14(31)).
+ * one attr=value record per line does not admit (store.md §14(35)).
  * The operator's read is what reaches the render: role=client I/O on
  * an instance whose own record says status=out is F3's `down' (§6.4).
  */
@@ -1117,7 +1117,7 @@ Out:
 
 /*
  * §5.4 steps 4 and 5 on a build with no peer client (store.md
- * §14(30)).  The map places every object on this instance and on one
+ * §14(34)).  The map places every object on this instance and on one
  * that is up=no: nothing was sent to it, so M is not empty, step 5a
  * owes a durable stale mark to a monitor this build has no client for,
  * and every client mutation answers `degraded'.  A read is not on that
@@ -2211,7 +2211,7 @@ Out:
 
 /*
  * The look §5.4 step 3 owes before its commit, and the two answers
- * store.md §14(33) keeps apart.  Step 7 discards the stage the FID
+ * store.md §14(37) keeps apart.  Step 7 discards the stage the FID
  * holds, whichever of the fid's requests was flushed, so a Tflush of a
  * second write QUEUED on this fid takes the running write's stage —
  * and the objprelook point parks that write in exactly the window
