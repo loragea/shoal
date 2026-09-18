@@ -413,6 +413,17 @@ int	srvjobcount(Srvctx*);	/* jobs held: what the shutdown waits for */
  *		chunk naming a second object — against a stage whose owner
  *		is past its look and still inside its step.  Taken with no
  *		lock held, like the two above.
+ *	newhold	n != 0 holds the first n requests that reach the call which
+ *		takes the fid's stage slot, before that call's lock
+ *		(obj.c's stagenew).  Two chunks naming different objects
+ *		can both find the slot empty and both come here for a stage
+ *		of their own; the winner fills the slot and the loser wakes
+ *		into the clause that decides whether the slot may be taken
+ *		from what is in it.  So this point parks the loser and lets
+ *		everything behind it through — a point that held both would
+ *		leave nobody to fill the slot — and srvheld below is how a
+ *		test waits for the loser to be parked.  It is the only
+ *		point of the set that does not hold every arrival.
  *	flushhold
  *		n != 0 holds a Tflush of a pooled request between the
  *		lookup that found it and the flush itself, which is the
@@ -450,7 +461,8 @@ void	srvhook(Srvctx*, char *name, uvlong n);
  * WHILE a request is parked, and a sleep long enough today is a wedge
  * or a silent pass tomorrow.  A point counts only where a case needs
  * the wait — today the three of the /repl transfer, fullhold, openhold
- * and finalhold — and an unnamed point answers 0.
+ * and finalhold, and the stage slot's newhold — and an unnamed point
+ * answers 0.
  */
 uvlong	srvheld(Srvctx*, char *name);
 
@@ -470,10 +482,10 @@ int	srvqindex(Srvctx*, uchar *oid, int oidlen);
  * srvholdclear, which the shutdown runs before it drains, clears the
  * whole of srvhook's set and nothing else: objhold, objprelook,
  * objstage, objlook, objarm, objexit, fullhold, openhold, finalhold,
- * flushhold, mapopen, walkhold, anyexit, step7, jobhold, slotfail,
- * reclaimhold and dirhold.  A HOLD belongs in srvhook — a program that
- * set a point and stopped watching must not be able to hold the
- * store's close.  (The shutdown also turns srvcellpoint off, by its
+ * newhold, flushhold, mapopen, walkhold, anyexit, step7, jobhold,
+ * slotfail, reclaimhold and dirhold.  A HOLD belongs in srvhook — a
+ * program that set a point and stopped watching must not be able to
+ * hold the store's close.  (The shutdown also turns srvcellpoint off, by its
  * own call and for its own reason: the file table those cells are in
  * outlives the context that was given them.)  Clearing a point is not
  * the same as reaching the proc that is parked in it: a parked QUEUE

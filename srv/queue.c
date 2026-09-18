@@ -475,15 +475,48 @@ srvqflush(Req *r)
  * opens (srv.h's srvheld).  nil for a point nothing waits on.
  */
 static void
+qholdpark(Srvctx *c, Qreq *qr, uvlong *pt)		/* under holdlk */
+{
+	while(*pt != 0 && (qr == nil || qr->q->flush == 0)){
+		qunlock(&c->holdlk);
+		sleep(5);
+		qlock(&c->holdlk);
+	}
+}
+
+static void
 qhold(Srvctx *c, Qreq *qr, uvlong *pt, uvlong *cnt)
 {
 	qlock(&c->holdlk);
 	if(cnt != nil && *pt != 0)
 		(*cnt)++;
-	while(*pt != 0 && (qr == nil || qr->q->flush == 0)){
-		qunlock(&c->holdlk);
-		sleep(5);
-		qlock(&c->holdlk);
+	qholdpark(c, qr, pt);
+	qunlock(&c->holdlk);
+}
+
+/*
+ * The same park for a point that must hold SOME arrivals and let the
+ * rest through: `n' parks the first n requests that reach it and every
+ * later one runs on.  One window asks for that.  Two chunks on one
+ * /repl fid can both be inside the call that takes the fid's stage
+ * slot, and a case about what the loser does when it wakes needs the
+ * loser parked THERE while the winner runs through the same call
+ * behind it (srv.h's newhold) — which a point that parked both would
+ * have nobody left to do.
+ *
+ * `cnt' counts the parks, so it is still what a test waits on — a
+ * request that ran through was never in the window the case is about.
+ * It is also this point's whole memory of how many it has parked, and
+ * never resets, so raising the point again does not re-arm it; a case
+ * that wants another park raises it to a larger n.
+ */
+static void
+qholdfirst(Srvctx *c, Qreq *qr, uvlong *pt, uvlong *cnt)
+{
+	qlock(&c->holdlk);
+	if(*cnt < *pt && (qr == nil || qr->q->flush == 0)){
+		(*cnt)++;
+		qholdpark(c, qr, pt);
 	}
 	qunlock(&c->holdlk);
 }
@@ -674,6 +707,17 @@ srvqhold(Req *r, uvlong *pt, uvlong *cnt)
 	if((qr = r->aux) == nil)
 		return;
 	qhold(qr->ctx, qr, pt, cnt);
+}
+
+/* the same, for a point that parks the first `n' arrivals only */
+void
+srvqholdfirst(Req *r, uvlong *pt, uvlong *cnt)
+{
+	Qreq *qr;
+
+	if((qr = r->aux) == nil)
+		return;
+	qholdfirst(qr->ctx, qr, pt, cnt);
 }
 
 /*
@@ -960,6 +1004,8 @@ srvhook(Srvctx *c, char *name, uvlong n)
 		c->openhold = n;
 	else if(strcmp(name, "finalhold") == 0)
 		c->finalhold = n;
+	else if(strcmp(name, "newhold") == 0)
+		c->newhold = n;
 	else if(strcmp(name, "mapopen") == 0)
 		c->mapopen = n;
 	else if(strcmp(name, "walkhold") == 0)
@@ -1004,6 +1050,7 @@ srvholdclear(Srvctx *c)
 	c->fullhold = 0;
 	c->openhold = 0;
 	c->finalhold = 0;
+	c->newhold = 0;
 	c->mapopen = 0;
 	c->walkhold = 0;
 	c->anyexit = 0;
@@ -1018,7 +1065,8 @@ srvholdclear(Srvctx *c)
 /*
  * How many requests have reached a point (srv.h).  The set is the
  * points a case has to wait on rather than sleep before, which are the
- * three of the /repl transfer; anything else answers 0.
+ * three of the /repl transfer and the stage slot's own; anything else
+ * answers 0.
  */
 uvlong
 srvheld(Srvctx *c, char *name)
@@ -1033,6 +1081,8 @@ srvheld(Srvctx *c, char *name)
 		n = c->openheld;
 	else if(strcmp(name, "finalhold") == 0)
 		n = c->finalheld;
+	else if(strcmp(name, "newhold") == 0)
+		n = c->newheld;
 	qunlock(&c->holdlk);
 	return n;
 }

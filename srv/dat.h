@@ -738,15 +738,18 @@ struct Srvctx
 	uvlong	fullhold;	/* srvhook("fullhold") */
 	uvlong	openhold;	/* srvhook("openhold") */
 	uvlong	finalhold;	/* srvhook("finalhold") */
+	uvlong	newhold;	/* srvhook("newhold") */
 	/*
-	 * How many requests have reached the three points of the /repl
-	 * transfer, counted where they park and never reset: a test waits
-	 * on one rather than on a sleep, and the window each point holds
-	 * open is exactly what the case is about (srv.h's srvheld).
+	 * How many requests have parked at the three points of the /repl
+	 * transfer and at the stage slot's own, counted where they park
+	 * and never reset: a test waits on one rather than on a sleep, and
+	 * the window each point holds open is exactly what the case is
+	 * about (srv.h's srvheld).
 	 */
 	uvlong	fullheld;
 	uvlong	openheld;
 	uvlong	finalheld;
+	uvlong	newheld;
 	uvlong	mapopen;	/* srvhook("mapopen") */
 	uvlong	walkhold;	/* srvhook("walkhold") */
 	uvlong	anyexit;	/* srvhook("anyexit") */

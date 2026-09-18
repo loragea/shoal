@@ -2006,6 +2006,139 @@ Out:
 }
 
 /*
+ * The other side of the same rule: the slot, from the point of view of
+ * a chunk that is asking for it.  Two chunks naming different objects
+ * can both pass the continue-this-transfer path with the slot EMPTY
+ * and both go on to stage one of their own, on two queues and so at
+ * once; the winner fills the slot, and what the loser must not do when
+ * it wakes is take the slot from a stage whose own handler is still
+ * inside a step on it, dead or not (store.md §14(45)).  Taking it
+ * would free that stage under the arm that is about to store a handle
+ * in it, which is a use after free and a reservation nothing gives
+ * back.
+ *
+ * `newhold' parks the loser inside that call and lets the winner
+ * through (srv.h).  The winner is then parked at `openhold' — live,
+ * busy, no handle yet — and a flushed sibling on its queue runs step
+ * 7, which marks its stage dead and released without clearing the
+ * slot.  So the loser wakes to a stage that is dead, released AND
+ * busy, which is the one arrival that clause has.
+ */
+static void
+tstagewedge(void)
+{
+	char *m, cs[Csumhexlen], d0[2*Blkdlen+1], *hy, *hz, *hz2;
+	uchar want[2*Tblksz];
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall tf, r;
+	uvlong live, done, openat, np0, nd0, np, nd;
+	ushort ty, tz, tz2, ft;
+	int i;
+
+	clstage = "stagewedge";
+	m = mkmap();
+	d = newdisk(Tnslots, nil);
+	if((ctx = startsrv(d, m, 0, 60000)) == nil)	/* no idle sweep */
+		return;
+	for(i = 0; i < sizeof want; i++)
+		want[i] = i*5 + 1;
+	ocsum(cs, want, sizeof want);
+	dcs(d0, want, Tblksz);
+	clstart(&cl, ctx, Clmsize);
+	if(!chopen(&cl, ctx, Nrepl, Froot, Frepl, ~0UL))
+		goto Out;
+	if(!apart(ctx, "yak", "zeta"))
+		goto Out;
+	hy = smprint("op=full oid=yak epoch=7 ver=3 wepoch=7 len=%d off=0"
+		" n=%d dcsum=%s csum=%s final=0", 2*Tblksz, Tblksz, d0, cs);
+	hz = smprint("op=full oid=zeta epoch=7 ver=3 wepoch=7 len=%d off=0"
+		" n=%d dcsum=%s csum=%s final=0", 2*Tblksz, Tblksz, d0, cs);
+	hz2 = smprint("op=full oid=zeta epoch=7 ver=3 wepoch=7 len=%d off=%d"
+		" n=%d dcsum=%s csum=%s final=0", 2*Tblksz, Tblksz, Tblksz, d0,
+		cs);
+	waitidle(ctx, &np0, &nd0);
+	srvhook(ctx, "newhold", 1);
+	srvhook(ctx, "openhold", 1);
+
+	/* the loser, parked with the slot still empty */
+	ty = pushchunk(&cl, hy, want, Tblksz);
+	waitpush(ctx, np0, 1, &np, &nd);
+	waitheld(ctx, "newhold", 1);
+	srvstagecount(ctx, &live, &done, nil);
+	eqv("the parked chunk has taken no slot yet", live, 0);
+
+	/* the winner, through that call and parked with `g' still nil */
+	tz = pushchunk(&cl, hz, want, Tblksz);
+	waitpush(ctx, np0, 2, &np, &nd);
+	waitheld(ctx, "openhold", 1);
+	srvstagecount(ctx, &live, &done, nil);
+	eqv("the winner's stage is in the slot", live, 1);
+
+	/* a sibling on the winner's queue, flushed: step 7 kills that stage */
+	tz2 = pushchunk(&cl, hz2, want, Tblksz);
+	waitpush(ctx, np0, 3, &np, &nd);
+	memset(&tf, 0, sizeof tf);
+	tf.type = Tflush;
+	tf.tag = ft = cltag(&cl);
+	tf.oldtag = tz2;
+	clput(&cl, &tf);
+	if(clgettag(&cl, tz2, &r) < 0)
+		fail("no answer to the flushed sibling chunk");
+	else
+		eqs("the flushed sibling chunk", clerr(&r), "interrupted");
+	cltagfree(&cl, tz2);
+	if(clgettag(&cl, ft, &r) != Rflush)
+		fail("no Rflush: %s", clerr(&r));
+	cltagfree(&cl, ft);
+	srvstagecount(ctx, &live, &done, nil);
+	eqv("step 7 marks the winner's stage dead and released", done, 1);
+	eqv("... and has no handle to park", srvstagepend(ctx), 0);
+
+	/* the loser wakes to a stage that is dead, released and busy */
+	srvhook(ctx, "newhold", 0);
+	if(clgettag(&cl, ty, &r) < 0)
+		fail("no answer to the chunk that lost the race");
+	else
+		eqs("the loser is refused rather than given the slot",
+			clerr(&r), "disk full");
+	cltagfree(&cl, ty);
+	srvstagecount(ctx, &live, &done, nil);
+	eqv("so nothing gave the winner's stage back a second time", done, 1);
+
+	/* and the winner's own give-back is what clears it */
+	srvhook(ctx, "openhold", 0);
+	if(clgettag(&cl, tz, &r) < 0)
+		fail("no answer to the opening chunk");
+	else
+		eqs("the opening chunk answers its own refusal", clerr(&r),
+			"shoalsrv: stage expired");
+	cltagfree(&cl, tz);
+	srvstagecount(ctx, &live, &done, &openat);
+	eqv("the slot is clear", live, 0);
+	eqv("the stage was given back exactly once", done, 1);
+	eqv("... with the store open", openat, 1);
+	eqv("and the handle it had taken went to the drain",
+		srvstagepend(ctx), 1);
+	eqs("so the race leaves no reservation behind", statstaged(&cl), "0");
+	eqs("and the fid takes a fresh transfer",
+		repler(&cl, Frepl, hz, want, Tblksz), "ok");
+	free(hy);
+	free(hz);
+	free(hz2);
+	clclunk(&cl, Frepl, &r);
+	clclunk(&cl, Froot, &r);
+Out:
+	srvhook(ctx, "newhold", 0);
+	srvhook(ctx, "openhold", 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * §5.6's channel rules: one outstanding request per fid, a response
  * prepared at Twrite time and delivered by exactly one Tread, and a
  * read with nothing buffered answering count 0.
@@ -2817,6 +2950,7 @@ threadmain(int argc, char **argv)
 	tstagebusy();
 	tstageopen();
 	tstagefinal();
+	tstagewedge();
 	tchannel();
 	trpcops();
 	tdropdiscard();

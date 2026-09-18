@@ -479,8 +479,8 @@ srvstagesweep(Srvctx *c)
  * and spanning that round is what the stage is for.
  */
 static Sstage*
-stagenew(Srvctx *c, Sfid *f, int kind, uchar *oid, int oidlen, uvlong ver,
-	uvlong wepoch, long n, uvlong off, char **err)
+stagenew(Req *r, Srvctx *c, Sfid *f, int kind, uchar *oid, int oidlen,
+	uvlong ver, uvlong wepoch, long n, uvlong off, char **err)
 {
 	Sstage *s, *old;
 	int inuse;
@@ -534,7 +534,14 @@ stagenew(Srvctx *c, Sfid *f, int kind, uchar *oid, int oidlen, uvlong ver,
 	 * anything, every chunk on the fid goes through srvstagemore, which
 	 * answers one whose stage is dead and busy — leaving the slot where
 	 * it is (§14(44)) — without ever asking for a new stage.
+	 *
+	 * §13's point over exactly that race (srv.h's newhold), before the
+	 * lock so that the winner can take it and fill the slot while the
+	 * loser waits.  It parks the first arrivals only, for the same
+	 * reason: a point that parked the winner too would leave nobody to
+	 * be raced against.
 	 */
+	srvqholdfirst(r, &c->newhold, &c->newheld);
 	qlock(&f->lk);
 	old = f->aux;
 	if(old != nil && f->auxflush != stageflushhook){
@@ -837,8 +844,8 @@ srvstagefull(Req *r, Srvctx *c, Sfid *f, uchar *oid, int oidlen, uvlong flen,
 	Stage *g;
 
 	*sp = nil;
-	if((s = stagenew(c, f, Stfull, oid, oidlen, ver, wepoch, n, off,
-		err)) == nil)
+	if((s = stagenew(r, c, f, Stfull, oid, oidlen, ver, wepoch, n,
+		off, err)) == nil)
 		return nil;
 	qlock(&c->stagelk);
 	s->flen = flen;
@@ -1208,7 +1215,7 @@ objwriteq(Req *r)
 		srvqdone(r, e);
 		return;
 	}
-	if((s = stagenew(c, f, Stwrite, f->oid, f->oidlen, oi.ver+1,
+	if((s = stagenew(r, c, f, Stwrite, f->oid, f->oidlen, oi.ver+1,
 		c->map->epoch, n, off, &e)) == nil){
 		srvqdone(r, e);
 		return;
@@ -1319,7 +1326,7 @@ objopenq(Req *r)
 		return;
 	}
 	if((r->ifcall.mode & OTRUNC) != 0 && oi.len != 0){
-		if((s = stagenew(c, f, Sttrunc, f->oid, f->oidlen, oi.ver+1,
+		if((s = stagenew(r, c, f, Sttrunc, f->oid, f->oidlen, oi.ver+1,
 			c->map->epoch, 0, 0, &e)) == nil){
 			srvqdone(r, e);
 			return;
@@ -1354,7 +1361,7 @@ objopenq(Req *r)
 	f->qidvers = q.vers;
 	r->ofcall.qid = q;
 	if(stagepointon(c) && (r->ifcall.mode&3) != OREAD)
-		if((s = stagenew(c, f, Stpoint, f->oid, f->oidlen, 0, 0,
+		if((s = stagenew(r, c, f, Stpoint, f->oid, f->oidlen, 0, 0,
 			0, 0, &e)) != nil){
 			/*
 			 * The window the stage exists in and the handle does
@@ -1425,7 +1432,7 @@ objremoveq(Req *r)
 		srvqdone(r, e);
 		return;
 	}
-	if((s = stagenew(c, f, Stremove, f->oid, f->oidlen, oi.ver+1,
+	if((s = stagenew(r, c, f, Stremove, f->oid, f->oidlen, oi.ver+1,
 		c->map->epoch, 0, 0, &e)) == nil){
 		srvqdone(r, e);
 		return;
@@ -1513,7 +1520,7 @@ objwstatq(Req *r)
 		srvqdone(r, nil);
 		return;
 	}
-	if((s = stagenew(c, f, Sttrunc, f->oid, f->oidlen, oi.ver+1,
+	if((s = stagenew(r, c, f, Sttrunc, f->oid, f->oidlen, oi.ver+1,
 		c->map->epoch, 0, 0, &e)) == nil){
 		srvqdone(r, e);
 		return;

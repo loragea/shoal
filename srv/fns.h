@@ -57,6 +57,7 @@ void	srvqflush(Req*);
 Qreq*	srvqreq(Req*);
 int	srvqcheck(Req*);
 void	srvqhold(Req*, uvlong *pt, uvlong *cnt);
+void	srvqholdfirst(Req*, uvlong *pt, uvlong *cnt);
 void	srvqexit(Req*);
 void	srvqwalkhold(Req*);
 void	srvqanyexit(Srvctx*);
