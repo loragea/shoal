@@ -2341,6 +2341,90 @@ tpipeopen(void)
 }
 
 /*
+ * A Tcreate pipelined behind a Topen that is REFUSED.  What the create
+ * cell reads to know that an open got to this fid first is lib9p's
+ * `Fid.omode' (srv/obj.c), and lib9p writes it only for an open it
+ * answered with an Ropen — so an open that was refused must leave the
+ * create free to win.
+ *
+ * The refusal driven here is lib9p's own: OWRITE on a directory is
+ * answered `is a directory' from the service loop, before the /obj
+ * row's open cell is reached at all, so no cell of this row ever sees
+ * this open.  `objhold' is what orders the two on the client's side —
+ * the create is held on its queue while the open's refusal comes back
+ * — so the create's claim test runs strictly after the open was
+ * answered, which is the moment a create would be refused if the
+ * error path wrote `Fid.omode'.
+ */
+static void
+trefusedopen(void)
+{
+	char *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall t, r;
+	Objinfo oi;
+	char *w[1];
+	ushort to, tc;
+
+	clstage = "refusedopen";
+	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4)) == nil)
+		return;
+	mkobj(srvstore(ctx), "alpha", nil, 0, 1);
+	w[0] = "obj";
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
+		fail("attach: %s", clerr(&r));
+		goto Out;
+	}
+	if(clwalk(&cl, Froot, Ffile, 1, w, &r) != Rwalk){
+		fail("walk /obj: %s", clerr(&r));
+		goto Out;
+	}
+	srvhook(ctx, "objhold", 1);	/* the create, once it is queued */
+	memset(&t, 0, sizeof t);
+	t.type = Topen;
+	t.fid = Ffile;
+	t.mode = OWRITE;		/* on a directory: lib9p refuses it */
+	t.tag = to = cltag(&cl);
+	clput(&cl, &t);
+	sleep(200);			/* answered on the loop, not queued */
+	memset(&t, 0, sizeof t);
+	t.type = Tcreate;
+	t.fid = Ffile;
+	t.name = "shoal.map.9";
+	t.perm = 0666;
+	t.mode = OWRITE;
+	t.tag = tc = cltag(&cl);
+	clput(&cl, &t);
+	sleep(200);			/* held at its check point */
+
+	clgettag(&cl, to, &r);
+	clerris("an OWRITE open of /obj", &r, "is a directory");
+	cltagfree(&cl, to);
+	srvhook(ctx, "objhold", 0);
+	checks++;
+	if(clgettag(&cl, tc, &r) != Rcreate)
+		fail("a create behind a refused open: %s", clerr(&r));
+	cltagfree(&cl, tc);
+	checks++;
+	if(objinfoof(srvstore(ctx), "shoal.map.9", &oi) < 0)
+		fail("the create that won made no object");
+
+	clclunk(&cl, Ffile, &r);
+	clclunk(&cl, Froot, &r);
+Out:
+	srvhook(ctx, "objhold", 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * A Tcreate that lands in a SECOND open's give-back window, which is
  * the one stretch in which a /obj fid whose open has ANSWERED holds
  * nothing at all.  Three messages pipelined on one fid: the first
@@ -4068,6 +4152,7 @@ threadmain(int argc, char **argv)
 	tcreategive();
 	tdircreate();
 	tpipeopen();
+	trefusedopen();
 	tgivecreate();
 	tholdaside();
 	tfidwalk();
