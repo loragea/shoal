@@ -5329,10 +5329,16 @@ name a half that is not built; each says which.
     *Settled here as implementation policy:* `down` wins. It is the
     instance's own standing state, read off the map it was started
     with (§14(18)), while the fence is the one gate an operator moves
-    under an open fid; and §2.6 has a client answer both the same way
-    — re-read the map and re-evaluate placement — so no client
-    behaviour turns on the choice. A conforming implementation may
-    answer `fenced` there instead.
+    under an open fid — and the two answers send the client to
+    different places. layer-a §0 classes `fenced` as **retryable**,
+    which a client library must retry with bounded backoff after
+    re-reading the map, and `down` as a **redirect**, which says only
+    that this instance may not serve and has the client re-evaluate
+    placement. F3's condition is standing state that no retry can
+    clear, so `down` is the answer that moves the client to an
+    instance that can serve it; answering `fenced` there would cost it
+    a backoff loop against an instance the map has taken out of
+    service. A conforming implementation may answer `fenced` instead.
 
     `/repl` and `/rpc` carry a gate of their own, and it is the fence
     alone: F1 fences "every `/repl` and `/rpc` operation", which is
