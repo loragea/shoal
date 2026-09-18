@@ -1325,6 +1325,78 @@ Out:
 }
 
 /*
+ * The sweep runs at the head of every queued operation that NAMES an
+ * object, which is more than this file's own handlers: a walk to
+ * /obj/<oid> and a stat of one are queued against that object too
+ * (queue.c), so each of them is a place an abandoned stage is
+ * collected.
+ */
+static void
+tsweepsites(void)
+{
+	char *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall r;
+	uvlong live;
+
+	clstage = "sweepsites";
+	m = mkmap(Palone, Tblksz, Tobjmax, Tuuid);
+	d = newdisk(Tnslots);
+	if((ctx = startsrv(d, m, 0, 50)) == nil)
+		return;
+	mkobj(srvstore(ctx), "alpha", nil, 0);
+	mkobj(srvstore(ctx), "beta", nil, 0);
+
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, Nclient, &r) != Rattach){
+		fail("attach: %s", clerr(&r));
+		goto Out;
+	}
+	/* a Tstat of an object is where this stage is collected */
+	srvstagepoint(ctx, 1);
+	if(clwalkobj(&cl, Froot, Ffile, "obj", "alpha", &r) != Rwalk
+	|| clopen(&cl, Ffile, OWRITE, &r) != Ropen){
+		fail("open /obj/alpha: %s", clerr(&r));
+		goto Out;
+	}
+	srvstagepoint(ctx, 0);
+	if(clwalkobj(&cl, Froot, Ffile2, "obj", "beta", &r) != Rwalk){
+		fail("walk /obj/beta: %s", clerr(&r));
+		goto Out;
+	}
+	sleep(200);			/* longer than stagems */
+	if(clstat(&cl, Ffile2, &r) != Rstat)
+		fail("stat /obj/beta: %s", clerr(&r));
+	srvstagecount(ctx, &live, nil, nil);
+	eqv("a stat of an object sweeps at its head", live, 0);
+	clclunk(&cl, Ffile, &r);
+	clclunk(&cl, Ffile2, &r);
+
+	/* ... and so is a walk to one */
+	srvstagepoint(ctx, 1);
+	if(clwalkobj(&cl, Froot, Ffile, "obj", "alpha", &r) != Rwalk
+	|| clopen(&cl, Ffile, OWRITE, &r) != Ropen)
+		fail("re-open /obj/alpha: %s", clerr(&r));
+	srvstagepoint(ctx, 0);
+	sleep(200);
+	if(clwalkobj(&cl, Froot, Ffile2, "obj", "beta", &r) != Rwalk)
+		fail("re-walk /obj/beta: %s", clerr(&r));
+	srvstagecount(ctx, &live, nil, nil);
+	eqv("a walk to an object sweeps at its head", live, 0);
+	clclunk(&cl, Ffile, &r);
+	clclunk(&cl, Ffile2, &r);
+	clclunk(&cl, Froot, &r);
+Out:
+	srvstagepoint(ctx, 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * The sweep against the clunk of the fid it is sweeping.  The sweep
  * runs on a queue proc and holds no reference to a stage, while the
  * clunk runs on the service loop and frees whatever its fid holds, so
@@ -1893,6 +1965,7 @@ threadmain(int argc, char **argv)
 	tdiskfull();
 	tstage();
 	tstagesweep();
+	tsweepsites();
 	tsweepclunk();
 	tstageflush();
 	tstagecommit();

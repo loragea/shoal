@@ -5543,6 +5543,19 @@ name a half that is not built; each says which.
     `/repl` surface (§5.5) whose stages reserve. `/status` carries no
     `staged=` row until then.
 
+    **Which string a client sees when its staged update goes.** A
+    `Twrite` whose own request was flushed is answered `interrupted`
+    (§14(14)). One that finds its stage gone for any other reason —
+    step 7 for a *different* request on the same fid, or the idle
+    sweep — is answered this server's own
+    `shoalsrv: staged update discarded`, which carries no §2.6 prefix
+    because nothing §2.6 names has happened: the update was neither
+    applied nor refused on its merits, and the client retries. The
+    engine's `stage expired` is the same condition said to the other
+    kind of owner — a `/repl` sender CONTINUING a transfer whose
+    earlier chunks are gone (§3.6) — and a client operation continues
+    nothing, so the two never reach one caller.
+
 34. **A `Twstat` that sets a field other than `length` carries no
     §2.6 string.** §2.4 requires every other settable field to be
     rejected and names a condition for one of them alone —

@@ -345,11 +345,12 @@ stagefreehook(void *a)
  * of arrivals, and sweeping under one would take the bytes out from
  * under the commit that is reading them (§3.6).
  *
- * There is no sweeper proc.  A stage holds a reservation and a buffer,
- * and the only thing that can be waiting on either is another
- * operation on an object, so the sweep runs at the head of every
- * queued object operation: a store with nothing running has nothing
- * waiting for what an abandoned stage holds.  The handle is never
+ * There is no sweeper proc.  A stage holds a reservation, and the only
+ * thing that can be waiting on one is another operation on an object,
+ * so the sweep runs at the head of every queued operation that names
+ * an object — this file's handlers, and the walk and the stat in
+ * tree.c — a store with nothing running having nothing waiting for
+ * what an abandoned stage holds.  The handle is never
  * freed here — it is the fid's, and the clunk behind it is what frees
  * it (§3.6) — so the fid's next look finds it expired.
  *

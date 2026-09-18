@@ -991,6 +991,7 @@ walkq(Req *r)
 		srvqdone(r, nil);
 		return;
 	}
+	srvstagesweep(r->srv->aux);
 	dowalk(r);
 }
 
@@ -1294,6 +1295,7 @@ statq(Req *r)
 	}
 	c = r->srv->aux;
 	f = r->fid->aux;
+	srvstagesweep(c);
 	if(objstat(c->store, f->oid, f->oidlen, &oi) < 0){
 		srvqdone(r, srverr(buf, sizeof buf));
 		return;
