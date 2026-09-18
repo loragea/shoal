@@ -215,15 +215,17 @@ enum
  * puts the render on the reserved queue; /stale reads the adopted map
  * and /jobs the job list, so both stay on the service loop.
  *
- * /repl and /rpc are the peer channels: their read and write cells
- * belong with the replication surface (§5.5, §5.6) and are not built.
- * The per-fid state a multi-request op stages has its slot and its
- * lifetime rules here already (Sstage below), because the client
- * operations stage on the same slot; what is unfilled is §5.5's
- * op=full, the one kind of stage that outlives its request.  The two
- * channels' gate is already filled, because the fence is this file's
- * (tree.c's chgate); /advert has none, because F1's list names /repl
- * and /rpc alone.
+ * /repl and /rpc are the peer channels and are built (peer.c): /repl
+ * fills a write cell and a read cell — §5.5 defines no read, so a
+ * Tread of it is end of data — and /rpc fills all three, its open
+ * cell being where §5.6's ORDWR-only rule is applied.  The per-fid
+ * state a multi-request op stages is Sstage below, which the client
+ * operations share: §5.5's op=full is the one kind of stage that
+ * outlives its request, and it is the one that fills `g'.  A /rpc fid
+ * uses the same slot for the request it has outstanding and the
+ * response it has buffered.  The two channels' gate is this file's,
+ * because the fence is (tree.c's chgate); /advert has none, because
+ * F1's list names /repl and /rpc alone.
  *
  * The srvctls table below says the same for the verbs: a verb is
  * built by filling its row's fn or qfn, and the body of work that
@@ -555,14 +557,16 @@ extern int nsrvctls;
  *
  * The rules are the same for both, and they are the fid's:
  *
- *	one per fid.  A second is refused `disk full', which is §3.6's
- *		refusal for its per-fid bound, and so is an update
- *		covering more than `stagemax' allows — grains for a /repl
- *		stage, checksum blocks for a client write, which is this
- *		server's own quantity (store.md §14(37)).  A client write
- *		is SHORTENED to that bound rather than refused (layer-a
- *		§2.4's short write), so only a fid that already holds a
- *		stage reaches the refusal.
+ *	one per fid.  A second is refused `disk full', the pick §2.6's
+ *		set offers for a bound §3.6 does not define (store.md
+ *		§14(42)), and so is an update covering more than
+ *		`stagemax' allows — grains for a /repl stage, which is
+ *		§3.6's own quantity and which the ENGINE charges against
+ *		the handle for every chunk but the first; checksum blocks
+ *		for a client write, which is this server's own quantity
+ *		(store.md §14(37)).  A client write is SHORTENED to that
+ *		bound rather than refused (layer-a §2.4's short write), so
+ *		only a fid that already holds a stage reaches the refusal.
  *	discarded by step 7, through auxflush, whichever of the fid's
  *		requests was flushed: the stage is the fid's, and a stage
  *		spanning several Twrites has no one request to belong to.
@@ -573,16 +577,72 @@ extern int nsrvctls;
  *		of them (Sfid above) — but because of WHERE this one would
  *		be made: the hook reaches the handle under `stagelk', the
  *		context's leaf lock, and store.md §6 rule 1 takes no state
- *		lock under a leaf.  The hook therefore takes the handle
- *		out of the slot and parks it, and obj.c's drain — at the
- *		head of every queued object operation, and once at the
- *		shutdown while the store is still open — is where the
- *		discard is made, outside every lock.  A park that cannot
- *		take the handle puts it BACK in the slot, dead but not
- *		released, rather than make the call there: auxclose below
- *		reaches the slot whatever the sweep has done with the
- *		stage.  So what the fid owes is that the handle is
- *		released by someone that is not the hook.
+ *		lock under a leaf.  The hook therefore marks the stage dead
+ *		and leaves the release to someone else; which someone is
+ *		what `busy' decides.
+ *
+ *		A stage no handler is inside has its handle taken out of
+ *		the slot and parked, and obj.c's drain — at the head of
+ *		every queued object operation, and once at the shutdown
+ *		while the store is still open — is where the discard is
+ *		made, outside every lock.  A park that cannot take the
+ *		handle puts it BACK in the slot, dead but not released,
+ *		rather than make the call there: auxclose below reaches
+ *		the slot whatever the sweep has done with the stage.
+ *
+ *		A stage that IS busy keeps what it holds, and that chunk's
+ *		own handler is what releases it — that handler and NOBODY
+ *		ELSE (store.md §14(44)).  Where in the handler depends on
+ *		what the chunk still owes: the look its engine call returns
+ *		to is the release for a chunk that is not the last, and for
+ *		a final=1 chunk whose write went through the look keeps
+ *		`busy' set and the give-back behind it is the release
+ *		(obj.c's srvstagelive and srvstagefinal), since that chunk
+ *		holds the stage across the arbitration between the two.
+ *		That is the chunk that gets PAST its look: the look answers
+ *		on whether the stage is still the fid's and still live
+ *		BEFORE it consults the mark it was asked to keep, so a
+ *		final=1 chunk the hook reached while its write was in
+ *		flight is answered `stage expired' there and gives the
+ *		stage back at its look like any other.  A final=1 chunk
+ *		whose write FAILED asks for no mark either: its look clears
+ *		`busy' and leaves the stage in the slot for a later chunk
+ *		or the clunk (peer.c).  Not the hook, whose park would be a
+ *		discard made under the stagewrite the handle is an argument
+ *		of; not the idle sweep, which `busy' holds off (§3.6); and
+ *		not a refusal running on another queue — a chunk naming a
+ *		second object finds the stage dead, answers `stage expired'
+ *		and leaves the slot to that handler for the same reason,
+ *		which is the exception §14(43) grants its own rule (obj.c's
+ *		srvstagemore).  So what the fid owes is that the handle is
+ *		released by someone that is not the hook, and while a
+ *		handler is inside a step on it, that someone is the
+ *		handler itself.
+ *
+ *		auxclose is the exception to the NOBODY ELSE, and it is
+ *		one because it cannot land there.  stageclosehook
+ *		releases whatever the slot holds, busy or not: the clunk
+ *		and the shutdown are the last hands an engine stage can be
+ *		given back by (store.md §9), so one that waited on a
+ *		handler's look would be one the store outlives.  Neither
+ *		caller runs while a chunk is inside.  lib9p holds the Fid
+ *		across an outstanding Twrite, so the destroy behind a
+ *		Tclunk runs only once that chunk has responded; the
+ *		shutdown's own sweep runs behind srvqdrain, with every
+ *		request in flight already finished (srv.c); and the third
+ *		caller, the create cell's give-back, runs over an
+ *		enumeration's snapshot and never over a stage (tree.c's
+ *		srvfidgive).
+ *
+ *		`busy' says a handler is inside a step on the stage, handle
+ *		or NOT: the opening chunk of a transfer is busy from the
+ *		moment it stages, ACROSS the arm that fills `g' — which
+ *		leaves the mark set for that caller (obj.c's srvstagefull)
+ *		— and until the look behind it.  stageopen runs in that
+ *		window with no lock held.  A stage taken out of the slot
+ *		there is one the arm, and the look behind it, reach after
+ *		it has been freed — so what the qualifier is on is the
+ *		handler and not the handle.
  *	discarded at clunk and before the store closes, through
  *		auxclose, because releasing an engine stage is an engine
  *		call (store.md §9).
@@ -622,7 +682,15 @@ struct Sstage
 	uvlong	ver;		/* the key §5.4 step 3 chose */
 	uvlong	wepoch;
 	uvlong	off;
-	ulong	ngrain;		/* against §3.6's per-fid bound */
+	/*
+	 * §5.5's op=full declares the final length and `force' on EVERY
+	 * chunk and requires them identical on each, so the transfer's
+	 * pair is kept here and every later chunk is checked against it;
+	 * they are the two values stageopen fixed the engine handle with.
+	 * A client stage has neither and leaves both zero.
+	 */
+	uvlong	flen;
+	int	force;
 	vlong	last;		/* nsec of the last arrival */
 	int	busy;		/* a handler is inside a step on it */
 	int	dead;		/* the sweep expired it, or step 7 took it */
@@ -681,6 +749,7 @@ struct Srvctx
 	Lock	cntlk;
 	uvlong	npush;
 	uvlong	ndone;
+	uvlong	ndiverged;	/* §1.3's repairs, applied here (peer.c) */
 
 	QLock	holdlk;
 	uvlong	hold;		/* srvhook("objhold") */
@@ -690,6 +759,21 @@ struct Srvctx
 	uvlong	armhold;	/* srvhook("objarm") */
 	uvlong	exithold;	/* srvhook("objexit") */
 	uvlong	flushhold;	/* srvhook("flushhold") */
+	uvlong	fullhold;	/* srvhook("fullhold") */
+	uvlong	openhold;	/* srvhook("openhold") */
+	uvlong	finalhold;	/* srvhook("finalhold") */
+	uvlong	newhold;	/* srvhook("newhold") */
+	/*
+	 * How many requests have parked at the three points of the /repl
+	 * transfer and at the stage slot's own, counted where they park
+	 * and never reset: a test waits on one rather than on a sleep, and
+	 * the window each point holds open is exactly what the case is
+	 * about (srv.h's srvheld).
+	 */
+	uvlong	fullheld;
+	uvlong	openheld;
+	uvlong	finalheld;
+	uvlong	newheld;
 	uvlong	mapopen;	/* srvhook("mapopen") */
 	uvlong	walkhold;	/* srvhook("walkhold") */
 	uvlong	anyexit;	/* srvhook("anyexit") */

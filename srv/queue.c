@@ -35,7 +35,7 @@
  * off again.
  */
 
-static void	qhold(Srvctx*, Qreq*, uvlong*);
+static void	qhold(Srvctx*, Qreq*, uvlong*, uvlong*);
 static void	holdms(Srvctx*, uvlong*);
 
 enum
@@ -466,15 +466,60 @@ srvqflush(Req *r)
  * request is still flushable and the shutdown that clears every point
  * (srvholdclear) is not held up by one.  The flush hold below is the
  * exception, and says why.
+ *
+ * `cnt', where a point has one, counts the requests this park HELD —
+ * under the same lock and on the way in, so it says a request got here
+ * and not that one is still here.  That is what a test waits on: the
+ * request it wants parked is the one it just pushed, and a wait on the
+ * count is a wait on the window this park opens (srv.h's srvheld).  A
+ * request that reaches the point and runs straight through is not in
+ * that window and is not counted — the queue's flush flag is already
+ * up for it, which is one of the two exits, so the park it would be
+ * waited on for never happens.  nil for a point nothing waits on.
  */
 static void
-qhold(Srvctx *c, Qreq *qr, uvlong *pt)
+qholdpark(Srvctx *c, Qreq *qr, uvlong *pt)		/* under holdlk */
 {
-	qlock(&c->holdlk);
 	while(*pt != 0 && (qr == nil || qr->q->flush == 0)){
 		qunlock(&c->holdlk);
 		sleep(5);
 		qlock(&c->holdlk);
+	}
+}
+
+static void
+qhold(Srvctx *c, Qreq *qr, uvlong *pt, uvlong *cnt)
+{
+	qlock(&c->holdlk);
+	if(cnt != nil && *pt != 0 && (qr == nil || qr->q->flush == 0))
+		(*cnt)++;
+	qholdpark(c, qr, pt);
+	qunlock(&c->holdlk);
+}
+
+/*
+ * The same park for a point that must hold SOME arrivals and let the
+ * rest through: `n' parks the first n requests that reach it and every
+ * later one runs on.  One window asks for that.  Two chunks on one
+ * /repl fid can both be inside the call that takes the fid's stage
+ * slot, and a case about what the loser does when it wakes needs the
+ * loser parked THERE while the winner runs through the same call
+ * behind it (srv.h's newhold) — which a point that parked both would
+ * have nobody left to do.
+ *
+ * `cnt' counts the parks, so it is still what a test waits on — a
+ * request that ran through was never in the window the case is about.
+ * It is also this point's whole memory of how many it has parked, and
+ * never resets, so raising the point again does not re-arm it; a case
+ * that wants another park raises it to a larger n.
+ */
+static void
+qholdfirst(Srvctx *c, Qreq *qr, uvlong *pt, uvlong *cnt)
+{
+	qlock(&c->holdlk);
+	if(*cnt < *pt && (qr == nil || qr->q->flush == 0)){
+		(*cnt)++;
+		qholdpark(c, qr, pt);
 	}
 	qunlock(&c->holdlk);
 }
@@ -519,7 +564,7 @@ srvqcheck(Req *r)
 	 * while the point is off.
 	 */
 	srvauxstep(r, 1);
-	qhold(qr->ctx, qr, &qr->ctx->hold);
+	qhold(qr->ctx, qr, &qr->ctx->hold, nil);
 	srvauxstep(r, 0);
 	return qr->q->flush != 0;
 }
@@ -536,7 +581,7 @@ srvqcheck(Req *r)
 void
 srvqanyexit(Srvctx *c)
 {
-	qhold(c, nil, &c->anyexit);
+	qhold(c, nil, &c->anyexit, nil);
 }
 
 /*
@@ -549,7 +594,7 @@ srvqanyexit(Srvctx *c)
 void
 srvjobhold(Srvctx *c)
 {
-	qhold(c, nil, &c->jobhold);
+	qhold(c, nil, &c->jobhold, nil);
 }
 
 /*
@@ -594,7 +639,7 @@ srvreclaimhold(Srvctx *c, uvlong i)
 	n = c->reclaimhold;
 	qunlock(&c->holdlk);
 	if(n != 0 && i == n-1)
-		qhold(c, nil, &c->reclaimhold);
+		qhold(c, nil, &c->reclaimhold, nil);
 }
 
 /*
@@ -638,7 +683,7 @@ srvdirhold(Req *r, uvlong i)
 	n = qr->ctx->dirhold;
 	qunlock(&qr->ctx->holdlk);
 	if(n != 0 && i == n-1)
-		qhold(qr->ctx, qr, &qr->ctx->dirhold);
+		qhold(qr->ctx, qr, &qr->ctx->dirhold, nil);
 }
 
 /*
@@ -683,7 +728,7 @@ srvqwalkhold(Req *r)
 
 	if((qr = r->aux) == nil)
 		return;
-	qhold(qr->ctx, qr, &qr->ctx->walkhold);
+	qhold(qr->ctx, qr, &qr->ctx->walkhold, nil);
 }
 
 /*
@@ -703,13 +748,24 @@ srvqwalkhold(Req *r)
  * it waits (srv.h).
  */
 void
-srvqhold(Req *r, uvlong *pt)
+srvqhold(Req *r, uvlong *pt, uvlong *cnt)
 {
 	Qreq *qr;
 
 	if((qr = r->aux) == nil)
 		return;
-	qhold(qr->ctx, qr, pt);
+	qhold(qr->ctx, qr, pt, cnt);
+}
+
+/* the same, for a point that parks the first `n' arrivals only */
+void
+srvqholdfirst(Req *r, uvlong *pt, uvlong *cnt)
+{
+	Qreq *qr;
+
+	if((qr = r->aux) == nil)
+		return;
+	qholdfirst(qr->ctx, qr, pt, cnt);
 }
 
 /*
@@ -728,7 +784,7 @@ srvqexit(Req *r)
 	if((qr = r->aux) == nil)
 		return;
 	rerrstr(err, sizeof err);
-	qhold(qr->ctx, qr, &qr->ctx->exithold);
+	qhold(qr->ctx, qr, &qr->ctx->exithold, nil);
 	errstr(err, sizeof err);
 }
 
@@ -788,7 +844,7 @@ holdstep7(Srvctx *c, int onloop)
 	if(onloop)
 		holdms(c, &c->step7hold);
 	else
-		qhold(c, nil, &c->step7hold);
+		qhold(c, nil, &c->step7hold, nil);
 }
 
 void
@@ -990,6 +1046,14 @@ srvhook(Srvctx *c, char *name, uvlong n)
 		c->exithold = n;
 	else if(strcmp(name, "flushhold") == 0)
 		c->flushhold = n;
+	else if(strcmp(name, "fullhold") == 0)
+		c->fullhold = n;
+	else if(strcmp(name, "openhold") == 0)
+		c->openhold = n;
+	else if(strcmp(name, "finalhold") == 0)
+		c->finalhold = n;
+	else if(strcmp(name, "newhold") == 0)
+		c->newhold = n;
 	else if(strcmp(name, "mapopen") == 0)
 		c->mapopen = n;
 	else if(strcmp(name, "walkhold") == 0)
@@ -1037,6 +1101,10 @@ srvholdclear(Srvctx *c)
 	c->armhold = 0;
 	c->exithold = 0;
 	c->flushhold = 0;
+	c->fullhold = 0;
+	c->openhold = 0;
+	c->finalhold = 0;
+	c->newhold = 0;
 	c->mapopen = 0;
 	c->walkhold = 0;
 	c->anyexit = 0;
@@ -1049,6 +1117,40 @@ srvholdclear(Srvctx *c)
 	c->givehold = 0;
 	c->claimhold = 0;
 	qunlock(&c->holdlk);
+}
+
+/*
+ * How many requests have reached a point (srv.h).  The set is the
+ * points a case has to wait on rather than sleep before, which are the
+ * three of the /repl transfer and the stage slot's own; anything else
+ * answers 0.
+ */
+uvlong
+srvheld(Srvctx *c, char *name)
+{
+	uvlong n;
+
+	n = 0;
+	qlock(&c->holdlk);
+	if(strcmp(name, "fullhold") == 0)
+		n = c->fullheld;
+	else if(strcmp(name, "openhold") == 0)
+		n = c->openheld;
+	else if(strcmp(name, "finalhold") == 0)
+		n = c->finalheld;
+	else if(strcmp(name, "newhold") == 0)
+		n = c->newheld;
+	qunlock(&c->holdlk);
+	return n;
+}
+
+/* which queue of the pool an oid lands in (srv.h) */
+int
+srvqindex(Srvctx *c, uchar *oid, int oidlen)
+{
+	if(c->nq <= 0)
+		return -1;
+	return oidhash(oid, oidlen) % c->nq;
 }
 
 /* what a point is set to, for the one place that acts on the value */

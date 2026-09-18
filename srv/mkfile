@@ -9,6 +9,7 @@ OFILES=\
 	err.$O\
 	job.$O\
 	obj.$O\
+	peer.$O\
 	queue.$O\
 	srv.$O\
 	status.$O\

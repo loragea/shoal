@@ -56,7 +56,8 @@ void	srvqpushany(Srvctx*, Req*, void (*)(Req*));
 void	srvqflush(Req*);
 Qreq*	srvqreq(Req*);
 int	srvqcheck(Req*);
-void	srvqhold(Req*, uvlong*);
+void	srvqhold(Req*, uvlong *pt, uvlong *cnt);
+void	srvqholdfirst(Req*, uvlong *pt, uvlong *cnt);
 void	srvqexit(Req*);
 void	srvqwalkhold(Req*);
 void	srvqanyexit(Srvctx*);
@@ -128,6 +129,15 @@ void	srvctlwrite(Req*);
 int	srvfencekind(Srvctx*);
 
 /* obj.c: layer-a §2.4's object I/O, and the per-fid stage (dat.h) */
+extern char Estageexp[];
+extern char Efidstate[];
+Stage*	srvstagefull(Req*, Srvctx*, Sfid*, uchar *oid, int oidlen,
+		uvlong flen, int force, uvlong ver, uvlong wepoch, uvlong off,
+		long n, Sstage**, char *buf, int nbuf, char **err);
+Stage*	srvstagemore(Srvctx*, Sfid*, uchar *oid, int oidlen, uvlong flen,
+		int force, Sstage**, char **err);
+int	srvstagelive(Srvctx*, Sfid*, Sstage*, int keepbusy);
+Stage*	srvstagefinal(Srvctx*, Sfid*, Sstage*);
 void	srvobjopen(Req*);
 void	srvobjread(Req*);
 void	srvobjwrite(Req*);
@@ -138,3 +148,11 @@ void	srvmetaopen(Req*);
 char*	srvmetatext(Srvctx*, Sfid*, Text*);
 void	srvstagesweep(Srvctx*);
 void	srvstagedrain(Srvctx*);
+
+/* peer.c: layer-a §5.5's /repl and §5.6's /rpc */
+void	srvreplwrite(Req*);
+void	srvreplread(Req*);
+void	srvrpcopen(Req*);
+void	srvrpcread(Req*);
+void	srvrpcwrite(Req*);
+uvlong	srvdiverged(Srvctx*);

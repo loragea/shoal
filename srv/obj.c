@@ -33,16 +33,30 @@
  *
  * The stage is per FID, one at a time (dat.h's Sstage).  For a client
  * operation it is created at step 3 and consumed at step 6 or
- * discarded at step 7, inside the one request; for the /repl fid of
- * the replication surface it will hold an engine Stage across many
+ * discarded at step 7, inside the one request; on the /repl fid of
+ * the replication surface it holds an engine Stage across many
  * Twrites, which is the lifetime §3.6 gives one and the reason the
- * state is the fid's rather than the request's.
+ * state is the fid's rather than the request's.  The four calls the
+ * channel drives that stage through are below, beside the client
+ * paths that share the slot.
  */
 
+/*
+ * The two strings store.md §14(37) pairs: one condition said to the two
+ * kinds of owner a stage has.  A CLIENT whose staged update went —
+ * step 7 for another request on its fid, or the idle sweep — is told
+ * `staged update discarded'; a /repl sender CONTINUING a transfer whose
+ * earlier chunks are gone is told the engine's own `stage expired',
+ * which is also what the engine answers a chunk on a handle its sweep
+ * has stripped.  Neither carries a §2.6 prefix: nothing §2.6 names has
+ * happened, and the operation is retried rather than refused on its
+ * merits.
+ */
 static char Estagegone[] = "shoalsrv: staged update discarded";
+char Estageexp[] = "stage expired";
 static char Eoom[] = "shoalsrv: out of memory";
 static char Ewstatfield[] = "shoalsrv: only length may be set";
-static char Efidstate[] = "shoalsrv: the fid holds state of its own";
+char Efidstate[] = "shoalsrv: the fid holds state of its own";
 
 static long	wclamp(Srvctx*, uvlong off, long n);
 
@@ -81,9 +95,10 @@ oidstr(char *buf, uchar *oid, int oidlen)
  * and commits from the Req's buffer.  This server's own policy shares
  * the configured value because the two bound the same appetite for one
  * operation, and store.md §14(37) records that.  The process-wide
- * stagetot bounds reservations, so it is the engine's alone until the
- * /repl surface makes stages that hold them.  The engine reads a zero
- * as "the default" and so does this.
+ * stagetot bounds reservations and is the engine's alone; what this
+ * same number bounds on a /repl fid is that fid's staged grains,
+ * which is §3.6's own quantity.  The engine reads a zero as "the
+ * default" and so does this.
  */
 static ulong
 stagemaxof(Srvctx *c)
@@ -184,7 +199,6 @@ stagestrip(Srvctx *c, Sstage *s, Stage **gp)		/* under stagelk */
 	s->released = 1;
 	*gp = s->g;
 	s->g = nil;
-	s->ngrain = 0;
 	c->nstagedone++;
 	if(c->store == nil || c->closed)
 		return 0;
@@ -336,8 +350,25 @@ stageflushhook(Sfid *f, Req *r)
 	if((s = f->aux) == nil)
 		return;
 	c = s->ctx;
-	s->dead = 1;
 	qlock(&c->stagelk);
+	s->dead = 1;
+	/*
+	 * A handler inside an engine call THROUGH this handle is the one
+	 * case where the handle may not be taken here (store.md §14(44)):
+	 * §5.5's chunk passes the Stage* to stagewrite, and a discard made
+	 * while that call is in flight is a discard made under it.  `dead'
+	 * is enough — the look that handler takes when its call returns
+	 * finds it and releases the handle itself (srvstagelive below),
+	 * which is an engine call made from a queue proc holding no lock,
+	 * where it belongs.  A client stage never reaches this: it holds a
+	 * key and no handle, so `g' is nil for every one of them, and so is
+	 * an opening chunk's, which is why the slot is what the rule is on
+	 * elsewhere and the handle is what it is on here.
+	 */
+	if(s->busy && s->g != nil){
+		qunlock(&c->stagelk);
+		return;
+	}
 	open = stagestrip(c, s, &g);
 	if(g != nil && open && !stagepend(c, g))
 		stageunstrip(c, s, g, open);
@@ -429,12 +460,13 @@ srvstagesweep(Srvctx *c)
 /*
  * §5.4 step 3: stage the update on the fid.  The slot is single — a
  * fid stages one operation at a time — and a fid that already holds
- * one is refused `disk full', which is §3.6's refusal for its per-fid
- * bound.  So is an update covering more grains than that bound
- * allows, which no client path can reach: a client write is SHORTENED
- * to the bound before it gets here (wclamp, store.md §14(37)), and
- * the /repl surface whose chunks cannot be shortened is what will
- * (dat.h's Sstage).
+ * one is refused `disk full', the pick §2.6's set offers for it
+ * (store.md §14(42)).  So is an update covering more grains than
+ * §3.6's bound allows, which no client path can reach: a client write
+ * is SHORTENED to the bound before it gets here (wclamp, store.md
+ * §14(37)), and the opening chunk of a /repl transfer, which cannot
+ * be shortened, is the one that does reach it — every later chunk is
+ * charged against the handle by the engine instead (dat.h's Sstage).
  *
  * The bytes of a write are NOT copied here: they stay the Req's, and
  * the commit reads them from it.  A client stage lives inside its one
@@ -447,10 +479,11 @@ srvstagesweep(Srvctx *c)
  * and spanning that round is what the stage is for.
  */
 static Sstage*
-stagenew(Srvctx *c, Sfid *f, int kind, uchar *oid, int oidlen, uvlong ver,
-	uvlong wepoch, long n, uvlong off, char **err)
+stagenew(Req *r, Srvctx *c, Sfid *f, int kind, uchar *oid, int oidlen,
+	uvlong ver, uvlong wepoch, long n, uvlong off, char **err)
 {
 	Sstage *s, *old;
+	int inuse;
 
 	*err = nil;
 	if(stagegrains(c, off, n) > stagemaxof(c)){
@@ -468,7 +501,6 @@ stagenew(Srvctx *c, Sfid *f, int kind, uchar *oid, int oidlen, uvlong ver,
 	s->ver = ver;
 	s->wepoch = wepoch;
 	s->off = off;
-	s->ngrain = stagegrains(c, off, n);
 	s->last = nsec();
 	s->busy = 1;
 	/*
@@ -480,7 +512,36 @@ stagenew(Srvctx *c, Sfid *f, int kind, uchar *oid, int oidlen, uvlong ver,
 	 * CONTINUING a staged transfer, which answers `stage expired'
 	 * (§3.6), and a client operation continues nothing.  A stage that
 	 * is still live does stand in the way: one to a fid.
+	 *
+	 * So does a stage another queue proc is inside a STEP on, dead or
+	 * not (store.md §14(44)): that step ends in a look of its own, and
+	 * this is the only place the SLOT is taken from under such a stage
+	 * — which would leave that look nothing to find.  `busy' alone
+	 * says so, handle or not: the opening chunk of a transfer is busy
+	 * from here until the arm that fills `g', with stageopen running in
+	 * between under no lock, and a stage freed in that window is armed
+	 * and looked at after it has gone.
+	 *
+	 * One arrival reaches that clause, and it is a race rather than a
+	 * sequence: a chunk finds the slot EMPTY in srvstagemore and comes
+	 * here for a stage of its own, and a chunk naming another object —
+	 * another queue, so the two run together — fills the slot in
+	 * between.  A live stage is refused by the clause above it; this
+	 * one decides when a step 7 for the fid killed the winner's stage
+	 * in the same gap, which is the window where the loser would
+	 * otherwise free a stage its owner is still inside.  What cannot
+	 * reach it is the sequence it reads like: while the slot holds
+	 * anything, every chunk on the fid goes through srvstagemore, which
+	 * answers one whose stage is dead and busy — leaving the slot where
+	 * it is (§14(43)) — without ever asking for a new stage.
+	 *
+	 * §13's point over exactly that race (srv.h's newhold), before the
+	 * lock so that the winner can take it and fill the slot while the
+	 * loser waits.  It parks the first arrivals only, for the same
+	 * reason: a point that parked the winner too would leave nobody to
+	 * be raced against.
 	 */
+	srvqholdfirst(r, &c->newhold, &c->newheld);
 	qlock(&f->lk);
 	old = f->aux;
 	if(old != nil && f->auxflush != stageflushhook){
@@ -500,7 +561,13 @@ stagenew(Srvctx *c, Sfid *f, int kind, uchar *oid, int oidlen, uvlong ver,
 		*err = Efidstate;
 		return nil;
 	}
-	if(old != nil && !old->dead && !old->released){
+	inuse = 0;
+	if(old != nil){
+		qlock(&c->stagelk);
+		inuse = (!old->dead && !old->released) || old->busy;
+		qunlock(&c->stagelk);
+	}
+	if(inuse){
 		qunlock(&f->lk);
 		free(s);
 		*err = Ediskfull;
@@ -572,7 +639,7 @@ stagelive(Srvctx *c, Sfid *f, Sstage *s, Req *r)
 {
 	int ok;
 
-	srvqhold(r, &c->lookhold);
+	srvqhold(r, &c->lookhold, nil);
 	qlock(&f->lk);
 	qlock(&c->stagelk);
 	ok = f->aux == s && !s->dead && !s->released;
@@ -600,24 +667,33 @@ stagelive(Srvctx *c, Sfid *f, Sstage *s, Req *r)
  * context's from the moment it has no stage, exactly as it is when the
  * flush hook parks one (dat.h's Sstage).
  */
-static void
-stagepointarm(Srvctx *c, Sstage *s, Stage *g)
+static int
+stagearm(Srvctx *c, Sstage *s, Stage *g, int keepbusy)
 {
-	int open;
+	int open, live;
 
 	qlock(&c->stagelk);
 	open = c->store != nil && !c->closed;
-	if(g != nil && (s->dead || s->released)){
+	live = !s->dead && !s->released;
+	if(g != nil && !live){
 		if(open && stagepend(c, g))
 			g = nil;
 	}else{
 		s->g = g;
 		g = nil;
 	}
-	s->busy = 0;
+	if(!keepbusy)
+		s->busy = 0;
 	qunlock(&c->stagelk);
 	if(g != nil && open)
 		stagediscard(g);
+	return live;
+}
+
+static void
+stagepointarm(Srvctx *c, Sstage *s, Stage *g)
+{
+	stagearm(c, s, g, 0);
 }
 
 static void
@@ -638,12 +714,12 @@ stagedone(Sfid *f, Sstage *s)
  * still open, the idle sweep, and the `disk full' a second stage on
  * one fid is refused with.
  *
- * It exists because no operation in THIS half of the surface leaves a
- * stage behind: a client write stages at §5.4 step 3 and gives the
- * stage back at step 6 or 7, inside the one request.  The stage that
- * outlives its request is the op=full stage of the replication surface
- * (§3.6, §5.5), which is the next unit's; the lifetime rules are this
- * unit's and are testable now.  The point is per context, like
+ * It exists because no CLIENT operation leaves a stage behind: a
+ * client write stages at §5.4 step 3 and gives the stage back at step
+ * 6 or 7, inside the one request.  The stage that outlives its request
+ * is the op=full stage of the replication surface (§3.6, §5.5), and
+ * the point is what drives the lifetime rules with no transfer in
+ * flight and no engine handle to carry.  The point is per context, like
  * srvauxpoint and unlike the cell point, because what it fills is a
  * fid rather than a row of the file table.
  */
@@ -697,6 +773,24 @@ srvstagepend(Srvctx *c)
 }
 
 /*
+ * How many parked handles are still waiting for a drain.  It is the
+ * depth of the list srvstagepend counts the arrivals at, and what says
+ * the shutdown made the calls the flush hook could not: 0 once
+ * srvshutdown's own drain has run, which is the last moment store.md
+ * §9 allows one.
+ */
+uvlong
+srvstagewaiting(Srvctx *c)
+{
+	uvlong n;
+
+	qlock(&c->stagelk);
+	n = c->npend;
+	qunlock(&c->stagelk);
+	return n;
+}
+
+/*
  * How many stages the live fids hold, how many have been given back,
  * and how many of those found the store still open — which every one
  * of them must, since an engine stage's discard is an engine call
@@ -713,6 +807,225 @@ srvstagecount(Srvctx *c, uvlong *live, uvlong *done, uvlong *openat)
 	if(openat != nil)
 		*openat = c->nstageopen;
 	qunlock(&c->stagelk);
+}
+
+/*
+ * §5.5's op=full, the one stage whose lifetime is longer than the
+ * request that made it (§3.6).  Everything about the slot, the list
+ * and the three hooks is what a client stage uses; what differs is
+ * that `g' is filled, so the four calls below are where the engine
+ * handle is taken, carried across the chunks and given up.  The
+ * channel that drives them is peer.c's.
+ *
+ * The first chunk of a transfer.  The handle is taken with no lock
+ * held, because stageopen allocates, so a step 7 for another request
+ * on this fid can strip the stage in that window — which the arm has
+ * to find rather than store a handle nothing would reach (the stage
+ * point above takes the same care for the same reason).  `busy' is
+ * kept SET across the arm and stays set until the caller's look:
+ * a handler between two steps of one chunk is not an absence of
+ * arrivals (§3.6).  It is set from the stage below, so the whole of
+ * that window is a stage nobody else may take the slot from — the
+ * stage is in the slot and the handle is not in it yet, and a stage
+ * freed here is one this function arms and the caller looks at after
+ * it has gone.
+ *
+ * §13's point over exactly that window (srv.h's openhold) is held
+ * with no lock of the fid's or the stage list's, the stage call having
+ * returned, so the service loop is free to perform step 7 on this fid
+ * across it.
+ */
+Stage*
+srvstagefull(Req *r, Srvctx *c, Sfid *f, uchar *oid, int oidlen, uvlong flen,
+	int force, uvlong ver, uvlong wepoch, uvlong off, long n, Sstage **sp,
+	char *buf, int nbuf, char **err)
+{
+	Sstage *s;
+	Stage *g;
+
+	*sp = nil;
+	if((s = stagenew(r, c, f, Stfull, oid, oidlen, ver, wepoch, n,
+		off, err)) == nil)
+		return nil;
+	qlock(&c->stagelk);
+	s->flen = flen;
+	s->force = force;
+	qunlock(&c->stagelk);
+	srvqhold(r, &c->openhold, &c->openheld);
+	if((g = stageopen(c->store, oid, oidlen, flen, force)) == nil){
+		*err = srverr(buf, nbuf);
+		stagedone(f, s);
+		return nil;
+	}
+	if(!stagearm(c, s, g, 1)){
+		stagedone(f, s);
+		*err = Estageexp;
+		return nil;
+	}
+	*sp = s;
+	return g;
+}
+
+/*
+ * A later chunk of a transfer this fid is already staging.  Answers
+ * the handle to write through, or nil — with *err nil when the fid
+ * holds no stage at all, which is the first chunk's case and the
+ * caller's to take to srvstagefull.
+ *
+ * The refusals are the per-fid ones.  A chunk naming another object is
+ * a SECOND stage on one fid and is `disk full' — a pick from layer-a
+ * §2.6's set rather than a refusal §3.6 defines, because what §3.6
+ * bounds is the SPACE a fid holds staged and not how many transfers
+ * may be in flight on one (store.md §14(42)).  §3.6's grain bound is
+ * not counted here either: the engine charges `stagemax' against the
+ * handle, exactly and grain by grain, and one handle is all a fid may
+ * hold, so a count on this side would only be a coarser one over the
+ * same reservations.  A `len' or `force' that differs from the
+ * transfer's own is a header §5.5 forbids a conforming sender to send,
+ * so it is `bad ctl'.
+ *
+ * A stage the idle sweep expired, or step 7 discarded, is refused
+ * `stage expired' — and the refusal is what takes it out of the slot.
+ * §3.6 has the owner discard an expired stage and start the transfer
+ * over, which is free; leaving the handle in the slot would refuse
+ * that restart with the same string for as long as the fid lived
+ * (store.md §14(43)).
+ *
+ * With one exemption, which store.md §14(43) grants and §14(44) is
+ * the flush hook's half of: a dead stage another queue proc is inside
+ * a STEP on is left where it is.
+ * This runs on a chunk naming a SECOND object, which hashes to another
+ * queue and so runs beside a chunk that is inside stageopen or
+ * stagewrite on this stage — and taking it here would free the handle
+ * under the write, or free the stage itself under the arm that is
+ * about to store the handle in it.  The refusal is answered all the
+ * same; what §14(43) asks of it, that the dead stage leave the slot
+ * before the next transfer, is done a moment later by that chunk
+ * itself: its look when the write returns (srvstagelive below), the
+ * give-back that look leaves to when the chunk carries final=1
+ * (srvstagefinal below), or, for an opening chunk, the give-back
+ * behind an arm that finds the stage already gone (srvstagefull
+ * above).
+ */
+Stage*
+srvstagemore(Srvctx *c, Sfid *f, uchar *oid, int oidlen, uvlong flen,
+	int force, Sstage **sp, char **err)
+{
+	Sstage *s;
+	Stage *g;
+	int dead, inside;
+
+	*err = nil;
+	*sp = nil;
+	g = nil;
+	dead = 0;
+	inside = 0;
+	qlock(&f->lk);
+	if((s = f->aux) == nil){
+		qunlock(&f->lk);
+		return nil;
+	}
+	if(f->auxflush != stageflushhook){
+		qunlock(&f->lk);
+		*err = Efidstate;		/* the T1 fid-state point */
+		return nil;
+	}
+	qlock(&c->stagelk);
+	if(s->dead || s->released){
+		dead = 1;
+		inside = s->busy;
+	}else if(s->kind != Stfull || s->oidlen != oidlen
+	|| memcmp(s->oid, oid, oidlen) != 0)
+		*err = Ediskfull;
+	else if(s->flen != flen || s->force != force)
+		*err = Ebadctl;
+	else{
+		s->busy = 1;
+		s->last = nsec();
+		g = s->g;
+		*sp = s;
+	}
+	qunlock(&c->stagelk);
+	qunlock(&f->lk);
+	if(dead){
+		if(!inside)
+			stagedone(f, s);
+		*err = Estageexp;
+	}
+	return g;
+}
+
+/*
+ * The look a chunk takes when its engine call returns: is the stage
+ * still this fid's, and still live?  It clears `busy', which is what
+ * held the sweep off across the call, and a stage that went while the
+ * call was in flight is given back here — the flush hook leaves the
+ * handle of a busy stage alone precisely so that this is where it is
+ * released, outside every lock and on a queue proc.
+ *
+ * `keepbusy' is for the caller whose look is NOT the end of its step:
+ * a final=1 chunk goes on from here to the arbitration and the commit,
+ * still holding this Sstage*, and a look that cleared the mark would
+ * leave the sweep, a refusal on another queue and the flush hook free
+ * to take the slot and free the stage under it (store.md §14(44)).
+ * Such a caller owes the clear to the give-back it is on its way to,
+ * which is srvstagefinal below.  A look that answers 0 clears the mark
+ * and gives the stage back here whatever the caller asked for, the
+ * transfer being over: `keepbusy' asks to hold a stage this look has
+ * just found gone, and there is nothing left to hold it for.
+ */
+int
+srvstagelive(Srvctx *c, Sfid *f, Sstage *s, int keepbusy)
+{
+	int ok;
+
+	qlock(&f->lk);
+	qlock(&c->stagelk);
+	ok = f->aux == s && !s->dead && !s->released;
+	if(!ok || !keepbusy)
+		s->busy = 0;
+	s->last = nsec();
+	qunlock(&c->stagelk);
+	qunlock(&f->lk);
+	if(!ok)
+		stagedone(f, s);
+	return ok;
+}
+
+/*
+ * final=1: the fid forgets the handle BEFORE the outcome is known,
+ * because stagefinal consumes it on every one of them (§3.6) — a
+ * Tclunk behind a refused final=1 would otherwise discard a stage that
+ * has already been discarded.  The handle answered here is the
+ * caller's to pass to stagefinalcsum, or nil for a stage that was
+ * already stripped, whose transfer is over either way.
+ *
+ * This is also where the final chunk's `busy' is cleared.  Its look
+ * kept the mark set (srvstagelive above) so that nothing could take
+ * the slot between the two, and what ends that step is the give-back
+ * here rather than the look.
+ */
+Stage*
+srvstagefinal(Srvctx *c, Sfid *f, Sstage *s)
+{
+	Stage *g;
+
+	qlock(&c->stagelk);
+	g = s->g;
+	s->g = nil;
+	s->busy = 0;
+	s->dead = 1;
+	if(!s->released){
+		s->released = 1;
+		c->nstagedone++;
+		if(c->store != nil && !c->closed)
+			c->nstageopen++;
+	}
+	stageunlink(c, s);
+	qunlock(&c->stagelk);
+	if(stagetake(f, s) != nil)
+		free(s);
+	return g;
 }
 
 /*
@@ -904,7 +1217,7 @@ objwriteq(Req *r)
 		srvqdone(r, e);
 		return;
 	}
-	if((s = stagenew(c, f, Stwrite, f->oid, f->oidlen, oi.ver+1,
+	if((s = stagenew(r, c, f, Stwrite, f->oid, f->oidlen, oi.ver+1,
 		c->map->epoch, n, off, &e)) == nil){
 		srvqdone(r, e);
 		return;
@@ -915,7 +1228,7 @@ objwriteq(Req *r)
 	 * fid takes the stage out from under it, and the look is what turns
 	 * that into an answer instead of a commit (srv.h's objprelook).
 	 */
-	srvqhold(r, &c->prelookhold);
+	srvqhold(r, &c->prelookhold, nil);
 	if((e = replicate(c, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
 		stagedone(f, s);
 		srvqdone(r, e);
@@ -926,7 +1239,7 @@ objwriteq(Req *r)
 		srvqdone(r, Estagegone);
 		return;
 	}
-	srvqhold(r, &c->stagehold);
+	srvqhold(r, &c->stagehold, nil);
 	/*
 	 * The bytes are the Req's and the key is the stage's.  lib9p keeps
 	 * the Req's buffer until this handler responds, so a step 7 that
@@ -1015,7 +1328,7 @@ objopenq(Req *r)
 		return;
 	}
 	if((r->ifcall.mode & OTRUNC) != 0 && oi.len != 0){
-		if((s = stagenew(c, f, Sttrunc, f->oid, f->oidlen, oi.ver+1,
+		if((s = stagenew(r, c, f, Sttrunc, f->oid, f->oidlen, oi.ver+1,
 			c->map->epoch, 0, 0, &e)) == nil){
 			srvqdone(r, e);
 			return;
@@ -1050,7 +1363,7 @@ objopenq(Req *r)
 	f->qidvers = q.vers;
 	r->ofcall.qid = q;
 	if(stagepointon(c) && (r->ifcall.mode&3) != OREAD)
-		if((s = stagenew(c, f, Stpoint, f->oid, f->oidlen, 0, 0,
+		if((s = stagenew(r, c, f, Stpoint, f->oid, f->oidlen, 0, 0,
 			0, 0, &e)) != nil){
 			/*
 			 * The window the stage exists in and the handle does
@@ -1058,7 +1371,7 @@ objopenq(Req *r)
 			 * request on this fid strips the stage while it does
 			 * (srv.h's objarm).
 			 */
-			srvqhold(r, &c->armhold);
+			srvqhold(r, &c->armhold, nil);
 			stagepointarm(c, s, stageopen(c->store, f->oid,
 				f->oidlen, 0, 0));
 		}
@@ -1121,7 +1434,7 @@ objremoveq(Req *r)
 		srvqdone(r, e);
 		return;
 	}
-	if((s = stagenew(c, f, Stremove, f->oid, f->oidlen, oi.ver+1,
+	if((s = stagenew(r, c, f, Stremove, f->oid, f->oidlen, oi.ver+1,
 		c->map->epoch, 0, 0, &e)) == nil){
 		srvqdone(r, e);
 		return;
@@ -1209,7 +1522,7 @@ objwstatq(Req *r)
 		srvqdone(r, nil);
 		return;
 	}
-	if((s = stagenew(c, f, Sttrunc, f->oid, f->oidlen, oi.ver+1,
+	if((s = stagenew(r, c, f, Sttrunc, f->oid, f->oidlen, oi.ver+1,
 		c->map->epoch, 0, 0, &e)) == nil){
 		srvqdone(r, e);
 		return;

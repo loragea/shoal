@@ -5012,16 +5012,16 @@ would be a wire change.
 
 *Policy, but read it before implementing anything.*
 
-Thirty-nine places where layer-a is silent, self-defeating, or
+Forty-seven places where layer-a is silent, self-defeating, or
 contradicted by the measurements or by the platform. Each entry
 states the tension, its resolution, and where the argument for it
 lives; nothing here repeats an argument made in a section above.
 Items 1–5, 8, 9, 11, 12, 13, 14, 26 and 39 are amendments **made** to
-`docs/design/layer-a.md`; items 6, 7, 15, 17, 18–25 and 27–38 are
-recorded here and not made there; items 10 and 16 are **proposals** rather
-than amendments, because they touch the wire.
+`docs/design/layer-a.md`; items 6, 7, 15, 17, 18–25, 27–38 and 40–47
+are recorded here and not made there; items 10 and 16 are **proposals**
+rather than amendments, because they touch the wire.
 
-Items 18 to 39 are the object server's, and they describe what
+Items 18 to 47 are the object server's, and they describe what
 `srv/libshoalsrv.a` and `cmd/shoalsrv` **do today**. Several of them
 name a half that is not built; each says which.
 
@@ -5167,17 +5167,25 @@ name a half that is not built; each says which.
     §2.2's three values are not three states of one flag. `corrupt`
     is layer-a §7.5's local verification failure, which is the only
     one an instance decides by itself; `lost` is §7.5(4)'s "no peer
-    holds a verifying copy" and `diverged` is §1.3's equal key with
-    differing content, and both are verdicts about what peers hold.
-    This build has no peer client (§14(18)), so neither has been
-    reached, and the engine's flags say nothing about them: a slot
-    joins the lost list only when it is bad or carries `Icorrupt`
-    (§8), and the one path that sets either on an entry with an oid
-    sets both. *Not made:* an oid-bearing line renders `corrupt`
-    unconditionally, and the two peer verdicts land with the
-    replication surface. A condemned slot's line keeps `kind=lost`,
-    which is §9's wording for it and is §7.5(4)'s meaning with
-    nothing left to ask about: the copy cannot be read at all.
+    holds a verifying copy", a verdict about what peers hold, and
+    this build has no peer client (§14(18)), so it has not been
+    reached. `diverged` is §1.3's equal key with differing content,
+    and that one HAS been reached: §1.3 and §5.5 put the record on
+    the receiver that applies an `op=full force=1`, which is a
+    verdict about a repair this instance made itself and needs no
+    peer client to make. The engine holds no per-record divergence
+    flag for a line to render — a slot joins the lost list only when
+    it is bad or carries `Icorrupt` (§8), and the one path that sets
+    either on an entry with an oid sets both. *Not made:* an
+    oid-bearing line renders `corrupt` unconditionally and no line
+    reads `diverged` or `lost`; what records a repair is the count in
+    `/status`'s `diverged=` (§14(42)), which §1.3 asks for in the
+    same breath, and the durable line is the open half — it waits on
+    an engine record, since a count kept in the 9P server would not
+    survive the restart the file exists to outlive. A condemned
+    slot's line keeps `kind=lost`, which is §9's wording for it and
+    is §7.5(4)'s meaning with nothing left to ask about: the copy
+    cannot be read at all.
 
 16. **layer-a §5.5 requires the resulting-`csum` check but not that
     it precede the update.** §5.5 has the receiver "compute its own
@@ -5218,9 +5226,12 @@ name a half that is not built; each says which.
     currency check is made and no stale mark is registered. *Not
     made:* layer-a is unchanged and this is a build that does not yet
     conform to it. Items 19 to 23, 34 and 35 are the consequences
-    that are visible on the wire. `/repl` and `/rpc` are files that
-    exist, gate by role, and refuse with `shoalsrv: not built`
-    (§14(29)). `/advert` is built: it renders this instance's own
+    that are visible on the wire. `/repl` and `/rpc` are built, and
+    what is built is the RECEIVING half of both: every operation of
+    §5.5 and §5.6 is answered, and nothing is ever sent, because the
+    sender is the peer client this item is about. Items 41 to 48 are
+    what those two channels decide that layer-a leaves open.
+    `/advert` is built: it renders this instance's own
     inventory in §7.2's line grammar, live and tomb, for a peer to
     read. Nothing sends it, because §7.2's sender — and its rate
     limit — is the peer client this item is about; what is built is
@@ -5287,12 +5298,20 @@ name a half that is not built; each says which.
     None of the four can be computed without the peers and the
     reconcile pass §14(18) says are not built, and a zero would be a
     measurement this instance has not made. *Not made:* they are
-    absent from the file rather than present and wrong. Two fields
+    absent from the file rather than present and wrong. Four fields
     beyond §2.2's list are present because nothing else reports them:
-    `objsnapopen=`, which §9 makes the server's half of `objsnap=`,
-    and the queue pool's `queues=`, `qdepth=`, `qpushed=` and
+    `objsnapopen=`, which §9 makes the server's half of `objsnap=`;
+    the queue pool's `queues=`, `qdepth=`, `qpushed=` and
     `qdone=`, which §7 asks `/status` to report and which `Reqqueue`
-    does not count for itself. `queues=` is the size of the hash the
+    does not count for itself; `staged=`, the grains this process has
+    reserved against §3.6's `stagetot`, which §3.6 asks `/status` to
+    report and which is read straight off `Storestat.staged`; and
+    `diverged=`, the count of layer-a §1.3's repairs this process has
+    applied, which §1.3 requires to be
+    "reported in `/status`" without naming a field, so the name is
+    this server's. §14(15) has the rest of that record: the count is
+    in memory and per process, and the durable `/lost kind=diverged`
+    line is the open half. `queues=` is the size of the hash the
     object ids land in — the ceiling §7 is about — and does not count
     the one reserved queue an operation that names no object is
     offloaded to; the other three count every request the pool took
@@ -5483,12 +5502,14 @@ name a half that is not built; each says which.
     the content is. A `Tread` and a `Twrite` have no role gate of
     their own — 9P settles the role at the open, which is where
     §2.1's matrix is applied — and the row's gate runs on them as it
-    does on an open (§14(24)). `/repl` and `/rpc`, a `Tremove` or a
-    `Twstat` of the `/obj` and `/meta` directories themselves — no
-    cell of either row answers one, which §2.4 does not define — and
+    does on an open (§14(24)). A `Tremove` or a
+    `Twstat` of the `/obj` and `/meta` directories themselves, and of
+    `/repl` and `/rpc` — no cell of any of those rows answers one,
+    which §2.4 does not define — and
     the ctl verbs `pull`, `push`, `reconcile`, `advert`, `refresh`
     and `register` answer it today; the status files, the two
-    directories' opens, reads and creates, the object rows entire and
+    directories' opens, reads and creates, the object rows entire,
+    the two peer channels' opens, reads and writes, and
     the other ctl verbs are built and answer their own. A caller sees
     it only where those gates pass: a `role=admin` create or write of
     an id that is not reserved never reaches it, because §2.1 makes
@@ -5824,9 +5845,9 @@ name a half that is not built; each says which.
     *Not made; recorded here as this server's policy:* one accepted
     write covers at most `stagemax` checksum blocks and is answered
     short at that boundary, so the bound is back-pressure and not a
-    refusal. `disk full` on that bound is still reachable, and is
-    what a fid that already holds a stage is told — one stage to a
-    fid — which is the replication surface's case, where a chunk's
+    refusal. `disk full` is still what a fid that already holds a
+    stage is told — one stage to a fid, which is §14(42)'s refusal —
+    and that is the replication surface's case, where a chunk's
     offset is the sender's and shortening would publish a hole.
 
     **The quantity bounded is not §3.6's.** §3.6's `stagemax` bounds
@@ -5837,12 +5858,15 @@ name a half that is not built; each says which.
     configured number is the count of **checksum blocks one accepted
     write may cover** — its own policy, named as such, sharing the
     value because the two bound the same appetite for one operation.
-    The process-wide `stagetot` bounds reservations and so has
-    nothing yet to bound in this server: it is the engine's, enforced
-    in the store over the handles `stageopen` makes, and it and
-    `/status`'s `staged=<grains>` become live together with the
-    `/repl` surface (§5.5) whose stages reserve. `/status` carries no
-    `staged=` row until then.
+    The process-wide `stagetot` bounds reservations and is the
+    engine's, enforced in the store over the handles `stageopen`
+    makes; it became live with the `/repl` surface (§5.5), whose
+    stages reserve, and `/status` carries a `staged=<grains>` row
+    read straight off `Storestat.staged`. Over a `/repl` fid the
+    grain bound is the ENGINE's to enforce, per handle and over the
+    whole of one transfer; one handle to a fid is what makes that
+    §3.6's per-fid bound, and the 9P server keeps no count beside it.
+    §14(42) has that and the one chunk the server weighs itself.
 
     **Which string a client sees when its staged update goes.** A
     `Twrite` whose own request was flushed is answered `interrupted`
@@ -5946,6 +5970,266 @@ name a half that is not built; each says which.
     could still start one. layer-a §7.5's "continuously" for the
     scrub is a **separate** matter and is not built: `scrub` still
     runs only when an operator asks for it.
+
+40. **A `Tread` of `/repl` is end of data.** §5.5 defines no read of
+    the channel: it is one-way, and the reply to an operation is the
+    `Rwrite` that carries it. §2.1 still grants `role=repl` read
+    access to the row, so a fid opened `ORDWR` — which a sender that
+    treats both channels alike will open — can be read. *Not made;
+    recorded here as what the server does:* the row fills a read cell
+    that answers count 0. The alternative is a row with no read cell,
+    which answers `shoalsrv: not built` (§14(29)) — and that would be
+    a lie about a file that is built, on an operation that has
+    nothing to return rather than nothing to run.
+
+41. **§5.6's two rules about a second `Twrite` compose, and what
+    "destroyed" means for a response already read.** §5.6 says "a
+    second `Twrite` before the response is read MUST fail with `bad
+    ctl`" and, four paragraphs on, "a buffered response is destroyed
+    by the next `Twrite` on that fid and by the `Tclunk`, and by
+    nothing else". These do not contradict each other: the first
+    governs a response **nobody has read**, the second one that
+    **has** been, and between them they cover every `Twrite` a fid
+    can take. *Not made; recorded here as this server's reading of
+    the composition, which is what it implements:* a `Twrite` while a
+    request is outstanding, or while a prepared response is still
+    undelivered, is `bad ctl`; a `Twrite` after the delivery throws
+    the bytes away and takes the fid for the next exchange; and a
+    `Tread` after the delivery answers count 0, which is §5.6's own
+    rule and what makes a delivered response invisible rather than
+    absent. Destroying an invisible response changes nothing a caller
+    can observe, so the second rule is redundant rather than dead:
+    what it settles is that the server MAY stop holding the bytes,
+    and where the fid's memory goes back. This server holds them from
+    the delivery until that next `Twrite` or the `Tclunk` and no
+    longer.
+
+42. **One `op=full` transfer to a `/repl` fid at a time, and the
+    per-fid bound is charged per chunk.** §3.6 has a stage handle
+    "created by the first chunk of an `op=full` for an object on a
+    `/repl` fid" and owned by that fid, which does not say how many
+    objects one fid may have in flight; the per-fid state this server
+    keeps is a single slot. *Not made; recorded here as what the
+    server does:* a chunk naming a second object while a transfer is
+    staged is refused `disk full`, and a sender that wants two
+    transfers at once opens two fids — which §5.5 already has it do
+    per peer and which costs nothing. `disk full` is a pick from
+    layer-a §2.6's set and not a refusal §3.6 defines for this:
+    what §3.6 and §5.5 bound is the SPACE a fid may hold staged, and
+    neither addresses how many transfers may be in flight on one, so
+    §2.6 has no string that names this refusal exactly. `disk full`
+    is the nearest of the set: what it tells a sender to do — stop
+    pushing here and come back, or come back on another fid — is
+    what this refusal wants from it, and the alternative, `bad ctl`,
+    would blame a header that is well formed.
+
+    That single slot is also what makes §3.6's per-**fid** grain
+    bound the engine's per-**handle** one: the store charges
+    `stagemax` against the handle, grain by grain, and refuses the
+    chunk that would pass it with `disk full`, so with one handle to
+    a fid the two are the same bound. The 9P server keeps no count
+    beside it, with one exception it cannot avoid: the opening chunk
+    of a transfer arrives before any handle exists to charge, so the
+    server weighs that chunk's own grains against `stagemax` itself
+    and answers `disk full` when they already exceed it. Every later
+    chunk is the engine's to charge. `stagetot` and `/status`'s
+    `staged=` report the same reservations across the process.
+
+    **What a `force=1` repair records.** §5.5 has a receiver that
+    applies one record the event in `/lost` as a divergence, and §1.3
+    adds "reported in `/status`". *Not made; recorded here as what the
+    server does:* the receiver counts it, at `final=1`, when `force=1`
+    was applied over a copy it holds at an **equal** key whose `csum`
+    differs from the one the operation leaves. An equal key with an
+    equal `csum` repairs nothing, and a lower local key is an ordinary
+    heal that needs no `force` at all; neither is §1.3's case. Nor is
+    a push over a copy that fails local verification, which
+    contributes no key to be equal to (D14) and is §7.5(3)'s
+    reconcile. The count is in memory and per process, rendered as
+    `/status`'s `diverged=`; the durable `/lost kind=diverged` line is
+    the open half, and §14(15) says what it waits on.
+
+43. **`stage expired` is answered once, and the refusal is what takes
+    the dead stage out of the slot.** §3.6 has the idle sweep mark a
+    stage expired and leave the memory to the fid's clunk, and
+    refuses "a chunk or a `final=1` on an expired stage" with `stage
+    expired` — telling the owner to discard it and start over, which
+    is free. A dead stage left in the slot would refuse that restart
+    with the same string for as long as the fid lived. *Not made;
+    recorded here as what the server does:* the chunk that is told
+    `stage expired` takes the dead stage out of the slot, so the next
+    chunk on that fid starts a fresh transfer. A sender that had
+    pipelined chunks behind the refused one therefore starts its next
+    transfer part-way through the object; the resulting-`csum` check
+    at `final=1` is what refuses that transfer, so the cost is one
+    wasted round and never a published object with holes in it. A
+    chunk whose engine write FAILED is not this case and leaves the
+    stage where it is: §3.6 names the triggers for a stage whose
+    `final=1` has not been attempted "and for no other", so such a
+    transfer ends with the fid's clunk or with a `final=1`.
+
+    **One refusal leaves the slot where it is: one over a stage
+    another handler is inside a step on.** That handler is what clears
+    it a moment later, and the next chunk on the fid still starts
+    fresh because that clearing runs before it. Which step of the
+    handler clears it depends on what the chunk still owes. For a
+    chunk in the middle of a transfer it is the look its engine write
+    returns to. For a `final=1` chunk whose write went through the
+    look keeps the mark set, because that chunk holds the stage across
+    the arbitration and the commit, and the give-back behind the look
+    is what clears it — unless the stage was already dead when that
+    look ran, in which case the look answers `stage expired` and
+    clears the mark itself, like any other chunk's ((44)). A `final=1`
+    chunk whose write FAILED asks for no mark to be kept either: its
+    look clears the mark and leaves the stage in the slot for a later
+    chunk or the fid's clunk, which is the paragraph above. For
+    the chunk that OPENS a transfer there is no look at all in the
+    window this exception covers — it runs between the stage and the
+    handle — so what clears it is the give-back behind an arm that
+    finds the stage already gone. What the exception protects is the
+    handler in the middle: a refusal that took the slot would free the
+    handle under the engine call it is an argument of, or free the
+    stage itself under the arm that is about to store that handle in
+    it. `busy` is what says a handler is inside a step, and it is set
+    from the moment the stage is made and not from the moment it holds
+    a handle — the opening chunk is inside such a step too, and what a
+    slot taken from under it strands is the reservation its handle was
+    about to be stored in. (44) is the same rule said to the flush
+    hook, which meets such a stage from the other side.
+
+44. **The flush hook leaves the engine handle of a stage a chunk is
+    inside.** layer-a §5.4.1 step 7 discards what the flushed fid
+    staged, and the hook does it by stripping the handle and parking
+    it for the drain to release (§3.6). A `/repl` chunk passes that
+    same handle to `stagewrite`, so a park made while the call is in
+    flight is a discard made under it. *Not made; recorded here as
+    what the server does:* the hook marks such a stage dead and
+    leaves the handle alone, and that chunk releases it itself, on a
+    queue proc holding no lock, which is where an engine call belongs.
+    For a chunk that is not the last, the release is the look it takes
+    when its call returns, which finds the stage dead and answers
+    `stage expired`. A `final=1` chunk that gets PAST that look is
+    still inside its step: it goes on to arbitrate and commit through
+    the same handle, so the look keeps `busy` set, the give-back that
+    consumes the handle is the release, and its outcome is the
+    commit's rather than `stage expired`, because what step 7 discards
+    is the fid's stage and this one's last step is already under way.
+    Which side of the look step 7 lands on is what decides that. The
+    look answers on whether the stage is still the fid's and still
+    live *before* it consults the mark it was asked to keep, so a
+    `final=1` chunk step 7 reached while its engine write was in
+    flight is answered `stage expired` there like any other, clears
+    the mark and gives the stage back at the look. The kept mark buys
+    the window after the look, not the one before it.
+
+    The hook's own guard is `busy` **and** a handle to leave alone.
+    `busy` is what says a handler is inside a step on the stage, and
+    it is also what holds the idle sweep off (§3.6) — but this rule is
+    about the one call the hook may not make, and a stage with no
+    handle offers none to make: the hook strips such a stage as it
+    strips any other, and the give-back its owner is on its way to
+    finds nothing left to release. That is what keeps the opening
+    chunk's window, where the stage is busy and `g` is still nil, out
+    of this clause and inside (43)'s, which is on the slot. A client
+    stage holds a key and no handle, so none of this changes what step
+    7 does to one.
+
+45. **What the header grammar refuses, beyond what §5.5 spells.**
+    §5.5 and §5.6 give each operation a fixed set of attributes and
+    make a malformed header `bad ctl`, without saying what makes one.
+    *Not made; recorded here as this server's grammar:* an attribute
+    the operation does not define, a repeated attribute, a missing
+    required one, a `u64` that is not decimal digits, a `csum` or
+    `dcsum` of the wrong length, a header line longer than 1024
+    bytes, and a payload whose length is not the header's `n=` are
+    each `bad ctl`; an `oid=` or `after=` outside §1.1's bound is
+    `bad object name`, which §2.6 makes the answer to "any operation
+    naming an oid that violates §1.1" and which §14(27) already
+    prefers on the ctl path. A `len=` or `force=` that differs from
+    the transfer's own is `bad ctl` too: §5.5 makes both identical on
+    every chunk, so a chunk that disagrees is a header a conforming
+    sender cannot send. A delta operation naming an id this receiver
+    holds no record of is `out of sequence` and not `no such
+    object`: §5.3's rule is that the local committed key equals
+    `(pwepoch, pver)`, and an absent id has no key to equal — the
+    sender re-reads `op=meta` and pushes an `op=full`, which is the
+    operation for a receiver that holds nothing.
+
+    **One refusal on these paths is outside §5.5's table.** A delta
+    operation whose `(pwepoch, pver)` is exactly the key of a
+    TOMBSTONE passes §5.3's predecessor rule — a tombstone is a
+    record and carries a key — and reaches the engine, which answers
+    `object deleted`. §5.5's receiver rules offer a delta only `out
+    of sequence` and `stale version`. *Not made:* the string is the
+    right one and comes from §2.6's set. The id has a record, the
+    sender's predecessor did match it, and what stops the operation
+    is that the record is a tombstone — which is what `object
+    deleted` says and what neither of §5.5's two would.
+
+    **The split is more lenient than §5.5 spells.** The header line
+    is broken into fields by `tokenize`(2), so tabs and carriage
+    returns separate fields exactly as blanks do — a header written
+    with CRLF line endings parses, the `\r` falling to the rule that
+    eats the blanks — and a value may be quoted rc-style, with
+    `oid='a b'` reaching the field as `a b`. *Not made; recorded here
+    as what the grammar accepts:* the leniency is in the split alone.
+    Every value is validated after it, so a quoted oid with a blank
+    in it is still `bad object name` and a quoted `ver` that is not
+    decimal digits is still `bad ctl`; a sender that writes §5.5's
+    grammar exactly never reaches any of it.
+
+46. **What `op=list` and `op=get` clamp, and what they refuse.** §5.6
+    makes `op=list`'s `n=` a maximum the server MUST clamp to the
+    negotiated `msize` less `IOHDRSZ`, and says `op=get`'s `n` "MUST
+    fit the negotiated `msize`" without naming an error. *Not made;
+    recorded here as what the server does:* `op=list` answers at most
+    256 lines, and 64 when `n=` is absent, before the `msize` clamp
+    applies at all; a line that would cross the budget is dropped
+    whole rather than truncated, `more=1` says so, and the next page
+    re-renders it after `after=<the last oid sent>`. Nothing is held
+    between pages: each is a fresh scan of the index, run on the
+    reserved queue and taking the engine's state lock a chunk at a
+    time (§9), so a SEQUENCE of pages is no more a snapshot than one
+    page is (§14(17)) — the index may move under a pager, which is
+    what §5.6 has a reconcile pass tolerate. An `n=0` answers
+    `lines=0 more=1`, a page of nothing being unable to say the
+    inventory is over. An `op=get` whose `n` does not fit one `Tread`
+    of the negotiated `msize` is refused `bad ctl` rather than
+    shortened: the response is a line plus exactly `n` bytes
+    delivered by exactly one `Tread`, so a shortened answer is one
+    the caller cannot tell from the end of the object. The response's
+    own `n=` IS short at that end, which is §4's clamp and what the
+    caller reads the field for.
+
+    Two corners of the same two rules. A page whose FIRST line alone
+    crosses the budget answers `lines=0 more=1`, which a pager cannot
+    advance past — it is the same answer `n=0` gets, and it is a
+    standstill rather than an error. It is unreachable here: the
+    smallest `msize` an attach may negotiate is `Msizemin`, 8192 plus
+    `IOHDRSZ`, and an advert line over a 128-byte oid is about 300
+    bytes, so the budget holds twenty of the longest line this store
+    can render. And a `Tread` that offers less than the response is
+    long takes what it offered and leaves the rest: the response is
+    marked delivered, so the next `Tread` is the end of data.
+    §5.6's "MUST offer at least the negotiated `msize` less
+    `IOHDRSZ`" is the CALLER's obligation, and this is what breaking
+    it costs — the server neither refuses the short read nor holds
+    the remainder for a second one, because a response is delivered
+    by exactly one `Tread` and a held remainder would be a second
+    lifetime for this fid's state to carry.
+
+47. **§5.5's ordering rules are the sender's, and the receiver
+    refuses neither.** §5.5 allows "at most one outstanding operation
+    per object per `/repl` fid" and, in the same breath, lets
+    `op=full` chunks for one object be pipelined. A receiver that
+    refused a second outstanding operation would refuse what the
+    second rule licenses. *Not made; recorded here as what the server
+    does:* nothing on the receiving side counts outstanding
+    operations. What the receiver owes is that two operations naming
+    one object are ORDERED, and §7's pool is that — both hash to the
+    same queue and run one after the other — so a sender that breaks
+    the rule has its own operations serialised in arrival order
+    rather than refused.
 
 ## 15. Alternatives considered
 
