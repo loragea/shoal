@@ -1339,7 +1339,18 @@ srvobjcreate(Req *r)
  *		object under §5.1's clause (c), so this reads `no'.
  *	placement=, primary=
  *		computed from the map, which §2.4 marks advisory; they are
- *		the part of the line a static map answers in full.
+ *		the part of the line a static map answers in full.  Either
+ *		may have nothing to name — a map in which no node places at
+ *		all leaves P(o) empty, and one in which no member of P(o)
+ *		is up has no serving primary (§4.3) — and both then read
+ *		`-', because §0 makes this one attr=value record and an
+ *		attribute with no value at all is not one.  A `-' is no
+ *		iid: §3.3's node names carry no `.', so every iid has one
+ *		(store.md §14(31)).
+ *
+ * The placement array is Maxplace long and mapplace answers at most
+ * `replicas' members, which §3.2 refuses above Maxplace (lib/map.c),
+ * so the whole of P(o) is rendered and nothing is dropped.
  */
 char*
 srvmetatext(Srvctx *c, Sfid *f, Text *t)
@@ -1357,8 +1368,6 @@ srvmetatext(Srvctx *c, Sfid *f, Text *t)
 	csumfmt(csum, oi.csum);
 	if((n = mapplace(c->map, id, p, nelem(p))) < 0)
 		return srverr(buf, sizeof buf);
-	if(n > nelem(p))
-		n = nelem(p);
 	/*
 	 * One physical line, which is what §2.4's "one attr=value line per
 	 * object" asks for: the example there is wrapped typographically
@@ -1369,10 +1378,12 @@ srvmetatext(Srvctx *c, Sfid *f, Text *t)
 	textprint(t, " state=live mtime=%lld blksz=%lud cur=0",
 		oi.mtime, objblksz(c));
 	textprint(t, " placement=");
+	if(n == 0)
+		textprint(t, "-");
 	for(i = 0; i < n; i++)
 		textprint(t, "%s%s", i > 0 ? "," : "", p[i]->iid);
 	pr = mapprimary(c->map, id);
-	textprint(t, " primary=%s ready=no\n", pr != nil ? pr->iid : "");
+	textprint(t, " primary=%s ready=no\n", pr != nil ? pr->iid : "-");
 	return nil;
 }
 

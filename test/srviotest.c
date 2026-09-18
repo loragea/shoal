@@ -115,12 +115,18 @@ static char Nadmin[] = "role=admin";
  *	peer=up		replicas=1 with two placeable instances: HRW
  *			sends some ids to the other one, and a client
  *			operation on those is `not primary'.
+ *	self=out	replicas=1 with this instance status=out and the
+ *			other dead: no instance places, so P(o) is empty and
+ *			the object has no primary (§4.3).  role=client I/O
+ *			is F3's `down' here; the operator's read is not
+ *			(§2.1), and is what reaches the render.
  */
 enum
 {
 	Palone	= 0,
 	Pdown,
 	Pup,
+	Pout,
 };
 
 static char*
@@ -138,12 +144,13 @@ mkmap(int kind, ulong blksz, uvlong objmax, char *uuid)
 		"\n"
 		"instance=n1.0 onnode=n1 addr=tcp!10.0.0.1!17011\n"
 		"\tuuid=%s\n"
-		"\tclass=ssd weight=100 status=in up=yes since=1 fenced=no\n"
+		"\tclass=ssd weight=100 status=%s up=yes since=1 fenced=no\n"
 		"instance=n2.0 onnode=n2 addr=tcp!10.0.0.2!17011\n"
 		"\tuuid=0000000000000000000000000000000c\n"
 		"\tclass=ssd weight=100 status=%s up=%s since=1 fenced=no\n",
 		Tepoch, Tmonid, objmax, blksz, kind == Pdown ? 2 : 1, uuid,
-		kind == Palone ? "dead" : "in",
+		kind == Pout ? "out" : "in",
+		kind == Palone || kind == Pout ? "dead" : "in",
 		kind == Pup ? "yes" : "no");
 	if(p == nil)
 		sysfatal("smprint: %r");
@@ -922,6 +929,70 @@ tmeta(void)
 		"object deleted");
 	clclunk(&cl, Fdir, &r);
 	clclunk(&cl, Froot, &r);
+Out:
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
+ * §2.4's `placement=' and `primary=' when the map has nothing to name.
+ * This instance is status=out and the other is dead, so no node places
+ * at all: P(o) is empty and the object has no serving primary.  Both
+ * fields render `-' rather than an attribute with no value, which §0's
+ * one attr=value record per line does not admit (store.md §14(31)).
+ * The operator's read is what reaches the render: role=client I/O on
+ * an instance whose own record says status=out is F3's `down' (§6.4).
+ */
+static void
+tmetaplace(void)
+{
+	char buf[1024], val[128], *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall r;
+
+	clstage = "metaplace";
+	m = mkmap(Pout, Tblksz, Tobjmax, Tuuid);
+	d = newdisk(Tnslots);
+	if((ctx = startsrv(d, m, 0, 0)) == nil)
+		return;
+	mkobj(srvstore(ctx), "alpha", "0123456789", 10);
+
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, Nclient, &r) != Rattach){
+		fail("attach: %s", clerr(&r));
+		goto Out;
+	}
+	if(clwalkobj(&cl, Froot, Fmeta, "meta", "alpha", &r) != Rwalk)
+		fail("walk /meta/alpha: %s", clerr(&r));
+	clopen(&cl, Fmeta, OREAD, &r);
+	clerris("a client open of /meta on an instance that is out", &r,
+		"down");
+	clclunk(&cl, Fmeta, &r);
+	clclunk(&cl, Froot, &r);
+
+	if(clattach(&cl, Froot2, Nadmin, &r) != Rattach){
+		fail("attach admin: %s", clerr(&r));
+		goto Out;
+	}
+	if(clwalkobj(&cl, Froot2, Fmeta, "meta", "alpha", &r) != Rwalk
+	|| clopen(&cl, Fmeta, OREAD, &r) != Ropen){
+		fail("open /meta/alpha as admin: %s", clerr(&r));
+		goto Out;
+	}
+	if(clslurp(&cl, Fmeta, buf, sizeof buf) < 0)
+		fail("read /meta/alpha: %r");
+	else{
+		eqs("/meta names an empty placement `-'", metafield(buf,
+			"placement", val, sizeof val), "-");
+		eqs("... and an absent primary `-'", metafield(buf, "primary",
+			val, sizeof val), "-");
+	}
+	clclunk(&cl, Fmeta, &r);
+	clclunk(&cl, Froot2, &r);
 Out:
 	clstop(&cl);
 	srvfree(ctx);
@@ -2002,6 +2073,7 @@ threadmain(int argc, char **argv)
 	tcreate();
 	tremove();
 	tmeta();
+	tmetaplace();
 	tdegraded();
 	tnotprimary();
 	tshort();

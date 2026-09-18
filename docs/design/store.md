@@ -5489,6 +5489,16 @@ name a half that is not built; each says which.
     the field is advisory. The two are the same fact said twice, and
     both become live with the first peer client.
 
+    `/meta`'s two computed fields have an empty case §2.4 does not
+    spell. A map in which no node places at all leaves `P(o)` empty,
+    and one in which no member of `P(o)` is `up` has no serving
+    primary (§4.3) — `object unavailable` to a client, and still a
+    line an operator may read. *Not made:* `placement=` and
+    `primary=` render `-` there, because §0 makes the record one
+    `attr=value` line and an attribute with no value at all is not
+    one. A `-` names no instance: §3.3's node names carry no `.`, so
+    every iid has one.
+
     §5.2's own escape hatch is unreachable here for the same reason.
     Clause 2 has an instance that does not hold the `E−1` map either
     fetch `/maps/<E−1>` from the monitor or substitute every instance
