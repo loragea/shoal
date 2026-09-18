@@ -91,7 +91,7 @@ enum
 	 * threadmain.  Every check this file makes is unconditional once
 	 * its case is entered, so the number is fixed.
 	 */
-	Nchecks	= 271,
+	Nchecks	= 272,
 
 	/* fids the cases use */
 	Froot	= 1,
@@ -2186,6 +2186,17 @@ Out:
 		fail("the stopped pass left no /jobs line");
 	else
 		eqs("and the count it did reach stands beside it", val, "1");
+	/*
+	 * `done=' and `total=' are this walk's own entries, so the prefix
+	 * shows there as well: one of the snapshot's two entries counted
+	 * (store.md §14(31)).  It is the mark and not this pair that says
+	 * the walk is over, since a walk still running reads the same.
+	 */
+	if(slurpfile(&cl, Ffile2, "jobs", buf, sizeof buf) > 0)
+		istrue("and `done=' is a prefix of the snapshot too",
+			strstr(buf, "done=1/2 ") != nil);
+	else
+		fail("the stopped pass left no line to read done= from");
 Out2:
 	srvhook(ctx, "reclaimhold", 0);
 	srvhook(ctx, "jobhold", 0);

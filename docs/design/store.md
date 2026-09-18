@@ -5534,15 +5534,30 @@ name a half that is not built; each says which.
     waits on. *Not made:* **twelve passes may run at once**, counted
     over every verb that starts one — `scrub`, `reclaim` and
     `forget`, so `job=` at `/jobs` carries one of those three — and a
-    verb that would start a thirteenth is
-    refused with the local `shoalsrv: too many jobs` rather than
-    accepted. So is a pass the reclaim timer would start (§14(39)),
-    which is the one pass no verb asked for. §2.5's error column for these verbs names `fenced` and
-    `bad ctl` and neither covers this, so the refusal is a local
-    string (§14(29)); the number is implementation policy. `/jobs`
-    renders **every** job on the list, which §2.2's "one line per
-    running or queued background job" requires and which the cap
+    verb that would start a thirteenth is refused with the local
+    `shoalsrv: too many jobs` rather than accepted. So is a pass the
+    reclaim timer would start (§14(39)), which is the one pass no
+    verb asked for. §2.5's error column for these verbs names
+    `fenced` and `bad ctl` and neither covers this, so the refusal is
+    a local string (§14(29)); the number is implementation policy.
+    `/jobs` renders **every** job on the list, which §2.2's "one line
+    per running or queued background job" requires and which the cap
     bounds the cost of.
+
+    **One line shape for all three passes.** §2.2 fixes one record
+    per job and leaves the fields to the implementation, and the
+    fields here are one set rather than one per verb — so a reader
+    parses one line and a pass's counters are read the same way
+    whichever verb started it. What that costs is fields that stand
+    still: a `job=reclaim` line's `rate=` is the scrubber's pace and
+    the walk reads no grains, and its `bad=`, `skipped=` and
+    `dropped=` stay 0 for the whole run, because the walk verifies
+    nothing, pushes nothing through a queue and discards nothing
+    (§14(31)). `done=`, `total=`, `reclaimable=` and `err=` are the
+    four that move on it. The alternative — a line shape per verb —
+    buys an operator nothing a constant field does not already tell
+    them, and costs every reader of `/jobs` a second parse. Policy,
+    like the rest of the line.
 
     A pass has no client to answer and this build has no operator log,
     so a walk that broke off — a failed index read, a failed
@@ -5896,13 +5911,22 @@ name a half that is not built; each says which.
     one period after start-up rather than at it, so that an instance
     restarted often does not walk its index at every start.
 
-    **What the verb does not do.** `reclaim stop` stops the pass that
-    is running; it does not turn the timer off, and the next tick
-    starts a pass as a `reclaim start` would. §2.5's form has two
-    words and neither names a schedule, and an operator who wants the
-    walk off for good has no verb for it — which costs a walk of the
-    tombstone snapshot per period and no durable change, since the
-    walk discards nothing. The timer is not gated by the fence
+    **What the verb does not do, and the half that is open.**
+    `reclaim stop` stops the pass that is running; it does not turn
+    the timer off, and the next tick starts a pass as a `reclaim
+    start` would. §2.5's form has two words and neither names a
+    schedule, and an operator who wants the walk off for good has no
+    verb for it — which costs a walk of the tombstone snapshot per
+    period and no durable change, since the walk discards nothing.
+    That is the **open half**: `scrub` has no schedule of its own yet
+    (layer-a §7.5's "continuously" is not built), so `scrub stop`
+    means "stop this pass" and nothing else, and the two verbs agree
+    today by accident. When the scrub gets a scheduler, a `stop` that
+    holds the schedule until the next `start` is the reading that
+    verb will want, and this one's meaning has to be settled against
+    it — either the same reading here, or a form of §2.5's own for a
+    schedule. Nothing on the wire commits either way today: the two
+    `stop`s do the same thing. The timer is not gated by the fence
     either: it starts no discard while condition 1 is unanswerable,
     and what the fence governs is `start`, which is the surface §2.5
     has.

@@ -945,11 +945,19 @@ is per form: `reclaim start` is in that set and `reclaim stop` is
 not, because `stop` mutates nothing and an instance just fenced is
 where an operator most wants a running walk stopped. All of it is a
 ctl grammar a client writes, so a reimplementation must match it.
-§2.5's rule that a verb starting background work returns on
-acceptance is unchanged and governs it. §1.5's three discard
-conditions are normative and are layer-a's, not this row's — what
-this row settles is that a walk which can test only two of the three
-discards nothing.
+The row also carries a **SHOULD**, which is normative as a
+recommendation: an instance that discards at all should run the walk
+on a schedule of its own rather than wait to be asked, since the verb
+is there to ask for a pass early and not to be the only thing that
+runs one. What the schedule's period is remains implementation
+policy — `tombdays`/2 is this server's, because it is §8.3's own
+cadence for the `bump` that condition 3 waits on (§14(39)) — and an
+implementation whose operators run the verb on a clock of their own
+answers the SHOULD's purpose too. §2.5's rule that a verb starting
+background work returns on acceptance is unchanged and governs it.
+§1.5's three discard conditions are normative and are layer-a's, not
+this row's — what this row settles is that a walk which can test only
+two of the three discards nothing.
 **Implementation policy:** the rest — which verbs are passes, the
 walk's timer and its period (§14(39)), the scrub's rate default and
 the bytes it charges itself (§14(31)), `/jobs`'s line format, the
