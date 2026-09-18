@@ -730,12 +730,29 @@ tremove(void)
 		return;
 	mkobj(srvstore(ctx), "alpha", "bytes", 5);
 	mkobj(srvstore(ctx), "beta", nil, 0);
+	mkobj(srvstore(ctx), "gamma", nil, 0);
 
 	clstart(&cl, ctx, Clmsize);
 	if(clattach(&cl, Froot, Nclient, &r) != Rattach){
 		fail("attach: %s", clerr(&r));
 		goto Out;
 	}
+	/*
+	 * A tombstone reached through a fid that was walked while the
+	 * object was live: the walk cannot refuse what was not a
+	 * tombstone when it ran, so the open is where §2.6's
+	 * `object deleted' is answered — by this server, since 9P's open
+	 * reaches no engine call that would refuse it.
+	 */
+	if(clwalkobj(&cl, Froot, Ffile2, "obj", "gamma", &r) != Rwalk)
+		fail("walk /obj/gamma: %s", clerr(&r));
+	if(objremove(srvstore(ctx), (uchar*)"gamma", 5, 2, Tepoch, nil, 0) < 0)
+		fail("objremove gamma: %r");
+	clopen(&cl, Ffile2, OREAD, &r);
+	clerris("an open of an object deleted under the fid", &r,
+		"object deleted");
+	clclunk(&cl, Ffile2, &r);
+
 	if(clwalkobj(&cl, Froot, Ffile, "obj", "alpha", &r) != Rwalk){
 		fail("walk /obj/alpha: %s", clerr(&r));
 		goto Out;
