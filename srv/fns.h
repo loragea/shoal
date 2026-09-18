@@ -94,6 +94,9 @@ int	srvaname(Sfid*, char *aname);
 char*	srvstatustext(Srvctx*, Sfid*, Text*);
 char*	srvmaptext(Srvctx*, Sfid*, Text*);
 char*	srvemptytext(Srvctx*, Sfid*, Text*);
+char*	srvdirtytext(Srvctx*, Sfid*, Text*);
+char*	srvstaletext(Srvctx*, Sfid*, Text*);
+char*	srvlosttext(Srvctx*, Sfid*, Text*);
 
 /* enum.c */
 Objsnap* srvsnapopen(Store*, int kinds, char *buf, int nbuf);

@@ -135,6 +135,8 @@ Sfile srvfiles[Nfile] =
 	.walk	= Aadmin,
 	.rd	= Aadmin,
 	.wr	= 0,
+	.render	= srvdirtytext,
+	.open	= srvopenq,
 },
 [Qstale] = {
 	.name	= "stale",
@@ -142,6 +144,7 @@ Sfile srvfiles[Nfile] =
 	.walk	= Aadmin,
 	.rd	= Aadmin,
 	.wr	= 0,
+	.render	= srvstaletext,
 },
 [Qtombs] = {
 	.name	= "tombs",
@@ -158,6 +161,8 @@ Sfile srvfiles[Nfile] =
 	.walk	= Aadmin,
 	.rd	= Aadmin,
 	.wr	= 0,
+	.render	= srvlosttext,
+	.open	= srvopenq,
 },
 [Qjobs] = {
 	.name	= "jobs",
