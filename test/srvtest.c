@@ -606,9 +606,14 @@ tmatrix(void)
 		{"meta",  {nil, nil, nil},
 			  {"permission denied", "permission denied", nil}},
 		{"repl",  {"permission denied", nil, "permission denied"},
-			  {nil, "shoalsrv: not built", nil}},
+			  {nil, nil, nil}},
+		/*
+		 * §5.6 makes /rpc ORDWR-only — every exchange uses both
+		 * directions — so the one open this table makes, OREAD,
+		 * is the refusal rather than the grant for that row.
+		 */
 		{"rpc",	  {"permission denied", nil, nil},
-			  {nil, "shoalsrv: not built", "shoalsrv: not built"}},
+			  {nil, "bad open mode", "bad open mode"}},
 		{"advert",{"permission denied", nil, "permission denied"},
 			  {nil, nil, nil}},
 		{"dirty", {"permission denied", "permission denied", nil},

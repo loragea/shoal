@@ -112,6 +112,8 @@ Sfile srvfiles[Nfile] =
 	.rd	= Arepl,
 	.wr	= Arepl,
 	.gate	= chgate,
+	.read	= srvreplread,
+	.write	= srvreplwrite,
 },
 [Qrpc] = {
 	.name	= "rpc",
@@ -120,6 +122,9 @@ Sfile srvfiles[Nfile] =
 	.rd	= Arepl|Aadmin,
 	.wr	= Arepl|Aadmin,
 	.gate	= chgate,
+	.read	= srvrpcread,
+	.write	= srvrpcwrite,
+	.open	= srvrpcopen,
 },
 [Qadvert] = {
 	.name	= "advert",

@@ -39,10 +39,22 @@
  * state is the fid's rather than the request's.
  */
 
+/*
+ * The two strings store.md §14(37) pairs: one condition said to the two
+ * kinds of owner a stage has.  A CLIENT whose staged update went —
+ * step 7 for another request on its fid, or the idle sweep — is told
+ * `staged update discarded'; a /repl sender CONTINUING a transfer whose
+ * earlier chunks are gone is told the engine's own `stage expired',
+ * which is also what the engine answers a chunk on a handle its sweep
+ * has stripped.  Neither carries a §2.6 prefix: nothing §2.6 names has
+ * happened, and the operation is retried rather than refused on its
+ * merits.
+ */
 static char Estagegone[] = "shoalsrv: staged update discarded";
+char Estageexp[] = "stage expired";
 static char Eoom[] = "shoalsrv: out of memory";
 static char Ewstatfield[] = "shoalsrv: only length may be set";
-static char Efidstate[] = "shoalsrv: the fid holds state of its own";
+char Efidstate[] = "shoalsrv: the fid holds state of its own";
 
 static long	wclamp(Srvctx*, uvlong off, long n);
 
@@ -336,8 +348,23 @@ stageflushhook(Sfid *f, Req *r)
 	if((s = f->aux) == nil)
 		return;
 	c = s->ctx;
-	s->dead = 1;
 	qlock(&c->stagelk);
+	s->dead = 1;
+	/*
+	 * A handler inside an engine call THROUGH this handle is the one
+	 * case where the handle may not be taken here: §5.5's chunk passes
+	 * the Stage* to stagewrite, and a discard made while that call is
+	 * in flight is a discard made under it.  `dead' is enough — the
+	 * look that handler takes when its call returns finds it and
+	 * releases the handle itself (srvstagelive below), which is an
+	 * engine call made from a queue proc holding no lock, where it
+	 * belongs.  A client stage never reaches this: it holds a key and
+	 * no handle, so `g' is nil for every one of them.
+	 */
+	if(s->busy && s->g != nil){
+		qunlock(&c->stagelk);
+		return;
+	}
 	open = stagestrip(c, s, &g);
 	if(g != nil && open && !stagepend(c, g))
 		stageunstrip(c, s, g, open);
@@ -600,24 +627,33 @@ stagelive(Srvctx *c, Sfid *f, Sstage *s, Req *r)
  * context's from the moment it has no stage, exactly as it is when the
  * flush hook parks one (dat.h's Sstage).
  */
-static void
-stagepointarm(Srvctx *c, Sstage *s, Stage *g)
+static int
+stagearm(Srvctx *c, Sstage *s, Stage *g, int keepbusy)
 {
-	int open;
+	int open, live;
 
 	qlock(&c->stagelk);
 	open = c->store != nil && !c->closed;
-	if(g != nil && (s->dead || s->released)){
+	live = !s->dead && !s->released;
+	if(g != nil && !live){
 		if(open && stagepend(c, g))
 			g = nil;
 	}else{
 		s->g = g;
 		g = nil;
 	}
-	s->busy = 0;
+	if(!keepbusy)
+		s->busy = 0;
 	qunlock(&c->stagelk);
 	if(g != nil && open)
 		stagediscard(g);
+	return live;
+}
+
+static void
+stagepointarm(Srvctx *c, Sstage *s, Stage *g)
+{
+	stagearm(c, s, g, 0);
 }
 
 static void
@@ -713,6 +749,178 @@ srvstagecount(Srvctx *c, uvlong *live, uvlong *done, uvlong *openat)
 	if(openat != nil)
 		*openat = c->nstageopen;
 	qunlock(&c->stagelk);
+}
+
+/*
+ * §5.5's op=full, the one stage whose lifetime is longer than the
+ * request that made it (§3.6).  Everything about the slot, the list
+ * and the three hooks is what a client stage uses; what differs is
+ * that `g' is filled, so the four calls below are where the engine
+ * handle is taken, carried across the chunks and given up.  The
+ * channel that drives them is peer.c's.
+ *
+ * The first chunk of a transfer.  The handle is taken with no lock
+ * held, because stageopen allocates, so a step 7 for another request
+ * on this fid can strip the stage in that window — which the arm has
+ * to find rather than store a handle nothing would reach (the stage
+ * point above takes the same care for the same reason).  `busy' is
+ * kept SET across the arm and stays set until the caller's look:
+ * a handler between two steps of one chunk is not an absence of
+ * arrivals (§3.6).
+ */
+Stage*
+srvstagefull(Srvctx *c, Sfid *f, uchar *oid, int oidlen, uvlong flen,
+	int force, uvlong ver, uvlong wepoch, uvlong off, long n, Sstage **sp,
+	char *buf, int nbuf, char **err)
+{
+	Sstage *s;
+	Stage *g;
+
+	*sp = nil;
+	if((s = stagenew(c, f, Stfull, oid, oidlen, ver, wepoch, n, off,
+		err)) == nil)
+		return nil;
+	qlock(&c->stagelk);
+	s->flen = flen;
+	s->force = force;
+	qunlock(&c->stagelk);
+	if((g = stageopen(c->store, oid, oidlen, flen, force)) == nil){
+		*err = srverr(buf, nbuf);
+		stagedone(f, s);
+		return nil;
+	}
+	if(!stagearm(c, s, g, 1)){
+		stagedone(f, s);
+		*err = Estageexp;
+		return nil;
+	}
+	*sp = s;
+	return g;
+}
+
+/*
+ * A later chunk of a transfer this fid is already staging.  Answers
+ * the handle to write through, or nil — with *err nil when the fid
+ * holds no stage at all, which is the first chunk's case and the
+ * caller's to take to srvstagefull.
+ *
+ * The refusals are §3.6's per-fid ones.  A chunk naming another object
+ * is a SECOND stage on one fid and is `disk full', which is §3.6's
+ * refusal for its per-fid bound; so is one that would take the
+ * transfer past `stagemax' staged grains.  A `len' or `force' that
+ * differs from the transfer's own is a header §5.5 forbids a
+ * conforming sender to send, so it is `bad ctl'.
+ *
+ * A stage the idle sweep expired, or step 7 discarded, is refused
+ * `stage expired' — and the refusal is what takes it out of the slot.
+ * §3.6 has the owner discard an expired stage and start the transfer
+ * over, which is free; leaving the handle in the slot would refuse
+ * that restart with the same string for as long as the fid lived.
+ */
+Stage*
+srvstagemore(Srvctx *c, Sfid *f, uchar *oid, int oidlen, uvlong flen,
+	int force, uvlong off, long n, Sstage **sp, char **err)
+{
+	Sstage *s;
+	Stage *g;
+	uvlong gr;
+	int dead;
+
+	*err = nil;
+	*sp = nil;
+	g = nil;
+	dead = 0;
+	gr = stagegrains(c, off, n);
+	qlock(&f->lk);
+	if((s = f->aux) == nil){
+		qunlock(&f->lk);
+		return nil;
+	}
+	if(f->auxflush != stageflushhook){
+		qunlock(&f->lk);
+		*err = Efidstate;		/* the T1 fid-state point */
+		return nil;
+	}
+	qlock(&c->stagelk);
+	if(s->dead || s->released)
+		dead = 1;
+	else if(s->kind != Stfull || s->oidlen != oidlen
+	|| memcmp(s->oid, oid, oidlen) != 0)
+		*err = Ediskfull;
+	else if(s->flen != flen || s->force != force)
+		*err = Ebadctl;
+	else if(s->ngrain + gr > stagemaxof(c))
+		*err = Ediskfull;
+	else{
+		s->ngrain += gr;
+		s->busy = 1;
+		s->last = nsec();
+		g = s->g;
+		*sp = s;
+	}
+	qunlock(&c->stagelk);
+	qunlock(&f->lk);
+	if(dead){
+		stagedone(f, s);
+		*err = Estageexp;
+	}
+	return g;
+}
+
+/*
+ * The look a chunk takes when its engine call returns: is the stage
+ * still this fid's, and still live?  It clears `busy', which is what
+ * held the sweep off across the call, and a stage that went while the
+ * call was in flight is given back here — the flush hook leaves the
+ * handle of a busy stage alone precisely so that this is where it is
+ * released, outside every lock and on a queue proc.
+ */
+int
+srvstagelive(Srvctx *c, Sfid *f, Sstage *s)
+{
+	int ok;
+
+	qlock(&f->lk);
+	qlock(&c->stagelk);
+	ok = f->aux == s && !s->dead && !s->released;
+	s->busy = 0;
+	s->last = nsec();
+	qunlock(&c->stagelk);
+	qunlock(&f->lk);
+	if(!ok)
+		stagedone(f, s);
+	return ok;
+}
+
+/*
+ * final=1: the fid forgets the handle BEFORE the outcome is known,
+ * because stagefinal consumes it on every one of them (§3.6) — a
+ * Tclunk behind a refused final=1 would otherwise discard a stage that
+ * has already been discarded.  The handle answered here is the
+ * caller's to pass to stagefinalcsum, or nil for a stage that was
+ * already stripped, whose transfer is over either way.
+ */
+Stage*
+srvstagefinal(Srvctx *c, Sfid *f, Sstage *s)
+{
+	Stage *g;
+
+	qlock(&c->stagelk);
+	g = s->g;
+	s->g = nil;
+	s->busy = 0;
+	s->dead = 1;
+	if(!s->released){
+		s->released = 1;
+		c->nstagedone++;
+		if(c->store != nil && !c->closed)
+			c->nstageopen++;
+	}
+	stageunlink(c, s);
+	qunlock(&c->stagelk);
+	if(stagetake(f, s) != nil)
+		free(s);
+	return g;
 }
 
 /*

@@ -70,6 +70,7 @@ srvstatustext(Srvctx *c, Sfid *f, Text *t)
 	textprint(t, "objsnapopen=%llud\n", st.nobjsnap);
 	textprint(t, "dirty=%lud\n", dirtycount(c->store));
 	textprint(t, "lost=%llud\n", st.nlost);
+	textprint(t, "staged=%llud\n", st.staged);
 	textprint(t, "queues=%d\n", c->nq);
 	textprint(t, "qdepth=%llud\n", np - nd);
 	textprint(t, "qpushed=%llud\n", np);

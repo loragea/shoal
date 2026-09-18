@@ -609,6 +609,15 @@ struct Sstage
 	uvlong	ver;		/* the key §5.4 step 3 chose */
 	uvlong	wepoch;
 	uvlong	off;
+	/*
+	 * §5.5's op=full declares the final length and `force' on EVERY
+	 * chunk and requires them identical on each, so the transfer's
+	 * pair is kept here and every later chunk is checked against it;
+	 * they are the two values stageopen fixed the engine handle with.
+	 * A client stage has neither and leaves both zero.
+	 */
+	uvlong	flen;
+	int	force;
 	ulong	ngrain;		/* against §3.6's per-fid bound */
 	vlong	last;		/* nsec of the last arrival */
 	int	busy;		/* a handler is inside a step on it */
