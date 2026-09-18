@@ -123,7 +123,13 @@ enum
  * A row opts in by filling the cell that gets the request first: the
  * open cell for an open (a row with only a render cell is answered on
  * the loop, which is what the fixed status files want), the read cell
- * for a read.  Such a cell pushes and returns; what runs on the queue
+ * for a read.  Opting in is expected of a row whose render takes an
+ * engine snapshot or a lock the engine holds; /status has not, and is
+ * still rendered on the service loop although it calls storestat and
+ * dirtycount, which take the engine's state lock.  It stays there
+ * while it is the only caller and the lock is uncontended; the row
+ * moves to the offload path when that stops being true, and nothing
+ * outside this table has to change when it does.  Such a cell pushes and returns; what runs on the queue
  * obeys the pool's rules entire — it tests srvqcheck if it has work
  * worth skipping, and it MUST leave through srvqdone, which is where
  * the flush is answered and step 7 performed.  srvopentext is the
