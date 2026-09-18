@@ -327,6 +327,17 @@ dirfree(Dir *d)
  * (§9: "an object created after the open is not in the vector at
  * all").  An entry that will not fit in what the client asked for
  * leaves the cursor standing on it for the next Tread.
+ *
+ * The cursor is a PAIR and is committed as one.  A read that gives up
+ * part-way — objsnapent refusing, which §9 has it do for a store that
+ * has stopped serving — has consumed entries without serving their
+ * bytes, and lib9p does not advance `Fid.diroffset' on an error
+ * (/sys/src/lib9p/srv.c's rread), so the client's retry arrives at the
+ * offset this read started at.  Leaving `pos' where the failure left
+ * it would make that retry continue past every entry the failed read
+ * consumed, and drop them silently — the one thing layer-a §2.2 asks
+ * a sequential read not to do.  So the position goes back with the
+ * offset it never left.
  */
 static void
 objdirreadq(Req *r)
@@ -373,6 +384,10 @@ objdirreadq(Req *r)
 		p = (uchar*)r->ofcall.data;
 		while(d->pos < nent){
 			rc = objsnapent(d->sn, d->pos, oid, &oidlen, &oi);
+			if(rc >= 0 && srvslotfail(c, d->pos)){
+				werrstr("snapshot entry refused at the point");
+				rc = -1;
+			}
 			if(rc < 0){
 				rerrstr(buf, sizeof buf);
 				e = buf;
@@ -394,7 +409,8 @@ objdirreadq(Req *r)
 			d->prevoff = soff;
 			d->prevpos = spos;
 			d->off = soff + n;
-		}
+		}else
+			d->pos = spos;
 	}
 	qunlock(&f->lk);
 	if(e != nil){

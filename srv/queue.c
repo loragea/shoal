@@ -553,14 +553,16 @@ srvjobhold(Srvctx *c)
 }
 
 /*
- * The one point here that refuses rather than holds: whether the scrub
- * pass's read of this index slot is to be treated as having failed.
- * It is the only way to break a whole-index walk off part-way while
- * the store underneath it stays healthy — the engine's own way of
- * refusing an index read is to be condemned, which refuses every other
- * call the pass would make as well, so a pass broken off that way
- * cannot be told from one whose store has gone.  Set to slot+1; 0 is
- * off, and srvholdclear turns it off with the rest.
+ * The one point here that refuses rather than holds: whether this read
+ * of an index walk's n'th unit is to be treated as having failed — the
+ * scrub pass's read of an index slot (job.c) and the directory read's
+ * of a snapshot position (enum.c) both ask.  It is the only way to
+ * break such a walk off part-way while the store underneath it stays
+ * healthy — the engine's own way of refusing an index read is to be
+ * condemned, which refuses every other call the walk would make as
+ * well, so a walk broken off that way cannot be told from one whose
+ * store has gone.  Set to n+1; 0 is off, and srvholdclear turns it off
+ * with the rest.
  */
 int
 srvslotfail(Srvctx *c, uvlong slot)

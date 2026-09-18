@@ -286,11 +286,16 @@ void	srvcount(Srvctx*, uvlong *pushed, uvlong *done);
  *		unlink for it.
  *	slotfail
  *		the one point here that refuses rather than holds: n != 0
- *		makes the scrub pass treat its read of index slot n-1 as
- *		having failed.  It is how a whole-index walk is broken off
+ *		makes a walk over this instance's own index treat its n-1'th
+ *		read as having failed — the scrub pass's read of index slot
+ *		n-1, and the /obj and /meta directory read's objsnapent of
+ *		snapshot position n-1.  It is how such a walk is broken off
  *		part-way with the store under it still healthy — the
  *		engine's own way of refusing an index read is to be
- *		condemned, which refuses the rest of the pass's calls too.
+ *		condemned, which refuses the rest of the walk's calls too,
+ *		and a walk broken off that way cannot be told from one
+ *		whose store has gone.  The two walks are separate cases,
+ *		so the one number serves both.
  *	flushhold
  *		n != 0 holds a Tflush of a pooled request between the
  *		lookup that found it and the flush itself, which is the

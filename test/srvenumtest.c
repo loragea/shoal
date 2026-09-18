@@ -880,8 +880,145 @@ Out:
 	free(m);
 }
 
+/* every live object was listed exactly once across the reads */
+static void
+wholedir(char *what, char *buf, long n, int want)
+{
+	char names[64][Oidmax+1];
+	int i, k, nent;
+
+	nent = dirnames(buf, n, names, nelem(names));
+	eqv(what, nent, want);
+	for(i = 0; i < nent; i++)
+		for(k = i+1; k < nent; k++)
+			if(strcmp(names[i], names[k]) == 0){
+				fail("%s: the listing repeats %s", what,
+					names[i]);
+				return;
+			}
+}
+
 /*
- * store.md §9's two refusals at the open, as the wire carries them.
+ * Two ways a directory read can stop short of the snapshot's end, and
+ * what the cursor owes the read after it.
+ *
+ * The client's count is the first: an entry that will not fit in what
+ * was asked for is not listed, and layer-a §2.2 has it listed next
+ * time rather than skipped — so the cursor stands on it and not past
+ * it, and a whole listing read in counts that end mid-entry is the
+ * same listing as one read in a single count.
+ *
+ * An `objsnapent' that refuses is the second (store.md §9: a store
+ * that has stopped serving answers nothing).  The read answers an
+ * error, lib9p leaves `Fid.diroffset' where it was, and the client
+ * asks again at the offset the failed read started at — so the
+ * position must be back there too.  §13's `slotfail' point is what
+ * refuses one such read with the store under it healthy; nothing else
+ * can, since the engine's own way of refusing is to stop serving,
+ * which refuses the retry as well.
+ */
+static void
+tdircursor(void)
+{
+	char names[64][Oidmax+1];
+	char buf[16*1024], name[32], *m;
+	Srvctx *ctx;
+	Store *st;
+	Dev *d;
+	Cl cl;
+	Fcall r;
+	char *w[1];
+	vlong off;
+	long n;
+	int i, k;
+
+	clstage = "dircursor";
+	m = mkmap();
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4, 0)) == nil)
+		return;
+	st = srvstore(ctx);
+	for(i = 0; i < 20; i++){
+		snprint(name, sizeof name, "obj%.2d", i);
+		mkobj(st, name, nil, 0, 1);
+	}
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
+		fail("attach: %s", clerr(&r));
+		goto Out;
+	}
+	w[0] = "obj";
+
+	/* the whole listing in counts small enough to end mid-entry */
+	if(clopenpath(&cl, Froot, Fdir, 1, w, OREAD, &r) != Ropen){
+		fail("open /obj: %s", clerr(&r));
+		goto Out;
+	}
+	n = 0;
+	off = 0;
+	for(i = 0; i < 64; i++){
+		if(clread(&cl, Fdir, off, 200, &r) != Rread){
+			fail("a bounded read: %s", clerr(&r));
+			goto Out;
+		}
+		if(r.count == 0)
+			break;
+		if(n + r.count > sizeof buf)
+			break;
+		memmove(buf+n, r.data, r.count);
+		n += r.count;
+		off += r.count;
+	}
+	wholedir("an entry that did not fit is listed by the next read",
+		buf, n, 20);
+	clclunk(&cl, Fdir, &r);
+
+	/* a read refused part-way, and the client's retry at that offset */
+	if(clopenpath(&cl, Froot, Fdir, 1, w, OREAD, &r) != Ropen){
+		fail("re-open /obj: %s", clerr(&r));
+		goto Out;
+	}
+	if(clread(&cl, Fdir, 0, 200, &r) != Rread){
+		fail("first read: %s", clerr(&r));
+		goto Out;
+	}
+	n = r.count;
+	memmove(buf, r.data, n);
+	k = dirnames(buf, n, names, nelem(names));
+	istrue("a bounded read stops part-way through the snapshot",
+		k > 0 && k+2 < 20);
+	off = n;
+	srvhook(ctx, "slotfail", k+3);	/* the read of position k+2 refuses */
+	clread(&cl, Fdir, off, 4096, &r);
+	checks++;
+	if(r.type != Rerror)
+		fail("a read whose entry read was refused: type %d", r.type);
+	srvhook(ctx, "slotfail", 0);
+	for(i = 0; i < 64; i++){
+		if(clread(&cl, Fdir, off, 4096, &r) != Rread){
+			fail("the retry at the same offset: %s", clerr(&r));
+			goto Out;
+		}
+		if(r.count == 0)
+			break;
+		if(n + r.count > sizeof buf)
+			break;
+		memmove(buf+n, r.data, r.count);
+		n += r.count;
+		off += r.count;
+	}
+	wholedir("a refused read drops none of the entries it consumed",
+		buf, n, 20);
+	clclunk(&cl, Fdir, &r);
+Out:
+	srvhook(ctx, "slotfail", 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+, as the wire carries them.
  *
  * The bound's is layer-a §2.6's `disk full' with D20's detail, and it
  * goes out verbatim — err.c passes a §2.6 string through, and a
@@ -1932,6 +2069,7 @@ threadmain(int argc, char **argv)
 	tmonid();
 	tfiles();
 	tdir();
+	tdircursor();
 	tsnaprefuse();
 	tscrub();
 	tqueued();
