@@ -91,7 +91,7 @@ enum
 	 * threadmain.  Every check this file makes is unconditional once
 	 * its case is entered, so the number is fixed.
 	 */
-	Nchecks	= 262,
+	Nchecks	= 267,
 
 	/* fids the cases use */
 	Froot	= 1,
@@ -194,16 +194,24 @@ tspawn(void (*fn)(void*), void *a)
 	return 0;
 }
 
-/* D16's observable: the engine's last act before the Store's memory goes */
+/*
+ * D16's observable: the engine's last act before the Store's memory
+ * goes.  What the shutdown's waits are worth is read here and nowhere
+ * else — the hook runs inside storeclose, so a timer still reading the
+ * context at this point is one that outlived the store its passes
+ * walk, and the context itself a moment later.
+ */
 static int freedseen;
 static Srvctx *freedctx;
 static int freedjobs;
+static int freedlive;
 
 static void
 onfreed(void*)
 {
 	freedseen++;
 	freedjobs = freedctx != nil && srvstopping(freedctx);
+	freedlive = freedctx != nil ? srvreclaimlive(freedctx) : -1;
 }
 
 static Srvctx*
@@ -2505,6 +2513,66 @@ Out:
 }
 
 /*
+ * The same shutdown against the TIMER, which is the one proc of this
+ * unit that holds no job: srvshutdown waits for it apart from the jobs
+ * and before them (srv.h), and what that wait is worth is read at the
+ * moment the store closes.
+ *
+ * The timer is made demonstrably alive across the shutdown rather than
+ * assumed to be: the knob puts its period in tens of milliseconds, the
+ * case waits until a pass no verb asked for has come and gone, and it
+ * asserts the proc is still up with the client about to go.  The proc
+ * sleeps its wait in slices, so the shutdown begins with it inside
+ * one — which is exactly the proc the store must not close under.
+ */
+static void
+treclaimwait(void)
+{
+	char val[64], *m;
+	Srvctx *ctx;
+	Store *st;
+	Dev *d;
+	Cl cl;
+	int i;
+
+	clstage = "reclaimwait";
+	m = mkmapd(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid, 0);
+	d = newdisk();
+	freedseen = 0;
+	freedlive = -1;
+	if((ctx = startsrv(d, m, 4, 0)) == nil)
+		return;
+	st = srvstore(ctx);
+	mkobj(st, "old", nil, 0, 1);
+	rmobj(st, "old", 9, 3);			/* past both local cutoffs */
+	sleep(1100);				/* past the cutoff's second */
+	clstart(&cl, ctx, Clmsize);
+	if(!adminctl(&cl, "role=admin"))
+		goto Out;
+	srvhook(ctx, "jobhold", 1);
+	srvreclaimms(ctx, 30);
+	if(jobparked(&cl, "reclaimable", val, sizeof val) == nil)
+		fail("no pass reached the hold: the timer never fired");
+	else
+		eqs("a pass the timer started counted the tombstone",
+			val, "1");
+	srvhook(ctx, "jobhold", 0);
+	for(i = 0; i < 400 && jobrunning(&cl); i++)
+		sleep(20);
+	istrue("the timer is still up with the pass over",
+		srvreclaimlive(ctx) != 0);
+Out:
+	clstop(&cl);			/* the loop ends; the shutdown runs */
+	eqv("the store was closed once", freedseen, 1);
+	eqv("the timer had ended when the store closed", freedlive, 0);
+	istrue("and it is not reading the context now either",
+		srvreclaimlive(ctx) == 0);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * §2.5's `forget <iid>' (§7.1): the fine-grained records for that
  * peer go and no others do.  The coarse `fullsync' flag has no setter
  * and is already set for every peer the store knows of (store.md §9),
@@ -3377,6 +3445,7 @@ threadmain(int argc, char **argv)
 	treclaimctl();
 	treclaimrace();
 	treclaimdown();
+	treclaimwait();
 	tforget();
 	tscrubctl();
 	tscrubrate();

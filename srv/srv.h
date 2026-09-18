@@ -252,6 +252,7 @@ Cmap*	srvmap(Srvctx*);
 char*	srviid(Srvctx*);
 void	srvcount(Srvctx*, uvlong *pushed, uvlong *done);
 int	srvjobcount(Srvctx*);	/* jobs held: what the shutdown waits for */
+int	srvreclaimlive(Srvctx*);	/* ... and the timer, which holds none */
 
 /*
  * store.md §13's -X shape, for this library's own points: inert until
