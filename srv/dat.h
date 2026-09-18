@@ -229,10 +229,11 @@ enum
  * built by filling its row's fn or qfn, and the body of work that
  * verb names owns that cell.  `fence' and `newmonid' are ctl.c's and
  * `drop' is too, under the oid's queue; `verify' is object I/O's and
- * is built; `scrub' and `forget' are job.c's, and each starts a pass
- * /jobs lists.  `pull', `push', `reconcile', `advert', `refresh' and
- * `register' wait on the peer and monitor clients, so their rows hold
- * ctlnotbuilt and gate without a body (store.md §14(18)).
+ * is built; `scrub', `reclaim' and `forget' are job.c's, and each
+ * starts a pass /jobs lists.  `pull', `push', `reconcile', `advert',
+ * `refresh' and `register' wait on the peer and monitor clients, so
+ * their rows hold ctlnotbuilt and gate without a body (store.md
+ * §14(18)).
  */
 struct Sfile
 {
@@ -485,9 +486,9 @@ struct Qjob
  * that broke off silently was a walk that reported success.  The
  * first failure wins, since it is the one that stopped the walk where
  * a walk stops at all — an object that would not read does not stop
- * one — and `err' is also what says the walk's answer is not a whole
- * index's: the reclaim that rides on a scrub runs only over a walk
- * that completed and recorded none (store.md §14(30)).
+ * one — and `err' is also what says a count on the line is not the
+ * whole store's: a reclaim pass cut short carries `shoalsrv: stopped'
+ * beside the `reclaimable=' it did reach (store.md §14(31)).
  */
 struct Sjob
 {
@@ -496,8 +497,8 @@ struct Sjob
 	char	*verb;		/* the ctl verb that started it */
 	void	(*fn)(Sjob*);
 	int	running;	/* the proc has started: `queued' until then */
-	uvlong	done;		/* index slots walked */
-	uvlong	total;		/* index slots to walk */
+	uvlong	done;		/* units walked: index slots, tomb entries */
+	uvlong	total;		/* units to walk */
 	uvlong	bad;		/* objects the pass found mismatching */
 	uvlong	skipped;	/* ... gone between the index and the queue */
 	uvlong	reclaimable;	/* tombstones past layer-a §1.5's local two */
@@ -696,6 +697,7 @@ struct Srvctx
 	uvlong	jobhold;	/* srvhook("jobhold") */
 	uvlong	slotfail;	/* srvhook("slotfail") */
 	uvlong	reclaimhold;	/* srvhook("reclaimhold") */
+	uvlong	tickhold;	/* srvhook("tickhold") */
 	uvlong	dirhold;	/* srvhook("dirhold") */
 	uvlong	givehold;	/* srvhook("dirgive") */
 	uvlong	givecnt;	/* opens that have reached that window */
@@ -715,11 +717,24 @@ struct Srvctx
 	 * raises, which a running pass tests between objects exactly as
 	 * it tests srvstopping.  `scrubbing' is what keeps a second
 	 * `scrub start' from putting two passes over one index.
+	 *
+	 * The tombstone reclaim walk carries the same pair of flags, for
+	 * the same two jobs — one pass over one index, and a stop a
+	 * running pass reads between entries — and they are its own, not
+	 * the scrub's: the two walks run at once and neither stops the
+	 * other (job.c).  `reclaimms' is the T1 knob over the timer's
+	 * period and `reclaimup' says the timer proc is still reading
+	 * this context, which is what the shutdown waits for; the timer
+	 * holds no job, since it makes no engine call.
 	 */
 	Sjob	*jobs;
 	int	scrubbing;
 	int	scrubstop;
 	ulong	scrubrate;
+	int	reclaiming;
+	int	reclaimstop;
+	int	reclaimup;
+	uvlong	reclaimms;
 	int	stopping;	/* the shutdown has begun: no new jobs */
 	int	served;		/* a service loop was started over this context */
 	int	released;	/* lib9p has let go of the Srv (Srv.free) */

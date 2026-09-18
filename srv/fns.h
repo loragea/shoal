@@ -63,6 +63,7 @@ void	srvqanyexit(Srvctx*);
 void	srvjobhold(Srvctx*);
 int	srvslotfail(Srvctx*, uvlong slot);
 void	srvreclaimhold(Srvctx*, uvlong i);
+void	srvtickhold(Srvctx*);
 void	srvdirhold(Req*, uvlong i);
 void	srvgivehold(Req*);
 void	srvqdone(Req*, char *err);
@@ -118,7 +119,9 @@ char*	srvadverttext(Srvctx*, Sfid*, Text*);
 /* job.c */
 char*	srvjobstext(Srvctx*, Sfid*, Text*);
 char*	srvctlscrub(Srvctx*, Sfid*, int, char**);
+char*	srvctlreclaim(Srvctx*, Sfid*, int, char**);
 char*	srvctlforget(Srvctx*, Sfid*, int, char**);
+int	srvreclaimproc(Srvctx*);	/* the reclaim timer, from srvnew */
 
 /* ctl.c */
 void	srvctlwrite(Req*);

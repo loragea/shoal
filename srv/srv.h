@@ -231,8 +231,16 @@ void	srvshutdown(Srvctx*);
  * A proc takes a job for its whole run: srvjobstart before it touches
  * the engine, srvjobend when it is done, and it answers -1 once the
  * shutdown has begun, which is the answer a verb turns into its
- * refusal.  A pass already running SHOULD test srvstopping between
- * units of work and give up rather than leave the shutdown waiting.
+ * refusal.  The passes this library starts take the same count with
+ * the rest of their admission, under the one lock (job.c), and give
+ * it back through srvjobend like any other caller.  A pass already
+ * running SHOULD test srvstopping between units of work and give up
+ * rather than leave the shutdown waiting.
+ *
+ * The tombstone reclaim walk's timer is the one proc here that is NOT
+ * a job: it starts passes and makes no engine call of its own, so it
+ * holds nothing the store's close must wait behind.  What it does hold
+ * is the context it reads, and the shutdown waits for it separately.
  */
 int	srvjobstart(Srvctx*);
 void	srvjobend(Srvctx*);
@@ -245,6 +253,7 @@ Cmap*	srvmap(Srvctx*);
 char*	srviid(Srvctx*);
 void	srvcount(Srvctx*, uvlong *pushed, uvlong *done);
 int	srvjobcount(Srvctx*);	/* jobs held: what the shutdown waits for */
+int	srvreclaimlive(Srvctx*);	/* ... and the timer, which holds none */
 
 /*
  * store.md §13's -X shape, for this library's own points: inert until
@@ -385,15 +394,32 @@ int	srvjobcount(Srvctx*);	/* jobs held: what the shutdown waits for */
  *		slotfail.  The park is outside the fid's state lock, as
  *		every point here is.
  *	reclaimhold
- *		n != 0 holds the tombstone reclaim walk that rides on a
- *		scrub before its n-1'th entry, with the entries before
- *		that one already counted.  Nothing else can stop that walk
- *		part-way: it starts only once the scrub is past its index
- *		walk, and it is paced by nothing and asks no queue.  So it
- *		is where a test raises `scrub stop', or takes the server
+ *		n != 0 holds the tombstone reclaim walk before its n-1'th
+ *		entry, with the entries before that one already counted.
+ *		Nothing else can hold that walk still: it is paced by
+ *		nothing and asks no queue, so a walk over any index a test
+ *		can build is over before the next ctl write lands.  So it
+ *		is where a test raises `reclaim stop', or takes the server
  *		down, over a walk that has counted a prefix of the
- *		snapshot.  Set to n+1, like slotfail.  It parks a pass
- *		proc, so it carries jobhold's hazard above entire.
+ *		snapshot — and where it holds one still long enough to
+ *		write the next verb at all.  Set to n+1, like slotfail.  It
+ *		parks a pass proc, so it carries jobhold's hazard above
+ *		entire.
+ *	tickhold
+ *		n != 0 holds the reclaim TIMER's own start of a pass, after
+ *		it has decided to start one and before the pass's proc
+ *		exists.  That window is where a `reclaim start' written on
+ *		the service loop meets a tick in flight, and it is too
+ *		narrow to write into without a hold.  Only the timer's call
+ *		parks here, never a verb's: a verb's call IS the loop, and
+ *		a loop parked answers nothing else either.  The proc it
+ *		parks does hold a job — the admission has counted and
+ *		linked the pass before the timer reaches this point, so
+ *		/jobs lists it while it is parked — but it carries none of
+ *		jobhold's hazard, because a tick that reaches the point
+ *		was admitted before `stopping' was set: jobadmit reads
+ *		that flag under the same joblk hold the shutdown sets it
+ *		in, so no shutdown can have begun behind the parked tick.
  *	flushhold
  *		n != 0 holds a Tflush of a pooled request between the
  *		lookup that found it and the flush itself, which is the
@@ -430,19 +456,19 @@ void	srvhook(Srvctx*, char *name, uvlong n);
  * srvholdclear, which the shutdown runs before it drains, clears the
  * whole of srvhook's set and nothing else: objhold, objprelook,
  * objstage, objlook, objarm, objexit, flushhold, mapopen, walkhold,
- * anyexit, step7, jobhold, slotfail, reclaimhold, dirhold, dirgive
- * and objclaim.  A HOLD therefore belongs in srvhook — a program that
- * set a point and stopped watching must not be able to hold the
- * store's close.  (The shutdown also turns srvcellpoint off, by its
- * own call and for its own reason: the file table those cells are in
- * outlives the context that was given them.)  Clearing a point is not
- * the same as reaching the proc that is parked in it: a parked QUEUE
- * proc wakes when its point is cleared, but a parked SERVICE LOOP
- * never reaches srvholdclear at all, because the shutdown runs from
- * Srv.end, which lib9p calls on the loop.  A point that can park the
- * loop — the flush hold, and the step 7 hold when the flushed request
- * was still queued — therefore bounds its own park as well as being
- * cleared here.
+ * anyexit, step7, jobhold, slotfail, reclaimhold, tickhold, dirhold,
+ * dirgive and objclaim.  A HOLD therefore belongs in srvhook — a
+ * program that set a point and stopped watching must not be able to
+ * hold the store's close.  (The shutdown also turns srvcellpoint off,
+ * by its own call and for its own reason: the file table those cells
+ * are in outlives the context that was given them.)  Clearing a point
+ * is not the same as reaching the proc that is parked in it: a parked
+ * QUEUE proc wakes when its point is cleared, but a parked SERVICE
+ * LOOP never reaches srvholdclear at all, because the shutdown runs
+ * from Srv.end, which lib9p calls on the loop.  A point that can park
+ * the loop — the flush hold, and the step 7 hold when the flushed
+ * request was still queued — therefore bounds its own park as well as
+ * being cleared here.
  *
  * What srvholdclear does NOT touch belongs beside srvauxpoint below:
  * the fid-state point and its counts, and the end point, whose whole
@@ -504,6 +530,31 @@ void	srvcellpoint(Srvctx*, int on);
  * the count is the only bound a program that forgets it gets.
  */
 void	srvendpoint(Srvctx*, uvlong ms);
+
+/*
+ * The period between the tombstone reclaim walk's passes, in ms,
+ * overriding the map's own.  That period is `tombdays'/2 — layer-a
+ * §8.3's epoch-bump cadence, since §1.5's condition 3 is what the walk
+ * is waiting on — and the shortest a map can ask for is half a day,
+ * which is longer than any test can wait for.  Set it to a few tens of
+ * milliseconds to see the timer fire, and to 0 to put the map's own
+ * period back.  The value is re-read as the timer waits, so it
+ * shortens a wait already in progress — but the wait is slept in half-
+ * second slices, so a period below that is one tick per slice and the
+ * first tick comes within a slice of the call.  Like srvendpoint and
+ * unlike the srvhook holds, the shutdown does not clear it: it holds
+ * nothing up, since a pass the timer starts once the shutdown has
+ * begun is refused the job it needs and the timer proc itself ends
+ * with the shutdown either way.
+ *
+ * srvreclaimperiod is the period in force, which is what the knob
+ * overrides: the map's `tombdays'/2, or the floor under it for a map
+ * that retains nothing, or the knob's own value.  Half a day is longer
+ * than a test can wait, so the floor is asserted by reading it rather
+ * than by watching for a tick.
+ */
+void	srvreclaimms(Srvctx*, uvlong ms);
+uvlong	srvreclaimperiod(Srvctx*);
 
 /*
  * The stage point, over the per-fid staged operation layer-a §5.4 step

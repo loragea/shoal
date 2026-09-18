@@ -577,11 +577,11 @@ srvslotfail(Srvctx *c, uvlong slot)
 
 /*
  * The point inside the tombstone reclaim walk (job.c), which nothing
- * else here can stop part-way: the scrub that carries it is already
- * past its index walk when the walk begins, and the walk itself is
- * paced by nothing and asks no queue.  n != 0 parks it before its
+ * else here can hold still: the walk is paced by nothing and asks no
+ * queue, so it is over before a second ctl write can land on it.
+ * n != 0 parks it before its
  * n-1'th entry, with the entries before that one counted, so a test
- * can raise `scrub stop' or take the server down over a walk that
+ * can raise `reclaim stop' or take the server down over a walk that
  * has counted a prefix of the snapshot.  Set to n+1, like slotfail; 0
  * is off, and srvholdclear turns it off with the rest.
  */
@@ -595,6 +595,24 @@ srvreclaimhold(Srvctx *c, uvlong i)
 	qunlock(&c->holdlk);
 	if(n != 0 && i == n-1)
 		qhold(c, nil, &c->reclaimhold);
+}
+
+/*
+ * The point inside the reclaim timer's own start of a pass (job.c):
+ * n != 0 parks the tick after it has decided to start one and before
+ * the pass's proc exists.  That window is where a `reclaim start'
+ * written on the service loop meets a tick in flight, and it is too
+ * narrow to write into without a hold.  Only the timer's call parks
+ * here — a verb's is the loop itself, and a loop parked answers
+ * nothing else either.  The proc it parks holds a job — the admission
+ * has counted and linked the pass before the timer gets here — but a
+ * tick that reaches the point was admitted before `stopping' was set,
+ * so no shutdown can have begun behind it (srv.h).
+ */
+void
+srvtickhold(Srvctx *c)
+{
+	qhold(c, nil, &c->tickhold);
 }
 
 /*
@@ -986,6 +1004,8 @@ srvhook(Srvctx *c, char *name, uvlong n)
 		c->slotfail = n;
 	else if(strcmp(name, "reclaimhold") == 0)
 		c->reclaimhold = n;
+	else if(strcmp(name, "tickhold") == 0)
+		c->tickhold = n;
 	else if(strcmp(name, "dirhold") == 0)
 		c->dirhold = n;
 	else if(strcmp(name, "dirgive") == 0)
@@ -1024,6 +1044,7 @@ srvholdclear(Srvctx *c)
 	c->jobhold = 0;
 	c->slotfail = 0;
 	c->reclaimhold = 0;
+	c->tickhold = 0;
 	c->dirhold = 0;
 	c->givehold = 0;
 	c->claimhold = 0;

@@ -3390,7 +3390,11 @@ the caller's walk rather than the engine's: the engine holds no
 `tombdays` policy, because layer-a §3.1 makes `tombdays` a map-header
 attribute. The caller opens a `/tombs` snapshot and tests each entry's
 `mtime` against its own cutoff and the entry's `wepoch` against its
-own map epoch. It **counts** what passes both and removes nothing
+own map epoch. In the 9P server that caller is a background job of its
+own, on a timer and under layer-a §2.5's `reclaim` verb (§14(39)); it
+holds the snapshot for the whole walk, so the walk sees the
+tombstones the open saw and no others. It **counts** what passes both
+and removes nothing
 (§14(31)): layer-a §1.5's third condition has nothing to answer it
 while there is no peer client. The discard is addressed by the
 entry's **own key** and not by its slot — that is what `objdiscard`
@@ -4546,12 +4550,12 @@ Two more drive the 9P surface rather than the engine, over
 matrix, §2.2's tree, §2.3's qids, the render-at-open files, §2.5's
 ctl gates, §5.4.1's `Tflush` and step 7, the per-fid state hooks, and
 D16's shutdown order) and `srvenumtest` (what that framework carries:
-§2.5's `scrub`, `forget`, `drop` and `newmonid`, §2.2's `/dirty`,
+§2.5's `scrub`, `reclaim`, `forget`, `drop` and `newmonid`, §2.2's `/dirty`,
 `/stale`, `/tombs`, `/lost`, `/advert` and `/jobs`, the `/obj` and
 `/meta` directory reads over a §9 snapshot with entries going
 live→tomb mid-read, D20's retry and the `objsnapmax` refusal, §7.5's
 scrub pass with T1.27 below, and §9's tombstone reclaim at both sides
-of its cutoff). The split is by layer and not by size: a failure in
+of its cutoff, under its verb and under its timer). The split is by layer and not by size: a failure in
 one says which half broke.
 
 Against the list below that is T1.1–T1.33. Three of those rows are
@@ -5008,16 +5012,16 @@ would be a wire change.
 
 *Policy, but read it before implementing anything.*
 
-Thirty-eight places where layer-a is silent, self-defeating, or
+Thirty-nine places where layer-a is silent, self-defeating, or
 contradicted by the measurements or by the platform. Each entry
 states the tension, its resolution, and where the argument for it
 lives; nothing here repeats an argument made in a section above.
-Items 1–5, 8, 9, 11, 12, 13, 14 and 26 are amendments **made** to
+Items 1–5, 8, 9, 11, 12, 13, 14, 26 and 39 are amendments **made** to
 `docs/design/layer-a.md`; items 6, 7, 15, 17, 18–25 and 27–38 are
 recorded here and not made there; items 10 and 16 are **proposals** rather
 than amendments, because they touch the wire.
 
-Items 18 to 38 are the object server's, and they describe what
+Items 18 to 39 are the object server's, and they describe what
 `srv/libshoalsrv.a` and `cmd/shoalsrv` **do today**. Several of them
 name a half that is not built; each says which.
 
@@ -5528,14 +5532,32 @@ name a half that is not built; each says which.
     and a client could write it once per id it can spell — each write
     a proc holding a dirty snapshot and one of the jobs the shutdown
     waits on. *Not made:* **twelve passes may run at once**, counted
-    over both verbs, and a verb that would start a thirteenth is
-    refused with the local `shoalsrv: too many jobs` rather than
-    accepted. §2.5's error column for these verbs names `fenced` and
-    `bad ctl` and neither covers this, so the refusal is a local
-    string (§14(29)); the number is implementation policy. `/jobs`
-    renders **every** job on the list, which §2.2's "one line per
-    running or queued background job" requires and which the cap
+    over every verb that starts one — `scrub`, `reclaim` and
+    `forget`, so `job=` at `/jobs` carries one of those three — and a
+    verb that would start a thirteenth is refused with the local
+    `shoalsrv: too many jobs` rather than accepted. So is a pass the
+    reclaim timer would start (§14(39)), which is the one pass no
+    verb asked for. §2.5's error column for these verbs names
+    `fenced` and `bad ctl` and neither covers this, so the refusal is
+    a local string (§14(29)); the number is implementation policy.
+    `/jobs` renders **every** job on the list, which §2.2's "one line
+    per running or queued background job" requires and which the cap
     bounds the cost of.
+
+    **One line shape for all three passes.** §2.2 fixes one record
+    per job and leaves the fields to the implementation, and the
+    fields here are one set rather than one per verb — so a reader
+    parses one line and a pass's counters are read the same way
+    whichever verb started it. What that costs is fields that stand
+    still: a `job=reclaim` line's `rate=` is the scrubber's pace and
+    the walk reads no grains, and its `bad=`, `skipped=` and
+    `dropped=` stay 0 for the whole run, because the walk verifies
+    nothing, pushes nothing through a queue and discards nothing
+    (§14(31)). `done=`, `total=`, `reclaimable=` and `err=` are the
+    four that move on it. The alternative — a line shape per verb —
+    buys an operator nothing a constant field does not already tell
+    them, and costs every reader of `/jobs` a second parse. Policy,
+    like the rest of the line.
 
     A pass has no client to answer and this build has no operator log,
     so a walk that broke off — a failed index read, a failed
@@ -5546,20 +5568,17 @@ name a half that is not built; each says which.
     there is one and last on the line because the string may hold
     spaces. §2.2 makes `/jobs`'s format implementation policy beyond
     its being one record per line, so the field is policy entire. The
-    same record is what says the walk's answer is not a whole index's:
-    §9's reclaim walk runs only at the end of a scrub that walked
-    every slot, was not stopped and recorded no error, because
-    `reclaimable=` over a prefix of the index — or over an index the
-    pass could not read all of — is indistinguishable from
-    `reclaimable=` over the whole of it.
+    same record is what says a count on the line is not the whole
+    store's: a reclaim pass cut short leaves `reclaimable=` over a
+    prefix of its snapshot, which is indistinguishable from
+    `reclaimable=` over the whole of it without the mark (§14(31)).
 
     A **per-object** read failure is a failure of the pass and not the
     end of it: the scrub records it and walks on, since one object
     that would not read says nothing about the next and stopping would
     leave the rest of the index unverified as well. That is the one
-    way a pass reaches the end of its walk carrying an `err=`, and it
-    is why the reclaim's gate tests the error as well as the slot
-    count. An object that has merely **gone** between the index read
+    way a pass reaches the end of its walk carrying an `err=`. An
+    object that has merely **gone** between the index read
     and the queue is not a failure at all: the walk reads the index
     outside every queue and its unit is ordered behind whatever that
     queue held, so a delete or a drop in between is the ordering
@@ -5568,8 +5587,8 @@ name a half that is not built; each says which.
     by the string, and `/jobs` counts them at **`skipped=<n>`**
     (policy, like the rest of the line).
 
-31. **The scrub's pace is this server's, and it carries the reclaim
-    walk (§8, §9; layer-a §2.5, §7.5).** layer-a §7.5 leaves
+31. **The scrub's pace is this server's (§8; layer-a §2.5,
+    §7.5).** layer-a §7.5 leaves
     `scrubdays` and the rate to the implementation and sizes its own
     example at "a default near 14 days ... ~4 MiB/s on a 4 TB disk".
     *Not made:* `scrub rate=<n>` is in KiB/s as §2.5 says, the
@@ -5594,12 +5613,10 @@ name a half that is not built; each says which.
     a client. The `rate=` on a refused line stands, as it does for the
     other refusals.
 
-    §9's tombstone reclaim runs at the end of a pass that was not
-    stopped, and has no verb of its own: §2.5 fixes the ctl grammar
-    and has no verb for it, so adding one would be a wire change
-    (§13's own argument for `-X` being a flag), and `scrub` is the
-    only verb §2.5 gives an instance for walking its own index on a
-    schedule.
+    §9's tombstone reclaim is a pass of its own, on its own timer and
+    under its own verb; §14(39) has the decision and what it costs.
+    What stays here is the walk itself, which is the same walk either
+    way.
 
     **The walk counts and discards nothing.** layer-a §1.5 licenses a
     discard only when **all three** of its conditions hold. Two are
@@ -5619,24 +5636,27 @@ name a half that is not built; each says which.
     discards the replication surface will have to confirm; every
     record stays where it is, and `/tombs` still lists it.
 
-    A reclaim walk that is itself cut short — `scrub stop`, or the
+    A reclaim walk that is itself cut short — `reclaim stop`, or the
     shutdown, read between its entries — has counted a prefix of the
-    snapshot, and nothing else on the line says so: `done=` and
-    `total=` belong to the index walk and read `done=T/T` by then.
-    *Not made:* such a walk records `shoalsrv: stopped` through the
+    snapshot. *Not made:* such a walk records `shoalsrv: stopped`
+    through the
     same `err=` §14(30) gives a pass that gave up, so `reclaimable=`
     is read beside an error rather than as the whole store's answer.
     The count it did reach is left on the line, since a prefix marked
     as one is worth more to an operator than no number at all. One
     string covers both causes: what has to be known is that the
-    number is a prefix, not which of the two cut it short.
+    number is a prefix, not which of the two cut it short. `done=`
+    and `total=` are the walk's own entries and not the index's
+    slots, so a prefix shows there too — but a `done=` short of
+    `total=` is also what a walk still running reads, and the mark is
+    what says the walk is over.
 
     The walk
     reads the tombstones through a §9 snapshot of its own and holds it
     for its whole run, so it occupies one of `objsnapmax`'s slots and
     `/status`'s `objsnapopen=` counts it: an operator who watches that
-    field climb by one while a scrub is ending is watching the
-    reclaim, not a client. When that
+    field climb by one with a `job=reclaim` line at `/jobs` is
+    watching the walk, not a client. When the replication
     surface lands it adds condition 1 and §1.5's execution — `op=
     discard` to every confirming instance, this instance's own record
     removed last — and every discard then goes through that oid's
@@ -5854,6 +5874,78 @@ name a half that is not built; each says which.
     again, and a `qid` equal to the fid's sets nothing. A `Twstat`
     that sets nothing at all is 9P's own sync of a fid and succeeds,
     changing nothing.
+
+39. **The tombstone reclaim walk is a job of its own, with a verb
+    and a timer (§9; layer-a §2.5, §1.5).** D26 tied the walk to the
+    end of a `scrub` pass so that §2.5's ctl grammar would not have
+    to change. That couples a walk measured in seconds to a pass
+    layer-a §7.5 itself sizes at "a default near 14 days": a mass
+    delete's space is reported only after a whole scrub, a `scrub
+    stop` forfeits the walk with the pass that carried it, and no
+    tier below a full pass can exercise it at all. *Made:* layer-a
+    §2.5 carries a `reclaim [start|stop]` row, admin, with `start` in
+    the fenced set, and the walk is a background job like the other
+    two — `jobstart`, a `job=reclaim` line at `/jobs` with its
+    `reclaimable=` and its `err=`, the same twelve-pass cap
+    (§14(30)), the same stop mark and the same duty to test the
+    shutdown between entries. D26 carries the decision and the wire
+    change it is.
+
+    **`start` is fenced and `stop` is not.** §2.5's fenced set is
+    "every verb that mutates data or replication state" and the walk a
+    `start` asks for will: the discard is what it is a walk for, and a
+    fenced instance is one whose map may be stale — which is the map
+    `tombdays` and the epoch are read from. `start` is fenced today,
+    while it only counts, so that the set does not have to change
+    under a client when condition 1 becomes answerable. `stop` mutates
+    nothing — it raises a flag a running walk reads between two
+    entries — and an instance just fenced is where an operator most
+    wants the walk it started stopped, so it is answered while fenced
+    as `scrub stop` is. layer-a §2.5's fenced set names the two forms
+    apart for that reason, and the ctl row here is outside the set
+    with the gate for `start` in the verb's own body, which is how
+    `fence off`'s carve-out is built (§14(26)).
+
+    **The timer, and its period.** A pass runs every `tombdays`/2,
+    which is layer-a §8.3's own cadence for the `bump` that makes
+    §1.5's condition 3 reachable: the walk waits on the epoch moving
+    past each tombstone's `wepoch`, so looking oftener than the epoch
+    moves asks a question whose answer cannot have changed. The
+    period is **implementation policy**, and so is the floor under
+    it: a map may carry `tombdays=0` — the cutoff is then the present
+    (§14(31)) — and `tombdays`/2 is then no period at all, so the
+    timer is floored at twelve hours, which is what the shortest
+    non-zero retention a map can carry gives. The first pass comes
+    one period after start-up rather than at it, so that an instance
+    restarted often does not walk its index at every start.
+
+    **What the verb does not do, and the half that is open.**
+    `reclaim stop` stops the pass that is running; it does not turn
+    the timer off, and the next tick starts a pass as a `reclaim
+    start` would. §2.5's form has two words and neither names a
+    schedule, and an operator who wants the walk off for good has no
+    verb for it — which costs a walk of the tombstone snapshot per
+    period and no durable change, since the walk discards nothing.
+    That is the **open half**: `scrub` has no schedule of its own yet
+    (layer-a §7.5's "continuously" is not built), so `scrub stop`
+    means "stop this pass" and nothing else, and the two verbs agree
+    today by accident. When the scrub gets a scheduler, a `stop` that
+    holds the schedule until the next `start` is the reading that
+    verb will want, and this one's meaning has to be settled against
+    it — either the same reading here, or a form of §2.5's own for a
+    schedule. Nothing on the wire commits either way today: the two
+    `stop`s do the same thing. The timer is not gated by the fence
+    either: it starts no discard while condition 1 is unanswerable,
+    and what the fence governs is `start`, which is the surface §2.5
+    has.
+
+    **What it is not.** The timer proc holds none of §9's background
+    jobs, because it makes no engine call — the pass it starts holds
+    one for its own run — so the shutdown waits for the proc
+    separately and before the jobs, since it is the one thing that
+    could still start one. layer-a §7.5's "continuously" for the
+    scrub is a **separate** matter and is not built: `scrub` still
+    runs only when an operator asks for it.
 
 ## 15. Alternatives considered
 

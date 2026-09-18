@@ -626,6 +626,7 @@ once the job is *accepted*; progress is read from `/jobs`.
 | `drop` | admin | `drop <oid>` | Delete a local copy with no tombstone (§7.4). | `fenced`, `bad ctl`, `no such object`, `still placed` |
 | `verify` | admin | `verify <oid>` | Re-hash and compare now. | `bad ctl`, `no such object`, `checksum mismatch` |
 | `scrub` | admin | `scrub [start\|stop] [rate=<n>]` | Control the scrubber; `rate` in KiB/s. | `bad ctl` |
+| `reclaim` | admin | `reclaim [start\|stop]` | Control the tombstone reclaim walk (§1.5): start a pass over this instance's tombstones now, or stop the one running. An instance that discards at all SHOULD run the walk on a schedule of its own — a period of `tombdays`/2 matches the `bump` cadence condition 3 waits for (§8.3) — so the verb asks for a pass early rather than being the only thing that runs one, and neither word turns that schedule off. `start` alone is fenced. | `fenced` (`start`), `bad ctl` |
 | `forget` | admin | `forget <iid>` | Discard the fine-grained dirty set for a peer, marking it `fullsync` (§7.1). Does **not** clear the peer's stale mark at the monitor. | `fenced`, `bad ctl` |
 | `fence` | admin | `fence on\|off` | Set or clear an **operator** fence (§6.4). `fence off` MUST NOT clear a lease-derived fence; only a successful refresh does. | `bad ctl`, `fenced` |
 | `newmonid` | admin | `newmonid <hex32>` | Replace this instance's pinned `monid` (§6.3), so its next refresh may adopt a map carrying the new value. The instance-side half of `forceepoch <e> monid=`. MUST be logged. Available while fenced — a `monid` mismatch is precisely what keeps refresh failing. | `bad ctl` |
@@ -643,14 +644,20 @@ because they apply to every row.
 
 **ctl is inside the fence.** While the instance is fenced (§6.4),
 every verb that mutates data or replication state — `pull`, `push`,
-`drop`, `forget`, `reconcile`, `advert`, `fence off` — MUST fail with
-`fenced`, except that `fence off` MUST fail that way only while a
-**lease-derived** fence (F1) is in force (D25). Only `refresh`,
-`register`, `fence on`, `verify`, `scrub` and `newmonid` remain
-available, plus `fence off` against an operator fence alone. The
-first draft left `/ctl` outside both the epoch check and the fence,
-so a deposed instance could be driven to overwrite, delete, discard
-replication state, or unfence itself.
+`drop`, `forget`, `reclaim start`, `reconcile`, `advert`, `fence off`
+— MUST fail with `fenced`, except that `fence off` MUST fail that way
+only while a **lease-derived** fence (F1) is in force (D25). `reclaim
+start` is in that set because the walk it starts discards records
+(§1.5): a fenced instance is one whose map may be stale, and a discard
+is decided against that map's `tombdays` and epoch. `reclaim stop` is
+**not**: it mutates nothing — it asks a running walk to give up, which
+the walk reads between two entries — and an instance just fenced is
+where an operator most wants the walk it started stopped. Only
+`refresh`, `register`, `fence on`, `verify`, `scrub`, `reclaim stop`,
+`reclaim` with neither word, which changes nothing, and `newmonid`
+remain available, plus `fence off` against an operator fence alone. The first draft left `/ctl` outside both the epoch check
+and the fence, so a deposed instance could be driven to overwrite,
+delete, discard replication state, or unfence itself.
 
 Unknown verbs MUST fail with `unknown ctl`; a known verb with bad
 arguments MUST fail with `bad ctl`; a verb issued on a fid whose
