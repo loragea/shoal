@@ -892,10 +892,29 @@ tmeta(void)
 	clclunk(&cl, Fmeta, &r);
 	clclunk(&cl, Ffile, &r);
 
-	/* §2.6: a tombstone is `object deleted', through /meta as well */
+	/*
+	 * §2.4 admits OREAD on /meta and nothing else.  A mode in the write
+	 * column never reaches the row's cell — the matrix has no write
+	 * grant for /meta at all (store.md §14(24)) — so OEXEC is the mode
+	 * the cell itself refuses.
+	 */
+	if(clwalkobj(&cl, Froot, Ffile2, "meta", "alpha", &r) != Rwalk)
+		fail("walk /meta/alpha: %s", clerr(&r));
+	clopen(&cl, Ffile2, OEXEC, &r);
+	clerris("an open of /meta for execution", &r, "bad open mode");
+
+	/*
+	 * §2.6: a tombstone is `object deleted', through /meta as well — at
+	 * the walk, and, on a fid walked while the object was still live, at
+	 * the open, which is where the render reads the record.
+	 */
 	if(objremove(srvstore(ctx), (uchar*)"alpha", 5, oi.ver+1, Tepoch,
 		nil, 0) < 0)
 		fail("objremove alpha: %r");
+	clopen(&cl, Ffile2, OREAD, &r);
+	clerris("an open of /meta for an object deleted under the fid", &r,
+		"object deleted");
+	clclunk(&cl, Ffile2, &r);
 	if(clwalk1(&cl, Froot, Fdir, "meta", &r) != Rwalk)
 		fail("walk /meta: %s", clerr(&r));
 	clwalk1(&cl, Fdir, Fmeta, "alpha", &r);
