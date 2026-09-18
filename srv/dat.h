@@ -562,16 +562,32 @@ extern int nsrvctls;
  *		of them (Sfid above) — but because of WHERE this one would
  *		be made: the hook reaches the handle under `stagelk', the
  *		context's leaf lock, and store.md §6 rule 1 takes no state
- *		lock under a leaf.  The hook therefore takes the handle
- *		out of the slot and parks it, and obj.c's drain — at the
- *		head of every queued object operation, and once at the
- *		shutdown while the store is still open — is where the
- *		discard is made, outside every lock.  A park that cannot
- *		take the handle puts it BACK in the slot, dead but not
- *		released, rather than make the call there: auxclose below
- *		reaches the slot whatever the sweep has done with the
- *		stage.  So what the fid owes is that the handle is
- *		released by someone that is not the hook.
+ *		lock under a leaf.  The hook therefore marks the stage dead
+ *		and leaves the release to someone else; which someone is
+ *		what `busy' decides.
+ *
+ *		A stage no handler is inside has its handle taken out of
+ *		the slot and parked, and obj.c's drain — at the head of
+ *		every queued object operation, and once at the shutdown
+ *		while the store is still open — is where the discard is
+ *		made, outside every lock.  A park that cannot take the
+ *		handle puts it BACK in the slot, dead but not released,
+ *		rather than make the call there: auxclose below reaches
+ *		the slot whatever the sweep has done with the stage.
+ *
+ *		A stage that IS busy and holds a handle keeps it, and that
+ *		chunk's own look, when its engine call returns, is what
+ *		releases it — that look and NOBODY ELSE (store.md
+ *		§14(45)).  Not the hook, whose park would be a discard
+ *		made under the stagewrite the handle is an argument of;
+ *		not the idle sweep, which `busy' holds off (§3.6); and not
+ *		a refusal running on another queue — a chunk naming a
+ *		second object finds the stage dead, answers `stage
+ *		expired' and leaves the slot to that look for the same
+ *		reason (obj.c's srvstagemore).  So what the fid owes is
+ *		that the handle is released by someone that is not the
+ *		hook, and while a handler is inside a call through it,
+ *		that someone is the handler itself.
  *	discarded at clunk and before the store closes, through
  *		auxclose, because releasing an engine stage is an engine
  *		call (store.md §9).
