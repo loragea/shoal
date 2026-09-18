@@ -93,6 +93,7 @@ enum
 	Fdir	= 4,
 	Froot2	= 5,
 	Fmeta	= 6,
+	Fctl	= 7,
 };
 
 static char Tuuid[] = "0000000000000000000000000000000a";
@@ -267,6 +268,39 @@ clwriteb(Cl *c, ulong fid, vlong off, void *a, long n, Fcall *r)
 	return clrpc(c, &t, r);
 }
 
+/*
+ * Wait for the pool to be quiet — every request it has taken has
+ * completed — and then for it to have taken n more.  A case that
+ * pipelines requests has to know the server reached a given point
+ * before it sends the next message, and the pool's counters are what
+ * say so; a sleep only hopes (store.md §7).
+ */
+static void
+waitidle(Srvctx *ctx, uvlong *np, uvlong *nd)
+{
+	int i;
+
+	for(i = 0; i < 400; i++){
+		srvcount(ctx, np, nd);
+		if(*np == *nd)
+			return;
+		sleep(5);
+	}
+}
+
+static void
+waitpush(Srvctx *ctx, uvlong np0, uvlong n, uvlong *np, uvlong *nd)
+{
+	int i;
+
+	for(i = 0; i < 400; i++){
+		srvcount(ctx, np, nd);
+		if(*np - np0 >= n)
+			return;
+		sleep(5);
+	}
+}
+
 /* walk a fresh fid to /obj/<name> or /meta/<name> */
 static int
 clwalkobj(Cl *c, ulong root, ulong fid, char *dir, char *name, Fcall *r)
@@ -331,13 +365,14 @@ statlen(Cl *c, ulong fid, Fcall *r)
 static void
 tio(void)
 {
-	char buf[64], *m;
+	char buf[64], sbuf[512], *m;
 	uchar data[2048], want[8192];
 	Objinfo oi;
 	Srvctx *ctx;
 	Dev *d;
 	Cl cl;
 	Fcall r;
+	Dir dir;
 	int i;
 
 	clstage = "io";
@@ -424,6 +459,24 @@ tio(void)
 		eqv("a read of hole and bytes stops at the new len", r.count,
 			6004 - sizeof data);
 	eqv("stat length is the extended len", statlen(&cl, Ffile, &r), 6004);
+
+	/* §2.3's stat of an object, in full */
+	if(clstat(&cl, Ffile, &r) != Rstat)
+		fail("stat /obj/alpha: %s", clerr(&r));
+	else if(convM2D(r.stat, r.nstat, &dir, sbuf) <= BIT16SZ)
+		fail("a stat of /obj/alpha that convM2D will not read");
+	else if(statof(srvstore(ctx), "alpha", &oi) < 0)
+		fail("objstat alpha: %r");
+	else{
+		eqs("a stat names the object", dir.name, "alpha");
+		eqv("... with the object's own length", dir.length, oi.len);
+		eqv("... its mtime", dir.mtime, (ulong)oi.mtime);
+		eqv("... mode 0666, which is §2.2's row", dir.mode, 0666);
+		eqv("... and qid.vers, the low 32 of ver (§2.3)", dir.qid.vers,
+			(ulong)(oi.ver & 0xFFFFFFFFULL));
+		eqv("... over the object's own qid.path", dir.qid.path,
+			oi.qidpath);
+	}
 
 	/* §2.6: a write past objmax at either bound */
 	if(clwriteb(&cl, Ffile, Tobjmax, "x", 1, &r) == Rwrite)
@@ -619,7 +672,7 @@ Out:
 static void
 tcreate(void)
 {
-	char *m;
+	char buf[64], *m;
 	Objinfo oi;
 	Srvctx *ctx;
 	Dev *d;
@@ -713,7 +766,36 @@ tcreate(void)
 		eqv("... which is the qid the create answered", r.qid.path,
 			path);
 	}
+	/*
+	 * The new incarnation serves I/O like any other object, and its
+	 * qid.vers is §2.3's low 32 bits of the version the create chose —
+	 * which is what tells a client holding the old one that the object
+	 * it is looking at is not the object it had.
+	 */
+	if(clwriteb(&cl, Fdir, 0, "again", 5, &r) != Rwrite)
+		fail("write to the re-created object: %s", clerr(&r));
+	else
+		eqv("the re-created object takes bytes", r.count, 5);
 	clclunk(&cl, Fdir, &r);
+	if(statof(srvstore(ctx), "brandnew", &oi) < 0)
+		fail("objstat the re-written object: %r");
+	else if(clwalkobj(&cl, Froot, Ffile, "obj", "brandnew", &r) != Rwalk
+	|| clopen(&cl, Ffile, OREAD, &r) != Ropen)
+		fail("open the re-created object: %s", clerr(&r));
+	else{
+		eqv("an open answers qid.vers, the low 32 of ver (§2.3)",
+			r.qid.vers, (ulong)(oi.ver & 0xFFFFFFFFULL));
+		eqv("... over the qid.path the id has kept", r.qid.path, path);
+		if(clread(&cl, Ffile, 0, 16, &r) != Rread)
+			fail("read the re-created object: %s", clerr(&r));
+		else{
+			memmove(buf, r.data, r.count);
+			buf[r.count] = 0;
+			eqs("... and it reads back what was written to it", buf,
+				"again");
+		}
+	}
+	clclunk(&cl, Ffile, &r);
 	clclunk(&cl, Froot, &r);
 
 	/* §2.1: the operator may create a reserved id, and a client may not */
@@ -846,6 +928,7 @@ tmeta(void)
 	Dev *d;
 	Cl cl;
 	Fcall r;
+	int n;
 
 	clstage = "meta";
 	m = mkmap(Palone, Tblksz, Tobjmax, Tuuid);
@@ -910,13 +993,24 @@ tmeta(void)
 		fail("open /obj/alpha: %s", clerr(&r));
 	if(clwriteb(&cl, Ffile, 0, "zzzz", 4, &r) != Rwrite)
 		fail("write /obj/alpha: %s", clerr(&r));
-	clslurp(&cl, Fmeta, buf, sizeof buf);
-	if(statof(srvstore(ctx), "alpha", &oi) < 0)
+	/*
+	 * The return is checked because buf still holds the first read: a
+	 * re-read that answered nothing would leave the snapshot check
+	 * comparing the old bytes with themselves and passing.
+	 */
+	memset(buf, 0, sizeof buf);
+	n = clslurp(&cl, Fmeta, buf, sizeof buf);
+	checks++;
+	if(n <= 0)
+		fail("re-read /meta/alpha: %d", n);
+	else if(statof(srvstore(ctx), "alpha", &oi) < 0)
 		fail("objstat alpha: %r");
-	snprint(val, sizeof val, "%llud", oi.ver);
-	istrue("a read of /meta is served from the snapshot its open took",
-		metafield(buf, "ver", val2, sizeof val2) != nil
-		&& strcmp(val2, val) != 0);
+	else{
+		snprint(val, sizeof val, "%llud", oi.ver);
+		istrue("a read of /meta is served from the snapshot its open"
+			" took", metafield(buf, "ver", val2, sizeof val2) != nil
+			&& strcmp(val2, val) != 0);
+	}
 	clclunk(&cl, Fmeta, &r);
 	clclunk(&cl, Ffile, &r);
 
@@ -1382,13 +1476,40 @@ tstage(void)
 	/* §3.6's per-fid bound: a second stage on one fid is `disk full' */
 	clwriteb(&cl, Ffile, 0, "x", 1, &r);
 	clerris("a second stage on one fid", &r, "disk full");
-	/* the clunk gives it back */
+	/*
+	 * §2.4 makes Tclunk a MUST succeed "whatever the instance's epoch,
+	 * fence or role state", and the fid it is asked of here holds a
+	 * stage while the instance is fenced — the state that could make a
+	 * server want to answer something else.  lib9p answers a Tclunk
+	 * itself and offers no cell to answer it with, so what these three
+	 * checks hold is that it stays that way: a row that came to gate a
+	 * clunk, or a give-back that could fail one, would be seen here.
+	 */
+	if(clattach(&cl, Froot2, Nadmin, &r) != Rattach)
+		fail("attach admin: %s", clerr(&r));
+	else if(clwalk1(&cl, Froot2, Fctl, "ctl", &r) != Rwalk
+	|| clopen(&cl, Fctl, OWRITE, &r) != Ropen)
+		fail("open /ctl: %s", clerr(&r));
+	else if(clwrite(&cl, Fctl, 0, "fence on", &r) != Rwrite)
+		fail("fence on: %s", clerr(&r));
 	clclunk(&cl, Ffile, &r);
+	checks++;
+	if(r.type != Rclunk)
+		fail("the clunk of a staging fid on a fenced instance: %s",
+			clerr(&r));
 	srvstagecount(ctx, &live, &done, &openat);
 	eqv("a clunk discards the fid's stage", live, 0);
 	eqv("... exactly once", done, 1);
 	eqv("... with the store still open", openat, 1);
+	clclunk(&cl, Fctl, &r);
+	checks++;
+	if(r.type != Rclunk)
+		fail("the clunk of /ctl on a fenced instance: %s", clerr(&r));
+	clclunk(&cl, Froot2, &r);
 	clclunk(&cl, Froot, &r);
+	checks++;
+	if(r.type != Rclunk)
+		fail("the clunk of the attach's own fid: %s", clerr(&r));
 Out:
 	srvstagepoint(ctx, 0);
 	clstop(&cl);
@@ -1631,7 +1752,7 @@ tstageflush(void)
 	Dev *d;
 	Cl cl;
 	Fcall t, r;
-	uvlong live, done;
+	uvlong live, done, np0, nd0, np, nd;
 	ushort ta, tb, tf;
 
 	clstage = "stageflush";
@@ -1657,6 +1778,7 @@ tstageflush(void)
 	eqv("the fid holds a stage", live, 1);
 
 	/* one request running and held, one queued behind it, on this fid */
+	waitidle(ctx, &np0, &nd0);
 	srvhook(ctx, "objhold", 1);
 	memset(&t, 0, sizeof t);
 	t.type = Twrite;
@@ -1666,10 +1788,13 @@ tstageflush(void)
 	t.data = "a";
 	t.count = 1;
 	clput(&cl, &t);
-	sleep(200);
+	waitpush(ctx, np0, 1, &np, &nd);
+	eqv("the first write is in the pool", np - np0, 1);
 	t.tag = tb = cltag(&cl);
 	clput(&cl, &t);
-	sleep(200);
+	waitpush(ctx, np0, 2, &np, &nd);
+	eqv("the second is queued behind it", np - np0, 2);
+	eqv("... and neither has answered", nd, nd0);
 
 	memset(&t, 0, sizeof t);
 	t.type = Tflush;
