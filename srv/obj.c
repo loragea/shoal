@@ -518,12 +518,20 @@ stagenew(Srvctx *c, Sfid *f, int kind, uchar *oid, int oidlen, uvlong ver,
 	 * says so, handle or not: the opening chunk of a transfer is busy
 	 * from here until the arm that fills `g', with stageopen running in
 	 * between under no lock, and a stage freed in that window is armed
-	 * and looked at after it has gone.  Nothing on the wire reaches
-	 * that today: a fid whose stage is busy is one mid-transfer, and
-	 * every chunk on it goes through srvstagemore, which answers one
-	 * whose stage is dead and busy without ever asking for a new stage.
-	 * The guard is here because the rule belongs to the stage rather
-	 * than to one of its callers.
+	 * and looked at after it has gone.
+	 *
+	 * One arrival reaches that clause, and it is a race rather than a
+	 * sequence: a chunk finds the slot EMPTY in srvstagemore and comes
+	 * here for a stage of its own, and a chunk naming another object —
+	 * another queue, so the two run together — fills the slot in
+	 * between.  A live stage is refused by the clause above it; this
+	 * one decides when a step 7 for the fid killed the winner's stage
+	 * in the same gap, which is the window where the loser would
+	 * otherwise free a stage its owner is still inside.  What cannot
+	 * reach it is the sequence it reads like: while the slot holds
+	 * anything, every chunk on the fid goes through srvstagemore, which
+	 * answers one whose stage is dead and busy — leaving the slot where
+	 * it is (§14(44)) — without ever asking for a new stage.
 	 */
 	qlock(&f->lk);
 	old = f->aux;
