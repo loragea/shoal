@@ -101,12 +101,14 @@ char Edevintr[]		= "shoalsrv: interrupted";
 
 /*
  * Is e the device's interrupted class (store.md §0)?  The rule is
- * deverr's, because this is the same condition arriving one layer up:
- * only the last `: '-separated segment is matched, since a device call
- * reports which syscall failed on which device and this server marks
- * what it passes on, so the kernel's own word is what follows the last
- * wrap.  `shoalsrv: interrupted' and a bare `interrupted' are both
- * that class; `no such object' is not.
+ * deverr's, applied the same way, because this is the same condition
+ * arriving one layer up: the last `: '-separated segment is taken —
+ * a device call reports which syscall failed on which device, and
+ * this server marks what it passes on, so the kernel's own word is
+ * what follows the last wrap — and the word is looked for inside it,
+ * as lib/dev.c does, rather than matched whole.  `shoalsrv:
+ * interrupted', a bare `interrupted' and a segment that wraps the
+ * word once more are all that class; `no such object' is not.
  */
 int
 srvintr(char *e)
@@ -119,7 +121,7 @@ srvintr(char *e)
 		p += 2;
 	else
 		p = e;
-	return strcmp(p, Einterrupted) == 0;
+	return strstr(p, Einterrupted) != nil;
 }
 
 /* layer-a §2.6, exactly: the block above, read as data.  Prefix-free. */
