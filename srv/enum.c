@@ -415,14 +415,15 @@ srvobjdiropen(Req *r)
  * mode or the ownership.
  */
 static void
-objdirent(Srvctx *c, Sfid *f, uchar *oid, int oidlen, Objinfo *oi, Dir *d)
+objdirent(Srvctx *c, int file, int role, uchar *oid, int oidlen, Objinfo *oi,
+	Dir *d)
 {
 	Sfid g;
 	Qid q;
 
 	memset(&g, 0, sizeof g);
-	g.file = f->file == Qmeta ? Qmetafile : Qobjfile;
-	g.role = f->role;
+	g.file = file == Qmeta ? Qmetafile : Qobjfile;
+	g.role = role;
 	memmove(g.oid, oid, oidlen);
 	g.oidlen = oidlen;
 	srvobjqid(&g, oi, &q);
@@ -449,8 +450,9 @@ dirfree(Dir *d)
  * each taking the engine's state lock, and the service loop takes this
  * fid's state lock to perform step 7 for another request on the same
  * fid (queue.c) — which dat.h forbids the loop to wait on.  So the
- * snapshot and the cursor are lifted under the lock, the walk runs
- * over them unlocked, and the lock is retaken to commit the cursor.
+ * snapshot and the cursor are lifted under the lock, with the file and
+ * the role each entry is rendered from (objdirent), the walk runs over
+ * those locals unlocked, and the lock is retaken to commit the cursor.
  *
  * What makes the walk safe unlocked is that neither the Objdir nor its
  * snapshot can be given back while this read is in flight:
@@ -510,7 +512,7 @@ objdirreadq(Req *r)
 	uvlong soff;
 	ulong nent, spos, pos;
 	long n, m, cnt;
-	int oidlen, rc;
+	int oidlen, rc, sfile, srole;
 
 	if(srvqcheck(r)){
 		srvqdone(r, nil);
@@ -536,6 +538,8 @@ objdirreadq(Req *r)
 	sn = d->sn;
 	soff = d->off;
 	spos = d->pos;
+	sfile = f->file;
+	srole = f->role;
 	qunlock(&f->lk);
 	n = 0;
 	if(e == nil){
@@ -558,7 +562,7 @@ objdirreadq(Req *r)
 			pos++;
 			if(rc == 0)
 				continue;
-			objdirent(c, f, oid, oidlen, &oi, &dir);
+			objdirent(c, sfile, srole, oid, oidlen, &oi, &dir);
 			m = convD2M(&dir, p+n, cnt-n);
 			dirfree(&dir);
 			if(m <= BIT16SZ){
