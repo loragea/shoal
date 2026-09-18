@@ -98,6 +98,7 @@ Sfile srvfiles[Nfile] =
 	.walk	= Aall,
 	.rd	= Aadmin,
 	.wr	= 0,
+	.gate	= objgate,
 },
 [Qrepl] = {
 	.name	= "repl",

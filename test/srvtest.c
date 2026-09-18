@@ -1475,6 +1475,13 @@ tobjgate(void)
 	clerris("fenced admin create of an id that is not reserved", &r,
 		"permission denied");
 	clclunk(&cl, Ffile, &r);
+	/* the /meta directory is the same listing under a second name */
+	if(clwalk1(&cl, Froot, Ffile, "meta", &r) != Rwalk)
+		fail("walk /meta while fenced: %s", clerr(&r));
+	clopen(&cl, Ffile, OREAD, &r);
+	clerris("fenced admin open of the /meta directory", &r,
+		"shoalsrv: not built");
+	clclunk(&cl, Ffile, &r);
 	if(clwrite(&cl, Fctl, 0, "fence off", &r) != Rwrite)
 		fail("fence off: %s", clerr(&r));
 	clclunk(&cl, Fctl, &r);
