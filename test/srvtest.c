@@ -1112,6 +1112,14 @@ tcellclear(void)
  * such object'.  Which of the two a given id gets is the map's to
  * say, so the expected string is computed from the same map the
  * server adopted rather than guessed.
+ *
+ * It is computed with mapplace, which is the function the server's
+ * own guard calls, so this case does not check the placement: it
+ * checks what the verb does on each side of it.  That is deliberate
+ * and not an oversight.  `maptest' is where placement is checked, at
+ * known-answer vectors computed outside this codebase (AGENTS.md), and
+ * a case that recomputed it here would be asserting the server against
+ * itself and would pass whatever mapplace answered.
  */
 static char*
 droperr(Srvctx *ctx, char *oid)

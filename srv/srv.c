@@ -374,6 +374,23 @@ srvstopping(Srvctx *c)
 	return n;
 }
 
+/*
+ * How many jobs are held, which is what the shutdown waits for.  It is
+ * read back for the same reason srvcount is: a caller that has taken
+ * the service down asks what is left rather than inferring it from a
+ * call that would refuse for a different reason.
+ */
+int
+srvjobcount(Srvctx *c)
+{
+	int n;
+
+	lock(&c->joblk);
+	n = c->njob;
+	unlock(&c->joblk);
+	return n;
+}
+
 static void
 jobwait(Srvctx *c)
 {

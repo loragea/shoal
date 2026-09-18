@@ -85,6 +85,13 @@ enum
 	Tobjmax	= 1<<20,
 	Tepoch	= 7,
 
+	/*
+	 * How many checks a whole run makes, asserted at the end: see
+	 * threadmain.  Every check this file makes is unconditional once
+	 * its case is entered, so the number is fixed.
+	 */
+	Nchecks	= 201,
+
 	/* fids the cases use */
 	Froot	= 1,
 	Fctl	= 2,
@@ -544,6 +551,8 @@ tmonid(void)
 	if(slurpfile(&cl, Ffile, "status", buf, sizeof buf) > 0)
 		eqs("/status monid= is the one start-up pinned",
 			clfield(buf, "monid", val, sizeof val), Tmonid);
+	else
+		fail("/status is empty before the verb");
 
 	/* the value already pinned: the publish is a no-op and succeeds */
 	snprint(line, sizeof line, "newmonid %s", Tmonid);
@@ -552,6 +561,8 @@ tmonid(void)
 	if(slurpfile(&cl, Ffile, "status", buf, sizeof buf) > 0)
 		eqs("/status monid= is unchanged by it",
 			clfield(buf, "monid", val, sizeof val), Tmonid);
+	else
+		fail("/status is empty after the no-op publish");
 
 	/* a different one is what the engine has no call for */
 	snprint(line, sizeof line, "newmonid %s", newid);
@@ -561,6 +572,8 @@ tmonid(void)
 	if(slurpfile(&cl, Ffile, "status", buf, sizeof buf) > 0)
 		eqs("/status monid= is unchanged by the refusal",
 			clfield(buf, "monid", val, sizeof val), Tmonid);
+	else
+		fail("/status is empty after the refusal");
 Out:
 	clstop(&cl);
 	srvfree(ctx);
@@ -1322,6 +1335,8 @@ Out:
 	if(slurpfile(&cl, Ffile, "status", buf, sizeof buf) > 0)
 		eqs("/status objsnapopen= counts the open snapshots",
 			clfield(buf, "objsnapopen", val, sizeof val), "2");
+	else
+		fail("/status is empty with two snapshots open");
 	w[0] = "obj";
 	clopenpath(&cl, Froot, Fdir3, 1, w, OREAD, &r);
 	clerris("an open past objsnapmax", &r,
@@ -1448,6 +1463,8 @@ tscrub(void)
 	if(slurpfile(&cl, Ffile, "status", buf, sizeof buf) > 0)
 		eqs("/status lost= counts it",
 			clfield(buf, "lost", val, sizeof val), "1");
+	else
+		fail("/status is empty after a pass that found damage");
 
 	/*
 	 * store.md §8: every block matching clears the flag, so a pass
@@ -1572,7 +1589,7 @@ tqueued(void)
 	Fcall t, r;
 	char *w[1];
 	ushort ta;
-	uvlong done;
+	uvlong done, np0, np, nd;
 	int i;
 
 	clstage = "queued";
@@ -1595,6 +1612,7 @@ tqueued(void)
 		goto Out;
 
 	/* park a client request inside obj04's queue */
+	srvcount(ctx, &np0, &nd);
 	srvhook(ctx, "objhold", 1);
 	memset(&t, 0, sizeof t);
 	t.type = Twrite;
@@ -1604,7 +1622,19 @@ tqueued(void)
 	t.data = "verify obj04";
 	t.count = strlen(t.data);
 	clput(&cl, &t);
-	sleep(100);
+	/*
+	 * The pass must not start until that queue is occupied, and what
+	 * says so is the pool's own push count rather than a wait long
+	 * enough to be probably true: srvqpush counts a request as it
+	 * hands it to the queue, so one more push than there were is this
+	 * write and nothing else.  Nothing else is in flight here.
+	 */
+	np = np0;
+	for(i = 0; i < 400 && np == np0; i++){
+		sleep(5);
+		srvcount(ctx, &np, &nd);
+	}
+	eqv("the held verify reached its queue", np - np0, 1);
 
 	/* and start the pass over the whole index */
 	if(clattach(&cl, Froot2, "role=admin", &r) != Rattach)
@@ -1897,6 +1927,8 @@ tforget(void)
 	if(slurpfile(&cl, Ffile, "dirty", buf, sizeof buf) > 0)
 		eqv("/dirty carries three records before the verb",
 			nlines(buf, "oid="), 3);
+	else
+		fail("/dirty is empty with three records added");
 	if(clwrite(&cl, Fctl, 0, "forget n1.1", &r) != Rwrite){
 		fail("forget: %s", clerr(&r));
 		goto Out;
@@ -1911,10 +1943,13 @@ tforget(void)
 			hasline(buf, "oid=alpha peer=n2.0 epoch=12"));
 		istrue("the coarse flag for that peer is untouched",
 			hasline(buf, "fullsync peer=n1.1"));
-	}
+	}else
+		fail("/dirty is empty after forgetting one of two peers");
 	if(slurpfile(&cl, Ffile, "status", buf, sizeof buf) > 0)
 		eqs("/status dirty= falls with them",
 			clfield(buf, "dirty", val, sizeof val), "1");
+	else
+		fail("/status is empty after the forget pass");
 	/* a peer with nothing recorded is not an error */
 	if(clwrite(&cl, Fctl, 0, "forget n2.0", &r) != Rwrite)
 		fail("forget a peer with one record: %s", clerr(&r));
@@ -2041,6 +2076,8 @@ tpassfail(void)
 		eqs("a scrub that completed does reclaim-count", val, "1");
 	if(slurpfile(&cl, Ffile2, "jobs", buf, sizeof buf) > 0)
 		istrue("and carries no err=", strstr(buf, "err=") == nil);
+	else
+		fail("the parked whole pass left no /jobs line");
 Out:
 	storehook(srvstore(ctx), "fatal", 0);
 	srvhook(ctx, "slotfail", 0);
@@ -2096,11 +2133,15 @@ tscrubctl(void)
 	}
 	if(slurpfile(&cl, Ffile, "jobs", buf, sizeof buf) > 0)
 		eqv("a pass is listed at /jobs", nlines(buf, "job="), 1);
+	else
+		fail("/jobs is empty with a pass started");
 	if(clwrite(&cl, Fctl, 0, "scrub start", &r) != Rwrite)
 		fail("a second scrub start: %s", clerr(&r));
 	if(slurpfile(&cl, Ffile, "jobs", buf, sizeof buf) > 0)
 		eqv("a second scrub start puts no second pass over one index",
 			nlines(buf, "job="), 1);
+	else
+		fail("/jobs is empty after a second scrub start");
 
 	/* and `scrub stop' is read by the pass between objects */
 	if(clwrite(&cl, Fctl, 0, "scrub stop", &r) != Rwrite)
@@ -2275,6 +2316,8 @@ tjobs(void)
 	}
 	if(slurpfile(&cl, Ffile, "jobs", buf, sizeof buf) > 0)
 		eqv("/jobs renders all twelve", nlines(buf, "job="), 12);
+	else
+		fail("/jobs is empty with twelve passes accepted");
 	clwrite(&cl, Fctl, 0, "forget peer12", &r);
 	clerris("a pass past the cap", &r, "shoalsrv: too many jobs");
 	/* a second `forget' of a peer already running is one of the twelve */
@@ -2304,6 +2347,15 @@ Out:
  * the check that this instance is not in P(oid) is the server's; an
  * id it IS placed for is `still placed' whether or not a copy is
  * here, because the guard runs before the engine's drop.
+ *
+ * The pair of ids the case needs — one this instance is placed for
+ * and one it is not — is chosen with mapplace, which is the function
+ * the server's guard calls.  So this case does not check the
+ * placement: it checks what the verb does on each side of it, which
+ * is what it is for.  Placement is `maptest's, at known-answer
+ * vectors computed outside this codebase (AGENTS.md); choosing the
+ * ids here any other way would only be a second guess at the same
+ * function.
  */
 static void
 tdrop(void)
@@ -2361,8 +2413,8 @@ tdrop(void)
 	snprint(line, sizeof line, "drop %s", stray);
 	if(clwrite(&cl, Fctl, 0, line, &r) != Rwrite)
 		fail("a drop of a stray: %s", clerr(&r));
-	istrue("the stray copy is gone", statof(st, stray, &oi) < 0);
-	istrue("and it left no tombstone behind", statof(st, stray, &oi) < 0);
+	istrue("the stray copy is gone and left no tombstone",
+		statof(st, stray, &oi) < 0);
 
 	/* a second drop of the same id has nothing to remove */
 	clwrite(&cl, Fctl, 0, line, &r);
@@ -2427,7 +2479,7 @@ Out:
 	clstop(&cl);			/* the loop ends; the shutdown runs */
 	eqv("the store was closed once", freedseen, 1);
 	istrue("the pass had ended before the store closed", freedjobs == 1);
-	istrue("no job is left running", srvjobstart(ctx) < 0);
+	eqv("no job is left held", srvjobcount(ctx), 0);
 	/* the fid, and the snapshot it holds, are given back after that */
 	srvfree(ctx);
 	eqv("the store was not closed twice", freedseen, 1);
@@ -2465,6 +2517,14 @@ threadmain(int argc, char **argv)
 	tshutdown();
 
 	clwatchoff();
+	/*
+	 * Every case ran and every check in it was reached.  A case that
+	 * skips a block — a file that rendered empty, a fixture that
+	 * could not be built — reports one fewer check and no failure, so
+	 * the total is what says the suite is whole.  Update it when a
+	 * check is added or removed; it is not a target to reach.
+	 */
+	eqv("every case ran", checks, Nchecks);
 	if(fails > 0){
 		fprint(2, "srvenumtest: %d of %d checks failed\n", fails, checks);
 		threadexitsall("fail");

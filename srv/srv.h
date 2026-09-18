@@ -229,12 +229,14 @@ void	srvshutdown(Srvctx*);
 int	srvjobstart(Srvctx*);
 void	srvjobend(Srvctx*);
 int	srvstopping(Srvctx*);
+/* srvjobcount, below, is how many are held right now */
 
 /* what a caller and the tests read back */
 Store*	srvstore(Srvctx*);
 Cmap*	srvmap(Srvctx*);
 char*	srviid(Srvctx*);
 void	srvcount(Srvctx*, uvlong *pushed, uvlong *done);
+int	srvjobcount(Srvctx*);	/* jobs held: what the shutdown waits for */
 
 /*
  * store.md §13's -X shape, for this library's own points: inert until
