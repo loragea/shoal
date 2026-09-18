@@ -4978,16 +4978,16 @@ would be a wire change.
 
 *Policy, but read it before implementing anything.*
 
-Twenty-nine places where layer-a is silent, self-defeating, or
+Thirty-four places where layer-a is silent, self-defeating, or
 contradicted by the measurements or by the platform. Each entry
 states the tension, its resolution, and where the argument for it
 lives; nothing here repeats an argument made in a section above.
 Items 1–5, 8, 9, 11, 12, 13, 14 and 26 are amendments **made** to
-`docs/design/layer-a.md`; items 6, 7, 15, 17, 18–25 and 27–29 are
+`docs/design/layer-a.md`; items 6, 7, 15, 17, 18–25 and 27–34 are
 recorded here and not made there; items 10 and 16 are **proposals** rather
 than amendments, because they touch the wire.
 
-Items 18 to 29 are the object server's, and they describe what
+Items 18 to 34 are the object server's, and they describe what
 `srv/libshoalsrv.a` and `cmd/shoalsrv` **do today**. Several of them
 name a half that is not built; each says which.
 
@@ -5167,8 +5167,9 @@ name a half that is not built; each says which.
     refreshed; there are no peers, so nothing is replicated, no
     currency check is made and no stale mark is registered. *Not
     made:* layer-a is unchanged and this is a build that does not yet
-    conform to it. Items 19 to 23 are the consequences that are
-    visible on the wire, and `/repl`, `/rpc` and `/advert` are files
+    conform to it. Items 19 to 23, 30 and 31 are the consequences
+    that are visible on the wire, and `/repl`, `/rpc` and `/advert`
+    are files
     that exist, gate by role, and refuse with `shoalsrv: not built`
     (§14(29)).
 
@@ -5354,7 +5355,8 @@ name a half that is not built; each says which.
     neither row admits.
 
     A `role=client` create of a reserved id is §1.1's `reserved
-    name`; that one belongs to the create body, which is not built.
+    name`, which the create body answers after this gate has passed
+    the name (§14(30)).
 
 25. **An attach specifier missing a required attribute answers `bad
     aname`.** §2.1 makes `epoch` REQUIRED for `role=client` and
@@ -5426,9 +5428,8 @@ name a half that is not built; each says which.
     §2.1's matrix is applied — and the row's gate runs on them as it
     does on an open (§14(24)). `/obj` and `/meta` directory reads, `/repl`,
     `/rpc`, `/advert`, `/dirty`, `/stale`, `/tombs`, `/lost`,
-    `/jobs`, the object rows' open, read, write, create, remove and
-    wstat, and every ctl verb but `fence` and `verify` answer it
-    today. A caller sees it only where those gates pass: a
+    `/jobs` and every ctl verb but `fence` and `verify` answer it
+    today; the object rows' own operations no longer do (§14(30)). A caller sees it only where those gates pass: a
     `role=admin` create or write of an id that is not reserved never
     reaches it, because §2.1 makes that `permission denied`
     (§14(24)), and neither does anything F3 or the fence refuses.
@@ -5442,6 +5443,100 @@ name a half that is not built; each says which.
     of step 7 — what the request had staged is discarded either way —
     but only the queue's flush flag says a request was flushed, and
     the two answers keep that distinction where a client can see it.
+
+30. **The write path with no peers: one placement member acks alone,
+    and any other member is `degraded`.** layer-a §5.4 step 4 sends
+    the operation to every acker and step 5 resolves the ack set;
+    §14(18) leaves this build with no peer client, so nothing is ever
+    sent. *Not made; recorded here as what the server does:* `M` —
+    every member of `P(o)` other than this instance that has not
+    durably committed the update — is computed from the map and is
+    every other member there is. With `replicas=1`, or wherever
+    placement yields this instance alone, `M` is empty and step 5's
+    fast path commits: the write is acked on one disk, which is what
+    `mincopies=1` licenses. With any other member in `P(o)`, `k` is 1
+    and step 5a owes a durable stale mark at the monitor **before**
+    the primary may proceed; there is no monitor client, so that
+    round trip cannot be made and step 5a's own rule sends the
+    operation to step 7 — `degraded` (§6.5), whatever `mincopies`
+    says. A mirror whose peer is `up=no` therefore refuses every
+    client write, create, truncate and remove until the monitor
+    client exists, and reads are unaffected because they are not on
+    that path. T1 maps use `replicas=1` for that reason.
+
+    The four client mutations take that path; an operator's write of
+    a reserved `shoal.` id (§2.1) does not, being §8.6's rebuild path
+    and not §5.4's client write. §2.4's `create` is the one of the
+    four that stages nothing on its fid: the fid it is issued on is a
+    directory fid whose state is the enumeration's until the create
+    succeeds, so the key it chooses travels to the one engine call
+    that publishes it and no stage of it exists for step 7 to find.
+
+31. **No currency check is made, so `cur=` is 0 and `ready=` is
+    `no`.** layer-a §5.1 serves a `role=client` read only from an
+    instance that is (a) the serving primary, (b) past the handoff
+    grace and (c) current for the object, and §5.4 step 1 asks the
+    same of a write. A currency check is `op=meta` to every witness
+    (§5.2), which needs the peer client §14(18) says is not built.
+    *Not made:* clause (a) is computed from the static map and IS
+    enforced — a `role=client` operation on an object this instance
+    is not the serving primary for answers `not primary: <iid>`,
+    §2.6's own detail form — and clauses (b) and (c) are not
+    evaluated at all. The instance serves the copy it holds. So
+    `/meta`'s `cur=` reads 0 for every object, which is the value
+    §2.4 provides for ("or `0`"), and `ready=` reads `no`: an
+    instance that has completed no check is not ready under (c), and
+    the field is advisory. The two are the same fact said twice, and
+    both become live with the first peer client.
+
+    §5.2's own escape hatch is unreachable here for the same reason.
+    Clause 2 has an instance that does not hold the `E−1` map either
+    fetch `/maps/<E−1>` from the monitor or substitute every instance
+    with `status` ∈ {new,in,out}; clause 4 and the skip rule take no
+    substitute at all. That fetch is the **server's** obligation and
+    not the map library's — `mapwitness` (D22) answers on the maps it
+    is handed and substitutes for clause 2 alone — and with no
+    monitor client there is no fetch. Were a check made here it would
+    evaluate clause 4 on `P(o)` at `E` alone, which is what §5.2
+    prescribes when the `E−1` map is absent.
+
+32. **§2.4's "a write on a fid opened `OREAD`" cannot be answered
+    `bad open mode`.** §2.4 makes that refusal a MUST. `lib9p`
+    answers a `Twrite` on a fid whose `omode` is not `OWRITE` or
+    `ORDWR` itself, with its own `9P protocol botch`, before
+    `Srv.write` is reached (`/sys/src/lib9p/srv.c`, `swrite`), so no
+    server built on `lib9p` can hold this half of the rule. *Not
+    made:* the client is told the same thing in `lib9p`'s words. The
+    rest of §2.4's mode rules are the row's own and are answered as
+    §2.4 spells them: `ORCLOSE` and any mode that is not `OREAD`,
+    `OWRITE` or `ORDWR` with or without `OTRUNC` are `bad open
+    mode`, and `DMDIR`, `DMAPPEND`, `DMEXCL` and `DMTMP` on a create
+    are `bad create mode`. This is §14(28)'s shape: a rule 9P's own
+    layer answers first.
+
+33. **The per-fid stage bound shortens a client write rather than
+    refusing it.** §3.6 bounds one `/repl` fid to `stagemax` staged
+    grains and fails a chunk that would exceed it with `disk full`.
+    A client `Twrite` is not a chunk: §2.4 lets a server answer a
+    **short write** and requires clients to loop, and §5.5 makes that
+    how a primary bounds one operation to what fits one peer message.
+    *Not made; recorded here as this server's policy:* one accepted
+    write covers at most `stagemax` checksum blocks and is answered
+    short at that boundary, so the bound is back-pressure and not a
+    refusal. `disk full` on that bound is still reachable, and is
+    what a fid that already holds a stage is told — one stage to a
+    fid — which is the replication surface's case, where a chunk's
+    offset is the sender's and shortening would publish a hole.
+
+34. **A `Twstat` that sets a field other than `length` carries no
+    §2.6 string.** §2.4 requires every other settable field to be
+    rejected and names a condition for one of them alone —
+    `no rename` for `name`. Nothing in §2.6 fits `mode`, `mtime`,
+    `uid`, `gid` or `muid`. *Not made:* the rename is `no rename` and
+    the rest are refused with this server's own
+    `shoalsrv: only length may be set` (§14(29)). A `Twstat` that
+    sets nothing at all is 9P's own sync of a fid and succeeds,
+    changing nothing.
 
 ## 15. Alternatives considered
 
