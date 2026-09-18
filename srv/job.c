@@ -385,8 +385,12 @@ reclaim(Srvctx *c, Sjob *j)
 	ulong i, n;
 	int oidlen, rc;
 
-	if(c->map->tombdays == 0)
-		return;
+	/*
+	 * `tombdays' is the map's, layer-a §3.1, and 0 is a value it may
+	 * carry: the cutoff is then the present, and a tombstone written
+	 * before this second is reclaimable.  Nothing here special-cases
+	 * it — the comparison says what the attribute means.
+	 */
 	cutoff = time(0) - (vlong)c->map->tombdays*86400;
 	if((sn = srvsnapopen(c->store, Snaptomb, buf, sizeof buf)) == nil)
 		return;
