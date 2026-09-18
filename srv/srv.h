@@ -292,7 +292,14 @@ int	srvjobcount(Srvctx*);	/* jobs held: what the shutdown waits for */
  *		gave up with are read from /jobs, and /jobs lists a pass
  *		only while it is running or queued, so this is where a
  *		test reads what a pass finished with instead of racing the
- *		unlink for it.
+ *		unlink for it.  This is the one point whose park the
+ *		shutdown WAITS for rather than steps over: the wait for
+ *		the jobs is unbounded, because store.md §9 forbids closing
+ *		the store while a pass is still inside the engine, and the
+ *		shutdown clears the point before that wait.  So a program
+ *		that raises jobhold again after the shutdown has begun
+ *		parks a pass the shutdown then waits on for good; a
+ *		program clears it before it stops the server.
  *	slotfail
  *		the one point here that refuses rather than holds: n != 0
  *		makes a walk over this instance's own index treat its n-1'th
