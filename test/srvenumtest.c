@@ -1134,7 +1134,97 @@ Out:
 	free(m);
 }
 
-, as the wire carries them.
+/*
+ * A flushed directory OPEN holds nothing back.
+ *
+ * The open takes one of store.md §9's `objsnapmax' snapshots and
+ * installs it on the fid, and then leaves through srvqdone, which may
+ * answer `interrupted' (layer-a §5.4.1 step 7).  lib9p does not run
+ * its `ropen' on an error, so the fid never opens — and a snapshot
+ * left on it would be a slot no clunk this client makes gives back,
+ * which a client that flushes opens could spend the bound with.  Step
+ * 7 is where it goes back; `/status's `objsnapopen=' is where that
+ * shows, and the bound itself is the other half: with room for two,
+ * two opens must still find it after a flushed one.
+ */
+static void
+tdiropenflush(void)
+{
+	char buf[8192], val[64], *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall t, r;
+	char *w[1];
+	ushort ta, tf;
+
+	clstage = "diropenflush";
+	m = mkmap();
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4, 2)) == nil)	/* objsnapmax 2 */
+		return;
+	mkobj(srvstore(ctx), "alpha", nil, 0, 1);
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
+		fail("attach: %s", clerr(&r));
+		goto Out;
+	}
+	w[0] = "obj";
+	if(clwalk(&cl, Froot, Fdir, 1, w, &r) != Rwalk){
+		fail("walk to /obj: %s", clerr(&r));
+		goto Out;
+	}
+	srvhook(ctx, "objexit", 1);
+	memset(&t, 0, sizeof t);
+	t.type = Topen;
+	t.tag = ta = cltag(&cl);
+	t.fid = Fdir;
+	t.mode = OREAD;
+	clput(&cl, &t);
+	sleep(200);			/* it is now held at its exit */
+	memset(&t, 0, sizeof t);
+	t.type = Tflush;
+	t.tag = tf = cltag(&cl);
+	t.oldtag = ta;
+	clput(&cl, &t);
+	clget(&cl, &r);
+	checks++;
+	if(r.type != Rerror || r.tag != ta
+	|| strcmp(r.ename, "interrupted") != 0)
+		fail("a directory open flushed at its exit: type %d %s",
+			r.type, r.type == Rerror ? r.ename : "");
+	clget(&cl, &r);
+	checks++;
+	if(r.type != Rflush || r.tag != tf)
+		fail("the Rflush after it: type %d tag %ud", r.type, r.tag);
+	cltagfree(&cl, ta);
+	cltagfree(&cl, tf);
+	srvhook(ctx, "objexit", 0);
+
+	if(slurpfile(&cl, Ffile, "status", buf, sizeof buf) > 0)
+		eqs("a flushed open leaves no snapshot on the fid",
+			clfield(buf, "objsnapopen", val, sizeof val), "0");
+	else
+		fail("/status did not render after a flushed open");
+	/* and the bound is whole: two opens still find room */
+	if(clopenpath(&cl, Froot, Fdir2, 1, w, OREAD, &r) != Ropen)
+		fail("the first open after a flushed one: %s", clerr(&r));
+	w[0] = "meta";
+	if(clopenpath(&cl, Froot, Fdir3, 1, w, OREAD, &r) != Ropen)
+		fail("the second open after a flushed one: %s", clerr(&r));
+	clclunk(&cl, Fdir2, &r);
+	clclunk(&cl, Fdir3, &r);
+	clclunk(&cl, Fdir, &r);
+Out:
+	srvhook(ctx, "objexit", 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
+ * store.md §9's two refusals at the open, as the wire carries them.
  *
  * The bound's is layer-a §2.6's `disk full' with D20's detail, and it
  * goes out verbatim — err.c passes a §2.6 string through, and a
@@ -2187,6 +2277,7 @@ threadmain(int argc, char **argv)
 	tdir();
 	tdircursor();
 	tdirflush();
+	tdiropenflush();
 	tsnaprefuse();
 	tscrub();
 	tqueued();

@@ -245,14 +245,15 @@ void	srvcount(Srvctx*, uvlong *pushed, uvlong *done);
  *		one that is still queued at a known moment.
  *	objexit	n != 0 holds every queued request that has reached the
  *		other end of its handler — a ctl verb run on an oid's
- *		queue, and the /obj and /meta directory read on the
- *		reserved one — after its engine call and before the exit,
- *		so a test can flush a request whose work is done and
+ *		queue, and the /obj and /meta directory open and read on
+ *		the reserved one — after its engine call and before the
+ *		exit, so a test can flush a request whose work is done and
  *		require it to leave through srvqdone all the same.  For
- *		the directory read that is the only place a flush can land
- *		after the work: the cursor is committed by then, so this
- *		is the point that drives the rewind a flushed read leaves
- *		behind.
+ *		the two directory cells that is the only place a flush
+ *		can land after the work: the open's snapshot is taken and
+ *		installed by then, and the read's cursor is committed, so
+ *		this is the point that drives the give-back a flushed open
+ *		owes (enum.c) and the rewind a flushed read leaves behind.
  *	mapopen	1 offloads a Topen of /map to the reserved queue
  *		srvqpushany uses and holds it there until the point is
  *		cleared; 2 prepares that open for a queue and then

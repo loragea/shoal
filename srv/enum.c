@@ -60,6 +60,18 @@
  * able to give it back after the store has gone.  So this row's
  * auxclose stays nil, and the shutdown's sweep has nothing to do for
  * it.
+ *
+ * auxflush is filled, and is the open's own undoing: the Topen that
+ * takes the snapshot installs it here and then leaves through
+ * srvqdone, which MAY answer `interrupted' (layer-a §5.4.1 step 7).
+ * lib9p does not run its `ropen' on an error, so such a fid would
+ * hold a snapshot — one of store.md §9's objsnapmax slots — with
+ * omode still -1, and a client that flushes opens could drive other
+ * clients to `disk full'.  The hook gives it back at exactly that
+ * point, and only there: it discards nothing for a flushed READ,
+ * whose cursor and snapshot the next read needs (§14(33)), and
+ * nothing for a fid whose open completed, which lib9p has given an
+ * omode.
  */
 typedef struct Objdir Objdir;
 struct Objdir
@@ -93,6 +105,7 @@ static char Emoved[] = "object snapshot: the index moved";
 static char rendererr[ERRMAX];
 
 static void	objdirfree(void*);
+static void	objdirflush(Sfid*, Req*);
 
 static void
 hexof(char *out, uchar *p, int n)
@@ -232,6 +245,37 @@ objdirfree(void *a)
 }
 
 /*
+ * layer-a §5.4.1 step 7 on a fid of this row, which is where a flushed
+ * OPEN gives its snapshot back (above).  It runs under the fid's state
+ * lock, from srvqdone on the queue proc that is unwinding the open, so
+ * it does the give-back inline rather than through srvfidgive, which
+ * takes that lock itself.
+ *
+ * The two tests are what keep it to the open it is for.  A Tread is
+ * not it: a flushed read has advanced the cursor over a snapshot the
+ * next read continues from, and discarding it would turn a flush into
+ * a clunk.  An omode that is not -1 is not it either: lib9p sets the
+ * mode in `ropen', which it runs only after a successful open, so a
+ * fid that has one held this state before the flushed request arrived.
+ */
+static void
+objdirflush(Sfid *f, Req *r)			/* f->lk held */
+{
+	Objdir *d;
+
+	if(r->ifcall.type != Topen || r->fid == nil || r->fid->omode != -1)
+		return;
+	if(f->auxfree != objdirfree || (d = f->aux) == nil)
+		return;
+	f->aux = nil;
+	f->auxflush = nil;
+	f->auxclose = nil;
+	f->auxfree = nil;
+	f->auxclosed = 0;
+	objdirfree(d);
+}
+
+/*
  * The /obj and /meta open, on the reserved queue.  The fid gives back
  * whatever it was holding first: a fid holds one state, and taking
  * the snapshot without giving the old one back would lose its hooks
@@ -265,11 +309,12 @@ objdiropenq(Req *r)
 	srvfidgive(f);
 	qlock(&f->lk);
 	f->aux = d;
-	f->auxflush = nil;
+	f->auxflush = objdirflush;
 	f->auxclose = nil;
 	f->auxfree = objdirfree;
 	f->auxclosed = 0;
 	qunlock(&f->lk);
+	srvqexit(r);
 	srvqdone(r, nil);
 }
 

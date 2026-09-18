@@ -5544,7 +5544,12 @@ name a half that is not built; each says which.
     walk reports instead. `/jobs` carries `reclaimable=<n>`, the
     tombstones past conditions 2 and 3, which is the number of
     discards the replication surface will have to confirm; every
-    record stays where it is, and `/tombs` still lists it. When that
+    record stays where it is, and `/tombs` still lists it. The walk
+    reads the tombstones through a §9 snapshot of its own and holds it
+    for its whole run, so it occupies one of `objsnapmax`'s slots and
+    `/status`'s `objsnapopen=` counts it: an operator who watches that
+    field climb by one while a scrub is ending is watching the
+    reclaim, not a client. When that
     surface lands it adds condition 1 and §1.5's execution — `op=
     discard` to every confirming instance, this instance's own record
     removed last — and every discard then goes through that oid's
