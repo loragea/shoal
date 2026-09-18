@@ -15,8 +15,11 @@
  *
  * Every program built on this arms a watchdog proc before it starts:
  * a wedged server must fail the test, not hang `mk test'.  The
- * watchdog prints a FAIL line and kills the program by pid — never by
- * note group, which is the one the shell that ran mk put us in.
+ * watchdog prints a FAIL line and ends the whole program through
+ * threadexitsall (thread(2)), which is what takes the server proc and
+ * the pool's queue procs down with it: a note to one proc leaves those
+ * running for as long as the machine is up, and a note to the note
+ * group would reach the shell that ran mk.
  *
  * Include after <u.h>, <libc.h>, <libsec.h>, <fcall.h>, <thread.h>,
  * <9p.h>, "../lib/shoal.h" and "../srv/srv.h", and after the program's
@@ -57,31 +60,29 @@ static int clwdstop;
 static char *clstage = "starting";
 
 static void
-clwatch(void *v)
+clwatch(void*)
 {
-	int pid, i;
+	int i;
 
-	pid = (int)(uintptr)v;
 	for(i = 0; i < Clwatchms/50; i++){
 		if(clwdstop)
 			threadexits(nil);
 		sleep(50);
 	}
-	fprint(2, "FAIL: wedged at stage %s: killing the test\n", clstage);
-	postnote(PNPROC, pid, "kill");
-	threadexits("wedged");
+	fprint(2, "FAIL: wedged at stage %s: ending the test\n", clstage);
+	threadexitsall("wedged");
 }
 
 /*
  * Arm the watchdog.  It is a proc of the program's own, so it dies
  * with the program; clwatchoff lets a finished run retire it rather
- * than be killed by it.
+ * than end the program itself.
  */
 static void
 clwatchon(void)
 {
 	clwdstop = 0;
-	proccreate(clwatch, (void*)(uintptr)getpid(), 8192);
+	proccreate(clwatch, nil, 8192);
 }
 
 static void
