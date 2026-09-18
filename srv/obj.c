@@ -1320,11 +1320,17 @@ createdrop(Sfid *f)
  *
  * The claim is the other half of that meeting.  9P does not keep a
  * Tcreate and a Topen apart on one fid while the open is offloaded
- * (dat.h), so this cell refuses a fid that holds a listing's state or
- * that another create is moving, and claims the fid for itself before
- * its first engine call: the open cell tests the claim under the same
- * lock as it installs, so the two cells cannot both win, and the
- * claim is dropped again at whichever exit this cell takes.
+ * (dat.h), so this cell refuses a fid that an open has answered for,
+ * that holds a listing's state or that another create is moving, and
+ * claims the fid for itself before its first engine call: the open
+ * cell tests the claim under the same lock as it installs, so the two
+ * cells cannot both win, and the claim is dropped again at whichever
+ * exit this cell takes.  The three refusals are one test because none
+ * of them alone covers the fid a SECOND open is part-way through: its
+ * give-back has emptied the state slot and it has not installed its
+ * own snapshot yet, so `Fid.omode' — which lib9p wrote when the first
+ * open answered, and which is exactly the record that an open has won
+ * on this fid — is what the create sees there (dat.h).
  */
 static void
 objcreateq(Req *r)
@@ -1345,8 +1351,10 @@ objcreateq(Req *r)
 	c = r->srv->aux;
 	f = r->fid->aux;
 	qr = r->aux;
+	srvqhold(r, &c->claimhold);
 	qlock(&f->lk);
-	if(f->file != Qobj || f->moving || srvobjdirheld(f)){
+	if(f->file != Qobj || r->fid->omode != -1 || f->moving ||
+		srvobjdirheld(f)){
 		qunlock(&f->lk);
 		srvqdone(r, Ebotch);
 		return;

@@ -339,6 +339,13 @@ objdirfid(Sfid *f)				/* f->lk held */
  * test is caught by the second and the two cells cannot both win.
  * The give-back that ran in between costs nothing — the create that
  * raised the claim gives the same state back itself.
+ *
+ * What the give-back does leave is a window in which this fid holds
+ * nothing at all, which is a fid the create cell cannot tell from one
+ * no open has ever reached.  A create that lands there is refused by
+ * lib9p's own `Fid.omode', set when the first open on this fid
+ * answered and tested by that cell for exactly this window (obj.c);
+ * §13's `dirgive' point is the window, for a test that wants it.
  */
 static void
 objdiropenq(Req *r)
@@ -375,6 +382,7 @@ objdiropenq(Req *r)
 	d->sn = sn;
 	d->opener = r;
 	srvfidgive(f);
+	srvgivehold(r);
 	qlock(&f->lk);
 	if(!objdirfid(f)){
 		qunlock(&f->lk);

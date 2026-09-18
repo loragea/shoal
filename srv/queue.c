@@ -624,6 +624,33 @@ srvdirhold(Req *r, uvlong i)
 }
 
 /*
+ * The point inside the /obj and /meta open's give-back window (enum.c):
+ * the stretch in which the fid holds neither the state it held nor the
+ * one this open is about to install.  n != 0 parks the n-1'th open of
+ * this instance to reach that window, counting from 0, so a test can
+ * hold the window open under a SECOND open — the one the first open's
+ * answer has set Fid.omode for — and drive a create at the fid while
+ * it holds nothing.  Set to n+1, like slotfail; the count is the
+ * instance's own, and the hold ends on this queue's flush flag as the
+ * other request holds do.
+ */
+void
+srvgivehold(Req *r)
+{
+	Qreq *qr;
+	uvlong n, i;
+
+	if((qr = r->aux) == nil)
+		return;
+	qlock(&qr->ctx->holdlk);
+	n = qr->ctx->givehold;
+	i = qr->ctx->givecnt++;
+	qunlock(&qr->ctx->holdlk);
+	if(n != 0 && i == n-1)
+		qhold(qr->ctx, qr, &qr->ctx->givehold);
+}
+
+/*
  * The third point, at a queued walk's commit: the moment a walk that
  * moves its fid has given the old state back and is about to write
  * the new one.  It is where the service loop is concurrent with the
@@ -961,6 +988,10 @@ srvhook(Srvctx *c, char *name, uvlong n)
 		c->reclaimhold = n;
 	else if(strcmp(name, "dirhold") == 0)
 		c->dirhold = n;
+	else if(strcmp(name, "dirgive") == 0)
+		c->givehold = n;
+	else if(strcmp(name, "objclaim") == 0)
+		c->claimhold = n;
 	qunlock(&c->holdlk);
 }
 
@@ -994,6 +1025,8 @@ srvholdclear(Srvctx *c)
 	c->slotfail = 0;
 	c->reclaimhold = 0;
 	c->dirhold = 0;
+	c->givehold = 0;
+	c->claimhold = 0;
 	qunlock(&c->holdlk);
 }
 

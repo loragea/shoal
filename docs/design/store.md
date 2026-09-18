@@ -5715,25 +5715,33 @@ name a half that is not built; each says which.
     to the created object *and* install a listing's snapshot on it,
     and `lib9p` would then write the loser's `qid` and mode over the
     winner's. *Not made; recorded here as what the server does:* the
-    create cell refuses a fid that holds a listing's state or that
-    another create is moving, and the open cell refuses to install
-    over a fid a create has moved or is moving; both answer `lib9p`'s
-    own `9P protocol botch`, which is the string `lib9p` answers when
-    it *can* see the conflict, so a client cannot tell the two
-    refusals apart. The create claims the fid before its first engine
-    call and the open tests that claim under the lock it installs
-    under, so exactly one of the two wins whichever way the procs
-    interleave; an open that arrives while a create that then fails
-    holds the claim is refused too, which is the same client that
-    pipelined the pair. A create that succeeds gives the directory
-    fid's snapshot back through `srvfidgive` — the fid's own hooks,
-    run before the fid is the object's — and a create that fails
-    leaves the fid holding what it held.
+    create cell refuses a fid an open has already answered on, a fid
+    that holds a listing's state and a fid another create is moving,
+    and the open cell refuses to install over a fid a create has moved
+    or is moving; both answer `lib9p`'s own `9P protocol botch`, which
+    is the string `lib9p` answers when it *can* see the conflict, so a
+    client cannot tell the two refusals apart. The create claims the
+    fid before its first engine call and the open tests that claim
+    under the lock it installs under, so exactly one of the two wins
+    whichever way the procs interleave; an open that arrives while a
+    create that then fails holds the claim is refused too, which is
+    the same client that pipelined the pair. A create that succeeds
+    gives the directory fid's snapshot back through `srvfidgive` — the
+    fid's own hooks, run before the fid is the object's — and a create
+    that fails leaves the fid holding what it held.
 
     A second `Topen` is not that case and is not refused: it leaves
     the fid a directory fid, and the open cell's own give-back is
     what releases the first open's snapshot before the second's is
-    installed.
+    installed. That give-back is why the create reads `Fid.omode` too
+    and not the fid's state alone: it runs outside the fid's state
+    lock, so a second open leaves the fid holding nothing between the
+    give-back and the install, and a fid with an empty state slot and
+    no create moving it is what a create sees whether it arrived
+    first or third. `Fid.omode` is set once an open on that fid has
+    answered, so it is what tells the third message from the first —
+    `lib9p`'s own guard, read one message later than `lib9p` reads
+    it, which is what offloading the open costs this row.
 
 35. **No currency check is made, so `cur=` is 0 and `ready=` is
     `no`.** layer-a §5.1 serves a `role=client` read only from an

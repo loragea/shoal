@@ -2341,6 +2341,119 @@ tpipeopen(void)
 }
 
 /*
+ * A Tcreate that lands in a SECOND open's give-back window, which is
+ * the one stretch in which a /obj fid whose open has ANSWERED holds
+ * nothing at all.  Three messages pipelined on one fid: the first
+ * Topen installs a listing and answers, the second — legal, it passed
+ * lib9p's `Fid.omode' guard before the first answered — gives that
+ * listing back before installing its own, and the Tcreate's claim test
+ * runs in between, where the fid's state slot is as empty as on a fid
+ * no open has ever reached.  What tells the two apart is `Fid.omode',
+ * which lib9p wrote when the first open answered and which the create
+ * cell tests for exactly this window (srv/obj.c).
+ *
+ * The client's side is what the checks are: the open it was answered
+ * stays answered, the listing it opened is still there to read, and
+ * the object it never asked for was not created.  §13's two points
+ * hold the sequence still rather than race it — `dirgive' parks the
+ * second open in the window and `objclaim' parks the create at its
+ * claim test, so the create is released into a window that is being
+ * held open; `objhold' is what gets all three onto their queues before
+ * the first of them answers, which is what lib9p's own guard leaves
+ * room for and is the whole of how a client reaches this window.
+ */
+static void
+tgivecreate(void)
+{
+	char *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall t, r;
+	Objinfo oi;
+	char *w[1];
+	ushort to1, to2, tc;
+
+	clstage = "givecreate";
+	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4)) == nil)
+		return;
+	mkobj(srvstore(ctx), "alpha", nil, 0, 1);
+	w[0] = "obj";
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
+		fail("attach: %s", clerr(&r));
+		goto Out;
+	}
+	if(clwalk(&cl, Froot, Ffile, 1, w, &r) != Rwalk){
+		fail("walk /obj: %s", clerr(&r));
+		goto Out;
+	}
+	srvhook(ctx, "objhold", 1);	/* each of the three, as it arrives */
+	srvhook(ctx, "dirgive", 2);	/* the second open, in the window */
+	srvhook(ctx, "objclaim", 1);	/* the create, at its claim test */
+	memset(&t, 0, sizeof t);
+	t.type = Topen;
+	t.fid = Ffile;
+	t.mode = OREAD;
+	t.tag = to1 = cltag(&cl);
+	clput(&cl, &t);
+	sleep(200);			/* parked at its check point */
+	t.tag = to2 = cltag(&cl);
+	clput(&cl, &t);
+	sleep(200);			/* queued behind it, on the one proc */
+	memset(&t, 0, sizeof t);
+	t.type = Tcreate;
+	t.fid = Ffile;
+	t.name = "shoal.map.9";
+	t.perm = 0666;
+	t.mode = OWRITE;
+	t.tag = tc = cltag(&cl);
+	clput(&cl, &t);
+	sleep(200);			/* and this one on its own queue */
+	srvhook(ctx, "objhold", 0);
+
+	checks++;
+	if(clgettag(&cl, to1, &r) != Ropen){
+		fail("the first open of /obj: %s", clerr(&r));
+		goto Out;
+	}
+	cltagfree(&cl, to1);
+	sleep(200);			/* the second open is in the window */
+	srvhook(ctx, "objclaim", 0);
+	clgettag(&cl, tc, &r);
+	clerris("a create inside a second open's give-back", &r,
+		"9P protocol botch");
+	cltagfree(&cl, tc);
+	srvhook(ctx, "dirgive", 0);
+	checks++;
+	if(clgettag(&cl, to2, &r) != Ropen)
+		fail("the second open behind the create: %s", clerr(&r));
+	cltagfree(&cl, to2);
+
+	checks++;
+	if(objinfoof(srvstore(ctx), "shoal.map.9", &oi) >= 0)
+		fail("the refused create made its object anyway");
+	checks++;
+	if(clread(&cl, Ffile, 0, 4096, &r) != Rread)
+		fail("the listing the open was answered for: %s", clerr(&r));
+	else
+		eqv("the fid is the directory's still", dirents(r.data,
+			r.count), 1);
+	clclunk(&cl, Ffile, &r);
+	clclunk(&cl, Froot, &r);
+Out:
+	srvhook(ctx, "objhold", 0);
+	srvhook(ctx, "objclaim", 0);
+	srvhook(ctx, "dirgive", 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * The fid registry under a walk that moves a fid.  A walk that names
  * an object runs on that object's queue while attaches and clones run
  * on the service loop, and both reach the same list: the walk gives
@@ -3860,6 +3973,7 @@ threadmain(int argc, char **argv)
 	tcreategive();
 	tdircreate();
 	tpipeopen();
+	tgivecreate();
 	tfidwalk();
 	tflush();
 	tstep7fid();
