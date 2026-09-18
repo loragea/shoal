@@ -372,6 +372,7 @@ struct Srvctx
 	uvlong	mapopen;	/* srvhook("mapopen") */
 	uvlong	walkhold;	/* srvhook("walkhold") */
 	uvlong	anyexit;	/* srvhook("anyexit") */
+	uvlong	endhold;	/* srvendpoint: ms held in srvqended */
 
 	/*
 	 * The background jobs of §9's quiesce: work that is inside the
@@ -381,6 +382,8 @@ struct Srvctx
 	Lock	joblk;
 	int	njob;
 	int	stopping;	/* the shutdown has begun: no new jobs */
+	int	served;		/* a service loop was started over this context */
+	int	released;	/* lib9p has let go of the Srv (Srv.free) */
 
 	int	closed;		/* the store has been closed */
 };

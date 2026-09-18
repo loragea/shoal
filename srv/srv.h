@@ -152,9 +152,13 @@ struct Srvcfg
  * infd/outfd and calls srvrun.  srvrun returns when the connection
  * closes, by which time the shutdown sequence below has run.
  *
- * srvfree releases what is left after the loop has ended.  It does NOT
- * close the store — the shutdown sequence did — and it does not close
- * the device, which stays the caller's.
+ * srvfree releases what is left after the loop has ended.  It runs the
+ * shutdown if the caller has not, then waits for lib9p to let go of
+ * the service — the loop returning is not that moment, since lib9p
+ * frees its fid and request pools after it, and those run this
+ * library's destroy hooks over the context.  It does NOT close the
+ * store — the shutdown sequence did — and it does not close the
+ * device, which stays the caller's.
  *
  * A Srvctx serves ONE service loop.  The loop ending is the shutdown's
  * trigger and the shutdown closes the store, so a second srvrun over
@@ -289,6 +293,19 @@ void	srvhook(Srvctx*, char *name, uvlong n);
  * program's rather than one context's: set it, drive it, clear it.
  */
 void	srvcellpoint(Srvctx*, int on);
+
+/*
+ * The point over the gap between the two: a pushed request is counted
+ * complete from lib9p's closereq, which runs inside respond and before
+ * respond releases the service, so the drain can converge and the loop
+ * end while a queue proc is still inside lib9p.  Set to a count of
+ * milliseconds, it holds each completion there for that long, which is
+ * how a test drives the window a caller freeing the context at that
+ * moment falls into.  Like srvauxpoint and unlike the srvhook holds,
+ * the shutdown does not clear it: what it is about happens after the
+ * shutdown has run.
+ */
+void	srvendpoint(Srvctx*, uvlong ms);
 
 void	srvauxpoint(Srvctx*, int on);
 void	srvauxcount(Srvctx*, uvlong *flushed, uvlong *closed, uvlong *freed);

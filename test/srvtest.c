@@ -2739,6 +2739,89 @@ tshutdown(void)
 	free(m);
 }
 
+/*
+ * srvrun can return while lib9p is still using the context.  A pushed
+ * request is counted complete by srvdestroyreq, which lib9p runs from
+ * closereq inside respond and therefore BEFORE respond releases the
+ * service: the drain converges, the service loop ends and srvrun
+ * returns with that reference still outstanding.  When it is finally
+ * released, lib9p frees its fid pool, which runs this library's
+ * destroy hook over the server's own fid registry — so a caller that
+ * freed the context when srvrun returned would have it walk a registry
+ * that is no longer there.  The point widens the gap; what the case
+ * asks is that srvfree does not return inside it.
+ */
+static Srvctx *endctx;
+static int endfreed;
+
+static void
+endfreeproc(void*)
+{
+	srvfree(endctx);
+	endfreed = 1;
+}
+
+static void
+tendwait(void)
+{
+	char *m;
+	uchar data[1024];
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall r;
+	char *w[1];
+	int i;
+
+	clstage = "endwait";
+	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
+	d = newdisk();
+	if((ctx = startsrv(d, m, 1)) == nil)
+		return;
+	memset(data, 0x55, sizeof data);
+	mkobj(srvstore(ctx), "alpha", data, sizeof data, 1);
+
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach)
+		fail("attach: %s", clerr(&r));
+	w[0] = "ctl";
+	if(clopenpath(&cl, Froot, Fctl, 1, w, OWRITE, &r) != Ropen){
+		fail("open /ctl: %s", clerr(&r));
+		clstop(&cl);
+		srvfree(ctx);
+		devclose(d);
+		free(m);
+		return;
+	}
+
+	srvendpoint(ctx, 1500);
+	clwrite(&cl, Fctl, 0, "verify alpha", &r);
+	checks++;
+	if(r.type != Rwrite)
+		fail("verify before the hangup: %s", clerr(&r));
+
+	/*
+	 * Its queue proc is now between the completion count and lib9p's
+	 * release, so the drain converges and the loop ends under it.
+	 */
+	clhangup(&cl);
+	istrue("the service loop ends while a queue proc is still in lib9p",
+		clwaitend(&cl, 10000));
+	clclose(&cl);
+
+	endctx = ctx;
+	endfreed = 0;
+	if(tspawn(endfreeproc, nil) < 0)
+		fail("tspawn: %r");
+	sleep(400);
+	istrue("srvfree waits for lib9p to let go of the context", !endfreed);
+	for(i = 0; i < 500 && !endfreed; i++)
+		sleep(20);
+	istrue("and returns once it has", endfreed);
+	devclose(d);
+	free(m);
+}
+
 void
 threadmain(int argc, char **argv)
 {
@@ -2771,6 +2854,7 @@ threadmain(int argc, char **argv)
 	terrors();
 	tjobs();
 	tshutdown();
+	tendwait();
 
 	clwatchoff();
 	if(fails > 0){

@@ -21,6 +21,8 @@
  * trigger.
  */
 
+static void	srvserved(Srvctx*);
+
 static void
 hexof(char *out, uchar *p, int n)
 {
@@ -77,6 +79,24 @@ static void
 srvend(Srv *s)
 {
 	srvshutdown(s->aux);
+}
+
+/*
+ * Srv.free, which lib9p calls at the very end of its own srvclose —
+ * after the fid pool and the request pool have been freed, and so
+ * after the last srvdestroyfid and srvdestroyreq.  It is the only
+ * moment at which this context is certainly no longer in use, which is
+ * what srvfree waits for.
+ */
+static void
+srvfreed(Srv *s)
+{
+	Srvctx *c;
+
+	c = s->aux;
+	lock(&c->joblk);
+	c->released = 1;
+	unlock(&c->joblk);
 }
 
 Srvctx*
@@ -261,6 +281,7 @@ srvnew(Srvcfg *cfg)
 	c->srv.destroyfid = srvdestroyfid;
 	c->srv.destroyreq = srvdestroyreq;
 	c->srv.end = srvend;
+	c->srv.free = srvfreed;
 	return c;
 
 Fail:
@@ -286,12 +307,14 @@ srvrun(Srvctx *c, int infd, int outfd)
 {
 	c->srv.infd = infd;
 	c->srv.outfd = outfd;
+	srvserved(c);
 	threadsrv(&c->srv);
 }
 
 void
 srvpost(Srvctx *c, char *name)
 {
+	srvserved(c);
 	threadpostmountsrv(&c->srv, name, nil, 0);
 }
 
@@ -413,12 +436,51 @@ srvshutdown(Srvctx *c)
 	}
 }
 
+static void
+srvserved(Srvctx *c)
+{
+	lock(&c->joblk);
+	c->served = 1;
+	unlock(&c->joblk);
+}
+
+/*
+ * Wait for lib9p to let go of the Srv this context begins with.  The
+ * shutdown above is not that moment: it runs from Srv.end, which lib9p
+ * calls while the loop's own reference is still held, and a queue proc
+ * that has just answered a request is counted complete by
+ * srvdestroyreq — from closereq, inside respond — before respond
+ * releases the Srv.  So the drain converges, the loop ends and srvrun
+ * returns with that reference still outstanding; the release then
+ * takes lib9p through freefidpool, which runs srvdestroyfid over the
+ * server's own fid registry.  Freeing the context before that walks a
+ * registry whose lock is no longer there.
+ *
+ * Srv.free is lib9p's last act, so `released' is the observable; a
+ * context that never served waits for nothing.
+ */
+static void
+srvreleased(Srvctx *c)
+{
+	int n;
+
+	for(;;){
+		lock(&c->joblk);
+		n = !c->served || c->released;
+		unlock(&c->joblk);
+		if(n)
+			return;
+		sleep(5);
+	}
+}
+
 void
 srvfree(Srvctx *c)
 {
 	if(c == nil)
 		return;
 	srvshutdown(c);
+	srvreleased(c);
 	mapfree(c->map);
 	free(c->maptext);
 	free(c);

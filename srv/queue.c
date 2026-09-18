@@ -125,11 +125,32 @@ void
 srvqended(Qreq *qr)
 {
 	Srvctx *c;
+	uvlong ms;
 
 	c = qr->ctx;
 	lock(&c->cntlk);
 	c->ndone++;
 	unlock(&c->cntlk);
+	/*
+	 * The §13 point that widens the gap this count opens: the count is
+	 * taken from lib9p's closereq, inside respond and before respond's
+	 * own trailing release of the Srv, so the drain can converge and
+	 * the service loop end while this proc is still inside lib9p.
+	 * Nothing of the context is touched while it waits.
+	 */
+	qlock(&c->holdlk);
+	ms = c->endhold;
+	qunlock(&c->holdlk);
+	if(ms > 0)
+		sleep(ms);
+}
+
+void
+srvendpoint(Srvctx *c, uvlong ms)
+{
+	qlock(&c->holdlk);
+	c->endhold = ms;
+	qunlock(&c->holdlk);
 }
 
 /*
