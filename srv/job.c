@@ -707,9 +707,13 @@ reclaimgo(Srvctx *c, int bytimer)
  * needs, floored so that a map retaining nothing does not spin
  * (Reclaimminms above).  It is read fresh each slice, so a test that
  * sets the knob after srvnew shortens the wait it is already in.
+ *
+ * It is public for the same reason srvreclaimms is (srv.h): the floor
+ * and the period are minutes and days, so what a test can assert about
+ * them is the number itself and not a tick it waited for.
  */
-static uvlong
-reclaimperiod(Srvctx *c)
+uvlong
+srvreclaimperiod(Srvctx *c)
 {
 	uvlong ms;
 
@@ -746,7 +750,7 @@ reclaimtimer(void *a)
 
 	c = a;
 	for(;;){
-		for(t = 0; t < reclaimperiod(c); t += Reclaimslicems){
+		for(t = 0; t < srvreclaimperiod(c); t += Reclaimslicems){
 			if(srvstopping(c)){
 				lock(&c->joblk);
 				c->reclaimup = 0;

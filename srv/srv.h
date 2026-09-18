@@ -519,8 +519,15 @@ void	srvendpoint(Srvctx*, uvlong ms);
  * shutdown does not clear it: it holds nothing up, since a pass the
  * timer starts once the shutdown has begun is refused the job it needs
  * and the timer proc itself ends with the shutdown either way.
+ *
+ * srvreclaimperiod is the period in force, which is what the knob
+ * overrides: the map's `tombdays'/2, or the floor under it for a map
+ * that retains nothing, or the knob's own value.  Half a day is longer
+ * than a test can wait, so the floor is asserted by reading it rather
+ * than by watching for a tick.
  */
 void	srvreclaimms(Srvctx*, uvlong ms);
+uvlong	srvreclaimperiod(Srvctx*);
 
 /*
  * The stage point, over the per-fid staged operation layer-a §5.4 step

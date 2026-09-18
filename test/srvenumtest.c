@@ -91,7 +91,7 @@ enum
 	 * threadmain.  Every check this file makes is unconditional once
 	 * its case is entered, so the number is fixed.
 	 */
-	Nchecks	= 267,
+	Nchecks	= 270,
 
 	/* fids the cases use */
 	Froot	= 1,
@@ -197,13 +197,14 @@ tspawn(void (*fn)(void*), void *a)
 /*
  * D16's observable: the engine's last act before the Store's memory
  * goes.  What the shutdown's waits are worth is read here and nowhere
- * else — the hook runs inside storeclose, so a timer still reading the
- * context at this point is one that outlived the store its passes
- * walk, and the context itself a moment later.
+ * else — the hook runs inside storeclose, so a job still held or a
+ * timer still reading the context at this point is one that outlived
+ * the store it walks, and the context itself a moment later.
  */
 static int freedseen;
 static Srvctx *freedctx;
 static int freedjobs;
+static int freedheld;
 static int freedlive;
 
 static void
@@ -211,6 +212,7 @@ onfreed(void*)
 {
 	freedseen++;
 	freedjobs = freedctx != nil && srvstopping(freedctx);
+	freedheld = freedctx != nil ? srvjobcount(freedctx) : -1;
 	freedlive = freedctx != nil ? srvreclaimlive(freedctx) : -1;
 }
 
@@ -2230,8 +2232,18 @@ treclaimtimer(void)
 	if(!adminctl(&cl, "role=admin"))
 		goto Out;
 	istrue("no pass runs before the timer fires", !jobrunning(&cl));
+	/*
+	 * The period this map gets is the FLOOR (store.md §14(39)):
+	 * `tombdays=0' halves to no period at all, and a timer running on
+	 * that would walk the snapshot for as long as the instance
+	 * served.  Twelve hours is longer than a test can wait for, so it
+	 * is read rather than waited out.
+	 */
+	eqv("a map that retains nothing gets the floor, not no period",
+		srvreclaimperiod(ctx), 12*3600*1000);
 	srvhook(ctx, "jobhold", 1);
 	srvreclaimms(ctx, 50);
+	eqv("and the knob is what overrides it", srvreclaimperiod(ctx), 50);
 	if(jobparked(&cl, "reclaimable", val, sizeof val) == nil)
 		fail("no pass reached the hold: the timer never fired");
 	else
@@ -2292,6 +2304,9 @@ treclaimctl(void)
 	clstart(&cl, ctx, Clmsize);
 	if(!adminctl(&cl, "role=admin"))
 		goto Out;
+
+	eqv("a map's own period is half its tombdays",
+		srvreclaimperiod(ctx), (uvlong)7*86400000/2);
 
 	/* the form with neither word starts nothing and succeeds */
 	if(clwrite(&cl, Fctl, 0, "reclaim", &r) != Rwrite)
@@ -2480,7 +2495,7 @@ treclaimdown(void)
 	m = mkmapd(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid, 0);
 	d = newdisk();
 	freedseen = 0;
-	freedjobs = -1;
+	freedheld = -1;
 	if((ctx = startsrv(d, m, 4, 0)) == nil)
 		return;
 	st = srvstore(ctx);
@@ -2504,8 +2519,7 @@ treclaimdown(void)
 Out:
 	clstop(&cl);			/* the loop ends; the shutdown runs */
 	eqv("the store was closed once", freedseen, 1);
-	istrue("the parked walk ended before the store closed",
-		freedjobs == 1);
+	eqv("the parked walk had given its job back by then", freedheld, 0);
 	eqv("no job is left held", srvjobcount(ctx), 0);
 	srvfree(ctx);
 	devclose(d);
