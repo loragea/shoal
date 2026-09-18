@@ -93,6 +93,16 @@ qrun(Req *r)
 	Qreq *qr;
 
 	qr = r->aux;
+	/*
+	 * Marked before the handler and under the lock srvqflush reads it
+	 * under, so that a Tflush either finds the request still waiting
+	 * — and performs step 7 itself, since lib9p will answer such a
+	 * request without this handler ever running — or finds it started
+	 * and leaves step 7 to srvqdone.
+	 */
+	qlock(&qr->lk);
+	qr->running = 1;
+	qunlock(&qr->lk);
 	qr->f(r);
 	/*
 	 * Nothing of the request is touched after the handler: it has
@@ -266,6 +276,20 @@ srvqpush(Srvctx *c, uchar *oid, int oidlen, Req *r, void (*f)(Req*))
  * answer it `interrupted' behind the back of the loop that is
  * answering it.  The loop is this proc, so the two cannot really
  * overlap; `pushed' says so rather than leaving it to be re-derived.
+ *
+ * Step 7 is performed here for a request that is still WAITING on the
+ * queue, and only for one.  layer-a §5.4.1 makes the whole of step 7 a
+ * MUST on flush however far the request had got, and a fid's stage
+ * spans several Twrites, so a Tflush of the next queued write on a
+ * staging fid must still discard that fid's stage; but reqqueueflush
+ * unlinks such a request and answers it itself, so its handler —
+ * and with it srvqdone, the one exit that performs step 7 — never
+ * runs.  `running' is what tells the two apart, and `step7' is what
+ * keeps them from both doing it: a request whose handler has started
+ * leaves through srvqdone, which does it there with nothing else
+ * touching the fid.  The fid is live either way — sflush holds a
+ * reference to the flushed Req, which holds one to its Fid
+ * (/sys/src/lib9p/req.c, fid.c) — so r->oldreq->fid is safe to read.
  */
 void
 srvqflush(Req *r)
@@ -278,8 +302,13 @@ srvqflush(Req *r)
 	}
 	qhold(qr->ctx, nil, &qr->ctx->flushhold);
 	qlock(&qr->lk);
-	if(!qr->done && qr->pushed)
+	if(!qr->done && qr->pushed){
+		if(!qr->running && !qr->step7){
+			qr->step7 = 1;
+			srvstep7(r->oldreq);
+		}
 		reqqueueflush(qr->q, r->oldreq);
+	}
 	qunlock(&qr->lk);
 	respond(r, nil);
 }
@@ -432,6 +461,10 @@ srvstep7(Req *r)
  * precede the Rflush; 9P has the client discard the reply to a request
  * it flushed (§5.4.1, store.md §14(14)).
  *
+ * A request flushed before its handler started has had step 7 run by
+ * srvqflush, which is the only place it can run before lib9p's own
+ * answer; the Qreq records that, so this exit does not repeat it.
+ *
  * store.md §7 gives a device `interrupted' the same unwind: "either
  * one unwinds into the whole of step 7".  A note aborts a system call
  * whether or not a Tflush sent it, so a handler can be told
@@ -447,7 +480,7 @@ srvqdone(Req *r, char *err)
 {
 	char buf[ERRMAX];
 	Qreq *qr;
-	int flushed;
+	int flushed, did7;
 
 	if((qr = r->aux) != nil){
 		/*
@@ -468,9 +501,12 @@ srvqdone(Req *r, char *err)
 		qlock(&qr->lk);
 		qr->done = 1;
 		flushed = qr->pushed && qr->q->flush != 0;
+		did7 = qr->step7;
+		qr->step7 = 1;
 		qunlock(&qr->lk);
 		if(flushed || srvintr(err)){
-			srvstep7(r);
+			if(!did7)
+				srvstep7(r);
 			respond(r, flushed ? Einterrupted : Edevintr);
 			return;
 		}

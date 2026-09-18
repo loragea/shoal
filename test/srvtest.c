@@ -1936,9 +1936,12 @@ Out:
  * which deterministic.
  *
  * Step 7 is observed through the fid-state point's flush hook, which
- * is the cell the object-I/O surface will discard its stage from: it
- * runs for the request that was running and not for the one that was
- * never started, and never after the reply.
+ * is the cell the object-I/O surface will discard its stage from.
+ * §5.4.1 makes the whole of step 7 a MUST however far the flushed
+ * request had got — a fid's stage spans several Twrites, so a Tflush
+ * of the next queued write on a staging fid must still discard that
+ * fid's stage — so it runs exactly once for each of the two halves,
+ * and never after the reply.
  */
 static void
 tflush(void)
@@ -2047,7 +2050,8 @@ tflush(void)
 		fail("the held request completes: type %d tag %ud", r.type,
 			r.tag);
 	srvauxcount(ctx, &n7, nil, nil);
-	eqv("a request that never started runs no step 7", n7, 0);
+	eqv("a request flushed while queued runs step 7", n7, 1);
+	eqv("and it ran before lib9p's own answer", srvauxlate(ctx), 0);
 
 	/* a RUNNING request, flushed */
 	srvhook(ctx, "objhold", 1);
@@ -2078,7 +2082,7 @@ tflush(void)
 		fail("the Rflush after the running one: type %d tag %ud",
 			r.type, r.tag);
 	srvauxcount(ctx, &n7, nil, nil);
-	eqv("a flushed running request runs step 7 once", n7, 1);
+	eqv("a flushed running request runs step 7 once", n7, 2);
 	eqv("step 7 ran before the reply", srvauxlate(ctx), 0);
 	srvhook(ctx, "objhold", 0);
 
@@ -2115,7 +2119,7 @@ tflush(void)
 		fail("the Rflush after the exit-flushed one: type %d tag %ud",
 			r.type, r.tag);
 	srvauxcount(ctx, &n7, nil, nil);
-	eqv("a request flushed at its exit runs step 7", n7, 2);
+	eqv("a request flushed at its exit runs step 7", n7, 3);
 
 	memset(&t, 0, sizeof t);
 	t.type = Twrite;
@@ -2143,7 +2147,7 @@ tflush(void)
 		fail("the Rflush after the error exit: type %d tag %ud",
 			r.type, r.tag);
 	srvauxcount(ctx, &n7, nil, nil);
-	eqv("a request flushed at its error exit runs step 7", n7, 3);
+	eqv("a request flushed at its error exit runs step 7", n7, 4);
 	eqv("no step 7 ran after its reply", srvauxlate(ctx), 0);
 	srvhook(ctx, "objexit", 0);
 
