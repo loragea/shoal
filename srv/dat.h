@@ -157,32 +157,36 @@ enum
  * order under the registry lock, which is where the shutdown's own
  * sweep runs them, so the two cannot both close one state.
  *
- * The rows this file leaves unnamed above, by the same rule.  The
- * /meta directory row's open and read cells — and the aux a fid of
- * that row carries while it is a directory fid, which is that read's
- * snapshot — are the enumeration's too: it lists the same objects
- * under a second name.  The five status files —
- * /dirty, /stale, /tombs, /lost and /jobs — are render-at-open text
- * like /status and /map, and each belongs with the state it reports:
- * /dirty and /stale with the dirty set and the stale marks (layer-a
- * §7.1), /tombs with the enumeration, since it is that listing over
- * tombstones (§7.2), /lost with scrub and repair (§7.5), /jobs with
- * whatever starts background passes.  /repl and /rpc are the peer
- * channels: their read and write cells, and the per-fid state a
- * multi-request op stages, belong with the replication surface
- * (§5.5, §5.6), and /advert's read cell — or its render cell, if that
- * advertisement is composed once at open — is that surface's bulk
- * advertisement.  The two channels' gate is already filled, because
- * the fence is this file's (tree.c's chgate); /advert has none,
- * because F1's list names /repl and /rpc alone.
+ * The /meta directory row's open and read cells — and the aux a fid
+ * of that row carries while it is a directory fid — are the
+ * enumeration's too, and are the same two cells: it lists the same
+ * objects under a second name.  Both rows are built (enum.c).
+ *
+ * The six files that report state — /dirty, /stale, /tombs, /lost,
+ * /advert and /jobs — are render-at-open text like /status and /map
+ * and are built: /dirty, /stale and /lost in status.c beside the
+ * other two, /tombs and /advert in enum.c, because each is that same
+ * index snapshot rendered over a different set of states (layer-a
+ * §7.2's line grammar), and /jobs in job.c, which is what starts the
+ * background passes it lists.  The four whose render reaches the
+ * engine — /dirty, /lost, /tombs and /advert — fill an open cell that
+ * puts the render on the reserved queue; /stale reads the adopted map
+ * and /jobs the job list, so both stay on the service loop.
+ *
+ * /repl and /rpc are the peer channels: their read and write cells,
+ * and the per-fid state a multi-request op stages, belong with the
+ * replication surface (§5.5, §5.6) and are not built.  Their gate is
+ * already filled, because the fence is this file's (tree.c's chgate);
+ * /advert has none, because F1's list names /repl and /rpc alone.
  *
  * The srvctls table below says the same for the verbs: a verb is
  * built by filling its row's fn or qfn, and the body of work that
- * verb names owns that cell — `pull', `push', `reconcile', `advert',
- * `drop' and `forget' with replication, `verify' with object I/O,
- * `scrub' with the scrub pass, and `refresh', `register' and
- * `newmonid' with the monitor client.  `fence' is this file's and is
- * built.
+ * verb names owns that cell.  `fence' and `newmonid' are ctl.c's and
+ * `drop' is too, under the oid's queue; `verify' is object I/O's and
+ * is built; `scrub' and `forget' are job.c's, and each starts a pass
+ * /jobs lists.  `pull', `push', `reconcile', `advert', `refresh' and
+ * `register' wait on the peer and monitor clients, so their rows hold
+ * ctlnotbuilt and gate without a body (store.md §14(18)).
  */
 struct Sfile
 {

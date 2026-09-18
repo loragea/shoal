@@ -95,6 +95,14 @@ char*	srvstatustext(Srvctx*, Sfid*, Text*);
 char*	srvmaptext(Srvctx*, Sfid*, Text*);
 char*	srvemptytext(Srvctx*, Sfid*, Text*);
 
+/* enum.c */
+Objsnap* srvsnapopen(Store*, int kinds, char *buf, int nbuf);
+void	srvopenq(Req*);
+void	srvobjdiropen(Req*);
+void	srvobjdirread(Req*);
+char*	srvtombstext(Srvctx*, Sfid*, Text*);
+char*	srvadverttext(Srvctx*, Sfid*, Text*);
+
 /* ctl.c */
 void	srvctlwrite(Req*);
 int	srvfencekind(Srvctx*);

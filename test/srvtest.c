@@ -525,21 +525,21 @@ tmatrix(void)
 		{"map",	  {"permission denied", "permission denied", nil},
 			  {nil, nil, nil}},
 		{"obj",	  {nil, nil, nil},
-			  {"permission denied", "permission denied", "shoalsrv: not built"}},
+			  {"permission denied", "permission denied", nil}},
 		{"meta",  {nil, nil, nil},
-			  {"permission denied", "permission denied", "shoalsrv: not built"}},
+			  {"permission denied", "permission denied", nil}},
 		{"repl",  {"permission denied", nil, "permission denied"},
 			  {nil, "shoalsrv: not built", nil}},
 		{"rpc",	  {"permission denied", nil, nil},
 			  {nil, "shoalsrv: not built", "shoalsrv: not built"}},
 		{"advert",{"permission denied", nil, "permission denied"},
-			  {nil, "shoalsrv: not built", nil}},
+			  {nil, nil, nil}},
 		{"dirty", {"permission denied", "permission denied", nil},
 			  {nil, nil, "shoalsrv: not built"}},
 		{"stale", {"permission denied", "permission denied", nil},
 			  {nil, nil, "shoalsrv: not built"}},
 		{"tombs", {"permission denied", "permission denied", nil},
-			  {nil, nil, "shoalsrv: not built"}},
+			  {nil, nil, nil}},
 		{"lost",  {"permission denied", "permission denied", nil},
 			  {nil, nil, "shoalsrv: not built"}},
 		{"jobs",  {"permission denied", "permission denied", nil},
@@ -1517,10 +1517,18 @@ tobjgate(void)
 	clclunk(&cl, Ffile, &r);
 	if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk)
 		fail("walk /obj while fenced: %s", clerr(&r));
-	/* a listing is not a read of an object, so F1 does not fence it */
-	clopen(&cl, Ffile, OREAD, &r);
-	clerris("fenced admin open of the /obj directory", &r,
-		"shoalsrv: not built");
+	/*
+	 * A listing is not a read of an object, so F1 does not fence it.
+	 * It gets a fid of its own because the open succeeds, and 9P has
+	 * no Tcreate on a fid that is already open.
+	 */
+	if(clwalk1(&cl, Froot, Ffile2, "obj", &r) != Rwalk)
+		fail("walk /obj for a listing while fenced: %s", clerr(&r));
+	clopen(&cl, Ffile2, OREAD, &r);
+	checks++;
+	if(r.type != Ropen)
+		fail("fenced admin open of the /obj directory: %s", clerr(&r));
+	clclunk(&cl, Ffile2, &r);
 	clcreate(&cl, Ffile, "shoal.map.9", 0666, OWRITE, &r);
 	clerris("fenced admin create of a reserved id", &r, "fenced");
 	/*
@@ -1537,8 +1545,9 @@ tobjgate(void)
 	if(clwalk1(&cl, Froot, Ffile, "meta", &r) != Rwalk)
 		fail("walk /meta while fenced: %s", clerr(&r));
 	clopen(&cl, Ffile, OREAD, &r);
-	clerris("fenced admin open of the /meta directory", &r,
-		"shoalsrv: not built");
+	checks++;
+	if(r.type != Ropen)
+		fail("fenced admin open of the /meta directory: %s", clerr(&r));
 	clclunk(&cl, Ffile, &r);
 	if(clwrite(&cl, Fctl, 0, "fence off", &r) != Rwrite)
 		fail("fence off: %s", clerr(&r));
