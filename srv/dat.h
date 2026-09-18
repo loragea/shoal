@@ -420,7 +420,8 @@ struct Sjob
 	char	*verb;		/* the ctl verb that started it */
 	void	(*fn)(Sjob*);
 	int	running;	/* the proc has started: `queued' until then */
-	uvlong	done, total;	/* index slots walked, and to walk */
+	uvlong	done;		/* index slots walked */
+	uvlong	total;		/* index slots to walk */
 	uvlong	bad;		/* objects the pass found mismatching */
 	uvlong	reclaimable;	/* tombstones past layer-a §1.5's local two */
 	uvlong	dropped;	/* dirty records `forget' discarded */

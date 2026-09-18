@@ -5478,6 +5478,20 @@ name a half that is not built; each says which.
     it already set — so the coarse half of §7.1's meaning is in force
     for every peer before the verb runs.
 
+    Being a pass gives `forget` no bound of its own: `scrub` is kept
+    to one pass per index by a flag, but `forget <iid>` names a peer,
+    and a client could write it once per id it can spell — each write
+    a proc holding a dirty snapshot and one of the jobs the shutdown
+    waits on. *Not made:* **twelve passes may run at once**, counted
+    over both verbs, and a verb that would start a thirteenth is
+    refused with the local `shoalsrv: too many jobs` rather than
+    accepted. §2.5's error column for these verbs names `fenced` and
+    `bad ctl` and neither covers this, so the refusal is a local
+    string (§14(29)); the number is implementation policy. `/jobs`
+    renders **every** job on the list, which §2.2's "one line per
+    running or queued background job" requires and which the cap
+    bounds the cost of.
+
 31. **The scrub's pace is this server's, and it carries the reclaim
     walk (§8, §9; layer-a §2.5, §7.5).** layer-a §7.5 leaves
     `scrubdays` and the rate to the implementation and sizes its own

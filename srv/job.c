@@ -58,6 +58,22 @@ enum
 	Scrubfloor	= 1024,
 	Scrubslicems	= 20,
 
+	/*
+	 * How many passes may run at once.  layer-a §2.5 bounds neither
+	 * verb: `scrub' is bounded here by `scrubbing', which keeps a
+	 * second pass off one index, but `forget <iid>' names a peer and
+	 * nothing stopped a client writing it once per id it could spell
+	 * — each write a proc of its own, each holding a dirtysnap and a
+	 * job the shutdown waits on.  So a pass beyond this many is
+	 * refused rather than accepted, which is the one place §2.5's
+	 * "return success once the job is accepted" leaves for saying no.
+	 * The number is implementation policy (store.md §14(30)): the
+	 * passes are whole-store walks and an operator has no use for
+	 * many at once, so it is small enough to bound the procs and the
+	 * snapshots and larger than any sane operator's use.
+	 */
+	Njobmax		= 12,
+
 	/* what qjob runs on the object's queue */
 	Jscrub		= 0,
 };
@@ -100,6 +116,7 @@ struct Qwork
 
 static char Eshutting[] = "shoalsrv: shutting down";
 static char Enomem[] = "shoalsrv: out of memory";
+static char Ejobs[] = "shoalsrv: too many jobs";
 
 static void	scrubpass(Sjob*);
 static void	forgetpass(Sjob*);
@@ -147,23 +164,16 @@ qjob(Qwork *j)
  * it is accepted; the proc unlinks it as its last act before giving
  * the job back.
  */
-static Sjob*
-joblink(Srvctx *c, char *verb, void (*fn)(Sjob*), char *arg)
+static int
+joblen(Srvctx *c)			/* joblk held */
 {
 	Sjob *j;
+	int n;
 
-	if((j = mallocz(sizeof *j, 1)) == nil)
-		return nil;
-	j->ctx = c;
-	j->verb = verb;
-	j->fn = fn;
-	if(arg != nil)
-		strecpy(j->arg, j->arg + sizeof j->arg, arg);
-	lock(&c->joblk);
-	j->next = c->jobs;
-	c->jobs = j;
-	unlock(&c->joblk);
-	return j;
+	n = 0;
+	for(j = c->jobs; j != nil; j = j->next)
+		n++;
+	return n;
 }
 
 static void
@@ -223,10 +233,29 @@ jobstart(Srvctx *c, char *verb, void (*fn)(Sjob*), char *arg)
 
 	if(srvjobstart(c) < 0)
 		return Eshutting;
-	if((j = joblink(c, verb, fn, arg)) == nil){
+	if((j = mallocz(sizeof *j, 1)) == nil){
 		srvjobend(c);
 		return Enomem;
 	}
+	j->ctx = c;
+	j->verb = verb;
+	j->fn = fn;
+	if(arg != nil)
+		strecpy(j->arg, j->arg + sizeof j->arg, arg);
+	/*
+	 * The cap and the link are one hold of the lock, so that two
+	 * verbs cannot both find room for the last job.
+	 */
+	lock(&c->joblk);
+	if(joblen(c) >= Njobmax){
+		unlock(&c->joblk);
+		free(j);
+		srvjobend(c);
+		return Ejobs;
+	}
+	j->next = c->jobs;
+	c->jobs = j;
+	unlock(&c->joblk);
 	if(proccreate(jobproc, j, Srvstack) < 0){
 		jobunlink(j);
 		srvjobend(c);
@@ -236,33 +265,47 @@ jobstart(Srvctx *c, char *verb, void (*fn)(Sjob*), char *arg)
 }
 
 /*
- * /jobs, layer-a §2.2: one line per running or queued background job.
- * It reads the server's own list and touches the engine, so unlike
- * the other status files it is rendered on the service loop.
+ * /jobs, layer-a §2.2: one line per running or queued background job,
+ * and EVERY such job — a file that listed some of them would answer a
+ * §2.2 MUST with a sample.  It reads the server's own list and
+ * touches the engine, so unlike the other status files it is rendered
+ * on the service loop.
  *
- * The lines are copied out under the lock and formatted after it:
- * joblk is a spin lock, and textprint allocates.
+ * The list is sized under the lock, the room for it taken outside the
+ * lock, and the lines formatted outside it too: joblk is a spin lock,
+ * and both malloc and textprint allocate.  The list can only shrink
+ * between the two holds — a pass ending unlinks itself, and the verbs
+ * that link one run on this same loop — so `n' is an upper bound and
+ * `k' is what was there to copy.  Njobmax bounds both.
  */
 char*
 srvjobstext(Srvctx *c, Sfid *f, Text *t)
 {
-	Sjob cp[8], *j;
+	Sjob *cp, *j;
 	ulong rate;
-	int i, n;
+	int i, k, n;
 
 	USED(f);
-	n = 0;
 	rate = scrubrate(c);
 	lock(&c->joblk);
-	for(j = c->jobs; j != nil && n < nelem(cp); j = j->next)
-		cp[n++] = *j;
+	n = joblen(c);
 	unlock(&c->joblk);
-	for(i = 0; i < n; i++)
+	if(n == 0)
+		return nil;
+	if((cp = mallocz(n*sizeof *cp, 1)) == nil)
+		return Enomem;
+	k = 0;
+	lock(&c->joblk);
+	for(j = c->jobs; j != nil && k < n; j = j->next)
+		cp[k++] = *j;
+	unlock(&c->joblk);
+	for(i = 0; i < k; i++)
 		textprint(t, "job=%s state=%s rate=%lud done=%llud/%llud "
 			"bad=%llud reclaimable=%llud dropped=%llud\n",
 			cp[i].verb, cp[i].running ? "running" : "queued",
 			rate, cp[i].done, cp[i].total, cp[i].bad,
 			cp[i].reclaimable, cp[i].dropped);
+	free(cp);
 	return nil;
 }
 

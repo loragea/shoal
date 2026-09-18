@@ -1492,6 +1492,84 @@ Out:
 }
 
 /*
+ * /jobs lists every pass, and the passes are bounded.
+ *
+ * layer-a §2.2 wants "one line per running or queued background job",
+ * which is every one of them; and §2.5 bounds neither verb, so
+ * `forget <iid>' — one proc and one dirty snapshot per write — needed
+ * a bound of this server's (store.md §14(30)).  Twelve passes may run
+ * at once and a thirteenth is refused, which is the one thing §2.5's
+ * "return success once the job is accepted" leaves room to say.
+ *
+ * §13's jobhold point is what holds the passes still: each parks at
+ * the end of its walk with its record still listed, so the case can
+ * stack them up and count the lines.
+ */
+static void
+tjobs(void)
+{
+	char buf[16*1024], line[64], *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall r;
+	int i;
+
+	clstage = "jobs";
+	m = mkmap();
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4, 0)) == nil)
+		return;
+	clstart(&cl, ctx, Clmsize);
+	if(!adminctl(&cl, "role=admin"))
+		goto Out;
+	srvhook(ctx, "jobhold", 1);
+	for(i = 0; i < 9; i++){
+		snprint(line, sizeof line, "forget peer%.2d", i);
+		if(clwrite(&cl, Fctl, 0, line, &r) != Rwrite){
+			fail("%#q: %s", line, clerr(&r));
+			goto Out;
+		}
+	}
+	if(slurpfile(&cl, Ffile, "jobs", buf, sizeof buf) > 0)
+		eqv("/jobs renders a line for every pass, not the first few",
+			nlines(buf, "job="), 9);
+	else
+		fail("/jobs is empty with nine passes accepted");
+
+	/* the cap: three more are taken, and the one past it is refused */
+	for(i = 9; i < 12; i++){
+		snprint(line, sizeof line, "forget peer%.2d", i);
+		if(clwrite(&cl, Fctl, 0, line, &r) != Rwrite)
+			fail("%#q: %s", line, clerr(&r));
+	}
+	if(slurpfile(&cl, Ffile, "jobs", buf, sizeof buf) > 0)
+		eqv("/jobs renders all twelve", nlines(buf, "job="), 12);
+	clwrite(&cl, Fctl, 0, "forget peer12", &r);
+	clerris("a pass past the cap", &r, "shoalsrv: too many jobs");
+	/* a second `forget' of a peer already running is one of the twelve */
+	clwrite(&cl, Fctl, 0, "forget peer00", &r);
+	clerris("and so is a repeat of a peer already running", &r,
+		"shoalsrv: too many jobs");
+
+	/* let them all go: the list empties and the cap is free again */
+	srvhook(ctx, "jobhold", 0);
+	for(i = 0; i < 400 && jobrunning(&cl); i++)
+		sleep(20);
+	istrue("every pass ended once the hold was cleared", !jobrunning(&cl));
+	if(clwrite(&cl, Fctl, 0, "forget peer12", &r) != Rwrite)
+		fail("a pass after the list emptied: %s", clerr(&r));
+	for(i = 0; i < 400 && jobrunning(&cl); i++)
+		sleep(20);
+Out:
+	srvhook(ctx, "jobhold", 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * §2.5's `drop <oid>' and §7.4's guard.  The engine holds no map, so
  * the check that this instance is not in P(oid) is the server's; an
  * id it IS placed for is `still placed' whether or not a copy is
@@ -1645,6 +1723,7 @@ threadmain(int argc, char **argv)
 	tqjobcount();
 	treclaim();
 	tforget();
+	tjobs();
 	tdrop();
 	tshutdown();
 
