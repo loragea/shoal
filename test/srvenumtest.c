@@ -90,7 +90,7 @@ enum
 	 * threadmain.  Every check this file makes is unconditional once
 	 * its case is entered, so the number is fixed.
 	 */
-	Nchecks	= 222,
+	Nchecks	= 223,
 
 	/* fids the cases use */
 	Froot	= 1,
@@ -2971,6 +2971,13 @@ tshutdown(void)
 	w[0] = "obj";
 	if(clopenpath(&cl, Froot, Fdir, 1, w, OREAD, &r) != Ropen)
 		fail("open /obj: %s", clerr(&r));
+	/*
+	 * The job the shutdown is about to wait for, read while the pass
+	 * is still holding it.  The same count after clstop is taken once
+	 * jobwait has returned and so cannot be anything but 0; this is
+	 * the reading that can.
+	 */
+	eqv("the running pass holds a job", srvjobcount(ctx), 1);
 Out:
 	clstop(&cl);			/* the loop ends; the shutdown runs */
 	eqv("the store was closed once", freedseen, 1);
