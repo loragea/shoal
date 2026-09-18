@@ -1637,9 +1637,10 @@ Out:
  * release from either would be made under `stagewrite'.
  *
  * `fullhold' parks a chunk between its stage and that engine write,
- * which is the window both land in (srv.h).  Both queues are needed:
- * `alpha' and `kappa' hash to different ones, so the refusal really
- * does run while the first chunk is parked.
+ * which is the window both land in (srv.h).  Both queues are needed —
+ * the refusal has to run WHILE the first chunk is parked — so the case
+ * asserts that its two oids hash apart rather than trusting that they
+ * do.
  */
 static void
 tstagebusy(void)
@@ -1650,10 +1651,9 @@ tstagebusy(void)
 	Srvctx *ctx;
 	Dev *d;
 	Cl cl;
-	Fcall t, tf, r;
+	Fcall tf, r;
 	uvlong live, done, openat, np0, nd0, np, nd;
 	ushort ta2, ta3, ft;
-	long hn;
 	int i;
 
 	clstage = "stagebusy";
@@ -1668,6 +1668,8 @@ tstagebusy(void)
 	dcs(d0, want, Tblksz);
 	clstart(&cl, ctx, Clmsize);
 	if(!chopen(&cl, ctx, Nrepl, Froot, Frepl, ~0UL))
+		goto Out;
+	if(!apart(ctx, "alpha", "kappa"))
 		goto Out;
 	h0 = smprint("op=full oid=alpha epoch=7 ver=3 wepoch=7 len=%d off=0"
 		" n=%d dcsum=%s csum=%s final=0", 3*Tblksz, Tblksz, d0, cs);
@@ -1686,37 +1688,13 @@ tstagebusy(void)
 	srvhook(ctx, "fullhold", 1);
 
 	/* the second chunk, parked with the stage busy and the handle in hand */
-	memset(&t, 0, sizeof t);
-	t.type = Twrite;
-	t.tag = ta2 = cltag(&cl);
-	t.fid = Frepl;
-	hn = strlen(h1);
-	t.count = hn + 1 + Tblksz;
-	if((t.data = malloc(t.count)) == nil)
-		sysfatal("malloc: %r");
-	memmove(t.data, h1, hn);
-	t.data[hn] = '\n';
-	memmove(t.data + hn + 1, want, Tblksz);
-	clput(&cl, &t);
+	ta2 = pushchunk(&cl, h1, want, Tblksz);
 	waitpush(ctx, np0, 1, &np, &nd);
-	free(t.data);
-	sleep(200);
+	waitheld(ctx, "fullhold", 1);
 
 	/* a third chunk, queued behind it on the same object's queue */
-	memset(&t, 0, sizeof t);
-	t.type = Twrite;
-	t.tag = ta3 = cltag(&cl);
-	t.fid = Frepl;
-	hn = strlen(h2);
-	t.count = hn + 1 + Tblksz;
-	if((t.data = malloc(t.count)) == nil)
-		sysfatal("malloc: %r");
-	memmove(t.data, h2, hn);
-	t.data[hn] = '\n';
-	memmove(t.data + hn + 1, want, Tblksz);
-	clput(&cl, &t);
+	ta3 = pushchunk(&cl, h2, want, Tblksz);
 	waitpush(ctx, np0, 2, &np, &nd);
-	free(t.data);
 
 	/* its Tflush: step 7 runs on the service loop, over a busy stage */
 	memset(&tf, 0, sizeof tf);
