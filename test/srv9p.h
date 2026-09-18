@@ -87,7 +87,8 @@ struct Cl
 	uint	msize;
 	uchar	*wbuf;
 	uchar	*rbuf;
-	int	rlen;		/* the message rbuf is holding */
+	uchar	*rraw;		/* ... and the same message, undecoded */
+	int	rlen;		/* the message the two are holding */
 	ushort	tag;		/* the next tag never yet handed out */
 	ushort	freetag[Clmaxfree];
 	int	nfree;
@@ -244,6 +245,14 @@ clput(Cl *c, Fcall *t)
  * The next message off the wire, into rbuf.  What r points into stays
  * valid until the next read.
  *
+ * rraw keeps the bytes as they arrived, because convM2S DECODES IN
+ * PLACE: its gstring shifts each string down over the 2-byte count
+ * that precedes it and NUL-terminates it there, so the buffer it
+ * decoded is no longer a 9P message and a second convM2S over it
+ * reads a count out of the string's own text.  A reply held aside is
+ * held aside to be decoded again later (clgettag), so it is copied
+ * from rraw and not from the buffer that was decoded.
+ *
  * The tag settles here: a reply carrying one this client has nothing
  * outstanding for is a second answer to a request, or an answer to
  * none, and it fails where it arrives rather than being absorbed by
@@ -260,6 +269,7 @@ clrecv(Cl *c, Fcall *r)
 		return -1;
 	}
 	c->rlen = n;
+	memmove(c->rraw, c->rbuf, n);
 	if(convM2S(c->rbuf, n, r) != n)
 		sysfatal("convM2S: short message");
 	if(r->tag != NOTAG){
@@ -281,6 +291,7 @@ clpop(Cl *c, int i, Fcall *r)
 
 	n = c->pend[i].n;
 	memmove(c->rbuf, c->pend[i].m, n);
+	memmove(c->rraw, c->pend[i].m, n);
 	free(c->pend[i].m);
 	c->npend--;
 	memmove(c->pend+i, c->pend+i+1, (c->npend-i)*sizeof c->pend[0]);
@@ -334,7 +345,7 @@ clgettag(Cl *c, ushort tag, Fcall *r)
 		}
 		if((m = malloc(c->rlen)) == nil)
 			sysfatal("malloc: %r");
-		memmove(m, c->rbuf, c->rlen);
+		memmove(m, c->rraw, c->rlen);	/* as it arrived, not as decoded */
 		c->pend[c->npend].m = m;
 		c->pend[c->npend].n = c->rlen;
 		c->pend[c->npend].tag = r->tag;
@@ -385,7 +396,8 @@ clstart(Cl *c, Srvctx *ctx, ulong msize)
 	c->sout = b[0];
 	c->rfd = b[1];
 	c->msize = Clbuf;
-	if((c->wbuf = malloc(Clbuf)) == nil || (c->rbuf = malloc(Clbuf)) == nil)
+	if((c->wbuf = malloc(Clbuf)) == nil || (c->rbuf = malloc(Clbuf)) == nil
+		|| (c->rraw = malloc(Clbuf)) == nil)
 		sysfatal("malloc: %r");
 	proccreate(clsrvproc, c, Srvstack);
 
@@ -450,7 +462,8 @@ clclose(Cl *c)
 	c->rfd = c->sin = c->sout = -1;
 	free(c->wbuf);
 	free(c->rbuf);
-	c->wbuf = c->rbuf = nil;
+	free(c->rraw);
+	c->wbuf = c->rbuf = c->rraw = nil;
 	if(c->npend > 0)
 		fail("%s: %d replies nobody claimed", clstage, c->npend);
 	for(i = 0; i < c->npend; i++)

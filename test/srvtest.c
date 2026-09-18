@@ -2454,6 +2454,90 @@ Out:
 }
 
 /*
+ * A reply held aside comes back the way it arrived.  Replies need not
+ * arrive in request order once more than one queue is in play, so this
+ * client collects the one its caller asked for and holds the rest for
+ * a later clget or clgettag (srv9p.h) — and what it holds aside has to
+ * be the message, not what decoding it left behind: convM2S decodes in
+ * place, shifting every string down over the 2-byte count that
+ * precedes it, so a second decode of the same buffer reads a length
+ * out of the string's own text.
+ *
+ * An Rerror is the reply that carries a string and the one most of
+ * these cases assert, so it is the one driven here: the open is held
+ * on its queue while a create the service loop refuses out of hand
+ * answers past it, and the assertion is that the string survives being
+ * held aside and decoded a second time.
+ */
+static void
+tholdaside(void)
+{
+	char *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall t, r;
+	char *w[1];
+	ushort to, tc;
+
+	clstage = "holdaside";
+	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4)) == nil)
+		return;
+	mkobj(srvstore(ctx), "alpha", nil, 0, 1);
+	w[0] = "obj";
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
+		fail("attach: %s", clerr(&r));
+		goto Out;
+	}
+	if(clwalk(&cl, Froot, Ffile, 1, w, &r) != Rwalk ||
+		clwalk(&cl, Froot, Ffile2, 1, w, &r) != Rwalk){
+		fail("walk /obj: %s", clerr(&r));
+		goto Out;
+	}
+	srvhook(ctx, "objhold", 1);
+	memset(&t, 0, sizeof t);
+	t.type = Topen;
+	t.fid = Ffile;
+	t.mode = OREAD;
+	t.tag = to = cltag(&cl);
+	clput(&cl, &t);
+	sleep(200);			/* held on the reserved queue */
+	memset(&t, 0, sizeof t);
+	t.type = Tcreate;
+	t.fid = Ffile2;
+	t.name = "shoal.bad name";
+	t.perm = 0666;
+	t.mode = OWRITE;
+	t.tag = tc = cltag(&cl);
+	clput(&cl, &t);
+	sleep(200);			/* refused on the loop, and answered */
+	srvhook(ctx, "objhold", 0);
+
+	checks++;
+	if(clgettag(&cl, to, &r) != Ropen)
+		fail("the open the refused create answered past: %s",
+			clerr(&r));
+	cltagfree(&cl, to);
+	eqv("the create's Rerror was held aside", cl.npend, 1);
+	clgettag(&cl, tc, &r);
+	clerris("the Rerror held aside, decoded a second time", &r,
+		"bad object name");
+	cltagfree(&cl, tc);
+	clclunk(&cl, Ffile2, &r);
+	clclunk(&cl, Ffile, &r);
+	clclunk(&cl, Froot, &r);
+Out:
+	srvhook(ctx, "objhold", 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * The fid registry under a walk that moves a fid.  A walk that names
  * an object runs on that object's queue while attaches and clones run
  * on the service loop, and both reach the same list: the walk gives
@@ -3974,6 +4058,7 @@ threadmain(int argc, char **argv)
 	tdircreate();
 	tpipeopen();
 	tgivecreate();
+	tholdaside();
 	tfidwalk();
 	tflush();
 	tstep7fid();
