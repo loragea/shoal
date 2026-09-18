@@ -152,13 +152,25 @@ struct Srvcfg
  * infd/outfd and calls srvrun.  srvrun returns when the connection
  * closes, by which time the shutdown sequence below has run.
  *
- * srvfree releases what is left after the loop has ended.  It runs the
- * shutdown if the caller has not, then waits for lib9p to let go of
- * the service — the loop returning is not that moment, since lib9p
- * frees its fid and request pools after it, and those run this
- * library's destroy hooks over the context.  It does NOT close the
- * store — the shutdown sequence did — and it does not close the
- * device, which stays the caller's.
+ * srvpost is the other half of that pair and is NOT a pairing with
+ * srvfree: it posts the service and returns at once, with the loop in
+ * a proc of lib9p's making and the context in that loop's hands for as
+ * long as it serves.  A caller that must know when serving is over
+ * runs the loop itself with srvrun; there is nothing here to wait on a
+ * posted one with, and freeing the context under it would pull the
+ * server out from under its own clients.
+ *
+ * srvfree releases what is left after a loop this proc ran has ended.
+ * It runs the shutdown if the caller has not, then waits for lib9p to
+ * let go of the service — the loop returning is not that moment, since
+ * lib9p frees its fid and request pools after it, and those run this
+ * library's destroy hooks over the context.  srvreleased is that
+ * moment, answered rather than waited for, and it is also what makes
+ * srvfree's wait no wait at all on a context that never ran a loop
+ * here: a posted service marks nothing, so srvfree on one returns
+ * straight away rather than blocking until the last client unmounts.
+ * srvfree does NOT close the store — the shutdown sequence did — and
+ * it does not close the device, which stays the caller's.
  *
  * A Srvctx serves ONE service loop.  The loop ending is the shutdown's
  * trigger and the shutdown closes the store, so a second srvrun over
@@ -171,6 +183,7 @@ Srvctx*	srvnew(Srvcfg*);
 Srv*	srv9p(Srvctx*);
 void	srvrun(Srvctx*, int infd, int outfd);
 void	srvpost(Srvctx*, char *name);
+int	srvreleased(Srvctx*);
 void	srvfree(Srvctx*);
 
 /*

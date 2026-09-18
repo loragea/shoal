@@ -311,10 +311,17 @@ srvrun(Srvctx *c, int infd, int outfd)
 	threadsrv(&c->srv);
 }
 
+/*
+ * Post the service and return.  threadpostmountsrv writes the
+ * directory entry and leaves the loop to a proc of its own, so this
+ * returns with nothing served yet and the context in that proc's
+ * hands until the connection it serves ends (srv.h): it is srvrun,
+ * where the loop is this proc's, that marks the context served and so
+ * makes srvfree's wait mean something.
+ */
 void
 srvpost(Srvctx *c, char *name)
 {
-	srvserved(c);
 	threadpostmountsrv(&c->srv, name, nil, 0);
 }
 
@@ -462,21 +469,26 @@ srvserved(Srvctx *c)
  * registry whose lock is no longer there.
  *
  * Srv.free is lib9p's last act, so `released' is the observable; a
- * context that never served waits for nothing.
+ * context that never ran a loop in this proc waits for nothing, which
+ * is what a caller that posted the service rather than running it
+ * gets (srvpost).
  */
-static void
+int
 srvreleased(Srvctx *c)
 {
 	int n;
 
-	for(;;){
-		lock(&c->joblk);
-		n = !c->served || c->released;
-		unlock(&c->joblk);
-		if(n)
-			return;
+	lock(&c->joblk);
+	n = !c->served || c->released;
+	unlock(&c->joblk);
+	return n;
+}
+
+static void
+waitreleased(Srvctx *c)
+{
+	while(!srvreleased(c))
 		sleep(5);
-	}
 }
 
 void
@@ -485,7 +497,7 @@ srvfree(Srvctx *c)
 	if(c == nil)
 		return;
 	srvshutdown(c);
-	srvreleased(c);
+	waitreleased(c);
 	mapfree(c->map);
 	free(c->maptext);
 	free(c);
