@@ -196,6 +196,17 @@ srvstaletext(Srvctx *c, Sfid *f, Text *t)
  * fields a line HAS, and a copy dropped here would make this file and
  * /status's `lost=' count disagree about precisely the damage the
  * file exists for.
+ *
+ * A line that HAS an oid carries `kind=corrupt' and nothing else.
+ * §2.2's three values are not three states of one flag: `corrupt' is
+ * §7.5's local verification failure, `lost' is §7.5(4)'s "no peer
+ * holds a verifying copy" and `diverged' is §1.3's equal key with
+ * differing content, and the last two are verdicts about what PEERS
+ * hold.  This build has no peer client (store.md §14(18)), so neither
+ * can have been reached, and the engine's own flag says nothing about
+ * them: a slot joins the lost list only when it is bad or carries
+ * Icorrupt, and the one path that sets either on an entry with an oid
+ * sets both.  store.md §14(15) records it.
  */
 char*
 srvlosttext(Srvctx *c, Sfid *f, Text *t)
@@ -214,8 +225,8 @@ srvlosttext(Srvctx *c, Sfid *f, Text *t)
 		}
 		memmove(oid, lp[i].oid, lp[i].oidlen);
 		oid[lp[i].oidlen] = 0;
-		textprint(t, "oid=%s kind=%s slot=%lud\n", oid,
-			lp[i].oi.corrupt ? "corrupt" : "lost", lp[i].oi.slot);
+		textprint(t, "oid=%s kind=corrupt slot=%lud\n", oid,
+			lp[i].oi.slot);
 	}
 	free(lp);
 	return nil;

@@ -5143,6 +5143,22 @@ name a half that is not built; each says which.
     beyond `oid=` and `kind=` is implementation policy there, so the
     omission is the smaller of the two departures.
 
+    **`kind=` reads `corrupt` on every line that carries an `oid=`.**
+    §2.2's three values are not three states of one flag. `corrupt`
+    is layer-a §7.5's local verification failure, which is the only
+    one an instance decides by itself; `lost` is §7.5(4)'s "no peer
+    holds a verifying copy" and `diverged` is §1.3's equal key with
+    differing content, and both are verdicts about what peers hold.
+    This build has no peer client (§14(18)), so neither has been
+    reached, and the engine's flags say nothing about them: a slot
+    joins the lost list only when it is bad or carries `Icorrupt`
+    (§8), and the one path that sets either on an entry with an oid
+    sets both. *Not made:* an oid-bearing line renders `corrupt`
+    unconditionally, and the two peer verdicts land with the
+    replication surface. A condemned slot's line keeps `kind=lost`,
+    which is §9's wording for it and is §7.5(4)'s meaning with
+    nothing left to ask about: the copy cannot be read at all.
+
 16. **layer-a §5.5 requires the resulting-`csum` check but not that
     it precede the update.** §5.5 has the receiver "compute its own
     and MUST fail with `checksum mismatch` if they differ" and fixes

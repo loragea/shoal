@@ -1448,6 +1448,80 @@ Out:
 }
 
 /*
+ * /lost's other kind of line: store.md §5 step 10's condemned slot,
+ * which layer-a §2.2's `oid=' cannot name because the index entry
+ * that would have carried an oid IS the damage (store.md §14(15)).
+ *
+ * The damage is made where the engine will find it — an index entry
+ * on the freshly formatted platter, whose checksum then fails to
+ * unpack — and it is found at start-up, since §5 step 4 reads the
+ * index region tolerantly and step 10 condemns what replay did not
+ * restore.  The slot damaged is one no object is in: a slot an
+ * object's record names is restored by the replay of that record,
+ * which is the whole of step 10's "did not restore".
+ */
+static void
+tlostslot(void)
+{
+	char buf[8192], val[64], line[64], *m;
+	uchar sec[Idxentsz];
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall r;
+	Super sb;
+	Sbsel sel;
+	vlong off;
+	ulong slot;
+
+	clstage = "lostslot";
+	m = mkmap();
+	d = newdisk();
+	slot = 100;			/* within the 128 slots fmtcfg asks for */
+	if(superselect(d, &sel) < 0 || sel.start < 0){
+		fail("superselect: %r");
+		devclose(d);
+		free(m);
+		return;
+	}
+	sb = sel.sb[sel.start];
+	off = (vlong)sb.idxoff * sb.secsz + (vlong)slot * Idxentsz;
+	simpeek(d, off, sec, Idxentsz);
+	sec[0] ^= 0xff;			/* the entry no longer unpacks */
+	simpoke(d, off, sec, Idxentsz);
+
+	if((ctx = startsrv(d, m, 4, 0)) == nil){
+		devclose(d);
+		free(m);
+		return;
+	}
+	mkobj(srvstore(ctx), "alpha", nil, 0, 1);
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
+		fail("attach: %s", clerr(&r));
+		goto Out;
+	}
+	snprint(line, sizeof line, "slot=%lud kind=lost", slot);
+	if(slurpfile(&cl, Ffile, "lost", buf, sizeof buf) > 0){
+		istrue("/lost names the condemned slot and gives it no oid",
+			hasline(buf, line));
+		eqv("and the line carries no oid=", nlines(buf, "oid="), 0);
+		eqv("/lost has that one line", nlines(buf, "slot="), 1);
+	}else
+		fail("/lost is empty with a condemned slot");
+	if(slurpfile(&cl, Ffile, "status", buf, sizeof buf) > 0)
+		eqs("/status lost= counts the condemned slot",
+			clfield(buf, "lost", val, sizeof val), "1");
+	else
+		fail("/status did not render");
+Out:
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * store.md §13's T1.27, as far as a server can be driven to show it:
  * the scrub's read of one object is held inside THAT object's queue.
  *
@@ -2280,6 +2354,7 @@ threadmain(int argc, char **argv)
 	tdiropenflush();
 	tsnaprefuse();
 	tscrub();
+	tlostslot();
 	tqueued();
 	tqjobcount();
 	treclaim();
