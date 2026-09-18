@@ -129,11 +129,12 @@ enum
  * dirtycount, which take the engine's state lock.  It stays there
  * while it is the only caller and the lock is uncontended; the row
  * moves to the offload path when that stops being true, and nothing
- * outside this table has to change when it does.  Such a cell pushes and returns; what runs on the queue
- * obeys the pool's rules entire — it tests srvqcheck if it has work
- * worth skipping, and it MUST leave through srvqdone, which is where
- * the flush is answered and step 7 performed.  srvopentext is the
- * standard render-at-open body for a row that wants it on a queue.
+ * outside this table has to change when it does.  Such a cell pushes
+ * and returns; what runs on the queue obeys the pool's rules entire —
+ * it tests srvqcheck if it has work worth skipping, and it MUST leave
+ * through srvqdone, which is where the flush is answered and step 7
+ * performed.  srvopentext is the standard render-at-open body for a
+ * row that wants it on a queue.
  *
  * Which cells belong with which body of work.  The /obj directory
  * row's open and read cells — and the aux a fid of that row carries
