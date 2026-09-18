@@ -1664,7 +1664,7 @@ objcreateq(Req *r)
 	c = r->srv->aux;
 	f = r->fid->aux;
 	qr = r->aux;
-	srvqhold(r, &c->claimhold);
+	srvqhold(r, &c->claimhold, nil);
 	qlock(&f->lk);
 	if(f->file != Qobj || r->fid->omode != -1 || f->moving ||
 		srvobjdirheld(f)){

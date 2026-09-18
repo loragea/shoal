@@ -657,7 +657,7 @@ srvreclaimhold(Srvctx *c, uvlong i)
 void
 srvtickhold(Srvctx *c)
 {
-	qhold(c, nil, &c->tickhold);
+	qhold(c, nil, &c->tickhold, nil);
 }
 
 /*
@@ -710,7 +710,7 @@ srvgivehold(Req *r)
 	i = qr->ctx->givecnt++;
 	qunlock(&qr->ctx->holdlk);
 	if(n != 0 && i == n-1)
-		qhold(qr->ctx, qr, &qr->ctx->givehold);
+		qhold(qr->ctx, qr, &qr->ctx->givehold, nil);
 }
 
 /*
