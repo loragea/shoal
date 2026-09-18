@@ -1360,6 +1360,13 @@ Out2:
  * attr=value-per-line files; a /jobs line is one record with several
  * attributes on it (layer-a §2.2: one line per job), so this reads
  * the attribute out of the line instead.
+ *
+ * `err=' is the one field whose value is not a word: the string a
+ * pass gave up with may hold spaces and slashes, which is why
+ * store.md §14(30) puts it last on the line.  So it runs to the end
+ * of the line, and every other field stops at the first space — or at
+ * the `/' that separates `done='s pair, whose numerator is what a
+ * caller asking for `done' wants.
  */
 static char*
 jobfield(Cl *cl, char *attr, char *val, int nval)
@@ -1372,8 +1379,12 @@ jobfield(Cl *cl, char *attr, char *val, int nval)
 	if((p = strstr(buf, want)) == nil)
 		return nil;
 	p += strlen(want);
-	for(e = p; *e != 0 && *e != ' ' && *e != '\n' && *e != '/'; e++)
-		;
+	if(strcmp(attr, "err") == 0)
+		for(e = p; *e != 0 && *e != '\n'; e++)
+			;
+	else
+		for(e = p; *e != 0 && *e != ' ' && *e != '\n' && *e != '/'; e++)
+			;
 	if(e - p >= nval)
 		return nil;
 	memmove(val, p, e-p);
@@ -2035,7 +2046,8 @@ tpassfail(void)
 	if(!joberred(&cl, val, sizeof val))
 		fail("a scrub that broke off reported nothing at /jobs");
 	else{
-		istrue("/jobs says what the pass gave up with", val[0] != 0);
+		eqs("/jobs says what the pass gave up with", val,
+			"shoalsrv: index read refused at the point");
 		if(jobfield(&cl, "reclaimable", val, sizeof val) == nil)
 			fail("the failed pass left no /jobs line");
 		else
@@ -2057,8 +2069,9 @@ tpassfail(void)
 	if(!joberred(&cl, val, sizeof val))
 		fail("a forget that could not discard reported nothing");
 	else
-		istrue("/jobs says what the forget pass gave up with",
-			val[0] != 0);
+		eqs("/jobs says what the forget pass gave up with", val,
+			"store condemned: in-memory state no longer matches "
+			"the log; open it again");
 	storehook(st, "fatal", 0);
 	srvhook(ctx, "jobhold", 0);
 	for(i = 0; i < 400 && jobrunning(&cl); i++)
