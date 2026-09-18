@@ -996,9 +996,10 @@ Out:
 /*
  * §5.1 and §5.4 step 1: a role=client operation is served only by the
  * object's serving primary, and every other instance answers
- * `not primary' with the iid in §2.6's detail.  The map here places
- * with two instances up, so HRW sends some ids elsewhere; the case
- * finds one and one that stays here, so that both answers are
+ * `not primary' with the iid in §2.6's detail — through /meta as well
+ * as through /obj, both being reads of the object (§6.4 F1).  The map
+ * here places with two instances up, so HRW sends some ids elsewhere;
+ * the case finds one and one that stays here, so that both answers are
  * asserted against the same map.
  */
 static void
@@ -1059,6 +1060,21 @@ tnotprimary(void)
 	else
 		eqv("... and serves the ids it is the primary for", r.count, 5);
 	clclunk(&cl, Ffile, &r);
+	/*
+	 * /meta/<oid> is the same object under a second name, and §5.1 is
+	 * asked of a client read of it too: §2.1 exempts the operator's
+	 * read alone, and §6.4 F1 names /obj and /meta in one breath.
+	 */
+	if(clwalkobj(&cl, Froot, Fmeta, "meta", theirs, &r) != Rwalk)
+		fail("walk /meta/%s: %s", theirs, clerr(&r));
+	clopen(&cl, Fmeta, OREAD, &r);
+	clerris("a client open of /meta for an object placed elsewhere", &r,
+		want);
+	clclunk(&cl, Fmeta, &r);
+	if(clwalkobj(&cl, Froot, Fmeta, "meta", mine, &r) != Rwalk
+	|| clopen(&cl, Fmeta, OREAD, &r) != Ropen)
+		fail("open /meta/%s: %s", mine, clerr(&r));
+	clclunk(&cl, Fmeta, &r);
 	/* an operator is not a client: §5.1's rule is not asked of it */
 	clclunk(&cl, Froot, &r);
 	if(clattach(&cl, Froot2, Nadmin, &r) != Rattach)
@@ -1072,6 +1088,14 @@ tnotprimary(void)
 			fail("an operator read of an object placed elsewhere:"
 				" %s", clerr(&r));
 		clclunk(&cl, Ffile2, &r);
+		if(clwalkobj(&cl, Froot2, Fmeta, "meta", theirs, &r) != Rwalk)
+			fail("walk /meta as admin: %s", clerr(&r));
+		clopen(&cl, Fmeta, OREAD, &r);
+		checks++;
+		if(r.type != Ropen)
+			fail("an operator read of /meta for an object placed"
+				" elsewhere: %s", clerr(&r));
+		clclunk(&cl, Fmeta, &r);
 	}
 	clclunk(&cl, Froot2, &r);
 Out:

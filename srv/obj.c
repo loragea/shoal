@@ -1376,14 +1376,38 @@ srvmetatext(Srvctx *c, Sfid *f, Text *t)
 	return nil;
 }
 
+/*
+ * The render happens at the open, so the open is where §5.4 step 1's
+ * admission is asked — in objreadq's order, the admission before the
+ * record, so that an instance the client should not be asking answers
+ * `not primary' rather than the object's metadata.
+ *
+ * A client read of /meta is a role=client read like any other: §2.1
+ * exempts an ADMIN read from primaryship, handoff grace and currency
+ * and no one else, §6.4 F1 names "every role=client read … through
+ * /obj or /meta" in one breath, and the line this row renders is the
+ * object's own record.  admit is role=client's alone (it answers nil
+ * for every other role), so the operator's inspection path through
+ * /meta is untouched.
+ */
 static void
 metaopenq(Req *r)
 {
+	char buf[ERRMAX], *e;
+	Srvctx *c;
+	Sfid *f;
+
 	if(srvqcheck(r)){
 		srvqdone(r, nil);
 		return;
 	}
-	srvstagesweep(r->srv->aux);
+	c = r->srv->aux;
+	f = r->fid->aux;
+	srvstagesweep(c);
+	if((e = admit(c, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
+		srvqdone(r, e);
+		return;
+	}
 	srvopentext(r);
 }
 
