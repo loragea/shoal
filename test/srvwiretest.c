@@ -437,12 +437,12 @@ chopen(Cl *cl, Srvctx *ctx, char *aname, ulong root, ulong repl, ulong rpc)
 static void
 tgrammar(void)
 {
-	char *m, cs[Csumhexlen], zero[Csumhexlen], *hdr;
+	char *m, cs[Csumhexlen], zero[Csumhexlen], *hdr, *pad;
 	Srvctx *ctx;
 	Dev *d;
 	Cl cl;
 	Fcall r;
-	uvlong np, nd;
+	uvlong np, nd, np0, nd0;
 
 	clstage = "grammar";
 	m = mkmap();
@@ -451,7 +451,7 @@ tgrammar(void)
 		return;
 	ocsum(zero, nil, 0);
 	clstart(&cl, ctx, Clmsize);
-	if(!chopen(&cl, ctx, Nrepl, Froot, Frepl, ~0UL))
+	if(!chopen(&cl, ctx, Nrepl, Froot, Frepl, Frpc))
 		goto Out;
 	waitidle(ctx, &np, &nd);
 
@@ -504,6 +504,23 @@ tgrammar(void)
 		repler(&cl, Frepl, hdr, nil, 0), "bad ctl");
 	free(hdr);
 
+	/*
+	 * store.md §14(46): a header line longer than 1024 bytes carries
+	 * no header this design defines.  The padding is blanks, which
+	 * tokenize collapses, so what the line is refused for is its
+	 * length and nothing else.
+	 */
+	if((pad = malloc(1200)) == nil)
+		sysfatal("malloc: %r");
+	memset(pad, ' ', 1199);
+	pad[1199] = 0;
+	hdr = smprint("op=create%s oid=padded epoch=7 ver=1 wepoch=7 csum=%s",
+		pad, zero);
+	eqs("a header line past 1024 bytes", repler(&cl, Frepl, hdr, nil, 0),
+		"bad ctl");
+	free(hdr);
+	free(pad);
+
 	/* §5.5's epoch rule, which §5.6 shares */
 	hdr = smprint("op=create oid=a epoch=6 ver=1 wepoch=7 csum=%s", zero);
 	eqs("an epoch below ours", repler(&cl, Frepl, hdr, nil, 0),
@@ -513,6 +530,23 @@ tgrammar(void)
 	eqs("an epoch above ours", repler(&cl, Frepl, hdr, nil, 0),
 		"future epoch");
 	free(hdr);
+
+	/*
+	 * The two channels share the grammar and not the operations, so
+	 * an operation of one is not a header the other can read — and
+	 * the refusal is the parse's, on the service loop, so neither
+	 * costs the object's queue.
+	 */
+	srvcount(ctx, &np0, &nd0);
+	eqs("a /rpc operation written to /repl",
+		repler(&cl, Frepl, "op=meta oid=a epoch=7", nil, 0), "bad ctl");
+	hdr = smprint("op=create oid=a epoch=7 ver=1 wepoch=7 csum=%s", zero);
+	eqs("a /repl operation written to /rpc",
+		chanop(&cl, Frpc, hdr, nil, 0, &r) == Rwrite ? "ok" : clerr(&r),
+		"bad ctl");
+	free(hdr);
+	srvcount(ctx, &np, &nd);
+	eqv("neither crossed to the other channel's queue", np - np0, 0);
 
 	srvcount(ctx, &np, &nd);
 	eqv("not one of those reached a queue", np, nd);
@@ -526,6 +560,7 @@ tgrammar(void)
 	else
 		eqv("a Tread of /repl is end of data", r.count, 0);
 	clclunk(&cl, Frepl2, &r);
+	clclunk(&cl, Frpc, &r);
 	clclunk(&cl, Frepl, &r);
 	clclunk(&cl, Froot, &r);
 Out:
@@ -1015,6 +1050,14 @@ tfull(void)
 	free(h0);
 	free(h1);
 
+	/* §2.6's bound, which is weighed before the transfer's own */
+	h1 = smprint("op=full oid=big epoch=7 ver=3 wepoch=7 len=%llud"
+		" off=%llud n=%d dcsum=%s csum=%s final=0", (uvlong)Tobjmax,
+		(uvlong)Tobjmax, Tblksz, d0, cs);
+	eqs("a chunk whose bytes end past objmax",
+		repler(&cl, Frepl, h1, want, Tblksz), "object too large");
+	free(h1);
+
 	/* §5.5: `len' and `force' MUST be identical on every chunk */
 	h0 = smprint("op=full oid=gamma epoch=7 ver=3 wepoch=7 len=%d off=0"
 		" n=%d dcsum=%s csum=%s final=0", 2*Tblksz, Tblksz, d0, cs);
@@ -1404,9 +1447,9 @@ tchannel(void)
 	Srvctx *ctx;
 	Dev *d;
 	Cl cl;
-	Fcall t, r;
+	Fcall t, tf, r;
 	uvlong np0, nd0, np, nd;
-	ushort ta;
+	ushort ta, ft;
 	long n;
 
 	clstage = "channel";
@@ -1474,6 +1517,43 @@ tchannel(void)
 	else
 		istrue("... and the buffered response survived the refusal",
 			r.count > 0);
+
+	/*
+	 * layer-a §5.4.1 step 7 on a /rpc fid: the claim the flushed
+	 * request made goes with it, so the fid buffers nothing and is
+	 * free to carry the next exchange (store.md §14(42)).
+	 */
+	waitidle(ctx, &np0, &nd0);
+	srvhook(ctx, "objhold", 1);
+	memset(&t, 0, sizeof t);
+	t.type = Twrite;
+	t.tag = ta = cltag(&cl);
+	t.fid = Frpc;
+	t.data = "op=meta oid=alpha epoch=7\n";
+	t.count = strlen(t.data);
+	clput(&cl, &t);
+	waitpush(ctx, np0, 1, &np, &nd);
+	memset(&tf, 0, sizeof tf);
+	tf.type = Tflush;
+	tf.tag = ft = cltag(&cl);
+	tf.oldtag = ta;
+	clput(&cl, &tf);
+	srvhook(ctx, "objhold", 0);
+	if(clgettag(&cl, ta, &r) < 0)
+		fail("no answer to the flushed request");
+	else
+		eqs("a flushed /rpc request", clerr(&r), "interrupted");
+	cltagfree(&cl, ta);
+	if(clgettag(&cl, ft, &r) != Rflush)
+		fail("no Rflush: %s", clerr(&r));
+	cltagfree(&cl, ft);
+	if(clread(&cl, Frpc, 0, 4096, &r) != Rread)
+		fail("a read behind the flush: %s", clerr(&r));
+	else
+		eqv("... leaves nothing buffered", r.count, 0);
+	istrue("... and the fid takes the next request",
+		strncmp(rpc(&cl, Frpc, "op=meta oid=alpha epoch=7", nil),
+			"meta oid=alpha", 14) == 0);
 	clclunk(&cl, Frpc, &r);
 	clclunk(&cl, Froot, &r);
 Out:
@@ -1529,6 +1609,14 @@ trpcops(void)
 		"meta oid=nothing absent=1");
 	resp = rpc(&cl, Frpc, "op=meta oid=gone epoch=7", nil);
 	istrue("op=meta of a tombstone", strstr(resp, "state=tomb") != nil);
+
+	/* §5.6: the epoch rule is §5.5's, exactly as on /repl */
+	eqs("a /rpc request below our epoch",
+		line1(rpc(&cl, Frpc, "op=meta oid=alpha epoch=6", nil)),
+		"stale epoch");
+	eqs("a /rpc request above our epoch",
+		line1(rpc(&cl, Frpc, "op=meta oid=alpha epoch=8", nil)),
+		"future epoch");
 
 	/* op=get, which carries the expected key */
 	req = smprint("op=get oid=alpha epoch=7 ver=2 wepoch=7 off=0 n=10");
@@ -1768,6 +1856,14 @@ tlist(void)
 	istrue("... and the whole response fits one Tread",
 		n <= 8192 && n > 0);
 	istrue("... and says there is more", strstr(resp, " more=1") != nil);
+
+	/*
+	 * `n=0' is the caller clamping itself to nothing, and a page of no
+	 * lines cannot say the inventory is over (store.md §14(47)).
+	 */
+	eqs("a page the caller clamped to nothing",
+		line1(rpc(&cl, Frpc, "op=list epoch=7 n=0", nil)),
+		"list lines=0 more=1");
 	clclunk(&cl, Frpc, &r);
 	clclunk(&cl, Froot, &r);
 Out:
