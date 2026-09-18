@@ -192,6 +192,33 @@ stagestrip(Srvctx *c, Sstage *s, Stage **gp)		/* under stagelk */
 	return 1;
 }
 
+/*
+ * Put a handle back where the strip found it, which is what the flush
+ * hook does when the park below will not take it.  The hook may make no
+ * engine call, so a handle it cannot park has to stay somewhere the
+ * clunk and the shutdown still reach, and the fid's own slot is that
+ * place: auxclose goes through it whatever the sweep has done.  The
+ * strip's accounting goes back with it, so the discard is counted where
+ * it is finally made and not twice.
+ *
+ * The stage stays OFF the list.  It is the fid's from here — `dead' is
+ * set, so no handler will look at it again and the sweep has nothing
+ * further to do with it — and re-linking it would only offer the sweep
+ * a second strip of the same handle.
+ *
+ * Under stagelk.  `open' is what the strip answered: it says whether
+ * the strip counted the discard it owed.
+ */
+static void
+stageunstrip(Srvctx *c, Sstage *s, Stage *g, int open)
+{
+	s->released = 0;
+	s->g = g;
+	c->nstagedone--;
+	if(open)
+		c->nstageopen--;
+}
+
 static void
 stagerelease(Srvctx *c, Sstage *s)
 {
@@ -223,16 +250,20 @@ stagefree(Srvctx *c, Sstage *s)
  * here instead; the drain below is where the call is made, with no fid
  * lock, no request lock and the store still open.
  *
- * Under stagelk.  A push that cannot grow the array answers 0 and its
- * caller discards where it stands: parking is what this exists for,
- * but a handle dropped on the floor holds its reservations for as long
- * as the process lives.
+ * Under stagelk.  A push that cannot grow the array answers 0, and
+ * what its caller does with the handle then is the caller's: the hook
+ * puts it back in the stage it came from (stageunstrip), because the
+ * one thing it may not do is make the call itself.  `pendfull' is the
+ * T1 knob that drives that path (srv.h), a failing realloc being
+ * nothing a test can arrange.
  */
 static int
 stagepend(Srvctx *c, Stage *g)
 {
 	Stage **p;
 
+	if(c->pendfull)
+		return 0;
 	if(c->npend >= c->apend){
 		if((p = realloc(c->pend, (c->apend+8)*sizeof *p)) == nil)
 			return 0;
@@ -308,11 +339,9 @@ stageflushhook(Sfid *f, Req *r)
 	s->dead = 1;
 	qlock(&c->stagelk);
 	open = stagestrip(c, s, &g);
-	if(g != nil && open && stagepend(c, g))
-		g = nil;
+	if(g != nil && open && !stagepend(c, g))
+		stageunstrip(c, s, g, open);
 	qunlock(&c->stagelk);
-	if(g != nil && open)
-		stagediscard(g);
 }
 
 static void
@@ -620,6 +649,19 @@ srvstagepoint(Srvctx *c, int on)
 {
 	qlock(&c->stagelk);
 	c->stagept = on;
+	qunlock(&c->stagelk);
+}
+
+/*
+ * The other T1 knob on this state: with it on, the park refuses every
+ * handle, which is the path a failing realloc would take and which
+ * nothing else in a test can arrange (srv.h).
+ */
+void
+srvstagependfull(Srvctx *c, int on)
+{
+	qlock(&c->stagelk);
+	c->pendfull = on;
 	qunlock(&c->stagelk);
 }
 

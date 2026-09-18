@@ -436,8 +436,12 @@ extern int nsrvctls;
  *		its work.  The hook therefore takes the handle out of the
  *		slot and parks it, and obj.c's drain — at the head of every
  *		queued object operation, and once at the shutdown while the
- *		store is still open — is where the discard is made.  What
- *		the fid owes is only that the handle leaves the slot there.
+ *		store is still open — is where the discard is made.  A park
+ *		that cannot take the handle puts it BACK in the slot, dead
+ *		but not released, rather than make the call the hook may
+ *		not: auxclose below reaches the slot whatever the sweep has
+ *		done with the stage.  So what the fid owes is that the
+ *		handle is released by someone that is not the hook.
  *	discarded at clunk and before the store closes, through
  *		auxclose, because releasing an engine stage is an engine
  *		call (store.md §9).
@@ -578,5 +582,6 @@ struct Srvctx
 	Stage	**pend;		/* engine handles awaiting their discard */
 	int	npend;
 	int	apend;
-	uvlong	nstagepend;	/* how many the flush hook has parked */
+	int	pendfull;	/* srvstagependfull: the park refuses */
+	uvlong	nstagepend;	/* how many have been parked */
 };

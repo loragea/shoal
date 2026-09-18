@@ -444,8 +444,17 @@ void	srvendpoint(Srvctx*, uvlong ms);
  * is an engine call.  Like srvauxpoint and unlike the srvhook holds,
  * the shutdown does not clear this point: it is per context, and what
  * it is about is what the shutdown itself does with a fid's state.
+ *
+ * srvstagepend answers how many engine handles have been parked for
+ * obj.c's drain, which is where the flush hook leaves the one call it
+ * may not make.  srvstagependfull makes that park REFUSE, which is the
+ * path a failing allocation would take: the hook must still make no
+ * engine call, so the handle goes back on the fid and the clunk or the
+ * shutdown releases it.  It is a point like the one above and the
+ * shutdown does not clear it either.
  */
 void	srvstagepoint(Srvctx*, int on);
+void	srvstagependfull(Srvctx*, int on);
 void	srvstagecount(Srvctx*, uvlong *live, uvlong *done, uvlong *openat);
 uvlong	srvstagepend(Srvctx*);
 

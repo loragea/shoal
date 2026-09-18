@@ -1972,6 +1972,117 @@ Out:
 }
 
 /*
+ * The same hook when the park will not take the handle.  dat.h has the
+ * hook make no ENGINE call — it can run on the service loop under the
+ * flushed request's own Qreq.lk, and every engine call takes the state
+ * lock a queue proc holds across its work — so a park that refuses
+ * leaves it holding a handle it may not discard.  It puts the handle
+ * back on the fid instead, dead but not released, and the clunk is what
+ * makes the call.  srvstagecount is what says nobody made it in
+ * between: `openat' counts the discards that found the store open,
+ * which is every one that is really made.
+ */
+static void
+tpendfull(void)
+{
+	char *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall t, r;
+	uvlong live, done, openat, np0, nd0, np, nd;
+	ushort ta, tb, tf;
+
+	clstage = "pendfull";
+	m = mkmap(Palone, Tblksz, Tobjmax, Tuuid);
+	d = newdisk(Tnslots);
+	if((ctx = startsrv(d, m, 0, 0)) == nil)
+		return;
+	mkobj(srvstore(ctx), "alpha", nil, 0);
+	srvstagepoint(ctx, 1);
+
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, Nclient, &r) != Rattach){
+		fail("attach: %s", clerr(&r));
+		goto Out;
+	}
+	if(clwalkobj(&cl, Froot, Ffile, "obj", "alpha", &r) != Rwalk
+	|| clopen(&cl, Ffile, OWRITE, &r) != Ropen){
+		fail("open /obj/alpha: %s", clerr(&r));
+		goto Out;
+	}
+	srvstagepoint(ctx, 0);
+	srvstagecount(ctx, &live, nil, nil);
+	eqv("the fid holds a stage with an engine handle", live, 1);
+
+	/* one stat of this object running and held, one queued behind it */
+	srvstagependfull(ctx, 1);
+	waitidle(ctx, &np0, &nd0);
+	srvhook(ctx, "objhold", 1);
+	memset(&t, 0, sizeof t);
+	t.type = Tstat;
+	t.tag = ta = cltag(&cl);
+	t.fid = Ffile;
+	clput(&cl, &t);
+	waitpush(ctx, np0, 1, &np, &nd);
+	t.tag = tb = cltag(&cl);
+	clput(&cl, &t);
+	waitpush(ctx, np0, 2, &np, &nd);
+	eqv("the second stat is queued behind the held one", np - np0, 2);
+
+	/* flushed where it waits, so the hook runs on the service loop */
+	memset(&t, 0, sizeof t);
+	t.type = Tflush;
+	t.tag = tf = cltag(&cl);
+	t.oldtag = tb;
+	clput(&cl, &t);
+	if(clgettag(&cl, tb, &r) < 0)
+		fail("no answer for the flushed stat");
+	else
+		eqs("the flushed queued stat", clerr(&r), "interrupted");
+	cltagfree(&cl, tb);
+	if(clgettag(&cl, tf, &r) < 0)
+		fail("no Rflush");
+	else{
+		checks++;
+		if(r.type != Rflush)
+			fail("the Rflush after it: %s", clerr(&r));
+	}
+	cltagfree(&cl, tf);
+	eqv("the park took nothing", srvstagepend(ctx), 0);
+	srvstagecount(ctx, &live, &done, &openat);
+	eqv("the hook takes the stage off the list all the same", live, 0);
+	eqv("... gives the handle back to nobody", done, 0);
+	eqv("... and makes no engine call of its own", openat, 0);
+
+	srvhook(ctx, "objhold", 0);
+	if(clgettag(&cl, ta, &r) < 0)
+		fail("no answer for the held stat");
+	else{
+		checks++;
+		if(r.type != Rstat)
+			fail("stat /obj/alpha: %s", clerr(&r));
+	}
+	cltagfree(&cl, ta);
+
+	/* the fid holds it still, so the clunk is what makes the call */
+	clclunk(&cl, Ffile, &r);
+	srvstagecount(ctx, &live, &done, &openat);
+	eqv("the clunk reaches the handle the park refused", done, 1);
+	eqv("... and makes the one call it owes", openat, 1);
+	eqv("... leaving no stage behind", live, 0);
+	clclunk(&cl, Froot, &r);
+Out:
+	srvhook(ctx, "objhold", 0);
+	srvstagependfull(ctx, 0);
+	srvstagepoint(ctx, 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * The other side of step 7's discard: what it must NOT take.  A write
  * that is past §5.4 step 3 and about to commit holds the fid's stage,
  * and a Tflush of a second write QUEUED on that same fid runs step 7
@@ -2637,6 +2748,7 @@ threadmain(int argc, char **argv)
 	tsweepclunk();
 	tstagearm();
 	tstageflush();
+	tpendfull();
 	tstagecommit();
 	tstagediscard();
 	tstagelook();
