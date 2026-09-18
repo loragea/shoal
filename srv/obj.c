@@ -764,6 +764,24 @@ srvstagepend(Srvctx *c)
 }
 
 /*
+ * How many parked handles are still waiting for a drain.  It is the
+ * depth of the list srvstagepend counts the arrivals at, and what says
+ * the shutdown made the calls the flush hook could not: 0 once
+ * srvshutdown's own drain has run, which is the last moment store.md
+ * §9 allows one.
+ */
+uvlong
+srvstagewaiting(Srvctx *c)
+{
+	uvlong n;
+
+	qlock(&c->stagelk);
+	n = c->npend;
+	qunlock(&c->stagelk);
+	return n;
+}
+
+/*
  * How many stages the live fids hold, how many have been given back,
  * and how many of those found the store still open — which every one
  * of them must, since an engine stage's discard is an engine call

@@ -557,7 +557,12 @@ void	srvendpoint(Srvctx*, uvlong ms);
  *
  * srvstagepend answers how many engine handles have been parked for
  * obj.c's drain, which is where the flush hook leaves the one call it
- * may not make.  srvstagependfull makes that park REFUSE, which is the
+ * may not make, and srvstagewaiting how many of them are still there.
+ * The second is what says the shutdown emptied the list while the
+ * store was open, which the drain it runs behind its fid sweep is for:
+ * nothing walks that list once the service loop has ended, and a
+ * handle left on it is an engine stage nothing can give back.
+ * srvstagependfull makes that park REFUSE, which is the
  * path a failing allocation would take: the hook must still make no
  * engine call, so the handle goes back on the fid and the clunk or the
  * shutdown releases it.  It is a point like the one above and the
@@ -567,6 +572,7 @@ void	srvstagepoint(Srvctx*, int on);
 void	srvstagependfull(Srvctx*, int on);
 void	srvstagecount(Srvctx*, uvlong *live, uvlong *done, uvlong *openat);
 uvlong	srvstagepend(Srvctx*);
+uvlong	srvstagewaiting(Srvctx*);
 
 void	srvauxpoint(Srvctx*, int on);
 void	srvauxcount(Srvctx*, uvlong *flushed, uvlong *closed, uvlong *freed);

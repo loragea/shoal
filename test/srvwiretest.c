@@ -2564,6 +2564,100 @@ Out:
 	free(m);
 }
 
+/*
+ * The other state D16's shutdown has to give back: a handle the flush
+ * hook took OUT of a fid's slot.  tshutlive's stage is still the fid's
+ * and goes back through auxclose; this one is on the pend list, where
+ * the hook leaves the one engine call it may not make (dat.h's
+ * Sstage), and nothing walks that list once the service loop has
+ * ended.  srvstagedrain, which the shutdown runs behind its fid sweep
+ * and before the store closes, is what empties it — the last moment
+ * store.md §9 allows the call, and after it a handle left there is an
+ * engine stage nothing can give back.
+ */
+static void
+tshutpend(void)
+{
+	char *m, cs[Csumhexlen], d0[2*Blkdlen+1], *h0, *h1;
+	uchar want[2*Tblksz];
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall tf, r;
+	uvlong live, done, openat, np0, nd0, np, nd;
+	ushort ta, ft;
+	int i;
+
+	clstage = "shutpend";
+	m = mkmap();
+	d = newdisk(Tnslots, nil);
+	if((ctx = startsrv(d, m, 0, 60000)) == nil)	/* no idle sweep */
+		return;
+	for(i = 0; i < sizeof want; i++)
+		want[i] = i*13 + 7;
+	ocsum(cs, want, sizeof want);
+	dcs(d0, want, Tblksz);
+	clstart(&cl, ctx, Clmsize);
+	if(!chopen(&cl, ctx, Nrepl, Froot, Frepl, ~0UL))
+		goto Out;
+	h0 = smprint("op=full oid=beta epoch=7 ver=3 wepoch=7 len=%d off=0"
+		" n=%d dcsum=%s csum=%s final=0", 2*Tblksz, Tblksz, d0, cs);
+	h1 = smprint("op=full oid=beta epoch=7 ver=3 wepoch=7 len=%d off=%d"
+		" n=%d dcsum=%s csum=%s final=0", 2*Tblksz, Tblksz, Tblksz, d0,
+		cs);
+	eqs("the chunk that opens the transfer",
+		repler(&cl, Frepl, h0, want, Tblksz), "ok");
+
+	/* a second chunk, held before it reaches the stage, then flushed */
+	waitidle(ctx, &np0, &nd0);
+	srvhook(ctx, "objhold", 1);
+	ta = pushchunk(&cl, h1, want, Tblksz);
+	waitpush(ctx, np0, 1, &np, &nd);
+	memset(&tf, 0, sizeof tf);
+	tf.type = Tflush;
+	tf.tag = ft = cltag(&cl);
+	tf.oldtag = ta;
+	clput(&cl, &tf);
+	if(clgettag(&cl, ta, &r) < 0)
+		fail("no answer to the flushed chunk");
+	else
+		eqs("the flushed chunk", clerr(&r), "interrupted");
+	cltagfree(&cl, ta);
+	if(clgettag(&cl, ft, &r) != Rflush)
+		fail("no Rflush: %s", clerr(&r));
+	cltagfree(&cl, ft);
+	srvhook(ctx, "objhold", 0);
+	srvstagecount(ctx, &live, &done, &openat);
+	eqv("step 7 took the stage out of the fid's slot", live, 0);
+	eqv("... and parked its handle rather than calling the engine",
+		srvstagepend(ctx), 1);
+	eqv("... where it is waiting still", srvstagewaiting(ctx), 1);
+
+	/* the connection drops with that handle on the list */
+	clhangup(&cl);
+	if(!clwaitend(&cl, 10000))
+		fail("the service loop did not end");
+	clclose(&cl);
+	srvstagecount(ctx, &live, &done, &openat);
+	eqv("the shutdown left no stage on a fid", live, 0);
+	istrue("... and there was one to give back", done >= 1);
+	eqv("... and every release found the store open", done, openat);
+	eqv("and its drain made the call the hook could not",
+		srvstagewaiting(ctx), 0);
+	free(h0);
+	free(h1);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+	return;
+Out:
+	srvhook(ctx, "objhold", 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
 void
 threadmain(int argc, char **argv)
 {
@@ -2592,6 +2686,7 @@ threadmain(int argc, char **argv)
 	tstaged();
 	tverifybad();
 	tshutlive();
+	tshutpend();
 
 	clwatchoff();
 	if(fails > 0){
