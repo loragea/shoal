@@ -478,6 +478,21 @@ tgrammar(void)
 	eqs("store.md §3.8's ver=0, refused before any engine call",
 		repler(&cl, Frepl, hdr, nil, 0), "bad ctl");
 	free(hdr);
+	/*
+	 * The same 0 on a DELTA op, which is where refusing it here is
+	 * what the wire can see: the create above would be refused by the
+	 * engine too, and a delta would reach the engine's arbitration
+	 * and be answered by that instead of by §5.5's `bad ctl'.
+	 */
+	dcs(cs, "abcd", 4);
+	hdr = smprint("op=write oid=a epoch=7 ver=0 wepoch=7 pver=1 pwepoch=7"
+		" off=0 n=4 dcsum=%s csum=%s", cs, zero);
+	eqs("ver=0 on op=write", repler(&cl, Frepl, hdr, "abcd", 4), "bad ctl");
+	free(hdr);
+	hdr = smprint("op=trunc oid=a epoch=7 ver=0 wepoch=7 pver=1 pwepoch=7"
+		" len=4 csum=%s", zero);
+	eqs("ver=0 on op=trunc", repler(&cl, Frepl, hdr, nil, 0), "bad ctl");
+	free(hdr);
 	eqs("a csum that is not 64 hex characters", repler(&cl, Frepl,
 		"op=create oid=a epoch=7 ver=1 wepoch=7 csum=beef", nil, 0),
 		"bad ctl");
@@ -619,6 +634,9 @@ troles(void)
 			Ropen ? "ok" : clerr(&r), "bad open mode");
 		eqs("an ORDWR|ORCLOSE open of /rpc",
 			clopen(&cl, Frpc, ORDWR|ORCLOSE, &r) == Ropen ? "ok"
+			: clerr(&r), "bad open mode");
+		eqs("an ORDWR|OTRUNC open of /rpc",
+			clopen(&cl, Frpc, ORDWR|OTRUNC, &r) == Ropen ? "ok"
 			: clerr(&r), "bad open mode");
 		eqs("an ORDWR open of /rpc",
 			clopen(&cl, Frpc, ORDWR, &r) == Ropen ? "ok"
@@ -813,6 +831,10 @@ tdelete(void)
 	if(!chopen(&cl, ctx, Nrepl, Froot, Frepl, ~0UL))
 		goto Out;
 
+	hdr = smprint("op=delete oid=alpha epoch=7 ver=0 wepoch=7 csum=%s", cs);
+	eqs("ver=0 on op=delete over a live copy",
+		repler(&cl, Frepl, hdr, nil, 0), "bad ctl");
+	free(hdr);
 	hdr = smprint("op=delete oid=alpha epoch=7 ver=1 wepoch=7 csum=%s", cs);
 	eqs("a delete below our live key", repler(&cl, Frepl, hdr, nil, 0),
 		"stale version");
@@ -950,6 +972,7 @@ static void
 tfull(void)
 {
 	char *m, cs[Csumhexlen], d0[2*Blkdlen+1], d1[2*Blkdlen+1], *h0, *h1;
+	char dbad[2*Blkdlen+1];
 	uchar want[2*Tblksz], buf[2*Tblksz];
 	Srvctx *ctx;
 	Store *st;
@@ -971,6 +994,7 @@ tfull(void)
 	ocsum(cs, want, sizeof want);
 	dcs(d0, want, Tblksz);
 	dcs(d1, want+Tblksz, Tblksz);
+	dcs(dbad, want+1, Tblksz);	/* the digest of bytes nothing sends */
 	mkobj(st, "alpha", "hello", 5, 2);
 	clstart(&cl, ctx, Clmsize);
 	if(!chopen(&cl, ctx, Nrepl, Froot, Frepl, ~0UL))
@@ -1056,6 +1080,54 @@ tfull(void)
 		(uvlong)Tobjmax, Tblksz, d0, cs);
 	eqs("a chunk whose bytes end past objmax",
 		repler(&cl, Frepl, h1, want, Tblksz), "object too large");
+	free(h1);
+
+	/* §5.5's dcsum, over the chunk's payload alone */
+	h1 = smprint("op=full oid=dchk epoch=7 ver=4 wepoch=7 len=%d off=0"
+		" n=%d dcsum=%s csum=%s final=0", 2*Tblksz, Tblksz, dbad, cs);
+	eqs("a chunk whose payload is not the dcsum's",
+		repler(&cl, Frepl, h1, want, Tblksz), "checksum mismatch");
+	free(h1);
+
+	/*
+	 * D23 on this path: the resulting csum is checked inside the
+	 * commit, so a resync whose bytes do not hash to the csum it
+	 * names publishes nothing — and final=1 consumes the stage on
+	 * every outcome, so the fid is free for the next transfer.
+	 */
+	h1 = smprint("op=full oid=badcsum epoch=7 ver=4 wepoch=7 len=%d off=0"
+		" n=%d dcsum=%s csum=%s final=1", Tblksz, Tblksz, d0, cs);
+	eqs("a resync whose resulting csum is not the one it names",
+		cond(repler(&cl, Frepl, h1, want, Tblksz)), "checksum mismatch");
+	free(h1);
+	srvstagecount(ctx, &live, nil, nil);
+	eqv("... consumes the stage all the same", live, 0);
+	checks++;
+	if(statof(st, "badcsum", &oi) >= 0)
+		fail("the refused resync published an object");
+
+	/* the common heal: a whole object onto an id we hold nothing of */
+	h0 = smprint("op=full oid=fresh epoch=7 ver=4 wepoch=7 len=%d off=0"
+		" n=%d dcsum=%s csum=%s final=0", 2*Tblksz, Tblksz, d0, cs);
+	h1 = smprint("op=full oid=fresh epoch=7 ver=4 wepoch=7 len=%d off=%d"
+		" n=%d dcsum=%s csum=%s final=1", 2*Tblksz, Tblksz, Tblksz, d1,
+		cs);
+	eqs("the first chunk of a heal onto an id we hold nothing of",
+		repler(&cl, Frepl, h0, want, Tblksz), "ok");
+	eqs("... and its final=1", repler(&cl, Frepl, h1, want+Tblksz, Tblksz),
+		"ok");
+	if(statof(st, "fresh", &oi) < 0)
+		fail("objstat fresh: %r");
+	else{
+		eqv("... commits at the sender's key", oi.ver, 4);
+		eqv("... and its length", oi.len, 2*Tblksz);
+	}
+	if(objread(st, (uchar*)"fresh", 5, buf, sizeof buf, 0) != sizeof buf)
+		fail("objread fresh: %r");
+	else
+		eqv("... and every staged byte", memcmp(buf, want, sizeof buf),
+			0);
+	free(h0);
 	free(h1);
 
 	/* §5.5: `len' and `force' MUST be identical on every chunk */
@@ -1519,6 +1591,25 @@ tchannel(void)
 			r.count > 0);
 
 	/*
+	 * §5.6 has the caller offer a Tread of at least the negotiated
+	 * msize less IOHDRSZ, and that MUST is the CALLER's: a Tread that
+	 * offers less takes what it offered and the response counts as
+	 * delivered, so what is left of it is the end of data rather than
+	 * a second helping (store.md §14(47)).
+	 */
+	if(chanop(&cl, Frpc, "op=meta oid=alpha epoch=7", nil, 0, &r) != Rwrite)
+		fail("a request answered by a short read: %s", clerr(&r));
+	if(clread(&cl, Frpc, 0, 8, &r) != Rread)
+		fail("a short read: %s", clerr(&r));
+	else
+		eqv("a short Tread takes what it offered", r.count, 8);
+	if(clread(&cl, Frpc, 0, 4096, &r) != Rread)
+		fail("a read behind a short one: %s", clerr(&r));
+	else
+		eqv("... and the response is delivered all the same", r.count,
+			0);
+
+	/*
 	 * layer-a §5.4.1 step 7 on a /rpc fid: the claim the flushed
 	 * request made goes with it, so the fid buffers nothing and is
 	 * free to carry the next exchange (store.md §14(42)).
@@ -1864,6 +1955,11 @@ tlist(void)
 	eqs("a page the caller clamped to nothing",
 		line1(rpc(&cl, Frpc, "op=list epoch=7 n=0", nil)),
 		"list lines=0 more=1");
+
+	/* §2.6's answer to an oid outside §1.1, which `after=' is too */
+	eqs("an after= outside §1.1",
+		line1(rpc(&cl, Frpc, "op=list epoch=7 after= n=2", nil)),
+		"bad object name");
 	clclunk(&cl, Frpc, &r);
 	clclunk(&cl, Froot, &r);
 Out:
