@@ -406,8 +406,8 @@ void
 srvfidnew(Srvctx *c, Sfid *f)
 {
 	f->ctx = c;
-	auxpoint(c, f);
 	qlock(&c->fidlk);
+	auxpoint(c, f);
 	f->prev = nil;
 	f->next = c->fids;
 	if(c->fids != nil)
@@ -506,10 +506,18 @@ srvfidgive(Sfid *f)
 	fidgive(f, 0);
 }
 
+/*
+ * Under the registry lock, which is the lock the fids' own points use:
+ * every fid this server makes reads it as it is linked in, and the
+ * queue procs are making fids while the program that sets this is
+ * running.
+ */
 void
 srvauxpoint(Srvctx *c, int on)
 {
+	qlock(&c->fidlk);
 	c->fidaux = on;
+	qunlock(&c->fidlk);
 }
 
 void
