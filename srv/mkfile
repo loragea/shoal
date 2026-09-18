@@ -1,0 +1,21 @@
+</$objtype/mkfile
+
+LIB=libshoalsrv.a$O
+
+OFILES=\
+	attach.$O\
+	ctl.$O\
+	err.$O\
+	queue.$O\
+	srv.$O\
+	status.$O\
+	text.$O\
+	tree.$O\
+
+HFILES=\
+	srv.h\
+	dat.h\
+	fns.h\
+	../lib/shoal.h\
+
+</sys/src/cmd/mklib
