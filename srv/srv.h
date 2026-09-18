@@ -376,6 +376,21 @@ int	srvjobcount(Srvctx*);	/* jobs held: what the shutdown waits for */
  *		down, over a walk that has counted a prefix of the
  *		snapshot.  Set to n+1, like slotfail.  It parks a pass
  *		proc, so it carries jobhold's hazard above entire.
+ *	fullhold
+ *		n != 0 holds an op=full chunk on a /repl fid between the
+ *		stage it continued or opened and the engine write through
+ *		its handle (peer.c).  That is the window in which the
+ *		fid's stage is marked `busy' and the handle is an argument
+ *		of a call the handler is about to make, so it is where a
+ *		test drives the two things that may find such a stage
+ *		while another queue proc is inside it: step 7, for a
+ *		sibling chunk flushed on the same fid, and a chunk naming
+ *		a second object, which runs on another queue and is
+ *		refused (store.md §14(45), §14(43)).  Neither may release
+ *		the handle; the busy chunk's own look is what does
+ *		(obj.c).  The hold is taken with no lock held, the stage
+ *		call having returned, so the service loop is free to
+ *		perform step 7 on that fid across it.
  *	flushhold
  *		n != 0 holds a Tflush of a pooled request between the
  *		lookup that found it and the flush itself, which is the
@@ -411,8 +426,9 @@ void	srvhook(Srvctx*, char *name, uvlong n);
  *
  * srvholdclear, which the shutdown runs before it drains, clears the
  * whole of srvhook's set and nothing else: objhold, objprelook,
- * objstage, objlook, objarm, objexit, flushhold, mapopen, walkhold,
- * anyexit, step7, jobhold, slotfail, reclaimhold and dirhold.  A HOLD
+ * objstage, objlook, objarm, objexit, fullhold, flushhold, mapopen,
+ * walkhold, anyexit, step7, jobhold, slotfail, reclaimhold and
+ * dirhold.  A HOLD
  * therefore belongs in srvhook — a program that set a point and
  * stopped watching must not be able to hold the store's close.  (The
  * shutdown also

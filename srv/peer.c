@@ -868,6 +868,17 @@ replfullq(Req *r, Srvctx *c, Sfid *f, Hdr *h)
 			return;
 		}
 	}
+	/*
+	 * §13's point over the window this chunk owns the handle in: the
+	 * stage is marked `busy', the handle is about to be an argument of
+	 * stagewrite, and neither a step 7 for a sibling chunk on this fid
+	 * nor a chunk naming another object on another queue may release it
+	 * (store.md §14(45), obj.c).  Both stage calls have returned, so no
+	 * lock of the fid's or the stage list's is held across the park —
+	 * the service loop performs step 7 for this fid under the first of
+	 * them (srv.h).
+	 */
+	srvqhold(r, &c->fullhold);
 	rc = 0;
 	buf[0] = 0;
 	if(h->n > 0 && (rc = stagewrite(g, h->data, h->n, h->off)) < 0)

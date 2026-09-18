@@ -688,6 +688,7 @@ struct Srvctx
 	uvlong	armhold;	/* srvhook("objarm") */
 	uvlong	exithold;	/* srvhook("objexit") */
 	uvlong	flushhold;	/* srvhook("flushhold") */
+	uvlong	fullhold;	/* srvhook("fullhold") */
 	uvlong	mapopen;	/* srvhook("mapopen") */
 	uvlong	walkhold;	/* srvhook("walkhold") */
 	uvlong	anyexit;	/* srvhook("anyexit") */

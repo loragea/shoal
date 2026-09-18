@@ -480,6 +480,7 @@ stagenew(Srvctx *c, Sfid *f, int kind, uchar *oid, int oidlen, uvlong ver,
 	uvlong wepoch, long n, uvlong off, char **err)
 {
 	Sstage *s, *old;
+	int inuse;
 
 	*err = nil;
 	if(stagegrains(c, off, n) > stagemaxof(c)){
@@ -508,6 +509,17 @@ stagenew(Srvctx *c, Sfid *f, int kind, uchar *oid, int oidlen, uvlong ver,
 	 * CONTINUING a staged transfer, which answers `stage expired'
 	 * (§3.6), and a client operation continues nothing.  A stage that
 	 * is still live does stand in the way: one to a fid.
+	 *
+	 * So does a stage another queue proc is inside an engine call
+	 * THROUGH, dead or not (store.md §14(45)): the handle it holds is
+	 * that call's argument, and this is the only place the SLOT is
+	 * taken from under such a stage — which would leave the look that
+	 * is going to release the handle nothing to find.  Nothing on the
+	 * wire reaches that today: a fid whose stage is busy is one
+	 * mid-transfer, and every chunk on it goes through srvstagemore,
+	 * which answers one whose stage is dead and busy without ever
+	 * asking for a new stage.  The guard is here because the rule
+	 * belongs to the stage rather than to one of its callers.
 	 */
 	qlock(&f->lk);
 	old = f->aux;
@@ -528,7 +540,14 @@ stagenew(Srvctx *c, Sfid *f, int kind, uchar *oid, int oidlen, uvlong ver,
 		*err = Efidstate;
 		return nil;
 	}
-	if(old != nil && !old->dead && !old->released){
+	inuse = 0;
+	if(old != nil){
+		qlock(&c->stagelk);
+		inuse = (!old->dead && !old->released)
+			|| (old->busy && old->g != nil);
+		qunlock(&c->stagelk);
+	}
+	if(inuse){
 		qunlock(&f->lk);
 		free(s);
 		*err = Ediskfull;
@@ -821,6 +840,17 @@ srvstagefull(Srvctx *c, Sfid *f, uchar *oid, int oidlen, uvlong flen,
  * over, which is free; leaving the handle in the slot would refuse
  * that restart with the same string for as long as the fid lived
  * (store.md §14(44)).
+ *
+ * With one exemption, the flush hook's own (store.md §14(45)): a dead
+ * stage another queue proc is inside an engine call THROUGH is left
+ * where it is.  This runs on a chunk naming a SECOND object, which
+ * hashes to another queue and so runs beside the chunk that is inside
+ * stagewrite with this stage's handle — and taking the stage here
+ * would free that handle under the call.  The refusal is answered all
+ * the same; what §14(44) asks of it, that the dead stage leave the
+ * slot before the next transfer, is done a moment later by the busy
+ * chunk's own look (srvstagelive below), which is the one place the
+ * handle of a busy stage is ever released.
  */
 Stage*
 srvstagemore(Srvctx *c, Sfid *f, uchar *oid, int oidlen, uvlong flen,
@@ -828,12 +858,13 @@ srvstagemore(Srvctx *c, Sfid *f, uchar *oid, int oidlen, uvlong flen,
 {
 	Sstage *s;
 	Stage *g;
-	int dead;
+	int dead, inside;
 
 	*err = nil;
 	*sp = nil;
 	g = nil;
 	dead = 0;
+	inside = 0;
 	qlock(&f->lk);
 	if((s = f->aux) == nil){
 		qunlock(&f->lk);
@@ -845,9 +876,10 @@ srvstagemore(Srvctx *c, Sfid *f, uchar *oid, int oidlen, uvlong flen,
 		return nil;
 	}
 	qlock(&c->stagelk);
-	if(s->dead || s->released)
+	if(s->dead || s->released){
 		dead = 1;
-	else if(s->kind != Stfull || s->oidlen != oidlen
+		inside = s->busy && s->g != nil;
+	}else if(s->kind != Stfull || s->oidlen != oidlen
 	|| memcmp(s->oid, oid, oidlen) != 0)
 		*err = Ediskfull;
 	else if(s->flen != flen || s->force != force)
@@ -861,7 +893,8 @@ srvstagemore(Srvctx *c, Sfid *f, uchar *oid, int oidlen, uvlong flen,
 	qunlock(&c->stagelk);
 	qunlock(&f->lk);
 	if(dead){
-		stagedone(f, s);
+		if(!inside)
+			stagedone(f, s);
 		*err = Estageexp;
 	}
 	return g;

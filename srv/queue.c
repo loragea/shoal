@@ -945,6 +945,8 @@ srvhook(Srvctx *c, char *name, uvlong n)
 		c->exithold = n;
 	else if(strcmp(name, "flushhold") == 0)
 		c->flushhold = n;
+	else if(strcmp(name, "fullhold") == 0)
+		c->fullhold = n;
 	else if(strcmp(name, "mapopen") == 0)
 		c->mapopen = n;
 	else if(strcmp(name, "walkhold") == 0)
@@ -986,6 +988,7 @@ srvholdclear(Srvctx *c)
 	c->armhold = 0;
 	c->exithold = 0;
 	c->flushhold = 0;
+	c->fullhold = 0;
 	c->mapopen = 0;
 	c->walkhold = 0;
 	c->anyexit = 0;

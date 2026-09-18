@@ -1529,6 +1529,152 @@ Out:
 }
 
 /*
+ * A stage a chunk is INSIDE, and the two things that can find one dead
+ * while it is: step 7 for a sibling chunk on the same fid, whose hook
+ * marks it dead and leaves the handle alone (store.md §14(45)), and a
+ * chunk naming a second object, which hashes to another queue and runs
+ * beside it (§14(43)).  Neither may release the handle the busy chunk
+ * is about to write through — the look that chunk takes when its call
+ * returns is the one release there is (§14(44), §14(45)) — and a
+ * release from either would be made under `stagewrite'.
+ *
+ * `fullhold' parks a chunk between its stage and that engine write,
+ * which is the window both land in (srv.h).  Both queues are needed:
+ * `alpha' and `kappa' hash to different ones, so the refusal really
+ * does run while the first chunk is parked.
+ */
+static void
+tstagebusy(void)
+{
+	char *m, cs[Csumhexlen], ck[Csumhexlen], d0[2*Blkdlen+1];
+	char *h0, *h1, *h2, *hk;
+	uchar want[3*Tblksz];
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall t, tf, r;
+	uvlong live, done, openat, np0, nd0, np, nd;
+	ushort ta2, ta3, ft;
+	long hn;
+	int i;
+
+	clstage = "stagebusy";
+	m = mkmap();
+	d = newdisk(Tnslots, nil);
+	if((ctx = startsrv(d, m, 0, 60000)) == nil)	/* no idle sweep */
+		return;
+	for(i = 0; i < sizeof want; i++)
+		want[i] = i*7 + 3;
+	ocsum(cs, want, sizeof want);
+	ocsum(ck, want, Tblksz);
+	dcs(d0, want, Tblksz);
+	clstart(&cl, ctx, Clmsize);
+	if(!chopen(&cl, ctx, Nrepl, Froot, Frepl, ~0UL))
+		goto Out;
+	h0 = smprint("op=full oid=alpha epoch=7 ver=3 wepoch=7 len=%d off=0"
+		" n=%d dcsum=%s csum=%s final=0", 3*Tblksz, Tblksz, d0, cs);
+	h1 = smprint("op=full oid=alpha epoch=7 ver=3 wepoch=7 len=%d off=%d"
+		" n=%d dcsum=%s csum=%s final=0", 3*Tblksz, Tblksz, Tblksz, d0,
+		cs);
+	h2 = smprint("op=full oid=alpha epoch=7 ver=3 wepoch=7 len=%d off=%d"
+		" n=%d dcsum=%s csum=%s final=0", 3*Tblksz, 2*Tblksz, Tblksz,
+		d0, cs);
+	hk = smprint("op=full oid=kappa epoch=7 ver=3 wepoch=7 len=%d off=0"
+		" n=%d dcsum=%s csum=%s final=0", Tblksz, Tblksz, d0, ck);
+
+	eqs("the chunk that opens a transfer",
+		repler(&cl, Frepl, h0, want, Tblksz), "ok");
+	waitidle(ctx, &np0, &nd0);
+	srvhook(ctx, "fullhold", 1);
+
+	/* the second chunk, parked with the stage busy and the handle in hand */
+	memset(&t, 0, sizeof t);
+	t.type = Twrite;
+	t.tag = ta2 = cltag(&cl);
+	t.fid = Frepl;
+	hn = strlen(h1);
+	t.count = hn + 1 + Tblksz;
+	if((t.data = malloc(t.count)) == nil)
+		sysfatal("malloc: %r");
+	memmove(t.data, h1, hn);
+	t.data[hn] = '\n';
+	memmove(t.data + hn + 1, want, Tblksz);
+	clput(&cl, &t);
+	waitpush(ctx, np0, 1, &np, &nd);
+	free(t.data);
+	sleep(200);
+
+	/* a third chunk, queued behind it on the same object's queue */
+	memset(&t, 0, sizeof t);
+	t.type = Twrite;
+	t.tag = ta3 = cltag(&cl);
+	t.fid = Frepl;
+	hn = strlen(h2);
+	t.count = hn + 1 + Tblksz;
+	if((t.data = malloc(t.count)) == nil)
+		sysfatal("malloc: %r");
+	memmove(t.data, h2, hn);
+	t.data[hn] = '\n';
+	memmove(t.data + hn + 1, want, Tblksz);
+	clput(&cl, &t);
+	waitpush(ctx, np0, 2, &np, &nd);
+	free(t.data);
+
+	/* its Tflush: step 7 runs on the service loop, over a busy stage */
+	memset(&tf, 0, sizeof tf);
+	tf.type = Tflush;
+	tf.tag = ft = cltag(&cl);
+	tf.oldtag = ta3;
+	clput(&cl, &tf);
+	if(clgettag(&cl, ta3, &r) < 0)
+		fail("no answer to the flushed chunk");
+	else
+		eqs("the flushed sibling chunk", clerr(&r), "interrupted");
+	cltagfree(&cl, ta3);
+	if(clgettag(&cl, ft, &r) != Rflush)
+		fail("no Rflush: %s", clerr(&r));
+	cltagfree(&cl, ft);
+	srvstagecount(ctx, &live, &done, nil);
+	eqv("step 7 leaves the stage the chunk is inside", live, 1);
+	eqv("... and releases nothing", done, 0);
+
+	/* the chunk for a second object, refused on another queue */
+	eqs("a chunk naming a second object, on a stage step 7 took",
+		repler(&cl, Frepl, hk, want, Tblksz), "shoalsrv: stage expired");
+	srvstagecount(ctx, &live, &done, nil);
+	eqv("its refusal leaves the slot to the chunk inside the write",
+		live, 1);
+	eqv("... and releases nothing either", done, 0);
+
+	/* the parked chunk's own look is the release */
+	srvhook(ctx, "fullhold", 0);
+	if(clgettag(&cl, ta2, &r) < 0)
+		fail("no answer to the chunk that held the handle");
+	else
+		eqs("the chunk that held the handle", clerr(&r),
+			"shoalsrv: stage expired");
+	cltagfree(&cl, ta2);
+	srvstagecount(ctx, &live, &done, &openat);
+	eqv("its look released the handle", live, 0);
+	eqv("... exactly once", done, 1);
+	eqv("... with the store open", openat, 1);
+	eqs("and the fid takes a fresh transfer",
+		repler(&cl, Frepl, h0, want, Tblksz), "ok");
+	free(h0);
+	free(h1);
+	free(h2);
+	free(hk);
+	clclunk(&cl, Frepl, &r);
+	clclunk(&cl, Froot, &r);
+Out:
+	srvhook(ctx, "fullhold", 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * §5.6's channel rules: one outstanding request per fid, a response
  * prepared at Twrite time and delivered by exactly one Tread, and a
  * read with nothing buffered answering count 0.
@@ -2155,6 +2301,7 @@ threadmain(int argc, char **argv)
 	tdiverged();
 	tstagemax();
 	tstagelife();
+	tstagebusy();
 	tchannel();
 	trpcops();
 	tdropdiscard();
