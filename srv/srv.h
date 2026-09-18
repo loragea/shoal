@@ -275,6 +275,15 @@ void	srvcount(Srvctx*, uvlong *pushed, uvlong *done);
  */
 void	srvhook(Srvctx*, char *name, uvlong n);
 
+/*
+ * Where a new point goes.  A HOLD — a point that parks a request or a
+ * proc — belongs in srvhook, because srvholdclear empties that set and
+ * the shutdown runs it before the drain: a program that set a point
+ * and stopped watching must not be able to hold the store's close.  An
+ * OBSERVABLE, and a hold whose whole subject is what happens after the
+ * shutdown has run, goes beside srvauxpoint below, where nothing
+ * clears it; such a hold bounds itself, as the flush hold does.
+ */
 
 /*
  * The fid-state point, in the same shape and with the same reach.
