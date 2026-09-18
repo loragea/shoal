@@ -36,19 +36,21 @@
  */
 
 static void	qhold(Srvctx*, Qreq*, uvlong*);
-static void	holdflush(Srvctx*);
+static void	holdms(Srvctx*, uvlong*);
 
 enum
 {
 	/*
-	 * How long the flush hold parks the service loop before it lets
-	 * go of its own accord.  It is the one §13 point that holds the
-	 * loop rather than a queue proc, so it is the one the shutdown
+	 * How long a hold that parks the SERVICE LOOP waits before it
+	 * lets go of its own accord.  Such a hold is the one the shutdown
 	 * cannot clear — srvholdclear runs from Srv.end, which lib9p
-	 * calls on the loop — and an unbounded park there would wedge
-	 * the server for as long as the program lived.
+	 * calls on the loop — so an unbounded park there would wedge the
+	 * server for as long as the program lived.  Two points can park
+	 * the loop: the flush hold, which is only ever reached from
+	 * Srv.flush, and the step 7 hold when the flushed request was
+	 * still queued and the loop performs step 7 for it.
 	 */
-	Flushholdms	= 5000,
+	Loopholdms	= 5000,
 };
 
 /*
@@ -353,12 +355,12 @@ srvqflush(Req *r)
 		respond(r, nil);
 		return;
 	}
-	holdflush(qr->ctx);
+	holdms(qr->ctx, &qr->ctx->flushhold);
 	qlock(&qr->lk);
 	if(!qr->done && qr->pushed){
 		if(!qr->running && !qr->step7){
 			qr->step7 = 1;
-			srvstep7(r->oldreq);
+			srvstep7(r->oldreq, 1);
 		}
 		reqqueueflush(qr->q, r->oldreq);
 	}
@@ -397,20 +399,21 @@ qhold(Srvctx *c, Qreq *qr, uvlong *pt)
 }
 
 /*
- * The flush hold, which parks the SERVICE LOOP rather than a queue
- * proc.  srvholdclear cannot reach it: the shutdown runs from Srv.end,
- * which lib9p calls on the loop, so a loop parked here never gets
- * there and nothing else would ever clear the point.  It therefore
- * releases itself after Flushholdms, which is what keeps a point a
- * program set and stopped watching from wedging the server for good.
+ * The same park, for a point that holds the SERVICE LOOP rather than a
+ * queue proc.  srvholdclear cannot reach such a point: the shutdown
+ * runs from Srv.end, which lib9p calls on the loop, so a loop parked
+ * here never gets there and nothing else would ever clear it.  It
+ * therefore releases itself after Loopholdms, which is what keeps a
+ * point a program set and stopped watching from wedging the server for
+ * good.
  */
 static void
-holdflush(Srvctx *c)
+holdms(Srvctx *c, uvlong *pt)
 {
 	int i;
 
 	qlock(&c->holdlk);
-	for(i = 0; c->flushhold != 0 && i < Flushholdms/5; i++){
+	for(i = 0; *pt != 0 && i < Loopholdms/5; i++){
 		qunlock(&c->holdlk);
 		sleep(5);
 		qlock(&c->holdlk);
@@ -529,7 +532,7 @@ srvqexit(Req *r)
  * halves are added to this function, not to the handlers.
  */
 void
-srvstep7(Req *r)
+srvstep7(Req *r, int onloop)
 {
 	Srvctx *c;
 	Sfid *f;
@@ -566,10 +569,16 @@ srvstep7(Req *r)
 	 * The hold is inside the state lock, which is what a test drives a
 	 * clunk or a moving walk of this fid against, and outside the
 	 * registry lock, which a parked proc holding would wedge the loop
-	 * and with it the shutdown that clears the point.
+	 * and with it the shutdown that clears the point.  On the service
+	 * loop the point cannot be cleared at all — srvholdclear runs from
+	 * Srv.end, which lib9p calls on the loop — so there it ends on the
+	 * same deadline the flush hold does.
 	 */
 	qlock(&f->lk);
-	qhold(c, nil, &c->step7hold);
+	if(onloop)
+		holdms(c, &c->step7hold);
+	else
+		qhold(c, nil, &c->step7hold);
 	if(f->auxflush != nil)
 		f->auxflush(f, r);
 	qunlock(&f->lk);
@@ -629,7 +638,7 @@ srvqdone(Req *r, char *err)
 		qunlock(&qr->lk);
 		if(flushed || srvintr(err)){
 			if(!did7)
-				srvstep7(r);
+				srvstep7(r, 0);
 			respond(r, flushed ? Einterrupted : Edevintr);
 			return;
 		}

@@ -2506,6 +2506,11 @@ Out:
  * window is forced rather than raced for: the point parks the service
  * loop between the lookup and the flush, and the held request is
  * released inside it.
+ *
+ * That park has a deadline of its own (srv.h), which this case stays
+ * well inside: what it does between setting the point and clearing it
+ * is two 200 ms sleeps.  What a case that never clears the point gets
+ * is tloophold's subject.
  */
 static void
 tflushrace(void)
@@ -3143,6 +3148,132 @@ Out:
 }
 
 /*
+ * The two points that park the SERVICE LOOP, and the deadline that is
+ * all either has.  srvholdclear cannot reach them — the shutdown runs
+ * from Srv.end, which lib9p calls on the loop — so a program that sets
+ * one and stops watching would wedge the server for as long as it
+ * lived.  Neither arm below ever clears the point it sets.
+ */
+static void
+tloophold(void)
+{
+	char *m;
+	uchar data[1024];
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall t, r;
+	char *w[1];
+	vlong t0, ms;
+	ushort ta, tb, tf;
+
+	clstage = "loophold";
+	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
+	d = newdisk();
+	if((ctx = startsrv(d, m, 1)) == nil)
+		return;
+	memset(data, 0x99, sizeof data);
+	mkobj(srvstore(ctx), "alpha", data, sizeof data, 1);
+
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach)
+		fail("attach: %s", clerr(&r));
+	w[0] = "ctl";
+	if(clopenpath(&cl, Froot, Fctl, 1, w, OWRITE, &r) != Ropen){
+		fail("open /ctl: %s", clerr(&r));
+		goto Out;
+	}
+
+	/* the flush hold, over a Tflush of a request that is running */
+	srvhook(ctx, "objhold", 1);
+	memset(&t, 0, sizeof t);
+	t.type = Twrite;
+	t.tag = ta = cltag(&cl);
+	t.fid = Fctl;
+	t.offset = 0;
+	t.data = "verify alpha";
+	t.count = strlen(t.data);
+	clput(&cl, &t);
+	sleep(200);			/* running, and held */
+	srvhook(ctx, "flushhold", 1);
+	memset(&t, 0, sizeof t);
+	t.type = Tflush;
+	t.tag = tf = cltag(&cl);
+	t.oldtag = ta;
+	t0 = nsec();
+	clput(&cl, &t);
+	checks++;
+	if(clgettag(&cl, ta, &r) != Rerror
+	|| strcmp(r.ename, "interrupted") != 0)
+		fail("the flushed request: type %d %s", r.type, clerr(&r));
+	cltagfree(&cl, ta);
+	checks++;
+	if(clgettag(&cl, tf, &r) != Rflush)
+		fail("the Rflush the flush hold let go of: type %d", r.type);
+	cltagfree(&cl, tf);
+	ms = (nsec() - t0) / 1000000;
+	istrue("the flush hold parks the loop", ms > 1000);
+	istrue("and lets go although nothing cleared it", ms < 15000);
+	srvhook(ctx, "objhold", 0);
+
+	/*
+	 * The step 7 hold, on the loop: a request flushed while it was
+	 * still queued has step 7 performed for it there, so the point
+	 * parks the loop exactly as the flush hold does.  The first write
+	 * is what keeps the second one queued, and it stays held until
+	 * both replies are in, so that the second is still on the queue
+	 * when the flush reaches it.
+	 */
+	srvhook(ctx, "objhold", 1);
+	memset(&t, 0, sizeof t);
+	t.type = Twrite;
+	t.tag = ta = cltag(&cl);
+	t.fid = Fctl;
+	t.offset = 0;
+	t.data = "verify alpha";
+	t.count = strlen(t.data);
+	clput(&cl, &t);
+	sleep(200);			/* running, and held */
+	t.tag = tb = cltag(&cl);
+	clput(&cl, &t);
+	sleep(200);			/* ... and this one is queued behind it */
+	srvhook(ctx, "step7", 1);
+	memset(&t, 0, sizeof t);
+	t.type = Tflush;
+	t.tag = tf = cltag(&cl);
+	t.oldtag = tb;
+	t0 = nsec();
+	clput(&cl, &t);
+	checks++;
+	if(clgettag(&cl, tb, &r) != Rerror
+	|| strcmp(r.ename, "interrupted") != 0)
+		fail("the request flushed while queued: type %d %s", r.type,
+			clerr(&r));
+	cltagfree(&cl, tb);
+	checks++;
+	if(clgettag(&cl, tf, &r) != Rflush)
+		fail("the Rflush the step 7 hold let go of: type %d", r.type);
+	cltagfree(&cl, tf);
+	ms = (nsec() - t0) / 1000000;
+	istrue("the step 7 hold parks the loop", ms > 1000);
+	istrue("and lets go although nothing cleared it either", ms < 15000);
+	srvhook(ctx, "objhold", 0);
+	checks++;
+	if(clgettag(&cl, ta, &r) != Rwrite)
+		fail("the request that was running: type %d %s", r.type,
+			clerr(&r));
+	cltagfree(&cl, ta);
+Out:
+	srvhook(ctx, "objhold", 0);
+	clstop(&cl);
+	srvhook(ctx, "flushhold", 0);
+	srvhook(ctx, "step7", 0);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * srvrun can return while lib9p is still using the context.  A pushed
  * request is counted complete by srvdestroyreq, which lib9p runs from
  * closereq inside respond and therefore BEFORE respond releases the
@@ -3258,6 +3389,7 @@ threadmain(int argc, char **argv)
 	tstep7hold();
 	tanyq();
 	tflushrace();
+	tloophold();
 	terrors();
 	tjobs();
 	tshutdown();

@@ -62,7 +62,7 @@ void	srvqdone(Req*, char *err);
 void	srvqended(Qreq*);
 void	srvqdrain(Srvctx*);
 void	srvqfree(Srvctx*);
-void	srvstep7(Req*);
+void	srvstep7(Req*, int onloop);
 uvlong	srvpoint(Srvctx*, char*);
 void	srvholdclear(Srvctx*);
 

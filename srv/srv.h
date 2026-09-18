@@ -231,9 +231,13 @@ void	srvcount(Srvctx*, uvlong *pushed, uvlong *done);
  *		really needs one.
  *	step7	n != 0 holds a flushed request inside step 7, between the
  *		read of the flushed fid's cell and the call through it —
- *		which is under the fid registry's lock, so it is where a
- *		test drives a clunk or a moving walk of that same fid
- *		against the queue proc that is discarding its state.
+ *		which is under that fid's own state lock, so it is where a
+ *		test drives a clunk, a moving walk or another request on
+ *		that same fid against the proc that is discarding its
+ *		state.  Step 7 runs on a queue proc for a request that was
+ *		running when it was flushed and on the SERVICE LOOP for one
+ *		that was still queued, so this point can park the loop; it
+ *		then ends on its own deadline, like the flush hold below.
  *	anyexit	n != 0 holds an offloaded request that has found itself
  *		flushed, before it leaves through srvqdone.  Its proc is
  *		then still inside the handler and has not looped round to
@@ -262,8 +266,11 @@ void	srvcount(Srvctx*, uvlong *pushed, uvlong *done);
  * A held request leaves a queue proc's hold when the point is cleared
  * or, for the holds that name the request, when its queue's flush flag
  * is set, whichever is first; the shutdown clears every point, so a
- * request left holding cannot hold it up.  The flush hold above is the
- * exception, and ends on its own deadline.
+ * request left holding cannot hold it up.  A hold that parks the
+ * service loop is the exception — the shutdown runs on the loop it
+ * would be parking — and ends on its own deadline instead: the flush
+ * hold always, and the step 7 hold when step 7 is being performed on
+ * the loop.
  *
  * These points are reachable in-process only.  store.md §13's -X flag
  * names the points of the device under the store — it is what drives
