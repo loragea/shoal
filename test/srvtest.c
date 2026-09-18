@@ -70,15 +70,6 @@ eqs(char *what, char *got, char *want)
 		fail("%s: %#q, want %#q", what, got, want);
 }
 
-/* what a reply says went wrong, for a case that compares the string */
-static char*
-errof(Fcall *r)
-{
-	if(r->type == Rerror)
-		return r->ename;
-	return "ok";
-}
-
 #include "srv9p.h"
 
 enum
@@ -231,22 +222,6 @@ startsrv(Dev *d, char *maptext, int nq)
 		fail("srvnew: %r");
 	freedctx = c;
 	return c;
-}
-
-/* §2.4's Tcreate, which every gate case issues on a directory fid */
-static int
-clcreate(Cl *c, ulong fid, char *name, int mode, Fcall *r)
-{
-	Fcall t;
-
-	memset(&t, 0, sizeof t);
-	t.type = Tcreate;
-	t.tag = cltag(c);
-	t.fid = fid;
-	t.name = name;
-	t.perm = 0666;
-	t.mode = mode;
-	return clrpc(c, &t, r);
 }
 
 /* create and fill an object through the engine, as §2.4's create is not built */
@@ -676,14 +651,13 @@ tmodes(void)
 		"permission denied",
 		"permission denied",
 	};
-	uchar stat[STATMAX];
-	char *m;
+	char what[64], *m;
 	Srvctx *ctx;
 	Dev *d;
 	Cl cl;
-	Fcall t, r;
+	Fcall r;
 	Dir dir;
-	int role, n;
+	int role;
 
 	clstage = "modes";
 	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
@@ -700,51 +674,28 @@ tmodes(void)
 		}
 		/* Tcreate in /obj */
 		if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk)
-			fail("walk /obj: %s", r.type == Rerror ? r.ename : "?");
-		memset(&t, 0, sizeof t);
-		t.type = Tcreate;
-		t.tag = cltag(&cl);
-		t.fid = Ffile;
-		t.name = "newobj";
-		t.perm = 0666;
-		t.mode = OWRITE;
-		clrpc(&cl, &t, &r);
-		checks++;
-		if(r.type != Rerror || strcmp(r.ename, want[role]) != 0)
-			fail("create in /obj as %s: %s, want %s", anames[role],
-				r.type == Rerror ? r.ename : "ok", want[role]);
+			fail("walk /obj: %s", clerr(&r));
+		clcreate(&cl, Ffile, "newobj", 0666, OWRITE, &r);
+		snprint(what, sizeof what, "create in /obj as %s", anames[role]);
+		clerris(what, &r, want[role]);
 		clclunk(&cl, Ffile, &r);
 
-		/* Twstat and Tremove on /obj/<oid> */
+		/*
+		 * Twstat and Tremove on /obj/<oid>.  A Tremove clunks its fid
+		 * whether or not it removes anything, so Ffile2 is free again
+		 * for the next role's walk.
+		 */
 		if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk
 		|| clwalk1(&cl, Ffile, Ffile2, "alpha", &r) != Rwalk)
-			fail("walk /obj/alpha: %s",
-				r.type == Rerror ? r.ename : "?");
+			fail("walk /obj/alpha: %s", clerr(&r));
 		nulldir(&dir);
 		dir.length = 4096;
-		n = convD2M(&dir, stat, sizeof stat);
-		memset(&t, 0, sizeof t);
-		t.type = Twstat;
-		t.tag = cltag(&cl);
-		t.fid = Ffile2;
-		t.stat = stat;
-		t.nstat = n;
-		clrpc(&cl, &t, &r);
-		checks++;
-		if(r.type != Rerror || strcmp(r.ename, want[role]) != 0)
-			fail("wstat /obj/alpha as %s: %s, want %s",
-				anames[role], r.type == Rerror ? r.ename : "ok",
-				want[role]);
-		memset(&t, 0, sizeof t);
-		t.type = Tremove;
-		t.tag = cltag(&cl);
-		t.fid = Ffile2;
-		clrpc(&cl, &t, &r);
-		checks++;
-		if(r.type != Rerror || strcmp(r.ename, want[role]) != 0)
-			fail("remove /obj/alpha as %s: %s, want %s",
-				anames[role], r.type == Rerror ? r.ename : "ok",
-				want[role]);
+		clwstat(&cl, Ffile2, &dir, &r);
+		snprint(what, sizeof what, "wstat /obj/alpha as %s", anames[role]);
+		clerris(what, &r, want[role]);
+		clremove(&cl, Ffile2, &r);
+		snprint(what, sizeof what, "remove /obj/alpha as %s", anames[role]);
+		clerris(what, &r, want[role]);
 		clclunk(&cl, Ffile, &r);
 		clclunk(&cl, Froot, &r);
 	}
@@ -834,14 +785,9 @@ tobjects(void)
 	if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk)
 		fail("walk /obj: %s", r.type == Rerror ? r.ename : "?");
 	clwalk1(&cl, Ffile, Ffile2, "nosuch", &r);
-	checks++;
-	if(r.type != Rerror || strcmp(r.ename, "no such object") != 0)
-		fail("walk to an absent id: %s",
-			r.type == Rerror ? r.ename : "ok");
+	clerris("walk to an absent id", &r, "no such object");
 	clwalk1(&cl, Ffile, Ffile2, "not!a!name", &r);
-	checks++;
-	if(r.type != Rerror || strcmp(r.ename, "bad object name") != 0)
-		fail("walk to a bad id: %s", r.type == Rerror ? r.ename : "ok");
+	clerris("walk to a bad id", &r, "bad object name");
 	/*
 	 * An over-long id names no object, so it is not ordered against
 	 * one either: the pushed count does not move.  Cutting it to
@@ -850,10 +796,7 @@ tobjects(void)
 	 */
 	srvcount(ctx, &np, &nd);
 	clwalk1(&cl, Ffile, Ffile2, longname, &r);
-	checks++;
-	if(r.type != Rerror || strcmp(r.ename, "bad object name") != 0)
-		fail("walk to an over-long id: %s",
-			r.type == Rerror ? r.ename : "ok");
+	clerris("walk to an over-long id", &r, "bad object name");
 	srvcount(ctx, &np2, &nd);
 	eqv("a walk to an over-long id is queued against no object",
 		np2 - np, 0);
@@ -882,9 +825,7 @@ tobjects(void)
 	if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk)
 		fail("walk /obj: %s", r.type == Rerror ? r.ename : "?");
 	clwalk1(&cl, Ffile, Ffile2, "beta", &r);
-	checks++;
-	if(r.type != Rerror || strcmp(r.ename, "object deleted") != 0)
-		fail("walk to a tombstone: %s", r.type == Rerror ? r.ename : "ok");
+	clerris("walk to a tombstone", &r, "object deleted");
 	clclunk(&cl, Ffile, &r);
 	if(objinfoof(st, "beta", &oi) < 0)
 		fail("objstat beta: %r");
@@ -1082,12 +1023,12 @@ treadcell(void)
 	srvcellpoint(ctx, 1);
 	clstart(&cl, ctx, Clmsize);
 	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
-		fail("attach: %s", errof(&r));
+		fail("attach: %s", clerr(&r));
 		goto Out;
 	}
 	w[0] = "ctl";
 	if(clopenpath(&cl, Froot, Fctl, 1, w, OREAD, &r) != Ropen)
-		fail("open /ctl for reading: %s", errof(&r));
+		fail("open /ctl for reading: %s", clerr(&r));
 	else{
 		n = clslurp(&cl, Fctl, buf, sizeof buf);
 		istrue("a row with both cells serves its reads from the read one",
@@ -1144,7 +1085,7 @@ tctl(void)
 		{"pull alpha",		"bad ctl"},
 		{"verify not!a!name",	"bad object name"},
 	};
-	char *m, oid[Oidmax+2], line[Oidmax+16];
+	char *m, oid[Oidmax+2], line[Oidmax+16], what[Oidmax+32];
 	uchar data[1024];
 	Srvctx *ctx;
 	Dev *d;
@@ -1170,11 +1111,8 @@ tctl(void)
 		fail("client open /ctl: %s", r.type == Rerror ? r.ename : "?");
 	else for(i = 0; i < nelem(verbs); i++){
 		clwrite(&cl, Fctl, 0, verbs[i].line, &r);
-		checks++;
-		if(r.type != Rerror || strcmp(r.ename, "permission denied") != 0)
-			fail("%#q as client: %s, want permission denied",
-				verbs[i].line,
-				r.type == Rerror ? r.ename : "ok");
+		snprint(what, sizeof what, "%#q as client", verbs[i].line);
+		clerris(what, &r, "permission denied");
 	}
 	clclunk(&cl, Fctl, &r);
 	clclunk(&cl, Froot, &r);
@@ -1187,10 +1125,8 @@ tctl(void)
 	}
 	for(i = 0; i < nelem(bad); i++){
 		clwrite(&cl, Fctl, 0, bad[i].line, &r);
-		checks++;
-		if(r.type != Rerror || strcmp(r.ename, bad[i].err) != 0)
-			fail("%#q: %s, want %s", bad[i].line,
-				r.type == Rerror ? r.ename : "ok", bad[i].err);
+		snprint(what, sizeof what, "%#q", bad[i].line);
+		clerris(what, &r, bad[i].err);
 	}
 	/*
 	 * An id one byte over §1.1's bound, with the object its first 128
@@ -1210,10 +1146,7 @@ tctl(void)
 	oid[Oidmax+1] = 0;
 	snprint(line, sizeof line, "verify %s", oid);
 	clwrite(&cl, Fctl, 0, line, &r);
-	checks++;
-	if(r.type != Rerror || strcmp(r.ename, "bad object name") != 0)
-		fail("verify of a 129-byte id: %s",
-			r.type == Rerror ? r.ename : "ok");
+	clerris("verify of a 129-byte id", &r, "bad object name");
 
 	/* a trailing newline is one line, not a partial one */
 	clwrite(&cl, Fctl, 0, "verify alpha\n", &r);
@@ -1266,10 +1199,7 @@ tctl(void)
 		fail("walk to an object while fenced: %s",
 			r.type == Rerror ? r.ename : "?");
 	clopen(&cl, Ffile2, OREAD, &r);
-	checks++;
-	if(r.type != Rerror || strcmp(r.ename, "fenced") != 0)
-		fail("open an object while fenced: %s",
-			r.type == Rerror ? r.ename : "ok");
+	clerris("open an object while fenced", &r, "fenced");
 	clclunk(&cl, Ffile2, &r);
 	clclunk(&cl, Ffile, &r);
 
@@ -1280,10 +1210,8 @@ tctl(void)
 		fail("fence off under an operator fence: %s",
 			r.type == Rerror ? r.ename : "?");
 	clwrite(&cl, Fctl, 0, "drop alpha", &r);
-	checks++;
-	if(r.type != Rerror || strcmp(r.ename, "shoalsrv: not built") != 0)
-		fail("a fenced-set verb after fence off: %s",
-			r.type == Rerror ? r.ename : "ok");
+	clerris("a fenced-set verb after fence off", &r,
+		"shoalsrv: not built");
 Out:
 	clstop(&cl);
 	srvfree(ctx);
@@ -1333,10 +1261,7 @@ tverify(void)
 		fail("verify a good object: %s",
 			r.type == Rerror ? r.ename : "?");
 	clwrite(&cl, Fctl, 0, "verify nosuch", &r);
-	checks++;
-	if(r.type != Rerror || strcmp(r.ename, "no such object") != 0)
-		fail("verify an absent object: %s",
-			r.type == Rerror ? r.ename : "ok");
+	clerris("verify an absent object", &r, "no such object");
 
 	/*
 	 * Damage one object's bytes on the platter.  The grain holding
@@ -1364,10 +1289,7 @@ tverify(void)
 	}
 	istrue("an object's bytes were found in the data region", found > 0);
 	clwrite(&cl, Fctl, 0, "verify alpha", &r);
-	checks++;
-	if(r.type != Rerror || strcmp(r.ename, "checksum mismatch") != 0)
-		fail("verify a damaged object: %s",
-			r.type == Rerror ? r.ename : "ok");
+	clerris("verify a damaged object", &r, "checksum mismatch");
 Out:
 	clstop(&cl);
 	srvfree(ctx);
@@ -1409,15 +1331,15 @@ tdevintr(void)
 
 	clstart(&cl, ctx, Clmsize);
 	if(clattach(&cl, Froot, "role=admin", &r) != Rattach)
-		fail("attach: %s", errof(&r));
+		fail("attach: %s", clerr(&r));
 	w[0] = "ctl";
 	if(clopenpath(&cl, Froot, Fctl, 1, w, OWRITE, &r) != Ropen){
-		fail("open /ctl: %s", errof(&r));
+		fail("open /ctl: %s", clerr(&r));
 		goto Out;
 	}
 	simfault(d, Sfintr, 1);
 	clwrite(&cl, Fctl, 0, "verify alpha", &r);
-	eqs("a device interrupt with no flush pending", errof(&r),
+	clerris("a device interrupt with no flush pending", &r,
 		"shoalsrv: interrupted");
 	srvauxcount(ctx, &n7, nil, nil);
 	eqv("a device interrupt unwinds into step 7", n7, 1);
@@ -1429,7 +1351,7 @@ tdevintr(void)
 	clwrite(&cl, Fctl, 0, "verify alpha", &r);
 	checks++;
 	if(r.type != Rwrite)
-		fail("verify after a device interrupt: %s", errof(&r));
+		fail("verify after a device interrupt: %s", clerr(&r));
 	srvauxcount(ctx, &n7, nil, nil);
 	eqv("a request that was not interrupted runs no step 7", n7, 1);
 Out:
@@ -1464,116 +1386,116 @@ tobjgate(void)
 	mkobj(srvstore(ctx), "shoal.map.7", nil, 0, 1);
 	clstart(&cl, ctx, Clmsize);
 	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
-		fail("attach admin: %s", errof(&r));
+		fail("attach admin: %s", clerr(&r));
 		goto Out;
 	}
 
 	/* §2.1: role=admin's grant of /obj is read-only … */
 	if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk)
-		fail("walk /obj: %s", errof(&r));
-	clcreate(&cl, Ffile, "brandnew", OWRITE, &r);
-	eqs("admin create of an id that is not reserved", errof(&r),
+		fail("walk /obj: %s", clerr(&r));
+	clcreate(&cl, Ffile, "brandnew", 0666, OWRITE, &r);
+	clerris("admin create of an id that is not reserved", &r,
 		"permission denied");
 	/* … except for §1.1's reserved ids, which it may create and write */
-	clcreate(&cl, Ffile, "shoal.map.8", OWRITE, &r);
-	eqs("admin create of a reserved id", errof(&r), "shoalsrv: not built");
+	clcreate(&cl, Ffile, "shoal.map.8", 0666, OWRITE, &r);
+	clerris("admin create of a reserved id", &r, "shoalsrv: not built");
 	clclunk(&cl, Ffile, &r);
 
 	w[0] = "obj";
 	w[1] = "alpha";
 	if(clwalk(&cl, Froot, Ffile, 2, w, &r) != Rwalk)
-		fail("walk /obj/alpha: %s", errof(&r));
+		fail("walk /obj/alpha: %s", clerr(&r));
 	clopen(&cl, Ffile, OWRITE, &r);
-	eqs("admin open of an unreserved object for writing", errof(&r),
+	clerris("admin open of an unreserved object for writing", &r,
 		"permission denied");
 	clopen(&cl, Ffile, OREAD, &r);
-	eqs("admin open of an unreserved object for reading", errof(&r),
+	clerris("admin open of an unreserved object for reading", &r,
 		"shoalsrv: not built");
 	/* ORCLOSE is the remove §2.1 refuses, one message earlier */
 	clopen(&cl, Ffile, OREAD|ORCLOSE, &r);
-	eqs("admin open of an unreserved object for reading with ORCLOSE",
-		errof(&r), "permission denied");
+	clerris("admin open of an unreserved object for reading with ORCLOSE",
+		&r, "permission denied");
 	clclunk(&cl, Ffile, &r);
 
 	w[1] = "shoal.map.7";
 	if(clwalk(&cl, Froot, Ffile, 2, w, &r) != Rwalk)
-		fail("walk /obj/shoal.map.7: %s", errof(&r));
+		fail("walk /obj/shoal.map.7: %s", clerr(&r));
 	clopen(&cl, Ffile, OWRITE, &r);
-	eqs("admin open of a reserved object for writing", errof(&r),
+	clerris("admin open of a reserved object for writing", &r,
 		"shoalsrv: not built");
 	clclunk(&cl, Ffile, &r);
 
 	/* the fence, and §2.1's sole exemption from it */
 	w[0] = "ctl";
 	if(clopenpath(&cl, Froot, Fctl, 1, w, OWRITE, &r) != Ropen){
-		fail("open /ctl: %s", errof(&r));
+		fail("open /ctl: %s", clerr(&r));
 		goto Out;
 	}
 	if(clwrite(&cl, Fctl, 0, "fence on", &r) != Rwrite)
-		fail("fence on: %s", errof(&r));
+		fail("fence on: %s", clerr(&r));
 	w[0] = "obj";
 	w[1] = "shoal.map.7";
 	if(clwalk(&cl, Froot, Ffile, 2, w, &r) != Rwalk)
-		fail("walk /obj/shoal.map.7 while fenced: %s", errof(&r));
+		fail("walk /obj/shoal.map.7 while fenced: %s", clerr(&r));
 	clopen(&cl, Ffile, OREAD, &r);
-	eqs("fenced admin read of a reserved id", errof(&r),
+	clerris("fenced admin read of a reserved id", &r,
 		"shoalsrv: not built");
 	clopen(&cl, Ffile, OWRITE, &r);
-	eqs("fenced admin write of a reserved id", errof(&r), "fenced");
+	clerris("fenced admin write of a reserved id", &r, "fenced");
 	clclunk(&cl, Ffile, &r);
 	w[0] = "meta";
 	if(clwalk(&cl, Froot, Ffile, 2, w, &r) != Rwalk)
-		fail("walk /meta/shoal.map.7 while fenced: %s", errof(&r));
+		fail("walk /meta/shoal.map.7 while fenced: %s", clerr(&r));
 	clopen(&cl, Ffile, OREAD, &r);
-	eqs("fenced admin read of a reserved id through /meta", errof(&r),
+	clerris("fenced admin read of a reserved id through /meta", &r,
 		"shoalsrv: not built");
 	clclunk(&cl, Ffile, &r);
 	w[0] = "obj";
 	w[1] = "alpha";
 	if(clwalk(&cl, Froot, Ffile, 2, w, &r) != Rwalk)
-		fail("walk /obj/alpha while fenced: %s", errof(&r));
+		fail("walk /obj/alpha while fenced: %s", clerr(&r));
 	clopen(&cl, Ffile, OREAD, &r);
-	eqs("fenced admin read of an unreserved id", errof(&r), "fenced");
+	clerris("fenced admin read of an unreserved id", &r, "fenced");
 	clclunk(&cl, Ffile, &r);
 	if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk)
-		fail("walk /obj while fenced: %s", errof(&r));
+		fail("walk /obj while fenced: %s", clerr(&r));
 	/* a listing is not a read of an object, so F1 does not fence it */
 	clopen(&cl, Ffile, OREAD, &r);
-	eqs("fenced admin open of the /obj directory", errof(&r),
+	clerris("fenced admin open of the /obj directory", &r,
 		"shoalsrv: not built");
-	clcreate(&cl, Ffile, "shoal.map.9", OWRITE, &r);
-	eqs("fenced admin create of a reserved id", errof(&r), "fenced");
+	clcreate(&cl, Ffile, "shoal.map.9", 0666, OWRITE, &r);
+	clerris("fenced admin create of a reserved id", &r, "fenced");
 	/*
 	 * The order of the gate's rules is on the wire.  §2.1's operator
 	 * rule is asked first, so an operation it forbids is `permission
 	 * denied' whatever the fence says: the fence is a state that
 	 * moves, and the name and the role are not.
 	 */
-	clcreate(&cl, Ffile, "brandnew", OWRITE, &r);
-	eqs("fenced admin create of an id that is not reserved", errof(&r),
+	clcreate(&cl, Ffile, "brandnew", 0666, OWRITE, &r);
+	clerris("fenced admin create of an id that is not reserved", &r,
 		"permission denied");
 	clclunk(&cl, Ffile, &r);
 	if(clwrite(&cl, Fctl, 0, "fence off", &r) != Rwrite)
-		fail("fence off: %s", errof(&r));
+		fail("fence off: %s", clerr(&r));
 	clclunk(&cl, Fctl, &r);
 	clclunk(&cl, Froot, &r);
 
 	/* a client is not the operator: its writes are §2.4's, not §2.1's */
 	if(clattach(&cl, Froot, "role=client,epoch=7", &r) != Rattach){
-		fail("attach client: %s", errof(&r));
+		fail("attach client: %s", clerr(&r));
 		goto Out;
 	}
 	if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk)
-		fail("walk /obj as client: %s", errof(&r));
-	clcreate(&cl, Ffile, "brandnew", OWRITE, &r);
-	eqs("client create of an id that is not reserved", errof(&r),
+		fail("walk /obj as client: %s", clerr(&r));
+	clcreate(&cl, Ffile, "brandnew", 0666, OWRITE, &r);
+	clerris("client create of an id that is not reserved", &r,
 		"shoalsrv: not built");
 	clclunk(&cl, Ffile, &r);
 	w[1] = "alpha";
 	if(clwalk(&cl, Froot, Ffile, 2, w, &r) != Rwalk)
-		fail("walk /obj/alpha as client: %s", errof(&r));
+		fail("walk /obj/alpha as client: %s", clerr(&r));
 	clopen(&cl, Ffile, OWRITE, &r);
-	eqs("client open of an object for writing", errof(&r),
+	clerris("client open of an object for writing", &r,
 		"shoalsrv: not built");
 	clclunk(&cl, Ffile, &r);
 	clclunk(&cl, Froot, &r);
@@ -1614,12 +1536,12 @@ tiogate(void)
 	srvcellpoint(ctx, 1);
 	clstart(&cl, ctx, Clmsize);
 	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
-		fail("attach admin: %s", errof(&r));
+		fail("attach admin: %s", clerr(&r));
 		goto Out;
 	}
 	w[0] = "ctl";
 	if(clopenpath(&cl, Froot, Fctl, 1, w, OWRITE, &r) != Ropen){
-		fail("open /ctl: %s", errof(&r));
+		fail("open /ctl: %s", clerr(&r));
 		goto Out;
 	}
 
@@ -1627,27 +1549,27 @@ tiogate(void)
 	w[0] = "obj";
 	w[1] = "shoal.map.7";
 	if(clopenpath(&cl, Froot, Ffile, 2, w, OWRITE, &r) != Ropen){
-		fail("open /obj/shoal.map.7 for writing: %s", errof(&r));
+		fail("open /obj/shoal.map.7 for writing: %s", clerr(&r));
 		goto Out;
 	}
 	clwrite(&cl, Ffile, 0, "bytes", &r);
 	checks++;
 	if(r.type != Rwrite)
 		fail("an admin write of a reserved id while unfenced: %s",
-			errof(&r));
+			clerr(&r));
 	w[1] = "alpha";
 	if(clopenpath(&cl, Froot, Ffile2, 2, w, OREAD, &r) != Ropen)
-		fail("open /obj/alpha for reading: %s", errof(&r));
+		fail("open /obj/alpha for reading: %s", clerr(&r));
 	clread(&cl, Ffile2, 0, 16, &r);
-	eqs("an admin read of an object while unfenced", errof(&r),
+	clerris("an admin read of an object while unfenced", &r,
 		"shoalsrv: not built");
 
 	if(clwrite(&cl, Fctl, 0, "fence on", &r) != Rwrite)
-		fail("fence on: %s", errof(&r));
+		fail("fence on: %s", clerr(&r));
 	clwrite(&cl, Ffile, 0, "bytes", &r);
-	eqs("a write on a fid opened before the fence", errof(&r), "fenced");
+	clerris("a write on a fid opened before the fence", &r, "fenced");
 	clread(&cl, Ffile2, 0, 16, &r);
-	eqs("a read on a fid opened before the fence", errof(&r), "fenced");
+	clerris("a read on a fid opened before the fence", &r, "fenced");
 	clclunk(&cl, Ffile, &r);
 	clclunk(&cl, Ffile2, &r);
 	clclunk(&cl, Fctl, &r);
@@ -1655,15 +1577,15 @@ tiogate(void)
 
 	/* the channels are in F1's list; F3's `down' is not theirs */
 	if(clattach(&cl, Froot2, "role=repl,peer=n1.1", &r) != Rattach){
-		fail("attach repl: %s", errof(&r));
+		fail("attach repl: %s", clerr(&r));
 		goto Out;
 	}
 	w[0] = "repl";
 	clopenpath(&cl, Froot2, Ffile, 1, w, ORDWR, &r);
-	eqs("a repl open of /repl while fenced", errof(&r), "fenced");
+	clerris("a repl open of /repl while fenced", &r, "fenced");
 	w[0] = "rpc";
 	clopenpath(&cl, Froot2, Ffile2, 1, w, ORDWR, &r);
-	eqs("a repl open of /rpc while fenced", errof(&r), "fenced");
+	clerris("a repl open of /rpc while fenced", &r, "fenced");
 	clclunk(&cl, Ffile, &r);
 	clclunk(&cl, Ffile2, &r);
 	clclunk(&cl, Froot2, &r);
@@ -1702,37 +1624,37 @@ tdown(char *status, char *up)
 	/* the attach is not gated: §2.1 names no `down' among its refusals */
 	if(clattach(&cl, Froot, "role=client,epoch=7", &r) != Rattach){
 		fail("attach client on a %s/%s instance: %s", status, up,
-			errof(&r));
+			clerr(&r));
 		goto Out;
 	}
 	w[0] = "obj";
 	w[1] = "alpha";
 	if(clwalk(&cl, Froot, Ffile, 2, w, &r) != Rwalk)
-		fail("walk /obj/alpha: %s", errof(&r));
+		fail("walk /obj/alpha: %s", clerr(&r));
 	clopen(&cl, Ffile, OREAD, &r);
-	eqs("a client read on an instance the map does not serve with",
-		errof(&r), "down");
+	clerris("a client read on an instance the map does not serve with",
+		&r, "down");
 	clopen(&cl, Ffile, OWRITE, &r);
-	eqs("a client write on an instance the map does not serve with",
-		errof(&r), "down");
+	clerris("a client write on an instance the map does not serve with",
+		&r, "down");
 	clclunk(&cl, Ffile, &r);
 	if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk)
-		fail("walk /obj: %s", errof(&r));
-	clcreate(&cl, Ffile, "brandnew", OWRITE, &r);
-	eqs("a client create on an instance the map does not serve with",
-		errof(&r), "down");
+		fail("walk /obj: %s", clerr(&r));
+	clcreate(&cl, Ffile, "brandnew", 0666, OWRITE, &r);
+	clerris("a client create on an instance the map does not serve with",
+		&r, "down");
 	clclunk(&cl, Ffile, &r);
 	clclunk(&cl, Froot, &r);
 
 	/* F3 is about serving clients: an operator still reaches the disk */
 	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
-		fail("attach admin: %s", errof(&r));
+		fail("attach admin: %s", clerr(&r));
 		goto Out;
 	}
 	if(clwalk(&cl, Froot, Ffile, 2, w, &r) != Rwalk)
-		fail("walk /obj/alpha as admin: %s", errof(&r));
+		fail("walk /obj/alpha as admin: %s", clerr(&r));
 	clopen(&cl, Ffile, OREAD, &r);
-	eqs("an admin read on the same instance", errof(&r),
+	clerris("an admin read on the same instance", &r,
 		"shoalsrv: not built");
 	clclunk(&cl, Ffile, &r);
 
@@ -1743,20 +1665,20 @@ tdown(char *status, char *up)
 	 */
 	w2[0] = "ctl";
 	if(clopenpath(&cl, Froot, Fctl, 1, w2, OWRITE, &r) != Ropen)
-		fail("open /ctl as admin: %s", errof(&r));
+		fail("open /ctl as admin: %s", clerr(&r));
 	else if(clwrite(&cl, Fctl, 0, "fence on", &r) != Rwrite)
-		fail("fence on: %s", errof(&r));
+		fail("fence on: %s", clerr(&r));
 	clclunk(&cl, Fctl, &r);
 	clclunk(&cl, Froot, &r);
 	if(clattach(&cl, Froot2, "role=client,epoch=7", &r) != Rattach){
-		fail("attach client while fenced: %s", errof(&r));
+		fail("attach client while fenced: %s", clerr(&r));
 		goto Out;
 	}
 	if(clwalk(&cl, Froot2, Ffile, 2, w, &r) != Rwalk)
-		fail("walk /obj/alpha while fenced: %s", errof(&r));
+		fail("walk /obj/alpha while fenced: %s", clerr(&r));
 	clopen(&cl, Ffile, OREAD, &r);
-	eqs("a client read on an instance that is both down and fenced",
-		errof(&r), "down");
+	clerris("a client read on an instance that is both down and fenced",
+		&r, "down");
 	clclunk(&cl, Ffile, &r);
 	clclunk(&cl, Froot2, &r);
 Out:
@@ -1792,7 +1714,7 @@ tfidstate(void)
 	srvauxpoint(ctx, 1);
 	clstart(&cl, ctx, Clmsize);
 	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
-		fail("attach: %s", errof(&r));
+		fail("attach: %s", clerr(&r));
 		goto Out;
 	}
 	srvauxcount(ctx, nil, &nc, &nf);
@@ -1805,11 +1727,11 @@ tfidstate(void)
 
 	/* a walk that moves a fid gives back what that fid was holding */
 	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
-		fail("attach: %s", errof(&r));
+		fail("attach: %s", clerr(&r));
 		goto Out;
 	}
 	if(clwalk1(&cl, Froot, Froot, "ctl", &r) != Rwalk)
-		fail("walk /ctl onto the same fid: %s", errof(&r));
+		fail("walk /ctl onto the same fid: %s", clerr(&r));
 	srvauxcount(ctx, nil, &nc, &nf);
 	eqv("a walk that moves a fid closes the state it held", nc, 2);
 	eqv("a walk that moves a fid frees the state it held", nf, 2);
@@ -1827,7 +1749,7 @@ tfidstate(void)
 	 * free hook runs with lib9p's fid pool, after it.
 	 */
 	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
-		fail("attach: %s", errof(&r));
+		fail("attach: %s", clerr(&r));
 		goto Out;
 	}
 
@@ -1844,7 +1766,7 @@ tfidstate(void)
 	clrpc(&cl, &t, &r);
 	checks++;
 	if(r.type != Rwalk || r.nwqid != 0)
-		fail("a zero-name walk of a fid onto itself: %s", errof(&r));
+		fail("a zero-name walk of a fid onto itself: %s", clerr(&r));
 	srvauxcount(ctx, nil, &nc, &nf);
 	eqv("a fid that did not move closed nothing", nc, 2);
 	eqv("a fid that did not move freed nothing", nf, 2);
@@ -1890,18 +1812,18 @@ tcreategive(void)
 	srvcellpoint(ctx, 1);
 	clstart(&cl, ctx, Clmsize);
 	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
-		fail("attach: %s", errof(&r));
+		fail("attach: %s", clerr(&r));
 		goto Out;
 	}
 	if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk){
-		fail("walk /obj: %s", errof(&r));
+		fail("walk /obj: %s", clerr(&r));
 		goto Out;
 	}
 	srvauxcount(ctx, nil, &nc, &nf);
 	eqv("the directory fid is still holding its state", nc + nf, 0);
 
-	clcreate(&cl, Ffile, "shoal.map.9", OWRITE, &r);
-	eqs("the create cell answered", errof(&r), "shoalsrv: not built");
+	clcreate(&cl, Ffile, "shoal.map.9", 0666, OWRITE, &r);
+	clerris("the create cell answered", &r, "shoalsrv: not built");
 	srvauxcount(ctx, nil, &nc, &nf);
 	eqv("a create closes the directory fid's state", nc, 1);
 	eqv("a create frees the directory fid's state", nf, 1);
@@ -1953,11 +1875,11 @@ tfidwalk(void)
 	mkobj(srvstore(ctx), "alpha", nil, 0, 1);
 	clstart(&cl, ctx, Clmsize);
 	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
-		fail("attach: %s", errof(&r));
+		fail("attach: %s", clerr(&r));
 		goto Out;
 	}
 	if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk){
-		fail("walk /obj: %s", errof(&r));
+		fail("walk /obj: %s", clerr(&r));
 		goto Out;
 	}
 	eqv("the registry holds the attach's fid and the walk's",
@@ -1980,7 +1902,7 @@ tfidwalk(void)
 	sleep(200);			/* it is held at its commit */
 
 	if(clattach(&cl, Froot2, "role=admin", &r) != Rattach)
-		fail("attach while a walk is held at its commit: %s", errof(&r));
+		fail("attach while a walk is held at its commit: %s", clerr(&r));
 	eqv("the attach's fid is on the registry too", srvfidcount(ctx), 3);
 
 	srvhook(ctx, "walkhold", 0);
@@ -1988,7 +1910,7 @@ tfidwalk(void)
 	checks++;
 	if(r.type != Rwalk || r.tag != ta || r.nwqid != 1)
 		fail("the held self-walk: type %d tag %ud %s", r.type, r.tag,
-			errof(&r));
+			clerr(&r));
 	eqv("and it is still there once the walk has committed",
 		srvfidcount(ctx), 3);
 
@@ -2062,7 +1984,7 @@ tflush(void)
 	clwrite(&cl, Fctl, 0, "verify alpha", &r);
 	checks++;
 	if(r.type != Rwrite)
-		fail("verify before the hold: %s", errof(&r));
+		fail("verify before the hold: %s", clerr(&r));
 	sleep(100);			/* its Req is freed after its reply */
 
 	/* a QUEUED request, flushed */
@@ -2093,7 +2015,7 @@ tflush(void)
 	eqv("completions counted while two requests are in flight", nd, 1);
 	w[0] = "status";
 	if(clopenpath(&cl, Froot, Ffile, 1, w, OREAD, &r) != Ropen)
-		fail("open /status under the hold: %s", errof(&r));
+		fail("open /status under the hold: %s", clerr(&r));
 	else{
 		clslurp(&cl, Ffile, buf, sizeof buf);
 		eqs("/status qdepth= under the hold",
@@ -2226,14 +2148,8 @@ tflush(void)
 	srvhook(ctx, "objexit", 0);
 
 	/* a Tflush naming a request answered on the loop is still answered */
-	memset(&t, 0, sizeof t);
-	t.type = Tflush;
-	t.tag = tf = cltag(&cl);
-	t.oldtag = 31337;
-	clput(&cl, &t);
-	clget(&cl, &r);
 	checks++;
-	if(r.type != Rflush || r.tag != tf)
+	if(clflush(&cl, 31337, &r) != Rflush)
 		fail("a Tflush of an unknown tag: type %d", r.type);
 	sleep(200);			/* the parked Rflushes have been answered */
 	srvcount(ctx, &np, &nd);
@@ -2267,7 +2183,7 @@ tanyq(void)
 	Fcall t, r;
 	char *w[1];
 	uvlong np, nd;
-	ushort ta, tf;
+	ushort ta, tb, tf;
 	long n;
 
 	clstage = "anyq";
@@ -2280,14 +2196,14 @@ tanyq(void)
 
 	clstart(&cl, ctx, Clmsize);
 	if(clattach(&cl, Froot, "role=admin", &r) != Rattach)
-		fail("attach: %s", errof(&r));
+		fail("attach: %s", clerr(&r));
 	w[0] = "ctl";
 	if(clopenpath(&cl, Froot, Fctl, 1, w, OWRITE, &r) != Ropen){
-		fail("open /ctl: %s", errof(&r));
+		fail("open /ctl: %s", clerr(&r));
 		goto Out;
 	}
 	if(clwalk1(&cl, Froot, Ffile, "map", &r) != Rwalk){
-		fail("walk /map: %s", errof(&r));
+		fail("walk /map: %s", clerr(&r));
 		goto Out;
 	}
 	srvhook(ctx, "mapopen", 1);
@@ -2306,7 +2222,7 @@ tanyq(void)
 	w[0] = "status";
 	if(clopenpath(&cl, Froot, Ffile2, 1, w, OREAD, &r) != Ropen)
 		fail("open /status while a request is held off the loop: %s",
-			errof(&r));
+			clerr(&r));
 	else{
 		n = clslurp(&cl, Ffile2, buf, sizeof buf);
 		istrue("/status renders while a request is held off the loop",
@@ -2317,17 +2233,11 @@ tanyq(void)
 	checks++;
 	if(r.type != Rwrite)
 		fail("an object's verb while a request is held off the loop: "
-			"%s", errof(&r));
-	memset(&t, 0, sizeof t);
-	t.type = Tflush;
-	t.tag = tf = cltag(&cl);
-	t.oldtag = 31337;
-	clput(&cl, &t);
-	clget(&cl, &r);
+			"%s", clerr(&r));
 	checks++;
-	if(r.type != Rflush || r.tag != tf)
+	if(clflush(&cl, 31337, &r) != Rflush)
 		fail("an unrelated Tflush while a request is held off the "
-			"loop: type %d tag %ud", r.type, r.tag);
+			"loop: type %d", r.type);
 
 	/* and it is flushable, like every other pushed request */
 	memset(&t, 0, sizeof t);
@@ -2349,7 +2259,7 @@ tanyq(void)
 
 	/* released rather than flushed, it answers what the loop would have */
 	if(clwalk1(&cl, Froot, Ffile, "map", &r) != Rwalk)
-		fail("walk /map again: %s", errof(&r));
+		fail("walk /map again: %s", clerr(&r));
 	memset(&t, 0, sizeof t);
 	t.type = Topen;
 	t.tag = ta = cltag(&cl);
@@ -2382,12 +2292,12 @@ tanyq(void)
 	 */
 	srvhook(ctx, "mapopen", 2);
 	if(clwalk1(&cl, Froot, Ffile, "map", &r) != Rwalk)
-		fail("walk /map a third time: %s", errof(&r));
+		fail("walk /map a third time: %s", clerr(&r));
 	clopen(&cl, Ffile, OREAD, &r);
 	checks++;
 	if(r.type != Ropen)
 		fail("an open prepared for a queue and answered on the loop: "
-			"%s", errof(&r));
+			"%s", clerr(&r));
 	clclunk(&cl, Ffile, &r);
 	srvhook(ctx, "mapopen", 0);
 	sleep(100);
@@ -2395,13 +2305,52 @@ tanyq(void)
 	eqv("a preparation without a push leaves the pool empty", np - nd, 0);
 	w[0] = "status";
 	if(clopenpath(&cl, Froot, Ffile2, 1, w, OREAD, &r) != Ropen)
-		fail("open /status: %s", errof(&r));
+		fail("open /status: %s", clerr(&r));
 	else{
 		clslurp(&cl, Ffile2, buf, sizeof buf);
 		eqs("/status qdepth= after it",
 			clfield(buf, "qdepth", val, sizeof val), "0");
 		clclunk(&cl, Ffile2, &r);
 	}
+
+	/*
+	 * Two requests in flight and their replies out of order: the open
+	 * waits on the reserved queue while the verb issued behind it runs
+	 * to completion on an object's queue, so the second request is
+	 * answered first.  A client that pipelines picks the reply it is
+	 * waiting for out by tag, and the one it passed over is still
+	 * there, in arrival order, for the read after it.
+	 */
+	srvhook(ctx, "mapopen", 1);
+	if(clwalk1(&cl, Froot, Ffile, "map", &r) != Rwalk)
+		fail("walk /map a fourth time: %s", clerr(&r));
+	memset(&t, 0, sizeof t);
+	t.type = Topen;
+	t.tag = ta = cltag(&cl);
+	t.fid = Ffile;
+	t.mode = OREAD;
+	clput(&cl, &t);
+	sleep(200);			/* held on the reserved queue */
+	memset(&t, 0, sizeof t);
+	t.type = Twrite;
+	t.tag = tb = cltag(&cl);
+	t.fid = Fctl;
+	t.offset = 0;
+	t.data = "verify alpha";
+	t.count = strlen(t.data);
+	clput(&cl, &t);
+	sleep(200);			/* answered while the open is still held */
+	srvhook(ctx, "mapopen", 0);
+	sleep(200);			/* and the open's answer is behind it now */
+	checks++;
+	if(clgettag(&cl, ta, &r) != Ropen)
+		fail("the held open, collected by its tag: type %d tag %ud %s",
+			r.type, r.tag, clerr(&r));
+	checks++;
+	if(clget(&cl, &r) != Rwrite || r.tag != tb)
+		fail("the reply that came first, read after it: type %d tag "
+			"%ud", r.type, r.tag);
+	clclunk(&cl, Ffile, &r);
 Out:
 	srvhook(ctx, "mapopen", 0);
 	clstop(&cl);
@@ -2442,10 +2391,10 @@ tflushrace(void)
 
 	clstart(&cl, ctx, Clmsize);
 	if(clattach(&cl, Froot, "role=admin", &r) != Rattach)
-		fail("attach: %s", errof(&r));
+		fail("attach: %s", clerr(&r));
 	w[0] = "ctl";
 	if(clopenpath(&cl, Froot, Fctl, 1, w, OWRITE, &r) != Ropen){
-		fail("open /ctl: %s", errof(&r));
+		fail("open /ctl: %s", clerr(&r));
 		goto Out;
 	}
 	srvhook(ctx, "objhold", 1);
@@ -2482,7 +2431,7 @@ tflushrace(void)
 	clwrite(&cl, Fctl, 0, "verify alpha", &r);
 	checks++;
 	if(r.type != Rwrite)
-		fail("verify after the lost flush: %s", errof(&r));
+		fail("verify after the lost flush: %s", clerr(&r));
 Out:
 	clstop(&cl);
 	srvfree(ctx);
@@ -2633,7 +2582,7 @@ tjobs(void)
 
 	clstart(&cl, ctx, Clmsize);
 	if(clattach(&cl, Froot, "role=admin", &r) != Rattach)
-		fail("attach: %s", errof(&r));
+		fail("attach: %s", clerr(&r));
 	if(tspawn(jobproc, nil) < 0)
 		fail("tspawn: %r");
 	for(i = 0; i < 200 && !jobstarted; i++)
