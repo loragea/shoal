@@ -395,10 +395,12 @@ auxpoint(Srvctx *c, Sfid *f)
  * nothing but the Objsnap calls after that, which is auxfree's half.
  *
  * A clunk and a walk that moves a fid run their own fid's hook, so the
- * only caller srvfidsclose has is a shutdown that must reach the fids
- * still open when the service loop ends.  The shutdown sequence does
- * not call it yet, and no row fills a fid with state that must be
- * given back before the store closes.
+ * only caller srvfidsclose has is the shutdown, which must reach the
+ * fids still open when the service loop ends: srvshutdown sweeps here
+ * after the drain and the job wait, because a hook may call the
+ * engine, and before the store closes, because that is what the sweep
+ * is for.  No row fills a fid with state that must be given back
+ * before the store closes yet; the sweep is what will reach it.
  */
 void
 srvfidnew(Srvctx *c, Sfid *f)
