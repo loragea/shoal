@@ -5380,7 +5380,12 @@ name a half that is not built; each says which.
     **lease** fence, which is the fence a deposed instance carries
     and the one `fence off` MUST NOT clear anyway, so the rule §2.5
     is protecting survives without F4 becoming one-way.
-    `decisions.md` D25 carries the argument.
+    `decisions.md` D25 carries the argument. The refusal itself is
+    unreachable in this build: the lease half of the fence can never
+    be raised while the map is static (§14(19)), so `fence off` always
+    clears the operator fence here. The check that carries the rule is
+    in place and answers `fenced` the moment a refresh loop gives F1 a
+    real clock.
 
 27. **A ctl verb naming a malformed oid answers `bad object
     name`.** §2.5 answers a known verb with bad arguments `bad ctl`;
