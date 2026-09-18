@@ -77,21 +77,18 @@ enum
  * discards: the queue is the object's ordering point (§5.4 step 2),
  * and a mutation outside it is ordered against nothing.
  *
- * The pool's entry points all take a Req, because every other caller
- * is one.  A pass is not, so it carries a Req of its own — this
- * structure's first member, so the handler finds the rest of the work
- * beside it — and drives it through the same srvqprep/srvqgo the
- * service loop uses.  That Req is never in lib9p's tag pool, so no
- * Tflush can name it and no reqqueueflush can reach it; it leaves
- * through srvqended rather than through respond, which is the
- * completion count srvdestroyreq would have taken for a real one, and
- * the pass proc's stack is what holds it for as long as the queue's
- * proc is in it.
+ * Most of the pool's entry points take a Req, because every other
+ * caller is one.  A pass is not, so it enters through srvqjob
+ * (queue.c), which is the pool's entry for a caller with no tag, no
+ * Req pool and no reference to the Srv: it pushes a unit of work,
+ * waits for it, and gives the pool its completion back through
+ * srvqended.  Nothing on this path allocates, and nothing on it
+ * responds — dat.h's Qjob states the rule.  This structure is the
+ * work itself, which srvqjob carries as an opaque argument.
  */
-typedef struct Qjob Qjob;
-struct Qjob
+typedef struct Qwork Qwork;
+struct Qwork
 {
-	Req	r;		/* the pool carries this; keep it first */
 	Srvctx	*ctx;
 	int	op;
 	uchar	oid[Oidmax];
@@ -100,9 +97,6 @@ struct Qjob
 	int	rc;
 	int	bad;
 	char	err[ERRMAX];
-	QLock	lk;
-	Rendez	rz;
-	int	done;
 };
 
 static char Eshutting[] = "shoalsrv: shutting down";
@@ -113,15 +107,12 @@ static void	forgetpass(Sjob*);
 static ulong	scrubrate(Srvctx*);
 
 static void
-qjobrun(Req *r)
+qworkrun(void *a)
 {
-	Qjob *j;
+	Qwork *j;
 	Vfy v;
 
-	j = (Qjob*)r;
-	j->rc = 0;
-	j->bad = 0;
-	j->err[0] = 0;
+	j = a;
 	switch(j->op){
 	case Jscrub:
 		/*
@@ -146,38 +137,15 @@ qjobrun(Req *r)
 		}
 		break;
 	}
-	qlock(&j->lk);
-	j->done = 1;
-	rwakeup(&j->rz);
-	qunlock(&j->lk);
 }
 
 static int
-qjob(Qjob *j)
+qjob(Qwork *j)
 {
-	Qreq *qr;
-
-	memset(&j->r, 0, sizeof j->r);
-	j->r.srv = srv9p(j->ctx);
-	j->done = 0;
-	j->rz.l = &j->lk;
-	if((qr = srvqprep(j->ctx, j->oid, j->oidlen, &j->r, qjobrun)) == nil)
-		return -1;
-	srvqgo(j->ctx, &j->r);
-	qlock(&j->lk);
-	while(!j->done)
-		rsleep(&j->rz);
-	qunlock(&j->lk);
-	/*
-	 * The completion the pool is owed.  For a client's request this
-	 * is srvdestroyreq's, run when lib9p frees the Req; this Req is
-	 * not lib9p's, so the pass gives the count back itself and frees
-	 * what srvqprep allocated.  Until it does, the shutdown's drain
-	 * counts this unit as in flight, which is what makes the store
-	 * outlive it.
-	 */
-	srvqended(qr);
-	free(qr);
+	j->rc = 0;
+	j->bad = 0;
+	j->err[0] = 0;
+	srvqjob(j->ctx, j->oid, j->oidlen, qworkrun, j);
 	return j->rc;
 }
 
@@ -379,7 +347,7 @@ reclaim(Srvctx *c, Sjob *j)
 	char buf[ERRMAX];
 	Objsnap *sn;
 	Objinfo oi;
-	Qjob w;
+	Qwork w;
 	uchar oid[Oidmax];
 	vlong cutoff;
 	ulong i, n;
@@ -432,7 +400,7 @@ scrubpass(Sjob *j)
 {
 	Srvctx *c;
 	Storestat st;
-	Qjob w;
+	Qwork w;
 	uchar oid[Oidmax];
 	Objinfo oi;
 	uvlong bytes, slot;

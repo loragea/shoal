@@ -49,6 +49,7 @@ int	srvqinit(Srvctx*, int nq);
 Qreq*	srvqprep(Srvctx*, uchar *oid, int oidlen, Req*, void (*)(Req*));
 void	srvqgo(Srvctx*, Req*);
 void	srvqpush(Srvctx*, uchar *oid, int oidlen, Req*, void (*)(Req*));
+int	srvqjob(Srvctx*, uchar *oid, int oidlen, void (*)(void*), void*);
 Qreq*	srvqprepany(Srvctx*, Req*, void (*)(Req*));
 void	srvqpushany(Srvctx*, Req*, void (*)(Req*));
 void	srvqflush(Req*);

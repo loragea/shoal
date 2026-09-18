@@ -1219,6 +1219,71 @@ Out:
 }
 
 /*
+ * The pass's units are the pool's: srvqjob counts a push on the way in
+ * and a completion on the way out, exactly as a client's request is
+ * counted, so the shutdown's drain (D16) sees a pass's work in flight
+ * and the store outlives it.  What a test can hold the server to is
+ * the arithmetic: a pass over an index holding `nlive' live objects
+ * and some tombstones pushes one unit per LIVE object and none for a
+ * tombstone (layer-a §7.5 re-verifies live copies), and the two counts
+ * balance once it has ended.
+ *
+ * The counts are read with no 9P traffic in between, because a walk or
+ * an open of some rows pushes to the pool too; the pass is given a
+ * fixed wait rather than polled at /jobs for the same reason.
+ */
+static void
+tqjobcount(void)
+{
+	char buf[4096], name[32], *m;
+	uvlong p0, d0, p1, d1;
+	Srvctx *ctx;
+	Store *st;
+	Dev *d;
+	Cl cl;
+	Fcall r;
+	int i;
+
+	clstage = "qjobcount";
+	m = mkmap();
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4, 0)) == nil)
+		return;
+	st = srvstore(ctx);
+	for(i = 0; i < 8; i++){
+		snprint(name, sizeof name, "obj%.2d", i);
+		mkobj(st, name, nil, 0, 1);
+	}
+	for(i = 5; i < 8; i++){			/* three of them go to tomb */
+		snprint(name, sizeof name, "obj%.2d", i);
+		rmobj(st, name, 9, 3);
+	}
+	clstart(&cl, ctx, Clmsize);
+	if(!adminctl(&cl, "role=admin"))
+		goto Out;
+	srvcount(ctx, &p0, &d0);
+	if(clwrite(&cl, Fctl, 0, "scrub start rate=1000000", &r) != Rwrite){
+		fail("scrub start: %s", clerr(&r));
+		goto Out;
+	}
+	sleep(1500);				/* 128 slots at that rate */
+	srvcount(ctx, &p1, &d1);
+	eqv("the pass pushed one unit per live object",
+		p1 - p0, 5);
+	eqv("and the pool counted every one of them off again",
+		d1 - d0, p1 - p0);
+	istrue("the pass had ended", !jobrunning(&cl));
+	if(slurpfile(&cl, Ffile, "tombs", buf, sizeof buf) >= 0)
+		eqv("the tombstones it did not push are still there",
+			nlines(buf, "oid="), 3);
+Out:
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * store.md §9's tombstone reclaim, which rides on the scrub pass: the
  * cutoff is the map header's `tombdays' and the entry's own wepoch
  * against the map epoch, and the discard names the entry's key rather
@@ -1521,6 +1586,7 @@ threadmain(int argc, char **argv)
 	tsnaprefuse();
 	tscrub();
 	tqueued();
+	tqjobcount();
 	treclaim();
 	tforget();
 	tdrop();

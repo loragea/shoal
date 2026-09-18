@@ -9,6 +9,7 @@ typedef struct Sfid Sfid;
 typedef struct Sfile Sfile;
 typedef struct Sctl Sctl;
 typedef struct Qreq Qreq;
+typedef struct Qjob Qjob;
 typedef struct Sjob Sjob;
 
 /*
@@ -342,6 +343,36 @@ struct Qreq
 	Cmdbuf	*cb;		/* its parsed line */
 	uchar	oid[Oidmax];
 	int	oidlen;
+};
+
+/*
+ * One unit of work a caller that is NOT a request runs on a queue —
+ * the background passes' entry to the pool, srvqjob (queue.c).  The
+ * Req is the pool's to carry and so comes first; the Qreq beside it is
+ * this unit's own, because the push path allocates nothing.
+ *
+ * What such a unit is not.  It has no tag, so no Tflush can name it
+ * and reqqueueflush cannot reach it; it is not in lib9p's Req pool, so
+ * it takes no reference to the Srv and lib9p never frees it.  It
+ * therefore never enters respond, and its handler is a plain function
+ * of the caller's rather than a Req handler: it MUST NOT respond, MUST
+ * NOT leave through srvqdone, and MUST NOT be flushed.  srvqjob is
+ * what leaves through srvqended instead, which is the completion the
+ * pool is owed and srvdestroyreq would have taken for a real request.
+ *
+ * `done' and the two beside it are the caller's wait: the queue's proc
+ * marks it and wakes the caller, which is what holds this structure —
+ * the caller's own stack — alive for as long as the queue is in it.
+ */
+struct Qjob
+{
+	Req	r;		/* the pool carries this; keep it first */
+	Qreq	qr;		/* this unit's own: no malloc on the push */
+	QLock	lk;
+	Rendez	rz;
+	int	done;
+	void	(*fn)(void*);
+	void	*arg;
 };
 
 /*

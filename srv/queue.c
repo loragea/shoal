@@ -291,6 +291,74 @@ srvqpush(Srvctx *c, uchar *oid, int oidlen, Req *r, void (*f)(Req*))
 		srvqgo(c, r);
 }
 
+static void
+qjobrun(Req *r)
+{
+	Qjob *j;
+
+	j = (Qjob*)r;		/* the Req is Qjob's first member (dat.h) */
+	j->fn(j->arg);
+	qlock(&j->lk);
+	j->done = 1;
+	rwakeup(&j->rz);
+	qunlock(&j->lk);
+}
+
+/*
+ * The pool's entry for a caller that is not a request: the background
+ * passes, which run work on an object's queue because the queue is
+ * that object's ordering point (§5.4 step 2) and a mutation or a read
+ * outside it is ordered against nothing.
+ *
+ * THE RULE, which is why this is an entry point of its own and not a
+ * Req threaded through srvqprep: a non-Req caller never enters
+ * `respond'.  It has no tag, so nothing can flush it; it is not in
+ * lib9p's Req pool, so it holds no reference to the Srv and no pool
+ * freed it; and its Req is the caller's stack.  respond on such a Req
+ * would compute an Rmsg type from an ifcall that was never filled,
+ * free a stack address, and drop a reference the caller never took.
+ * So this path allocates nothing — the Qreq rides in the Qjob — and
+ * there is no failure for it to answer: it returns once the work has
+ * run.  The completion the pool is owed is given back here through
+ * srvqended, which is the count srvdestroyreq takes for a real Req;
+ * until it is given back, the shutdown's drain counts this unit as in
+ * flight, which is what makes the store outlive it (D16).
+ */
+int
+srvqjob(Srvctx *c, uchar *oid, int oidlen, void (*fn)(void*), void *arg)
+{
+	Qjob j;
+
+	memset(&j, 0, sizeof j);
+	j.r.srv = srv9p(c);
+	j.fn = fn;
+	j.arg = arg;
+	j.rz.l = &j.lk;
+	j.qr.ctx = c;
+	j.qr.f = qjobrun;
+	j.qr.q = c->q[oidhash(oid, oidlen) % c->nq];
+	if(oidlen > 0 && oidlen <= Oidmax){
+		memmove(j.qr.oid, oid, oidlen);
+		j.qr.oidlen = oidlen;
+	}
+	/*
+	 * Counted where srvqprep counts a request's: at the arming, so
+	 * that the push and the completion below are the same unit to the
+	 * drain (srvqdrain) and to /status's depth.
+	 */
+	lock(&c->cntlk);
+	c->npush++;
+	unlock(&c->cntlk);
+	j.r.aux = &j.qr;
+	srvqgo(c, &j.r);
+	qlock(&j.lk);
+	while(!j.done)
+		rsleep(&j.rz);
+	qunlock(&j.lk);
+	srvqended(&j.qr);
+	return 0;
+}
+
 /*
  * Srv.flush.  layer-a §5.4.1: a Tflush naming a pending object
  * operation MUST be answered with Rflush, because devmnt sends one on
