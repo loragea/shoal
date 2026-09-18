@@ -440,6 +440,7 @@ srvshutdown(Srvctx *c)
 	srvqdrain(c);
 	jobwait(c);
 	srvfidsclose(c);
+	srvstagedrain(c);		/* the last moment §9 allows one */
 	c->closed = 1;
 	srvqfree(c);
 	if(c->store != nil){

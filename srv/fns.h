@@ -110,3 +110,4 @@ void	srvobjcreate(Req*);
 void	srvmetaopen(Req*);
 char*	srvmetatext(Srvctx*, Sfid*, Text*);
 void	srvstagesweep(Srvctx*);
+void	srvstagedrain(Srvctx*);

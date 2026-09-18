@@ -414,6 +414,7 @@ void	srvendpoint(Srvctx*, uvlong ms);
  */
 void	srvstagepoint(Srvctx*, int on);
 void	srvstagecount(Srvctx*, uvlong *live, uvlong *done, uvlong *openat);
+uvlong	srvstagepend(Srvctx*);
 
 void	srvauxpoint(Srvctx*, int on);
 void	srvauxcount(Srvctx*, uvlong *flushed, uvlong *closed, uvlong *freed);

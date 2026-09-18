@@ -548,7 +548,11 @@ srvqexit(Req *r)
  *		discards it too, and the handler that staged it finds it
  *		gone at its next look.  The engine's own half of the
  *		release (lib/shoal.h's stagediscard) hangs off that cell,
- *		so nothing here had to change for it.
+ *		so nothing here had to change for it — and is not made
+ *		from the cell either: this can run on the service loop
+ *		with the flushed request's Qreq.lk held, so the cell
+ *		parks the engine handle and obj.c's drain makes the
+ *		call (dat.h's Sstage).
  *	clear the sync state — this instance has no peers: there is no
  *		outbound peer client in this wave, so no candidate was
  *		ever told anything and the dirty set (lib/shoal.h's

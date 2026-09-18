@@ -1482,6 +1482,15 @@ tstageflush(void)
 	srvstagecount(ctx, &live, &done, nil);
 	eqv("step 7 discards the stage the fid held", live, 0);
 	eqv("... and gives back what it held", done, 1);
+	/*
+	 * ... and the engine half of the discard was PARKED rather than
+	 * made: this step 7 ran on the service loop under the flushed
+	 * request's own Qreq.lk, where dat.h forbids blocking on anything a
+	 * queue proc needs, and an engine stage's discard takes the lock a
+	 * queue proc holds across its work.
+	 */
+	eqv("... with the engine call it owes left to the drain",
+		srvstagepend(ctx), 1);
 	eqv("and no hook ran inside a handler's step", srvauxbusy(ctx), 0);
 
 	srvhook(ctx, "objhold", 0);

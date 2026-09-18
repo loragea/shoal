@@ -420,6 +420,15 @@ extern int nsrvctls;
  *	discarded by step 7, through auxflush, whichever of the fid's
  *		requests was flushed: the stage is the fid's, and a stage
  *		spanning several Twrites has no one request to belong to.
+ *		The hook makes no ENGINE call, and a builder filling `g'
+ *		must not give it one: auxflush can run on the service loop
+ *		under the flushed request's Qreq.lk (below), and every
+ *		engine call takes the state lock a queue proc holds across
+ *		its work.  The hook therefore takes the handle out of the
+ *		slot and parks it, and obj.c's drain — at the head of every
+ *		queued object operation, and once at the shutdown while the
+ *		store is still open — is where the discard is made.  What
+ *		the fid owes is only that the handle leaves the slot there.
  *	discarded at clunk and before the store closes, through
  *		auxclose, because releasing an engine stage is an engine
  *		call (store.md §9).
@@ -550,4 +559,8 @@ struct Srvctx
 	int	stagept;	/* srvstagepoint */
 	uvlong	nstagedone;	/* stages given back */
 	uvlong	nstageopen;	/* ... of those that found the store open */
+	Stage	**pend;		/* engine handles awaiting their discard */
+	int	npend;
+	int	apend;
+	uvlong	nstagepend;	/* how many the flush hook has parked */
 };

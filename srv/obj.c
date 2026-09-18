@@ -206,6 +206,69 @@ stagefree(Srvctx *c, Sstage *s)
 }
 
 /*
+ * Where the flush-side discard of an ENGINE handle waits for a place
+ * it may be made.  stageflushhook runs under the fid's state lock and,
+ * for a request flushed while it was still queued, on the service loop
+ * with that request's Qreq.lk held (queue.c's srvqflush) — where dat.h
+ * forbids it to block on anything a queue proc needs.  stagediscard
+ * takes the engine's state lock, which a queue proc holds across its
+ * work, so the hook takes the handle out of the stage and parks it
+ * here instead; the drain below is where the call is made, with no fid
+ * lock, no request lock and the store still open.
+ *
+ * Under stagelk.  A push that cannot grow the array answers 0 and its
+ * caller discards where it stands: parking is what this exists for,
+ * but a handle dropped on the floor holds its reservations for as long
+ * as the process lives.
+ */
+static int
+stagepend(Srvctx *c, Stage *g)
+{
+	Stage **p;
+
+	if(c->npend >= c->apend){
+		if((p = realloc(c->pend, (c->apend+8)*sizeof *p)) == nil)
+			return 0;
+		c->pend = p;
+		c->apend += 8;
+	}
+	c->pend[c->npend++] = g;
+	c->nstagepend++;
+	return 1;
+}
+
+/*
+ * Make the engine calls the flush hook could not.  It runs at the head
+ * of every queued object operation, beside the sweep, and once more
+ * from the shutdown while the store is still open — which is the last
+ * chance, since store.md §9 allows no such call after the close and
+ * what is left then can only be freed with the process.
+ *
+ * The array is taken whole under stagelk, so the handles are this
+ * proc's from that moment and nothing of the context is held across
+ * the calls.
+ */
+void
+srvstagedrain(Srvctx *c)
+{
+	Stage **p;
+	int i, n, open;
+
+	qlock(&c->stagelk);
+	p = c->pend;
+	n = c->npend;
+	c->pend = nil;
+	c->npend = 0;
+	c->apend = 0;
+	open = c->store != nil && !c->closed;
+	qunlock(&c->stagelk);
+	if(open)
+		for(i = 0; i < n; i++)
+			stagediscard(p[i]);
+	free(p);
+}
+
+/*
  * The three hooks dat.h declares, filled on a fid the moment it takes
  * a stage.  They run under the fid's state lock, which is what keeps
  * step 7 between two steps of a handler working on the same fid rather
@@ -226,13 +289,23 @@ stagefree(Srvctx *c, Sstage *s)
 static void
 stageflushhook(Sfid *f, Req *r)
 {
+	Srvctx *c;
 	Sstage *s;
+	Stage *g;
+	int open;
 
 	USED(r);
 	if((s = f->aux) == nil)
 		return;
+	c = s->ctx;
 	s->dead = 1;
-	stagerelease(s->ctx, s);
+	qlock(&c->stagelk);
+	open = stagestrip(c, s, &g);
+	if(g != nil && open && stagepend(c, g))
+		g = nil;
+	qunlock(&c->stagelk);
+	if(g != nil && open)
+		stagediscard(g);
 }
 
 static void
@@ -292,6 +365,7 @@ srvstagesweep(Srvctx *c)
 	vlong now, ms;
 	int open;
 
+	srvstagedrain(c);
 	if(c->store != nil && !c->closed)
 		stagesweep(c->store, nsec());
 	ms = stagemsof(c);
@@ -456,15 +530,19 @@ stagelive(Srvctx *c, Sfid *f, Sstage *s, Req *r)
 }
 
 /*
- * The stage is nobody's step any more: a handler that leaves one
- * behind — which is the stage point, and will be the /repl fid between
- * two chunks — clears `busy' here, under the lock the sweep reads it
- * under, and the sweep may have it from this moment (§3.6).
+ * The stage point's stage, once it is made.  It takes an engine handle
+ * of its own, because §5.5's op=full stage is the one that holds one
+ * and this point is what has that shape before that surface exists —
+ * so the rules around a handle, the flush-side discard's included, are
+ * driven on a real one.  And it stops being a handler's step: from
+ * here the sweep may have it (§3.6).  Both under the lock the sweep
+ * reads them under.
  */
 static void
-stagerest(Srvctx *c, Sstage *s)
+stagepointarm(Srvctx *c, Sstage *s, Stage *g)
 {
 	qlock(&c->stagelk);
+	s->g = g;
 	s->busy = 0;
 	qunlock(&c->stagelk);
 }
@@ -521,6 +599,22 @@ stagepointon(Srvctx *c)
  * of them must, since an engine stage's discard is an engine call
  * (dat.h).  nil for a count the caller does not want.
  */
+/*
+ * How many engine handles the flush-side discard has parked for the
+ * drain — which is every one it has met, since it makes no engine call
+ * of its own.
+ */
+uvlong
+srvstagepend(Srvctx *c)
+{
+	uvlong n;
+
+	qlock(&c->stagelk);
+	n = c->nstagepend;
+	qunlock(&c->stagelk);
+	return n;
+}
+
 void
 srvstagecount(Srvctx *c, uvlong *live, uvlong *done, uvlong *openat)
 {
@@ -864,7 +958,8 @@ objopenq(Req *r)
 	if(stagepointon(c) && (r->ifcall.mode&3) != OREAD)
 		if((s = stagenew(c, f, Stpoint, f->oid, f->oidlen, 0, 0,
 			0, 0, &e)) != nil)
-			stagerest(c, s);
+			stagepointarm(c, s, stageopen(c->store, f->oid,
+				f->oidlen, 0, 0));
 	srvqdone(r, nil);
 }
 
