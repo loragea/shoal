@@ -62,10 +62,10 @@ enum
 	 * program linking this library MUST set `mainstacksize' to before
 	 * it makes a Srvctx.  That is not a convention: lib9p creates the
 	 * Reqqueue procs itself, with the program's mainstacksize
-	 * (9pqueue(2), /sys/src/lib9p/queue.c), so this library cannot
-	 * size them and a program that leaves the default in place gets
-	 * queue procs too small for the engine code they run — a queue
-	 * proc composes a blksz block and builds a record on its stack
+	 * (/sys/src/lib9p/queue.c; 9pqueue(2) does not say so), so this
+	 * library cannot size them and a program that leaves the default
+	 * in place gets queue procs too small for the code they run — such
+	 * a proc composes a blksz block and builds a record on its stack
 	 * (store.md §7).  The procs this library does create, the
 	 * engine's among them, take this size through srvspawn.
 	 */
@@ -274,6 +274,7 @@ void	srvcount(Srvctx*, uvlong *pushed, uvlong *done);
  * the ctl grammar, so a debug verb would be a wire change.
  */
 void	srvhook(Srvctx*, char *name, uvlong n);
+
 
 /*
  * The fid-state point, in the same shape and with the same reach.
