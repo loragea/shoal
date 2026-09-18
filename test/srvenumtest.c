@@ -91,7 +91,7 @@ enum
 	 * threadmain.  Every check this file makes is unconditional once
 	 * its case is entered, so the number is fixed.
 	 */
-	Nchecks	= 259,
+	Nchecks	= 262,
 
 	/* fids the cases use */
 	Froot	= 1,
@@ -2374,6 +2374,78 @@ Out:
 }
 
 /*
+ * A `reclaim start' written while a tick is in flight that can start
+ * nothing.  The verb owes the answer the pass itself would be given:
+ * the job cap (store.md §14(30)) is what refuses both, and a tick
+ * refused it raises no flag, so the write meets the cap rather than a
+ * flag standing for a pass that never started.  Answering success
+ * there loses the pass outright — nothing runs, no line at /jobs, and
+ * the next chance is a period away.
+ *
+ * §13's `tickhold' is what puts a tick in that window and holds it
+ * there: it is the timer's own call that parks, so the verb's write
+ * lands on the service loop while the tick is inside it.  The twelve
+ * `forget' passes parked at `jobhold' are what leaves no job to be
+ * had, and `srvreclaimms' is what makes the timer tick inside a test
+ * at all (srv.h).
+ */
+static void
+treclaimrace(void)
+{
+	char buf[16*1024], line[64], *m;
+	Srvctx *ctx;
+	Store *st;
+	Dev *d;
+	Cl cl;
+	Fcall r;
+	int i;
+
+	clstage = "reclaimrace";
+	m = mkmapd(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid, 0);
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4, 0)) == nil)
+		return;
+	st = srvstore(ctx);
+	mkobj(st, "old", nil, 0, 1);
+	rmobj(st, "old", 9, 3);			/* past both local cutoffs */
+	clstart(&cl, ctx, Clmsize);
+	if(!adminctl(&cl, "role=admin"))
+		goto Out;
+	srvhook(ctx, "jobhold", 1);
+	for(i = 0; i < 12; i++){
+		snprint(line, sizeof line, "forget peer%.2d", i);
+		if(clwrite(&cl, Fctl, 0, line, &r) != Rwrite)
+			fail("%#q: %s", line, clerr(&r));
+	}
+	clwrite(&cl, Fctl, 0, "reclaim start", &r);
+	clerris("a reclaim start with the job list full", &r,
+		"shoalsrv: too many jobs");
+
+	/* the same write, with a tick of the timer's inside the window */
+	srvhook(ctx, "tickhold", 1);
+	srvreclaimms(ctx, 30);
+	sleep(1200);
+	clwrite(&cl, Fctl, 0, "reclaim start", &r);
+	clerris("a reclaim start against a tick that can start nothing",
+		&r, "shoalsrv: too many jobs");
+	if(slurpfile(&cl, Ffile, "jobs", buf, sizeof buf) > 0)
+		eqv("and neither of them left a walk at /jobs",
+			nlines(buf, "job=reclaim"), 0);
+	else
+		fail("/jobs is empty with twelve passes parked");
+	srvreclaimms(ctx, 0);
+	srvhook(ctx, "tickhold", 0);
+Out:
+	srvhook(ctx, "jobhold", 0);
+	for(i = 0; i < 400 && jobrunning(&cl); i++)
+		sleep(20);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * D16's shutdown over a reclaim walk parked at §13's `reclaimhold'.
  *
  * That point holds a pass proc, so it carries `jobhold's hazard
@@ -3303,6 +3375,7 @@ threadmain(int argc, char **argv)
 	treclaim();
 	treclaimtimer();
 	treclaimctl();
+	treclaimrace();
 	treclaimdown();
 	tforget();
 	tscrubctl();

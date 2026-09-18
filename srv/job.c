@@ -304,47 +304,89 @@ jobproc(void *a)
 }
 
 /*
- * Accept a pass: take the job the shutdown waits on, link the record
- * /jobs shows, and spawn the proc.  The job is taken before the proc
- * exists so that a shutdown starting in the window cannot slip past
- * it; every way out from here gives it back.
+ * Accepting a pass is three steps, because a caller can have a flag of
+ * its own to raise in the same hold of joblk that decides the refusal
+ * (reclaimgo below): the record is made, then admitted, then launched.
+ *
+ * jobnew allocates it outside the lock, since joblk is a spin lock and
+ * malloc allocates.
  */
-static char*
-jobstart(Srvctx *c, char *verb, void (*fn)(Sjob*), char *arg)
+static Sjob*
+jobnew(Srvctx *c, char *verb, void (*fn)(Sjob*), char *arg)
 {
 	Sjob *j;
 
-	if(srvjobstart(c) < 0)
-		return Eshutting;
-	if((j = mallocz(sizeof *j, 1)) == nil){
-		srvjobend(c);
-		return Enomem;
-	}
+	if((j = mallocz(sizeof *j, 1)) == nil)
+		return nil;
 	j->ctx = c;
 	j->verb = verb;
 	j->fn = fn;
 	if(arg != nil)
 		strecpy(j->arg, j->arg + sizeof j->arg, arg);
-	/*
-	 * The cap and the link are one hold of the lock, so that two
-	 * verbs cannot both find room for the last job.
-	 */
-	lock(&c->joblk);
-	if(joblen(c) >= Njobmax){
-		unlock(&c->joblk);
-		free(j);
-		srvjobend(c);
+	return j;
+}
+
+/*
+ * jobadmit decides the two refusals that are not out of memory — the
+ * shutdown and the cap — takes the job the shutdown waits on, and
+ * links the record /jobs shows, all in the caller's hold of joblk: so
+ * two verbs cannot both find room for the last job, and a caller that
+ * raises a flag in that same hold cannot raise it for a pass that is
+ * about to be refused.  The job is taken before the proc exists so
+ * that a shutdown starting in the window cannot slip past it.
+ *
+ * It reads `stopping' and takes the count itself rather than calling
+ * srvjobstart, which takes this same lock (srv.c).  On a refusal the
+ * record is the caller's to free.
+ */
+static char*
+jobadmit(Srvctx *c, Sjob *j)		/* joblk held */
+{
+	if(c->stopping)
+		return Eshutting;
+	if(joblen(c) >= Njobmax)
 		return Ejobs;
-	}
+	c->njob++;
 	j->next = c->jobs;
 	c->jobs = j;
-	unlock(&c->joblk);
+	return nil;
+}
+
+/*
+ * joblaunch spawns the proc for a record already admitted, so the one
+ * way out it has is out of memory — which is what leaves the caller's
+ * own flags to be put back.
+ */
+static char*
+joblaunch(Sjob *j)
+{
+	Srvctx *c;
+
+	c = j->ctx;
 	if(proccreate(jobproc, j, Srvstack) < 0){
 		jobunlink(j);
 		srvjobend(c);
 		return Enomem;
 	}
 	return nil;
+}
+
+static char*
+jobstart(Srvctx *c, char *verb, void (*fn)(Sjob*), char *arg)
+{
+	char *e;
+	Sjob *j;
+
+	if((j = jobnew(c, verb, fn, arg)) == nil)
+		return Enomem;
+	lock(&c->joblk);
+	e = jobadmit(c, j);
+	unlock(&c->joblk);
+	if(e != nil){
+		free(j);
+		return e;
+	}
+	return joblaunch(j);
 }
 
 /*
@@ -592,18 +634,33 @@ reclaimpass(Sjob *j)
  * over a pass the timer started is the same no-op as one written over
  * a pass the verb started.
  *
- * The flag is raised before jobstart is called, because raising it
- * after the proc exists would race the proc's own clearing of it, so
- * every way jobstart can refuse puts it back — a flag left raised
- * makes every later start answer success and start nothing, and stops
- * the timer for good besides.  The stop flag goes back with it.
+ * The flag is raised before the proc exists, because raising it after
+ * would race the proc's own clearing of it — but it is raised in the
+ * SAME hold of joblk that admits the job, because the refusals a pass
+ * can meet are the answer this verb owes.  A flag raised ahead of them
+ * would have the caller that finds it up answered success for a pass
+ * the admission then refuses: the timer calls this off the service
+ * loop, so a `reclaim start' lands inside that window, and both would
+ * come away having started nothing.  What is left below the admission
+ * is out of memory alone, and that still puts the flag back — a flag
+ * left raised makes every later start answer success and start
+ * nothing, and stops the timer for good besides.  The stop flag goes
+ * back with it.
+ *
+ * `bytimer' is the timer's own call.  It is what §13's `tickhold'
+ * parks (srv.h): the window between the decision and the proc is the
+ * timer's to be caught in, since a verb's own call is the service loop
+ * and parking that answers nothing else either.
  */
 static char*
-reclaimgo(Srvctx *c)
+reclaimgo(Srvctx *c, int bytimer)
 {
 	char *e;
+	Sjob *j;
 	int wasstop;
 
+	if((j = jobnew(c, "reclaim", reclaimpass, nil)) == nil)
+		return Enomem;
 	lock(&c->joblk);
 	if(c->reclaiming){
 		/*
@@ -617,16 +674,25 @@ reclaimgo(Srvctx *c)
 		 */
 		if(c->reclaimstop){
 			unlock(&c->joblk);
+			free(j);
 			return Ereclaimstopping;
 		}
 		unlock(&c->joblk);
+		free(j);
 		return nil;
+	}
+	if((e = jobadmit(c, j)) != nil){
+		unlock(&c->joblk);
+		free(j);
+		return e;
 	}
 	wasstop = c->reclaimstop;
 	c->reclaiming = 1;
 	c->reclaimstop = 0;
 	unlock(&c->joblk);
-	if((e = jobstart(c, "reclaim", reclaimpass, nil)) == nil)
+	if(bytimer)
+		srvtickhold(c);
+	if((e = joblaunch(j)) == nil)
 		return nil;
 	lock(&c->joblk);
 	c->reclaiming = 0;
@@ -689,7 +755,7 @@ reclaimtimer(void *a)
 			}
 			sleep(Reclaimslicems);
 		}
-		reclaimgo(c);
+		reclaimgo(c, 1);
 	}
 }
 
@@ -1041,7 +1107,7 @@ srvctlreclaim(Srvctx *c, Sfid *f, int argc, char **argv)
 	}
 	if(!start)
 		return nil;
-	return reclaimgo(c);
+	return reclaimgo(c, 0);
 }
 
 /*

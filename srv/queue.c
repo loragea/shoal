@@ -598,6 +598,23 @@ srvreclaimhold(Srvctx *c, uvlong i)
 }
 
 /*
+ * The point inside the reclaim timer's own start of a pass (job.c):
+ * n != 0 parks the tick after it has decided to start one and before
+ * the pass's proc exists.  That window is where a `reclaim start'
+ * written on the service loop meets a tick in flight, and it is too
+ * narrow to write into without a hold.  Only the timer's call parks
+ * here — a verb's is the loop itself, and a loop parked answers
+ * nothing else either.  The proc it parks holds no job, and the
+ * shutdown clears every point before it waits for the timer, so a
+ * point left set cannot hold that wait up.
+ */
+void
+srvtickhold(Srvctx *c)
+{
+	qhold(c, nil, &c->tickhold);
+}
+
+/*
  * The point inside the /obj and /meta directory read's entry walk
  * (enum.c), which is the one stretch of a queued handler that runs
  * over the fid's state with the fid's state lock NOT held.  n != 0
@@ -959,6 +976,8 @@ srvhook(Srvctx *c, char *name, uvlong n)
 		c->slotfail = n;
 	else if(strcmp(name, "reclaimhold") == 0)
 		c->reclaimhold = n;
+	else if(strcmp(name, "tickhold") == 0)
+		c->tickhold = n;
 	else if(strcmp(name, "dirhold") == 0)
 		c->dirhold = n;
 	qunlock(&c->holdlk);
@@ -993,6 +1012,7 @@ srvholdclear(Srvctx *c)
 	c->jobhold = 0;
 	c->slotfail = 0;
 	c->reclaimhold = 0;
+	c->tickhold = 0;
 	c->dirhold = 0;
 	qunlock(&c->holdlk);
 }

@@ -685,6 +685,7 @@ struct Srvctx
 	uvlong	jobhold;	/* srvhook("jobhold") */
 	uvlong	slotfail;	/* srvhook("slotfail") */
 	uvlong	reclaimhold;	/* srvhook("reclaimhold") */
+	uvlong	tickhold;	/* srvhook("tickhold") */
 	uvlong	dirhold;	/* srvhook("dirhold") */
 	uvlong	endhold;	/* srvendpoint: ms held in srvqended */
 

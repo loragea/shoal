@@ -344,10 +344,12 @@ srvpost(Srvctx *c, char *name)
  * exactly as it waits for the requests in flight.
  *
  * srvjobstart answers -1 once the shutdown has begun, which is what a
- * verb that would start a pass asks before starting one; srvstopping
- * is the same fact for a pass already running, which SHOULD test it
- * between units of work and return rather than leave the shutdown
- * waiting for it.
+ * caller asks before starting one.  The passes of job.c take the same
+ * count under this same lock instead, because their refusal has to be
+ * decided in the hold that raises the verb's own flag (jobadmit);
+ * srvstopping is the same fact for a pass already running, which
+ * SHOULD test it between units of work and return rather than leave
+ * the shutdown waiting for it.
  */
 int
 srvjobstart(Srvctx *c)

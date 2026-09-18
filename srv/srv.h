@@ -231,7 +231,9 @@ void	srvshutdown(Srvctx*);
  * A proc takes a job for its whole run: srvjobstart before it touches
  * the engine, srvjobend when it is done, and it answers -1 once the
  * shutdown has begun, which is the answer a verb turns into its
- * refusal.  A pass already running SHOULD test srvstopping between
+ * refusal.  The passes this library starts take the same count with
+ * the rest of their admission, under the one lock (job.c), and give
+ * it back through srvjobend like any other caller.  A pass already running SHOULD test srvstopping between
  * units of work and give up rather than leave the shutdown waiting.
  *
  * The tombstone reclaim walk's timer is the one proc here that is NOT
@@ -383,6 +385,17 @@ int	srvjobcount(Srvctx*);	/* jobs held: what the shutdown waits for */
  *		write the next verb at all.  Set to n+1, like slotfail.  It
  *		parks a pass proc, so it carries jobhold's hazard above
  *		entire.
+ *	tickhold
+ *		n != 0 holds the reclaim TIMER's own start of a pass, after
+ *		it has decided to start one and before the pass's proc
+ *		exists.  That window is where a `reclaim start' written on
+ *		the service loop meets a tick in flight, and it is too
+ *		narrow to write into without a hold.  Only the timer's call
+ *		parks here, never a verb's: a verb's call IS the loop, and
+ *		a loop parked answers nothing else either.  The proc it
+ *		parks holds no job, so it carries none of jobhold's hazard
+ *		— the shutdown clears every point before it waits for the
+ *		timer.
  *	flushhold
  *		n != 0 holds a Tflush of a pooled request between the
  *		lookup that found it and the flush itself, which is the
