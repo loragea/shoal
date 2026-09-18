@@ -578,15 +578,20 @@ extern int nsrvctls;
  *		the slot whatever the sweep has done with the stage.
  *
  *		A stage that IS busy keeps what it holds, and that chunk's
- *		own look, when its engine call returns, is what releases
- *		it — that look and NOBODY ELSE (store.md §14(45)).  Not
- *		the hook, whose park would be a discard made under the
- *		stagewrite the handle is an argument of; not the idle
- *		sweep, which `busy' holds off (§3.6); and not a refusal
- *		running on another queue — a chunk naming a second object
- *		finds the stage dead, answers `stage expired' and leaves
- *		the slot to that look for the same reason, which is the
- *		exception §14(44) grants its own rule (obj.c's
+ *		own handler is what releases it — that handler and NOBODY
+ *		ELSE (store.md §14(45)).  Where in the handler depends on
+ *		what the chunk still owes: the look its engine call returns
+ *		to is the release for a chunk that is not the last, and for
+ *		a final=1 chunk the look keeps `busy' set and the give-back
+ *		behind it is (obj.c's srvstagelive and srvstagefinal),
+ *		since that chunk holds the stage across the arbitration
+ *		between the two.  Not the hook, whose park would be a
+ *		discard made under the stagewrite the handle is an argument
+ *		of; not the idle sweep, which `busy' holds off (§3.6); and
+ *		not a refusal running on another queue — a chunk naming a
+ *		second object finds the stage dead, answers `stage expired'
+ *		and leaves the slot to that handler for the same reason,
+ *		which is the exception §14(44) grants its own rule (obj.c's
  *		srvstagemore).  So what the fid owes is that the handle is
  *		released by someone that is not the hook, and while a
  *		handler is inside a step on it, that someone is the
@@ -732,14 +737,16 @@ struct Srvctx
 	uvlong	flushhold;	/* srvhook("flushhold") */
 	uvlong	fullhold;	/* srvhook("fullhold") */
 	uvlong	openhold;	/* srvhook("openhold") */
+	uvlong	finalhold;	/* srvhook("finalhold") */
 	/*
-	 * How many requests have reached the two points of the /repl
+	 * How many requests have reached the three points of the /repl
 	 * transfer, counted where they park and never reset: a test waits
-	 * on one rather than on a sleep, and the window either point holds
+	 * on one rather than on a sleep, and the window each point holds
 	 * open is exactly what the case is about (srv.h's srvheld).
 	 */
 	uvlong	fullheld;
 	uvlong	openheld;
+	uvlong	finalheld;
 	uvlong	mapopen;	/* srvhook("mapopen") */
 	uvlong	walkhold;	/* srvhook("walkhold") */
 	uvlong	anyexit;	/* srvhook("anyexit") */

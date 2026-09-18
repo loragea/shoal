@@ -131,7 +131,7 @@ Stage*	srvstagefull(Req*, Srvctx*, Sfid*, uchar *oid, int oidlen,
 		long n, Sstage**, char *buf, int nbuf, char **err);
 Stage*	srvstagemore(Srvctx*, Sfid*, uchar *oid, int oidlen, uvlong flen,
 		int force, Sstage**, char **err);
-int	srvstagelive(Srvctx*, Sfid*, Sstage*);
+int	srvstagelive(Srvctx*, Sfid*, Sstage*, int keepbusy);
 Stage*	srvstagefinal(Srvctx*, Sfid*, Sstage*);
 void	srvobjopen(Req*);
 void	srvobjread(Req*);

@@ -883,7 +883,17 @@ replfullq(Req *r, Srvctx *c, Sfid *f, Hdr *h)
 	buf[0] = 0;
 	if(h->n > 0 && (rc = stagewrite(g, h->data, h->n, h->off)) < 0)
 		rerrstr(buf, sizeof buf);
-	if(!srvstagelive(c, f, s)){
+	/*
+	 * The look keeps `busy' set for a final=1 chunk whose write went
+	 * through: this handler holds the stage across the arbitration
+	 * and the give-back below, and a stage nothing marks in use is
+	 * one the sweep may expire and a chunk naming a second object may
+	 * free out of the slot (store.md §14(45), obj.c).  The two exits
+	 * that follow a cleared mark are the two that are done with the
+	 * stage here: a failed write, whose transfer stays open for a
+	 * later chunk or the clunk, and a chunk that is not the last.
+	 */
+	if(!srvstagelive(c, f, s, h->final && rc >= 0)){
 		srvqdone(r, Estageexp);
 		return;
 	}
@@ -896,6 +906,13 @@ replfullq(Req *r, Srvctx *c, Sfid *f, Hdr *h)
 		replok(r);
 		return;
 	}
+	/*
+	 * §13's point over the window the final chunk owns a stage
+	 * nothing else may take: past the look, with `busy' still set,
+	 * and before the give-back that clears it (srv.h).  No lock is
+	 * held here either.
+	 */
+	srvqhold(r, &c->finalhold, &c->finalheld);
 	/*
 	 * final=1 consumes the handle on every outcome (§3.6), so the fid
 	 * forgets it here, before the comparison stagefinal makes is

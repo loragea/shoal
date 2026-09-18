@@ -5963,9 +5963,12 @@ other files cite, so a gap is cheaper than a renumbering.
     transfer ends with the fid's clunk or with a `final=1`.
 
     **One refusal leaves the slot where it is: one over a stage
-    another handler is inside a step on.** That handler's own look, a
-    moment later, is what clears it, and the next chunk on the fid
-    still starts fresh because the look runs before it. What the
+    another handler is inside a step on.** That handler is what clears
+    it a moment later — its own look for a chunk that is not the last,
+    and the give-back the look leaves to for a `final=1` chunk, which
+    holds the stage across the arbitration between the two — and the
+    next chunk on the fid still starts fresh because that clearing
+    runs before it. What the
     exception protects is the handler in the middle: a refusal that
     took the slot would free the handle under the engine call it is
     an argument of, or free the stage itself under the arm that is
@@ -5987,11 +5990,18 @@ other files cite, so a gap is cheaper than a renumbering.
     what the server does:* the hook marks such a stage dead and
     leaves the handle alone — `busy` is what says a handler is inside
     a step on it, which is also what holds the idle sweep off (§3.6)
-    — and the look that chunk takes when its call returns finds the
-    stage dead and releases the handle itself, on a queue proc
-    holding no lock, which is where an engine call belongs. The chunk
-    is then answered `stage expired`. A client stage holds a key and
-    no handle, so none of this changes what step 7 does to one.
+    — and that chunk releases the handle itself, on a queue proc
+    holding no lock, which is where an engine call belongs. For a
+    chunk that is not the last, the release is the look it takes when
+    its call returns, which finds the stage dead and answers `stage
+    expired`. A `final=1` chunk is still inside its step at that
+    look: it goes on to arbitrate and commit through the same handle,
+    so the look keeps `busy` set and the give-back that consumes the
+    handle is the release. Its outcome is then the commit's, not
+    `stage expired`, because what step 7 discards is the fid's stage
+    and this one's last step is already under way. A client stage
+    holds a key and no handle, so none of this changes what step 7
+    does to one.
 
 46. **What the header grammar refuses, beyond what §5.5 spells.**
     §5.5 and §5.6 give each operation a fixed set of attributes and

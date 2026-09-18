@@ -403,6 +403,16 @@ int	srvjobcount(Srvctx*);	/* jobs held: what the shutdown waits for */
  *		fullhold it is taken with no lock held, so the service loop
  *		performs step 7 on that fid across it, and srvheld below is
  *		how a test waits for a chunk to reach it.
+ *	finalhold
+ *		n != 0 holds a final=1 chunk between the look that followed
+ *		its engine write and the give-back that ends the transfer
+ *		(peer.c).  The look keeps the stage marked `busy' across
+ *		that window because the chunk arbitrates and commits
+ *		through the same handle, so this is where a test drives the
+ *		two actors above — step 7 for a sibling on the fid, and a
+ *		chunk naming a second object — against a stage whose owner
+ *		is past its look and still inside its step.  Taken with no
+ *		lock held, like the two above.
  *	flushhold
  *		n != 0 holds a Tflush of a pooled request between the
  *		lookup that found it and the flush itself, which is the
@@ -439,8 +449,8 @@ void	srvhook(Srvctx*, char *name, uvlong n);
  * sleeping: a case built around a window is a case about what runs
  * WHILE a request is parked, and a sleep long enough today is a wedge
  * or a silent pass tomorrow.  A point counts only where a case needs
- * the wait — today the two of the /repl transfer, fullhold and
- * openhold — and an unnamed point answers 0.
+ * the wait — today the three of the /repl transfer, fullhold, openhold
+ * and finalhold — and an unnamed point answers 0.
  */
 uvlong	srvheld(Srvctx*, char *name);
 
@@ -459,9 +469,9 @@ int	srvqindex(Srvctx*, uchar *oid, int oidlen);
  *
  * srvholdclear, which the shutdown runs before it drains, clears the
  * whole of srvhook's set and nothing else: objhold, objprelook,
- * objstage, objlook, objarm, objexit, fullhold, openhold, flushhold,
- * mapopen, walkhold, anyexit, step7, jobhold, slotfail, reclaimhold
- * and dirhold.  A HOLD therefore belongs in srvhook — a program that
+ * objstage, objlook, objarm, objexit, fullhold, openhold, finalhold,
+ * flushhold, mapopen, walkhold, anyexit, step7, jobhold, slotfail,
+ * reclaimhold and dirhold.  A HOLD belongs in srvhook — a program that
  * set a point and stopped watching must not be able to hold the
  * store's close.  (The shutdown also turns srvcellpoint off, by its
  * own call and for its own reason: the file table those cells are in

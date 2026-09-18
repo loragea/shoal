@@ -958,6 +958,8 @@ srvhook(Srvctx *c, char *name, uvlong n)
 		c->fullhold = n;
 	else if(strcmp(name, "openhold") == 0)
 		c->openhold = n;
+	else if(strcmp(name, "finalhold") == 0)
+		c->finalhold = n;
 	else if(strcmp(name, "mapopen") == 0)
 		c->mapopen = n;
 	else if(strcmp(name, "walkhold") == 0)
@@ -1001,6 +1003,7 @@ srvholdclear(Srvctx *c)
 	c->flushhold = 0;
 	c->fullhold = 0;
 	c->openhold = 0;
+	c->finalhold = 0;
 	c->mapopen = 0;
 	c->walkhold = 0;
 	c->anyexit = 0;
@@ -1014,8 +1017,8 @@ srvholdclear(Srvctx *c)
 
 /*
  * How many requests have reached a point (srv.h).  The set is the
- * points a case has to wait on rather than sleep before, which is the
- * two of the /repl transfer; anything else answers 0.
+ * points a case has to wait on rather than sleep before, which are the
+ * three of the /repl transfer; anything else answers 0.
  */
 uvlong
 srvheld(Srvctx *c, char *name)
@@ -1028,6 +1031,8 @@ srvheld(Srvctx *c, char *name)
 		n = c->fullheld;
 	else if(strcmp(name, "openhold") == 0)
 		n = c->openheld;
+	else if(strcmp(name, "finalhold") == 0)
+		n = c->finalheld;
 	qunlock(&c->holdlk);
 	return n;
 }

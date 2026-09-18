@@ -894,9 +894,11 @@ srvstagefull(Req *r, Srvctx *c, Sfid *f, uchar *oid, int oidlen, uvlong flen,
  * about to store the handle in it.  The refusal is answered all the
  * same; what §14(44) asks of it, that the dead stage leave the slot
  * before the next transfer, is done a moment later by that chunk
- * itself: its look when the write returns (srvstagelive below), or,
- * for an opening chunk, the give-back behind an arm that finds the
- * stage already gone (srvstagefull above).
+ * itself: its look when the write returns (srvstagelive below), the
+ * give-back that look leaves to when the chunk carries final=1
+ * (srvstagefinal below), or, for an opening chunk, the give-back
+ * behind an arm that finds the stage already gone (srvstagefull
+ * above).
  */
 Stage*
 srvstagemore(Srvctx *c, Sfid *f, uchar *oid, int oidlen, uvlong flen,
@@ -953,16 +955,26 @@ srvstagemore(Srvctx *c, Sfid *f, uchar *oid, int oidlen, uvlong flen,
  * call was in flight is given back here — the flush hook leaves the
  * handle of a busy stage alone precisely so that this is where it is
  * released, outside every lock and on a queue proc.
+ *
+ * `keepbusy' is for the caller whose look is NOT the end of its step:
+ * a final=1 chunk goes on from here to the arbitration and the commit,
+ * still holding this Sstage*, and a look that cleared the mark would
+ * leave the sweep, a refusal on another queue and the flush hook free
+ * to take the slot and free the stage under it (store.md §14(45)).
+ * Such a caller owes the clear to the give-back it is on its way to,
+ * which is srvstagefinal below.  A look that answers 0 gives the stage
+ * back here whatever the caller asked for, the transfer being over.
  */
 int
-srvstagelive(Srvctx *c, Sfid *f, Sstage *s)
+srvstagelive(Srvctx *c, Sfid *f, Sstage *s, int keepbusy)
 {
 	int ok;
 
 	qlock(&f->lk);
 	qlock(&c->stagelk);
 	ok = f->aux == s && !s->dead && !s->released;
-	s->busy = 0;
+	if(!keepbusy)
+		s->busy = 0;
 	s->last = nsec();
 	qunlock(&c->stagelk);
 	qunlock(&f->lk);
@@ -978,6 +990,11 @@ srvstagelive(Srvctx *c, Sfid *f, Sstage *s)
  * has already been discarded.  The handle answered here is the
  * caller's to pass to stagefinalcsum, or nil for a stage that was
  * already stripped, whose transfer is over either way.
+ *
+ * This is also where the final chunk's `busy' is cleared.  Its look
+ * kept the mark set (srvstagelive above) so that nothing could take
+ * the slot between the two, and what ends that step is the give-back
+ * here rather than the look.
  */
 Stage*
 srvstagefinal(Srvctx *c, Sfid *f, Sstage *s)

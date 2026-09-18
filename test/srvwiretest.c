@@ -1869,6 +1869,143 @@ Out:
 }
 
 /*
+ * The same two actors against the chunk that ENDS a transfer.  A
+ * final=1 chunk is not done with its stage at the look: it goes on to
+ * arbitrate against the local copy and to give the handle up to
+ * `stagefinal', holding the same Sstage* across both, so the look
+ * keeps `busy' set and the give-back is what clears it (store.md
+ * §14(45), obj.c's srvstagelive and srvstagefinal).  A look that
+ * cleared the mark would leave the slot to be taken in that window:
+ * step 7 for a sibling strips the handle, and the chunk naming a
+ * second object then finds a stage nobody is inside and FREES it — out
+ * from under the handler that is about to commit through it.
+ *
+ * `finalhold' parks a chunk in exactly that window (srv.h).  What the
+ * case asserts is that the transfer still commits: step 7 discards
+ * what a fid has STAGED, and this stage's last step was under way
+ * before it ran.
+ */
+static void
+tstagefinal(void)
+{
+	char *m, cs[Csumhexlen], ck[Csumhexlen], got[Csumhexlen];
+	char d0[2*Blkdlen+1], *h0, *h1, *hs, *hk;
+	uchar want[2*Tblksz];
+	Srvctx *ctx;
+	Objinfo oi;
+	Dev *d;
+	Cl cl;
+	Fcall tf, r;
+	uvlong live, done, openat, np0, nd0, np, nd;
+	ushort ta2, ts, ft;
+	int i;
+
+	clstage = "stagefinal";
+	m = mkmap();
+	d = newdisk(Tnslots, nil);
+	if((ctx = startsrv(d, m, 0, 60000)) == nil)	/* no idle sweep */
+		return;
+	for(i = 0; i < sizeof want; i++)
+		want[i] = i*13 + 2;
+	ocsum(cs, want, sizeof want);
+	ocsum(ck, want, Tblksz);
+	dcs(d0, want, Tblksz);
+	clstart(&cl, ctx, Clmsize);
+	if(!chopen(&cl, ctx, Nrepl, Froot, Frepl, ~0UL))
+		goto Out;
+	if(!apart(ctx, "alpha", "kappa"))
+		goto Out;
+	h0 = smprint("op=full oid=alpha epoch=7 ver=3 wepoch=7 len=%d off=0"
+		" n=%d dcsum=%s csum=%s final=0", 2*Tblksz, Tblksz, d0, cs);
+	h1 = smprint("op=full oid=alpha epoch=7 ver=3 wepoch=7 len=%d off=%d"
+		" n=%d dcsum=%s csum=%s final=1", 2*Tblksz, Tblksz, Tblksz, d0,
+		cs);
+	hs = smprint("op=full oid=alpha epoch=7 ver=3 wepoch=7 len=%d off=0"
+		" n=%d dcsum=%s csum=%s final=0", 2*Tblksz, Tblksz, d0, cs);
+	hk = smprint("op=full oid=kappa epoch=7 ver=3 wepoch=7 len=%d off=0"
+		" n=%d dcsum=%s csum=%s final=0", Tblksz, Tblksz, d0, ck);
+
+	eqs("the chunk that opens the transfer",
+		repler(&cl, Frepl, h0, want, Tblksz), "ok");
+	waitidle(ctx, &np0, &nd0);
+	srvhook(ctx, "finalhold", 1);
+
+	/* the final chunk, parked past its look and still inside its step */
+	ta2 = pushchunk(&cl, h1, want+Tblksz, Tblksz);
+	waitpush(ctx, np0, 1, &np, &nd);
+	waitheld(ctx, "finalhold", 1);
+	srvstagecount(ctx, &live, &done, nil);
+	eqv("the parked final chunk's stage is still the fid's", live, 1);
+	eqv("... and nothing has been released", done, 0);
+
+	/* a sibling queued behind it on the same object's queue, flushed */
+	ts = pushchunk(&cl, hs, want, Tblksz);
+	waitpush(ctx, np0, 2, &np, &nd);
+	memset(&tf, 0, sizeof tf);
+	tf.type = Tflush;
+	tf.tag = ft = cltag(&cl);
+	tf.oldtag = ts;
+	clput(&cl, &tf);
+	if(clgettag(&cl, ts, &r) < 0)
+		fail("no answer to the flushed sibling chunk");
+	else
+		eqs("the flushed sibling chunk", clerr(&r), "interrupted");
+	cltagfree(&cl, ts);
+	if(clgettag(&cl, ft, &r) != Rflush)
+		fail("no Rflush: %s", clerr(&r));
+	cltagfree(&cl, ft);
+	srvstagecount(ctx, &live, &done, nil);
+	eqv("step 7 leaves the stage the final chunk is inside", live, 1);
+	eqv("... and releases nothing", done, 0);
+
+	/* the chunk for a second object, refused on another queue */
+	eqs("a chunk naming a second object, over a stage past its look",
+		repler(&cl, Frepl, hk, want, Tblksz), "shoalsrv: stage expired");
+	srvstagecount(ctx, &live, &done, nil);
+	eqv("its refusal leaves the slot to the chunk that is committing",
+		live, 1);
+	eqv("... and releases nothing either", done, 0);
+
+	/* the parked chunk's own give-back ends the transfer */
+	srvhook(ctx, "finalhold", 0);
+	if(clgettag(&cl, ta2, &r) < 0)
+		fail("no answer to the final chunk");
+	else
+		eqs("the final chunk commits through the handle it held",
+			clerr(&r), "ok");
+	cltagfree(&cl, ta2);
+	if(statof(srvstore(ctx), "alpha", &oi) < 0)
+		fail("objstat alpha: %r");
+	else{
+		eqv("... at the key the transfer named", oi.ver, 3);
+		eqs("... over the bytes it pushed",
+			hexs(got, oi.csum, Csumlen), cs);
+	}
+	srvstagecount(ctx, &live, &done, &openat);
+	eqv("the slot is clear", live, 0);
+	eqv("the stage was given back exactly once", done, 1);
+	eqv("... with the store open", openat, 1);
+	eqv("and the give-back left nothing for the drain",
+		srvstagepend(ctx), 0);
+	eqs("so the transfer leaves no reservation behind",
+		statstaged(&cl), "0");
+	eqs("and the fid takes a fresh transfer",
+		repler(&cl, Frepl, h0, want, Tblksz), "ok");
+	free(h0);
+	free(h1);
+	free(hs);
+	free(hk);
+	clclunk(&cl, Frepl, &r);
+	clclunk(&cl, Froot, &r);
+Out:
+	srvhook(ctx, "finalhold", 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * §5.6's channel rules: one outstanding request per fid, a response
  * prepared at Twrite time and delivered by exactly one Tread, and a
  * read with nothing buffered answering count 0.
@@ -2679,6 +2816,7 @@ threadmain(int argc, char **argv)
 	tstagelife();
 	tstagebusy();
 	tstageopen();
+	tstagefinal();
 	tchannel();
 	trpcops();
 	tdropdiscard();
