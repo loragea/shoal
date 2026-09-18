@@ -2377,9 +2377,11 @@ hash, for exactly such a request — a queue of its own, so that
 offloading one neither waits behind an object's operations nor
 reorders them against each other. It is otherwise an ordinary push:
 counted in the depth, flushable, and unwound through the same single
-exit. Nothing on the served surface uses it yet — the renders and the
-`/obj` directory read that will need it are not built — so today it
-carries only what the server's own test point puts there.
+exit. Six rows of the served surface push to it: the `/dirty`,
+`/lost`, `/tombs` and `/advert` opens, each of which renders its file
+out of engine state, and the `/obj` and `/meta` directory opens and
+reads, which take a §9 snapshot and walk it. The server's own test
+point puts work there too.
 
 **The pool size is a ceiling, not just a collision parameter.** A
 queue proc runs one pushed request at a time, and a client write
@@ -4549,9 +4551,15 @@ scrub pass with T1.27 below, and §9's tombstone reclaim at both sides
 of its cutoff). The split is by layer and not by size: a failure in
 one says which half broke.
 
-Against the list below that is T1.1–T1.33. T1.21 is covered for the orderings and the
+Against the list below that is T1.1–T1.33. Three of those rows are
+covered at less than their full width, and each says so in its own
+place below as well. **T1.21** is covered for the orderings and the
 fields, but drives the four publish triggers in sequence rather than
-from concurrent procs. **T1.15** is covered at T1's geometry and not
+from concurrent procs. **T1.27** is covered at the property its
+argument rests on — the unit of scrub work is pushed to the object's
+`Reqqueue` — and not at the race, which needs a client write path to
+issue the racing commit with and the server has none. **T1.15** is
+covered at T1's geometry and not
 at the scale its row names: `enumtest` walks a snapshot of 1500
 entries over 4096 slots while four procs create, delete and discard
 beside it, and reads `/dirty` under the same churn, which is the shape
@@ -4799,8 +4807,13 @@ what would close it.
   race: with §13's `objhold` point set, a client's `verify <oid>`
   parks inside that oid's queue, and the pass's `/jobs` `done=` stops
   at that object's slot with slots still ahead of it and moves again
-  only when the hold is cleared. The commit racing the read is T2's:
-  the server has no client write path to issue it with yet.
+  only when the hold is cleared. That property and the mutation above
+  are the whole of this row's coverage: the mutation makes the case
+  fail and the queue push makes it pass, which is what a scrubber
+  reading beside the queue would and would not do. The commit racing
+  the read is not driven at all — issuing one needs a client write
+  path, and the server has none — so the row stays open at the race
+  until something can.
 - **T1.28 the online rebuild walk (§8, D18).** A store with a slot §5
   step 10 condemned, walked while it serves: the rebuilt bitmap
   equals a full scan of the live maps read off the media, `grainleak`
@@ -5198,9 +5211,13 @@ name a half that is not built; each says which.
     currency check is made and no stale mark is registered. *Not
     made:* layer-a is unchanged and this is a build that does not yet
     conform to it. Items 19 to 23 are the consequences that are
-    visible on the wire, and `/repl`, `/rpc` and `/advert` are files
-    that exist, gate by role, and refuse with `shoalsrv: not built`
-    (§14(29)).
+    visible on the wire. `/repl` and `/rpc` are files that exist,
+    gate by role, and refuse with `shoalsrv: not built` (§14(29)).
+    `/advert` is built: it renders this instance's own inventory in
+    §7.2's line grammar, live and tomb, for a peer to read. Nothing
+    sends it, because §7.2's sender — and its rate limit — is the
+    peer client this item is about; what is built is the readable
+    half.
 
 19. **§6.4 F1's lease fence is inert while the map is static.** F1
     fences an instance that has not refreshed its map within
@@ -5421,9 +5438,12 @@ name a half that is not built; each says which.
     name`.** §2.5 answers a known verb with bad arguments `bad ctl`;
     §2.6 makes `bad object name` the answer to "any operation naming
     an oid that violates §1.1". *Not made:* the more specific string
-    wins, so `verify` and every later verb that names an object
-    answer `bad object name` for an id §1.1 forbids and `bad ctl` for
-    every other argument fault, including the wrong number of them.
+    wins, so `verify` and `drop` — and every later verb that names an
+    object — answer `bad object name` for an id §1.1 forbids and `bad
+    ctl` for every other argument fault, including the wrong number
+    of them. §2.5's error column for `verify` and `drop` lists `bad
+    ctl` and not `bad object name`, so a client reading that column
+    alone would not expect the more specific one.
 
 28. **A multi-element walk cannot carry a §2.6 error.** §2.6 makes
     `no such object` the answer to a walk of an id nothing holds, and
@@ -5454,11 +5474,12 @@ name a half that is not built; each says which.
     the content is. A `Tread` and a `Twrite` have no role gate of
     their own — 9P settles the role at the open, which is where
     §2.1's matrix is applied — and the row's gate runs on them as it
-    does on an open (§14(24)). `/obj` and `/meta` directory reads, `/repl`,
-    `/rpc`, `/advert`, `/dirty`, `/stale`, `/tombs`, `/lost`,
-    `/jobs`, the object rows' open, read, write, create, remove and
-    wstat, and every ctl verb but `fence` and `verify` answer it
-    today. A caller sees it only where those gates pass: a
+    does on an open (§14(24)). `/repl` and `/rpc`, the object rows'
+    open, read, write, create, remove and wstat, and the ctl verbs
+    `pull`, `push`, `reconcile`, `advert`, `refresh` and `register`
+    answer it today; the status files, the `/obj` and `/meta`
+    directory reads and the other ctl verbs are built and answer
+    their own. A caller sees it only where those gates pass: a
     `role=admin` create or write of an id that is not reserved never
     reaches it, because §2.1 makes that `permission denied`
     (§14(24)), and neither does anything F3 or the fence refuses.
