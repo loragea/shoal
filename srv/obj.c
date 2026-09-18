@@ -677,16 +677,10 @@ stagepointon(Srvctx *c)
 }
 
 /*
- * How many stages the live fids hold, how many have been given back,
- * and how many of those found the store still open — which every one
- * of them must, since an engine stage's discard is an engine call
- * (dat.h).  nil for a count the caller does not want.
- */
-/*
  * How many engine handles have been parked for the drain: every one
- * the flush-side discard has met, since it makes no engine call of its
- * own, and every one the stage point armed onto a stage that had
- * already been stripped.
+ * the flush-side discard has met and could park, since it makes no
+ * engine call of its own, and every one the stage point armed onto a
+ * stage that had already been stripped.
  */
 uvlong
 srvstagepend(Srvctx *c)
@@ -699,6 +693,12 @@ srvstagepend(Srvctx *c)
 	return n;
 }
 
+/*
+ * How many stages the live fids hold, how many have been given back,
+ * and how many of those found the store still open — which every one
+ * of them must, since an engine stage's discard is an engine call
+ * (dat.h).  nil for a count the caller does not want.
+ */
 void
 srvstagecount(Srvctx *c, uvlong *live, uvlong *done, uvlong *openat)
 {
