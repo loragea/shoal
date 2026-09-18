@@ -285,6 +285,13 @@ int	srvjobcount(Srvctx*);	/* jobs held: what the shutdown waits for */
  *		a step 7 for another request on the same fid can strip the
  *		stage in that window — which is what the arm has to find
  *		rather than store a handle nothing would reach (obj.c).
+ *	objclaim
+ *		n != 0 holds a queued /obj create at its claim test, before
+ *		it reads the fid's state at all.  objhold above parks it
+ *		there too, but parks every other queued request with it —
+ *		including the directory open this point exists to let run
+ *		first, which is the request a create has to be driven
+ *		against (obj.c).
  *	objexit	n != 0 holds every queued request that has reached the
  *		other end of its handler — an object read or write on
  *		/obj/<oid> or /meta/<oid>, a ctl verb run on an oid's
@@ -366,6 +373,17 @@ int	srvjobcount(Srvctx*);	/* jobs held: what the shutdown waits for */
  *		request queued on the same fid, which the loop performs
  *		step 7 for and must answer without waiting for the walk.
  *		Set to n+1, like slotfail.
+ *	dirgive	n != 0 holds the n-1'th /obj or /meta open of this
+ *		instance to reach its give-back window — after srvfidgive
+ *		has emptied the fid's state slot and before the open
+ *		retakes the fid's state lock to install its own snapshot
+ *		(enum.c).  A fid whose first open has ANSWERED holds
+ *		nothing there, which is the window the create cell's
+ *		`Fid.omode' test refuses a Tcreate in, so a test holds it
+ *		open under the SECOND open of a fid (dirgive=2) and drives
+ *		a create at the fid inside it (obj.c).  Set to n+1, like
+ *		slotfail.  The park is outside the fid's state lock, as
+ *		every point here is.
  *	reclaimhold
  *		n != 0 holds the tombstone reclaim walk that rides on a
  *		scrub before its n-1'th entry, with the entries before
@@ -412,19 +430,19 @@ void	srvhook(Srvctx*, char *name, uvlong n);
  * srvholdclear, which the shutdown runs before it drains, clears the
  * whole of srvhook's set and nothing else: objhold, objprelook,
  * objstage, objlook, objarm, objexit, flushhold, mapopen, walkhold,
- * anyexit, step7, jobhold, slotfail, reclaimhold and dirhold.  A HOLD
- * therefore belongs in srvhook — a program that set a point and
- * stopped watching must not be able to hold the store's close.  (The
- * shutdown also
- * turns srvcellpoint off, by its own call and for its own reason: the
- * file table those cells are in outlives the context that was given
- * them.)  Clearing a point is not the same as reaching the proc
- * that is parked in it: a parked QUEUE proc wakes when its point is
- * cleared, but a parked SERVICE LOOP never reaches srvholdclear at all,
- * because the shutdown runs from Srv.end, which lib9p calls on the
- * loop.  A point that can park the loop — the flush hold, and the
- * step 7 hold when the flushed request was still queued — therefore
- * bounds its own park as well as being cleared here.
+ * anyexit, step7, jobhold, slotfail, reclaimhold, dirhold, dirgive
+ * and objclaim.  A HOLD therefore belongs in srvhook — a program that
+ * set a point and stopped watching must not be able to hold the
+ * store's close.  (The shutdown also turns srvcellpoint off, by its
+ * own call and for its own reason: the file table those cells are in
+ * outlives the context that was given them.)  Clearing a point is not
+ * the same as reaching the proc that is parked in it: a parked QUEUE
+ * proc wakes when its point is cleared, but a parked SERVICE LOOP
+ * never reaches srvholdclear at all, because the shutdown runs from
+ * Srv.end, which lib9p calls on the loop.  A point that can park the
+ * loop — the flush hold, and the step 7 hold when the flushed request
+ * was still queued — therefore bounds its own park as well as being
+ * cleared here.
  *
  * What srvholdclear does NOT touch belongs beside srvauxpoint below:
  * the fid-state point and its counts, and the end point, whose whole

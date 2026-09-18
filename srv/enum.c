@@ -339,6 +339,13 @@ objdirfid(Sfid *f)				/* f->lk held */
  * test is caught by the second and the two cells cannot both win.
  * The give-back that ran in between costs nothing — the create that
  * raised the claim gives the same state back itself.
+ *
+ * What the give-back does leave is a window in which this fid holds
+ * nothing at all, which is a fid the create cell cannot tell from one
+ * no open has ever reached.  A create that lands there is refused by
+ * lib9p's own `Fid.omode', set when the first open on this fid
+ * answered and tested by that cell for exactly this window (obj.c);
+ * §13's `dirgive' point is the window, for a test that wants it.
  */
 static void
 objdiropenq(Req *r)
@@ -375,6 +382,7 @@ objdiropenq(Req *r)
 	d->sn = sn;
 	d->opener = r;
 	srvfidgive(f);
+	srvgivehold(r);
 	qlock(&f->lk);
 	if(!objdirfid(f)){
 		qunlock(&f->lk);
@@ -407,14 +415,15 @@ srvobjdiropen(Req *r)
  * mode or the ownership.
  */
 static void
-objdirent(Srvctx *c, Sfid *f, uchar *oid, int oidlen, Objinfo *oi, Dir *d)
+objdirent(Srvctx *c, int file, int role, uchar *oid, int oidlen, Objinfo *oi,
+	Dir *d)
 {
 	Sfid g;
 	Qid q;
 
 	memset(&g, 0, sizeof g);
-	g.file = f->file == Qmeta ? Qmetafile : Qobjfile;
-	g.role = f->role;
+	g.file = file == Qmeta ? Qmetafile : Qobjfile;
+	g.role = role;
 	memmove(g.oid, oid, oidlen);
 	g.oidlen = oidlen;
 	srvobjqid(&g, oi, &q);
@@ -441,22 +450,40 @@ dirfree(Dir *d)
  * each taking the engine's state lock, and the service loop takes this
  * fid's state lock to perform step 7 for another request on the same
  * fid (queue.c) — which dat.h forbids the loop to wait on.  So the
- * snapshot and the cursor are lifted under the lock, the walk runs
- * over them unlocked, and the lock is retaken to commit the cursor.
+ * snapshot and the cursor are lifted under the lock, with the file and
+ * the role each entry is rendered from (objdirent), the walk runs over
+ * those locals unlocked, and the lock is retaken to commit the cursor.
  *
  * What makes the walk safe unlocked is that neither the Objdir nor its
  * snapshot can be given back while this read is in flight:
  *
  *	auxfree is the only thing that closes the snapshot (above), and
- *		it runs from the clunk or the moving walk — lib9p holds a
- *		reference to this request's Fid until the request is
- *		freed, so destroyfid cannot run inside this handler, and a
- *		walk cannot move a fid that is OPEN, which this one is or
- *		lib9p would not have reached a read cell at all.
+ *		it runs from the clunk, from the moving walk, or from the
+ *		create cell's give-back once its object is made (obj.c) —
+ *		lib9p holds a reference to this request's Fid until the
+ *		request is freed, so destroyfid cannot run inside this
+ *		handler, and a walk cannot move a fid that is OPEN, which
+ *		this one is or lib9p would not have reached a read cell at
+ *		all.  The create's give-back is the one of the three that
+ *		runs on another queue's proc — a per-oid queue, while this
+ *		read has the reserved one — and it is safe because a
+ *		create that reaches it holds `moving', set before it
+ *		staged anything, and both of objdiropenq's objdirfid tests
+ *		refuse under `moving', the second under the same hold of
+ *		the fid's state lock the create set it beneath.  So no
+ *		open can install a listing on this fid, and no Tread can
+ *		be reading one, across that give-back.
  *	auxflush frees it for a flushed OPEN alone (objdirflush), and no
- *		Topen can be outstanding on an open fid either: lib9p
- *		refuses one from Fid.omode.  A read's own step 7 does not
- *		free it, by the same test.
+ *		open of this fid can RUN while this read walks: both cells
+ *		are offloaded to the one reserved queue (srvqpushany), and
+ *		one Reqqueue is one proc taking its requests in order, so
+ *		an open behind this read starts only once the read has
+ *		left.  An open FLUSHED while it was still queued is the
+ *		other way objdirflush is reached, on the service loop —
+ *		and it finds Fid.omode set, by the open this read is
+ *		reading on, where objdirflush's first test answers.  A
+ *		read's own step 7 frees nothing either: that test asks for
+ *		a Topen and this is not one.
  *	the shutdown's sweep runs after the drain, which this request is
  *		part of, and this row's auxclose is nil in any case.
  *
@@ -495,7 +522,7 @@ objdirreadq(Req *r)
 	uvlong soff;
 	ulong nent, spos, pos;
 	long n, m, cnt;
-	int oidlen, rc;
+	int oidlen, rc, sfile, srole;
 
 	if(srvqcheck(r)){
 		srvqdone(r, nil);
@@ -521,6 +548,8 @@ objdirreadq(Req *r)
 	sn = d->sn;
 	soff = d->off;
 	spos = d->pos;
+	sfile = f->file;
+	srole = f->role;
 	qunlock(&f->lk);
 	n = 0;
 	if(e == nil){
@@ -543,7 +572,7 @@ objdirreadq(Req *r)
 			pos++;
 			if(rc == 0)
 				continue;
-			objdirent(c, f, oid, oidlen, &oi, &dir);
+			objdirent(c, sfile, srole, oid, oidlen, &oi, &dir);
 			m = convD2M(&dir, p+n, cnt-n);
 			dirfree(&dir);
 			if(m <= BIT16SZ){

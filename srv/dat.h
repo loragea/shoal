@@ -175,17 +175,29 @@ enum
  * fid to Qobjfile while the open installs a listing's snapshot on it,
  * and lib9p then writes the loser's qid and mode over the winner's.
  * So the cells refuse the second themselves, under this fid's state
- * lock, with lib9p's own Ebotch: the create refuses a fid that holds
- * a listing's state or that another create is moving, and the open
- * refuses to install over a fid a create has moved or is moving.  A
- * create claims the fid with `moving' before its engine work and
- * clears it at whichever exit it takes, so exactly one of the two can
- * win however the two procs interleave; the price is that an open
- * that arrives while a create that then FAILS holds the claim is
- * refused as well, which is a client that pipelined the two.  A
- * second Topen is not this case and is not refused: it leaves the fid
- * a directory fid, and srvfidgive in the open cell is what gives the
- * first open's snapshot back before the second's is installed.
+ * lock, with lib9p's own Ebotch: the create refuses a fid an open has
+ * ANSWERED for, one that holds a listing's state, and one another
+ * create is moving; the open refuses to install over a fid a create
+ * has moved or is moving.  A create claims the fid with `moving'
+ * before its engine work and clears it at whichever exit it takes, so
+ * exactly one of the two can win however the two procs interleave;
+ * the price is that an open that arrives while a create that then
+ * FAILS holds the claim is refused as well, which is a client that
+ * pipelined the two.  A second Topen is not this case and is not
+ * refused: it leaves the fid a directory fid, and srvfidgive in the
+ * open cell is what gives the first open's snapshot back before the
+ * second's is installed.
+ *
+ * That give-back is why the create tests `Fid.omode' as well as the
+ * state slot.  It runs outside this lock, so a second open leaves the
+ * fid holding NOTHING between the give-back and the install: the slot
+ * is empty and no create is moving, which is the same fid a create
+ * that got here first sees, and the state slot alone cannot tell the
+ * two apart.  `Fid.omode' can: lib9p sets it in `ropen', so a fid
+ * that has one is a fid an open has already answered on, and a create
+ * on it is the losing half of the pipelined pair however far the
+ * second open has got.  It is lib9p's own guard, read a message late
+ * — which is the whole of what the offload costs this row.
  *
  * The /meta directory row's open and read cells — and the aux a fid
  * of that row carries while it is a directory fid — are the
@@ -685,6 +697,9 @@ struct Srvctx
 	uvlong	slotfail;	/* srvhook("slotfail") */
 	uvlong	reclaimhold;	/* srvhook("reclaimhold") */
 	uvlong	dirhold;	/* srvhook("dirhold") */
+	uvlong	givehold;	/* srvhook("dirgive") */
+	uvlong	givecnt;	/* opens that have reached that window */
+	uvlong	claimhold;	/* srvhook("objclaim") */
 	uvlong	endhold;	/* srvendpoint: ms held in srvqended */
 
 	/*

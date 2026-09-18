@@ -2341,6 +2341,298 @@ tpipeopen(void)
 }
 
 /*
+ * A Tcreate pipelined behind a Topen that is REFUSED.  What the create
+ * cell reads to know that an open got to this fid first is lib9p's
+ * `Fid.omode' (srv/obj.c), and lib9p writes it only for an open it
+ * answered with an Ropen — so an open that was refused must leave the
+ * create free to win.
+ *
+ * The refusal driven here is lib9p's own: OWRITE on a directory is
+ * answered `is a directory' from the service loop, before the /obj
+ * row's open cell is reached at all, so no cell of this row ever sees
+ * this open.  `objhold' is what orders the two on the client's side —
+ * the create is held on its queue while the open's refusal comes back
+ * — so the create's claim test runs strictly after the open was
+ * answered, which is the moment a create would be refused if the
+ * error path wrote `Fid.omode'.
+ */
+static void
+trefusedopen(void)
+{
+	char *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall t, r;
+	Objinfo oi;
+	char *w[1];
+	ushort to, tc;
+
+	clstage = "refusedopen";
+	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4)) == nil)
+		return;
+	mkobj(srvstore(ctx), "alpha", nil, 0, 1);
+	w[0] = "obj";
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
+		fail("attach: %s", clerr(&r));
+		goto Out;
+	}
+	if(clwalk(&cl, Froot, Ffile, 1, w, &r) != Rwalk){
+		fail("walk /obj: %s", clerr(&r));
+		goto Out;
+	}
+	srvhook(ctx, "objhold", 1);	/* the create, once it is queued */
+	memset(&t, 0, sizeof t);
+	t.type = Topen;
+	t.fid = Ffile;
+	t.mode = OWRITE;		/* on a directory: lib9p refuses it */
+	t.tag = to = cltag(&cl);
+	clput(&cl, &t);
+	sleep(200);			/* answered on the loop, not queued */
+	memset(&t, 0, sizeof t);
+	t.type = Tcreate;
+	t.fid = Ffile;
+	t.name = "shoal.map.9";
+	t.perm = 0666;
+	t.mode = OWRITE;
+	t.tag = tc = cltag(&cl);
+	clput(&cl, &t);
+	sleep(200);			/* held at its check point */
+
+	clgettag(&cl, to, &r);
+	clerris("an OWRITE open of /obj", &r, "is a directory");
+	cltagfree(&cl, to);
+	srvhook(ctx, "objhold", 0);
+	checks++;
+	if(clgettag(&cl, tc, &r) != Rcreate)
+		fail("a create behind a refused open: %s", clerr(&r));
+	cltagfree(&cl, tc);
+	checks++;
+	if(objinfoof(srvstore(ctx), "shoal.map.9", &oi) < 0)
+		fail("the create that won made no object");
+
+	clclunk(&cl, Ffile, &r);
+	clclunk(&cl, Froot, &r);
+Out:
+	srvhook(ctx, "objhold", 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
+ * A Tcreate that lands in a SECOND open's give-back window, which is
+ * the one stretch in which a /obj fid whose open has ANSWERED holds
+ * nothing at all.  Three messages pipelined on one fid: the first
+ * Topen installs a listing and answers, the second — legal, it passed
+ * lib9p's `Fid.omode' guard before the first answered — gives that
+ * listing back before installing its own, and the Tcreate's claim test
+ * runs in between, where the fid's state slot is as empty as on a fid
+ * no open has ever reached.  What tells the two apart is `Fid.omode',
+ * which lib9p wrote when the first open answered and which the create
+ * cell tests for exactly this window (srv/obj.c).
+ *
+ * The client's side is what the checks are: the open it was answered
+ * stays answered, the listing it opened is still there to read, and
+ * the object it never asked for was not created.  §13's two points
+ * hold the sequence still rather than race it — `dirgive' parks the
+ * second open in the window and `objclaim' parks the create at its
+ * claim test, so the create is released into a window that is being
+ * held open; `objhold' is what gets all three onto their queues before
+ * the first of them answers, which is what lib9p's own guard leaves
+ * room for and is the whole of how a client reaches this window.
+ */
+static void
+tgivecreate(void)
+{
+	char *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall t, r;
+	Objinfo oi;
+	char *w[1];
+	ushort to1, to2, tc;
+
+	clstage = "givecreate";
+	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4)) == nil)
+		return;
+	mkobj(srvstore(ctx), "alpha", nil, 0, 1);
+	w[0] = "obj";
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
+		fail("attach: %s", clerr(&r));
+		goto Out;
+	}
+	if(clwalk(&cl, Froot, Ffile, 1, w, &r) != Rwalk){
+		fail("walk /obj: %s", clerr(&r));
+		goto Out;
+	}
+	srvhook(ctx, "objhold", 1);	/* each of the three, as it arrives */
+	srvhook(ctx, "dirgive", 2);	/* the second open, in the window */
+	srvhook(ctx, "objclaim", 1);	/* the create, at its claim test */
+	memset(&t, 0, sizeof t);
+	t.type = Topen;
+	t.fid = Ffile;
+	t.mode = OREAD;
+	t.tag = to1 = cltag(&cl);
+	clput(&cl, &t);
+	sleep(200);			/* parked at its check point */
+	t.tag = to2 = cltag(&cl);
+	clput(&cl, &t);
+	sleep(200);			/* queued behind it, on the one proc */
+	memset(&t, 0, sizeof t);
+	t.type = Tcreate;
+	t.fid = Ffile;
+	t.name = "shoal.map.9";
+	t.perm = 0666;
+	t.mode = OWRITE;
+	t.tag = tc = cltag(&cl);
+	clput(&cl, &t);
+	sleep(200);			/* and this one on its own queue */
+	srvhook(ctx, "objhold", 0);
+
+	checks++;
+	if(clgettag(&cl, to1, &r) != Ropen){
+		fail("the first open of /obj: %s", clerr(&r));
+		goto Out;
+	}
+	cltagfree(&cl, to1);
+	/*
+	 * This wait is what makes the case discriminate: the second open
+	 * has to be parked at `dirgive', inside the window, before the
+	 * create is let go.  A create released any earlier finds the fid
+	 * still holding the first open's listing and is refused by
+	 * srvobjdirheld — with the same string, so every assertion below
+	 * would pass for a reason that has nothing to do with `Fid.omode'.
+	 * And `dirgive' counts opens instance-wide (srv/queue.c), so these
+	 * two must stay the only /obj opens this instance sees, or the
+	 * open the point parks is not the one this case drives.
+	 */
+	sleep(200);			/* the second open is in the window */
+	srvhook(ctx, "objclaim", 0);
+	clgettag(&cl, tc, &r);
+	clerris("a create inside a second open's give-back", &r,
+		"9P protocol botch");
+	cltagfree(&cl, tc);
+	srvhook(ctx, "dirgive", 0);
+	checks++;
+	if(clgettag(&cl, to2, &r) != Ropen)
+		fail("the second open behind the create: %s", clerr(&r));
+	cltagfree(&cl, to2);
+
+	checks++;
+	if(objinfoof(srvstore(ctx), "shoal.map.9", &oi) >= 0)
+		fail("the refused create made its object anyway");
+	checks++;
+	if(clread(&cl, Ffile, 0, 4096, &r) != Rread)
+		fail("the listing the open was answered for: %s", clerr(&r));
+	else
+		eqv("the fid is the directory's still", dirents(r.data,
+			r.count), 1);
+	clclunk(&cl, Ffile, &r);
+	clclunk(&cl, Froot, &r);
+Out:
+	srvhook(ctx, "objhold", 0);
+	srvhook(ctx, "objclaim", 0);
+	srvhook(ctx, "dirgive", 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
+ * A reply held aside comes back the way it arrived.  Replies need not
+ * arrive in request order once more than one queue is in play, so this
+ * client collects the one its caller asked for and holds the rest for
+ * a later clget or clgettag (srv9p.h) — and what it holds aside has to
+ * be the message, not what decoding it left behind: convM2S decodes in
+ * place, shifting every string down over the 2-byte count that
+ * precedes it, so a second decode of the same buffer reads a length
+ * out of the string's own text.
+ *
+ * An Rerror is the reply that carries a string and the one most of
+ * these cases assert, so it is the one driven here: the open is held
+ * on its queue while a create the service loop refuses out of hand
+ * answers past it, and the assertion is that the string survives being
+ * held aside and decoded a second time.
+ */
+static void
+tholdaside(void)
+{
+	char *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall t, r;
+	char *w[1];
+	ushort to, tc;
+
+	clstage = "holdaside";
+	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4)) == nil)
+		return;
+	mkobj(srvstore(ctx), "alpha", nil, 0, 1);
+	w[0] = "obj";
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
+		fail("attach: %s", clerr(&r));
+		goto Out;
+	}
+	if(clwalk(&cl, Froot, Ffile, 1, w, &r) != Rwalk ||
+		clwalk(&cl, Froot, Ffile2, 1, w, &r) != Rwalk){
+		fail("walk /obj: %s", clerr(&r));
+		goto Out;
+	}
+	srvhook(ctx, "objhold", 1);
+	memset(&t, 0, sizeof t);
+	t.type = Topen;
+	t.fid = Ffile;
+	t.mode = OREAD;
+	t.tag = to = cltag(&cl);
+	clput(&cl, &t);
+	sleep(200);			/* held on the reserved queue */
+	memset(&t, 0, sizeof t);
+	t.type = Tcreate;
+	t.fid = Ffile2;
+	t.name = "shoal.bad name";
+	t.perm = 0666;
+	t.mode = OWRITE;
+	t.tag = tc = cltag(&cl);
+	clput(&cl, &t);
+	sleep(200);			/* refused on the loop, and answered */
+	srvhook(ctx, "objhold", 0);
+
+	checks++;
+	if(clgettag(&cl, to, &r) != Ropen)
+		fail("the open the refused create answered past: %s",
+			clerr(&r));
+	cltagfree(&cl, to);
+	eqv("the create's Rerror was held aside", cl.npend, 1);
+	clgettag(&cl, tc, &r);
+	clerris("the Rerror held aside, decoded a second time", &r,
+		"bad object name");
+	cltagfree(&cl, tc);
+	clclunk(&cl, Ffile2, &r);
+	clclunk(&cl, Ffile, &r);
+	clclunk(&cl, Froot, &r);
+Out:
+	srvhook(ctx, "objhold", 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * The fid registry under a walk that moves a fid.  A walk that names
  * an object runs on that object's queue while attaches and clones run
  * on the service loop, and both reach the same list: the walk gives
@@ -3860,6 +4152,9 @@ threadmain(int argc, char **argv)
 	tcreategive();
 	tdircreate();
 	tpipeopen();
+	trefusedopen();
+	tgivecreate();
+	tholdaside();
 	tfidwalk();
 	tflush();
 	tstep7fid();
