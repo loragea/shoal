@@ -5975,7 +5975,10 @@ other files cite, so a gap is cheaper than a renumbering.
     chunk in the middle of a transfer it is the look its engine write
     returns to. For a `final=1` chunk the look keeps the mark set,
     because that chunk holds the stage across the arbitration and the
-    commit, and the give-back behind the look is what clears it. For
+    commit, and the give-back behind the look is what clears it —
+    unless the stage was already dead when that look ran, in which
+    case the look answers `stage expired` and clears the mark itself,
+    like any other chunk's ((45)). For
     the chunk that OPENS a transfer there is no look at all in the
     window this exception covers — it runs between the stage and the
     handle — so what clears it is the give-back behind an arm that
@@ -6001,12 +6004,19 @@ other files cite, so a gap is cheaper than a renumbering.
     queue proc holding no lock, which is where an engine call belongs.
     For a chunk that is not the last, the release is the look it takes
     when its call returns, which finds the stage dead and answers
-    `stage expired`. A `final=1` chunk is still inside its step at
-    that look: it goes on to arbitrate and commit through the same
-    handle, so the look keeps `busy` set and the give-back that
-    consumes the handle is the release. Its outcome is then the
-    commit's, not `stage expired`, because what step 7 discards is the
-    fid's stage and this one's last step is already under way.
+    `stage expired`. A `final=1` chunk that gets PAST that look is
+    still inside its step: it goes on to arbitrate and commit through
+    the same handle, so the look keeps `busy` set, the give-back that
+    consumes the handle is the release, and its outcome is the
+    commit's rather than `stage expired`, because what step 7 discards
+    is the fid's stage and this one's last step is already under way.
+    Which side of the look step 7 lands on is what decides that. The
+    look answers on whether the stage is still the fid's and still
+    live *before* it consults the mark it was asked to keep, so a
+    `final=1` chunk step 7 reached while its engine write was in
+    flight is answered `stage expired` there like any other, clears
+    the mark and gives the stage back at the look. The kept mark buys
+    the window after the look, not the one before it.
 
     The hook's own guard is `busy` **and** a handle to leave alone.
     `busy` is what says a handler is inside a step on the stage, and

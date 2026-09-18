@@ -583,9 +583,15 @@ extern int nsrvctls;
  *		what the chunk still owes: the look its engine call returns
  *		to is the release for a chunk that is not the last, and for
  *		a final=1 chunk the look keeps `busy' set and the give-back
- *		behind it is (obj.c's srvstagelive and srvstagefinal),
- *		since that chunk holds the stage across the arbitration
- *		between the two.  Not the hook, whose park would be a
+ *		behind it is the release (obj.c's srvstagelive and
+ *		srvstagefinal), since that chunk holds the stage across the
+ *		arbitration between the two.  That is the chunk that gets
+ *		PAST its look: the look answers on whether the stage is
+ *		still the fid's and still live BEFORE it consults the mark
+ *		it was asked to keep, so a final=1 chunk the hook reached
+ *		while its write was in flight is answered `stage expired'
+ *		there and gives the stage back at its look like any other.
+ *		Not the hook, whose park would be a
  *		discard made under the stagewrite the handle is an argument
  *		of; not the idle sweep, which `busy' holds off (§3.6); and
  *		not a refusal running on another queue — a chunk naming a
