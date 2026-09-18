@@ -339,20 +339,20 @@ stagefreehook(void *a)
 
 /*
  * §3.6's idle sweep, over both kinds of stage: the engine's own
- * handles, which stagesweep strips, and the server's, which are
- * released whole because nothing else owns their bytes.  The trigger
- * is ARRIVAL — a stage a handler is inside right now is not an absence
- * of arrivals, and sweeping under one would take the bytes out from
- * under the commit that is reading them (§3.6).
+ * handles, which stagesweep strips, and this file's, which are
+ * released whole because a key is all they hold.  The trigger is
+ * ARRIVAL — a stage a handler is inside right now is not an absence of
+ * arrivals, and sweeping under one would take the reservations out
+ * from under the transfer that is filling them (§3.6).
  *
  * There is no sweeper proc.  A stage holds a reservation, and the only
  * thing that can be waiting on one is another operation on an object,
  * so the sweep runs at the head of every queued operation that names
  * an object — this file's handlers, and the walk and the stat in
  * tree.c — a store with nothing running having nothing waiting for
- * what an abandoned stage holds.  The handle is never
- * freed here — it is the fid's, and the clunk behind it is what frees
- * it (§3.6) — so the fid's next look finds it expired.
+ * what an abandoned stage holds.  The stage itself is never freed
+ * here: it is the fid's, and the clunk behind it is what frees it
+ * (§3.6), so the fid's next look finds it expired.
  *
  * Which is exactly why an expired stage is stripped WHERE IT IS FOUND,
  * under stagelk, one at a time, rather than chained onto a list the

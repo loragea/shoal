@@ -413,10 +413,12 @@ extern int nsrvctls;
  *
  *	one per fid.  A second is refused `disk full', which is §3.6's
  *		refusal for its per-fid bound, and so is an update
- *		covering more grains than `stagemax' allows.  A client
- *		write is SHORTENED to that bound rather than refused
- *		(layer-a §2.4's short write), so only a fid that already
- *		holds a stage reaches the refusal.
+ *		covering more than `stagemax' allows — grains for a /repl
+ *		stage, checksum blocks for a client write, which is this
+ *		server's own quantity (store.md §14(33)).  A client write
+ *		is SHORTENED to that bound rather than refused (layer-a
+ *		§2.4's short write), so only a fid that already holds a
+ *		stage reaches the refusal.
  *	discarded by step 7, through auxflush, whichever of the fid's
  *		requests was flushed: the stage is the fid's, and a stage
  *		spanning several Twrites has no one request to belong to.
@@ -451,7 +453,7 @@ enum
 	Sttrunc,		/* ... truncate, extend and OTRUNC */
 	Stremove,		/* ... remove */
 	Stfull,			/* §5.5's op=full/op=create, through Stage */
-	Stpoint,		/* srvstagepoint's, which stages nothing */
+	Stpoint,		/* srvstagepoint's: an engine handle, no update */
 };
 
 struct Sstage
