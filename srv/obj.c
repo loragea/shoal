@@ -856,8 +856,9 @@ srvstagefull(Req *r, Srvctx *c, Sfid *f, uchar *oid, int oidlen, uvlong flen,
  * that restart with the same string for as long as the fid lived
  * (store.md §14(44)).
  *
- * With one exemption, the flush hook's own (store.md §14(45)): a dead
- * stage another queue proc is inside a STEP on is left where it is.
+ * With one exemption, which store.md §14(44) grants and §14(45) is
+ * the flush hook's half of: a dead stage another queue proc is inside
+ * a STEP on is left where it is.
  * This runs on a chunk naming a SECOND object, which hashes to another
  * queue and so runs beside a chunk that is inside stageopen or
  * stagewrite on this stage — and taking it here would free the handle

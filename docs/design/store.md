@@ -5962,6 +5962,22 @@ other files cite, so a gap is cheaper than a renumbering.
     `final=1` has not been attempted "and for no other", so such a
     transfer ends with the fid's clunk or with a `final=1`.
 
+    **One refusal leaves the slot where it is: one over a stage
+    another handler is inside a step on.** That handler's own look, a
+    moment later, is what clears it, and the next chunk on the fid
+    still starts fresh because the look runs before it. What the
+    exception protects is the handler in the middle: a refusal that
+    took the slot would free the handle under the engine call it is
+    an argument of, or free the stage itself under the arm that is
+    about to store that handle in it. `busy` is
+    what says a handler is inside a step, and it is set from the
+    moment the stage is made and not from the moment it holds a
+    handle — the chunk that OPENS a transfer is inside such a step
+    too, and what a slot taken from under it strands is the
+    reservation its handle was about to be stored in. (45) is the
+    same rule said to the flush hook, which meets such a stage from
+    the other side.
+
 45. **The flush hook leaves the engine handle of a stage a chunk is
     inside.** layer-a §5.4.1 step 7 discards what the flushed fid
     staged, and the hook does it by stripping the handle and parking

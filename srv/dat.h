@@ -585,7 +585,8 @@ extern int nsrvctls;
  *		sweep, which `busy' holds off (§3.6); and not a refusal
  *		running on another queue — a chunk naming a second object
  *		finds the stage dead, answers `stage expired' and leaves
- *		the slot to that look for the same reason (obj.c's
+ *		the slot to that look for the same reason, which is the
+ *		exception §14(44) grants its own rule (obj.c's
  *		srvstagemore).  So what the fid owes is that the handle is
  *		released by someone that is not the hook, and while a
  *		handler is inside a step on it, that someone is the
