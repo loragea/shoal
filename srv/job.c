@@ -288,8 +288,10 @@ jobstart(Srvctx *c, char *verb, void (*fn)(Sjob*), char *arg)
  * /jobs, layer-a §2.2: one line per running or queued background job,
  * and EVERY such job — a file that listed some of them would answer a
  * §2.2 MUST with a sample.  It reads the server's own list and
- * touches the engine, so unlike the other status files it is rendered
- * on the service loop.
+ * touches no engine, so unlike the status files whose render does
+ * reach it — /dirty, /lost, /tombs and /advert, which fill an open
+ * cell that puts the render on the reserved queue — this one is
+ * rendered on the service loop, as /stale is (dat.h).
  *
  * The list is sized under the lock, the room for it taken outside the
  * lock, and the lines formatted outside it too: joblk is a spin lock,
