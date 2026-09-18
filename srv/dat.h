@@ -614,11 +614,13 @@ extern int nsrvctls;
  *
  *		`busy' says a handler is inside a step on the stage, handle
  *		or NOT: the opening chunk of a transfer is busy from the
- *		moment it stages until the arm that fills `g', and
- *		stageopen runs in that window with no lock held.  A stage
- *		taken out of the slot there is one the arm, and the look
- *		behind it, reach after it has been freed — so what the
- *		qualifier is on is the handler and not the handle.
+ *		moment it stages, ACROSS the arm that fills `g' — which
+ *		leaves the mark set for that caller (obj.c's srvstagefull)
+ *		— and until the look behind it.  stageopen runs in that
+ *		window with no lock held.  A stage taken out of the slot
+ *		there is one the arm, and the look behind it, reach after
+ *		it has been freed — so what the qualifier is on is the
+ *		handler and not the handle.
  *	discarded at clunk and before the store closes, through
  *		auxclose, because releasing an engine stage is an engine
  *		call (store.md §9).

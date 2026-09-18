@@ -5964,22 +5964,26 @@ other files cite, so a gap is cheaper than a renumbering.
 
     **One refusal leaves the slot where it is: one over a stage
     another handler is inside a step on.** That handler is what clears
-    it a moment later — its own look for a chunk that is not the last,
-    and the give-back the look leaves to for a `final=1` chunk, which
-    holds the stage across the arbitration between the two — and the
-    next chunk on the fid still starts fresh because that clearing
-    runs before it. What the
-    exception protects is the handler in the middle: a refusal that
-    took the slot would free the handle under the engine call it is
-    an argument of, or free the stage itself under the arm that is
-    about to store that handle in it. `busy` is
-    what says a handler is inside a step, and it is set from the
-    moment the stage is made and not from the moment it holds a
-    handle — the chunk that OPENS a transfer is inside such a step
-    too, and what a slot taken from under it strands is the
-    reservation its handle was about to be stored in. (45) is the
-    same rule said to the flush hook, which meets such a stage from
-    the other side.
+    it a moment later, and the next chunk on the fid still starts
+    fresh because that clearing runs before it. Which step of the
+    handler clears it depends on what the chunk still owes. For a
+    chunk in the middle of a transfer it is the look its engine write
+    returns to. For a `final=1` chunk the look keeps the mark set,
+    because that chunk holds the stage across the arbitration and the
+    commit, and the give-back behind the look is what clears it. For
+    the chunk that OPENS a transfer there is no look at all in the
+    window this exception covers — it runs between the stage and the
+    handle — so what clears it is the give-back behind an arm that
+    finds the stage already gone. What the exception protects is the
+    handler in the middle: a refusal that took the slot would free the
+    handle under the engine call it is an argument of, or free the
+    stage itself under the arm that is about to store that handle in
+    it. `busy` is what says a handler is inside a step, and it is set
+    from the moment the stage is made and not from the moment it holds
+    a handle — the opening chunk is inside such a step too, and what a
+    slot taken from under it strands is the reservation its handle was
+    about to be stored in. (45) is the same rule said to the flush
+    hook, which meets such a stage from the other side.
 
 45. **The flush hook leaves the engine handle of a stage a chunk is
     inside.** layer-a §5.4.1 step 7 discards what the flushed fid
@@ -5988,20 +5992,28 @@ other files cite, so a gap is cheaper than a renumbering.
     same handle to `stagewrite`, so a park made while the call is in
     flight is a discard made under it. *Not made; recorded here as
     what the server does:* the hook marks such a stage dead and
-    leaves the handle alone — `busy` is what says a handler is inside
-    a step on it, which is also what holds the idle sweep off (§3.6)
-    — and that chunk releases the handle itself, on a queue proc
-    holding no lock, which is where an engine call belongs. For a
-    chunk that is not the last, the release is the look it takes when
-    its call returns, which finds the stage dead and answers `stage
-    expired`. A `final=1` chunk is still inside its step at that
-    look: it goes on to arbitrate and commit through the same handle,
-    so the look keeps `busy` set and the give-back that consumes the
-    handle is the release. Its outcome is then the commit's, not
-    `stage expired`, because what step 7 discards is the fid's stage
-    and this one's last step is already under way. A client stage
-    holds a key and no handle, so none of this changes what step 7
-    does to one.
+    leaves the handle alone, and that chunk releases it itself, on a
+    queue proc holding no lock, which is where an engine call belongs.
+    For a chunk that is not the last, the release is the look it takes
+    when its call returns, which finds the stage dead and answers
+    `stage expired`. A `final=1` chunk is still inside its step at
+    that look: it goes on to arbitrate and commit through the same
+    handle, so the look keeps `busy` set and the give-back that
+    consumes the handle is the release. Its outcome is then the
+    commit's, not `stage expired`, because what step 7 discards is the
+    fid's stage and this one's last step is already under way.
+
+    The hook's own guard is `busy` **and** a handle to leave alone.
+    `busy` is what says a handler is inside a step on the stage, and
+    it is also what holds the idle sweep off (§3.6) — but this rule is
+    about the one call the hook may not make, and a stage with no
+    handle offers none to make: the hook strips such a stage as it
+    strips any other, and the give-back its owner is on its way to
+    finds nothing left to release. That is what keeps the opening
+    chunk's window, where the stage is busy and `g` is still nil, out
+    of this clause and inside (44)'s, which is on the slot. A client
+    stage holds a key and no handle, so none of this changes what step
+    7 does to one.
 
 46. **What the header grammar refuses, beyond what §5.5 spells.**
     §5.5 and §5.6 give each operation a fixed set of attributes and
