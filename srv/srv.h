@@ -423,7 +423,19 @@ int	srvjobcount(Srvctx*);	/* jobs held: what the shutdown waits for */
  *		everything behind it through — a point that held both would
  *		leave nobody to fill the slot — and srvheld below is how a
  *		test waits for the loser to be parked.  It is the only
- *		point of the set that does not hold every arrival.
+ *		point of the set that does not hold every arrival.  Two
+ *		things about it that its name does not say.  The call it
+ *		sits on is the one EVERY staging path takes, the client's
+ *		included — a Twrite, a Twstat truncation and a Tremove all
+ *		make their stage there — so what this point parks is
+ *		whichever n requests reach stagenew first, and a case that
+ *		wants two /repl chunks in the window must have no other
+ *		staging request in flight.  And `newheld' is both the count
+ *		srvheld answers and this point's whole memory of how many
+ *		it has parked, and it never resets (queue.c's qholdfirst):
+ *		raising the point to the same n a second time in one
+ *		context parks nobody, so a case that wants another park
+ *		raises it to a larger n.
  *	flushhold
  *		n != 0 holds a Tflush of a pooled request between the
  *		lookup that found it and the flush itself, which is the
