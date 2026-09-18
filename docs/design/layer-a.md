@@ -653,9 +653,9 @@ is decided against that map's `tombdays` and epoch. `reclaim stop` is
 **not**: it mutates nothing — it asks a running walk to give up, which
 the walk reads between two entries — and an instance just fenced is
 where an operator most wants the walk it started stopped. Only
-`refresh`, `register`, `fence on`, `verify`, `scrub`, `reclaim stop`
-and `newmonid` remain available, plus `fence off` against an operator
-fence alone. The first draft left `/ctl` outside both the epoch check
+`refresh`, `register`, `fence on`, `verify`, `scrub`, `reclaim stop`,
+`reclaim` with neither word, which changes nothing, and `newmonid`
+remain available, plus `fence off` against an operator fence alone. The first draft left `/ctl` outside both the epoch check
 and the fence, so a deposed instance could be driven to overwrite,
 delete, discard replication state, or unfence itself.
 

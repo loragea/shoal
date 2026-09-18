@@ -2417,12 +2417,15 @@ Out:
  * there loses the pass outright — nothing runs, no line at /jobs, and
  * the next chance is a period away.
  *
- * §13's `tickhold' is what puts a tick in that window and holds it
- * there: it is the timer's own call that parks, so the verb's write
- * lands on the service loop while the tick is inside it.  The twelve
- * `forget' passes parked at `jobhold' are what leaves no job to be
- * had, and `srvreclaimms' is what makes the timer tick inside a test
- * at all (srv.h).
+ * §13's `tickhold' is set here for what it would do if the flag were
+ * raised ahead of the admission: it parks the timer's own call between
+ * the decision and the proc, widening the window the verb's write has
+ * to land in.  With the flag raised inside the admission instead, a
+ * refused tick never reaches the point — the twelve `forget' passes
+ * parked at `jobhold' leave no job to be had, so the tick is turned
+ * back before the hold — and the case is what keeps it that way.
+ * `srvreclaimms' is what makes the timer tick inside a test at all
+ * (srv.h).
  */
 static void
 treclaimrace(void)
@@ -3450,6 +3453,7 @@ threadmain(int argc, char **argv)
 	USED(argc);
 	USED(argv);
 	quotefmtinstall();		/* the FAIL lines quote what they got */
+	clwatchms = 120*1000;		/* this program's own budget */
 	clwatchon();
 
 	tparse();
