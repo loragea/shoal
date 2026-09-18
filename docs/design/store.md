@@ -3388,13 +3388,16 @@ render, and so is clamping the requested `n=` to the negotiated
 §6's tombstone reclaim is the enumeration's first caller, and it is
 the caller's walk rather than the engine's: the engine holds no
 `tombdays` policy, because layer-a §3.1 makes `tombdays` a map-header
-attribute. The caller opens a `/tombs` snapshot, tests each entry's
+attribute. The caller opens a `/tombs` snapshot and tests each entry's
 `mtime` against its own cutoff and the entry's `wepoch` against its
-own map epoch, and discards by the entry's **own key** rather than by
-its slot — which is what makes the walk safe under concurrent
-mutation, since §6's receiver checks then refuse a record that is not
-the one the walk inspected instead of removing whatever the slot came
-to hold.
+own map epoch. It **counts** what passes both and removes nothing
+(§14(31)): layer-a §1.5's third condition has nothing to answer it
+while there is no peer client. The discard is addressed by the
+entry's **own key** and not by its slot — that is what `objdiscard`
+takes and what §6's receiver checks enforce, so a discard refuses a
+record that is not the one the walk inspected instead of removing
+whatever the slot came to hold — and it is what the walk will use
+when the replication surface brings condition 1.
 
 ## 10. The monitor's map slot store
 
