@@ -522,12 +522,15 @@ srvqexit(Req *r)
  *
  * Which halves exist today, and where the rest hook in:
  *
- *	discard the stage — nothing is staged here.  The stage belongs
- *		to a fid's write path (lib/shoal.h's stageopen and
- *		stagediscard), which is the object-I/O surface; that
- *		surface fills the flushed fid's auxflush cell (dat.h) and
- *		this function calls it, so the discard is added without
- *		touching this file.
+ *	discard the stage — the flushed fid's auxflush cell, which the
+ *		object-I/O surface fills with the discard of whatever that
+ *		fid staged (obj.c, dat.h's Sstage).  It is the FID's stage
+ *		and not this request's: a stage can span several Twrites,
+ *		so a Tflush of the next queued write on a staging fid
+ *		discards it too, and the handler that staged it finds it
+ *		gone at its next look.  The engine's own half of the
+ *		release (lib/shoal.h's stagediscard) hangs off that cell,
+ *		so nothing here had to change for it.
  *	clear the sync state — this instance has no peers: there is no
  *		outbound peer client in this wave, so no candidate was
  *		ever told anything and the dirty set (lib/shoal.h's

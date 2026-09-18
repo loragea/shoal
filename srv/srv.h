@@ -385,6 +385,28 @@ void	srvcellpoint(Srvctx*, int on);
  */
 void	srvendpoint(Srvctx*, uvlong ms);
 
+/*
+ * The stage point, over the per-fid staged operation layer-a §5.4 step
+ * 3 creates and §5.4.1 step 7 discards.  With it on, an open of
+ * /obj/<oid> for writing leaves a stage on the fid — one that stages
+ * nothing — so that the lifetime rules can be driven on a fid holding
+ * one while no request is in flight: the clunk's discard, the
+ * shutdown's discard before the store closes, the idle sweep, and the
+ * `disk full' a second stage on one fid is refused with.  No client
+ * operation leaves a stage behind, because each gives its own back
+ * inside its request; the stage that outlives its request is §5.5's
+ * op=full, whose surface is not built.
+ *
+ * srvstagecount answers how many stages the live fids hold, how many
+ * have been given back and how many of those found the store still
+ * open — which every one of them must, since releasing an engine stage
+ * is an engine call.  Like srvauxpoint and unlike the srvhook holds,
+ * the shutdown does not clear this point: it is per context, and what
+ * it is about is what the shutdown itself does with a fid's state.
+ */
+void	srvstagepoint(Srvctx*, int on);
+void	srvstagecount(Srvctx*, uvlong *live, uvlong *done, uvlong *openat);
+
 void	srvauxpoint(Srvctx*, int on);
 void	srvauxcount(Srvctx*, uvlong *flushed, uvlong *closed, uvlong *freed);
 uvlong	srvauxlate(Srvctx*);

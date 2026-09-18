@@ -98,3 +98,14 @@ char*	srvemptytext(Srvctx*, Sfid*, Text*);
 /* ctl.c */
 void	srvctlwrite(Req*);
 int	srvfencekind(Srvctx*);
+
+/* obj.c: layer-a §2.4's object I/O, and the per-fid stage (dat.h) */
+void	srvobjopen(Req*);
+void	srvobjread(Req*);
+void	srvobjwrite(Req*);
+void	srvobjremove(Req*);
+void	srvobjwstat(Req*);
+void	srvobjcreate(Req*);
+void	srvmetaopen(Req*);
+char*	srvmetatext(Srvctx*, Sfid*, Text*);
+void	srvstagesweep(Srvctx*);

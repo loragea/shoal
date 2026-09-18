@@ -6,6 +6,7 @@ OFILES=\
 	attach.$O\
 	ctl.$O\
 	err.$O\
+	obj.$O\
 	queue.$O\
 	srv.$O\
 	status.$O\

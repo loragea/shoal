@@ -9,6 +9,7 @@ typedef struct Sfid Sfid;
 typedef struct Sfile Sfile;
 typedef struct Sctl Sctl;
 typedef struct Qreq Qreq;
+typedef struct Sstage Sstage;
 
 /*
  * layer-a §2.2's tree, one entry per file, in the order it is listed
@@ -376,6 +377,94 @@ struct Sctl
 extern Sctl srvctls[];
 extern int nsrvctls;
 
+/*
+ * The staged operation a fid holds, layer-a §5.4 step 3 and store.md
+ * §3.6 — what `aux' above names on a fid that is staging, and the one
+ * thing the three hooks beside it were written for.  A fid holds at
+ * most one, which is why the slot is the fid's rather than a list.
+ *
+ * Two surfaces stage, and they differ only in what the handle owns.
+ *
+ *	A CLIENT operation on /obj/<oid> — a write, a create, a truncate
+ *	or a remove — stages at §5.4 step 3 and gives the stage back at
+ *	step 6 or step 7, inside the one request.  What it holds is the
+ *	key step 3 chose and, for a write, this stage's own copy of the
+ *	bytes: the Req's buffer is the request's and a stage may outlive
+ *	it.  The commit is an engine call that stages and publishes in
+ *	one (objwrite and friends), so a discard that lands while that
+ *	call is in flight does not unmake it — layer-a §5.4.1's "MAY or
+ *	MAY NOT have been applied" — and what the handler owes is not to
+ *	commit AFTER a discard, which is what the look before the call
+ *	is for.
+ *
+ *	An op=full or op=create on a /repl fid (§5.5, store.md §3.6)
+ *	stages across MANY Twrites and the handle holds the engine's
+ *	Stage: created by the first chunk, added to by each one, and
+ *	consumed by final=1 — which consumes it on every outcome, so
+ *	whatever owns the fid forgets the handle there (§3.6).  That is
+ *	the lifetime this state exists for, and it is the replication
+ *	surface's to fill in; nothing in the client paths above produces
+ *	a stage that outlives its request.
+ *
+ * The rules are the same for both, and they are the fid's:
+ *
+ *	one per fid.  A second is refused `disk full', which is §3.6's
+ *		refusal for its per-fid bound, and so is an update
+ *		covering more grains than `stagemax' allows.  A client
+ *		write is SHORTENED to that bound rather than refused
+ *		(layer-a §2.4's short write), so only a fid that already
+ *		holds a stage reaches the refusal.
+ *	discarded by step 7, through auxflush, whichever of the fid's
+ *		requests was flushed: the stage is the fid's, and a stage
+ *		spanning several Twrites has no one request to belong to.
+ *	discarded at clunk and before the store closes, through
+ *		auxclose, because releasing an engine stage is an engine
+ *		call (store.md §9).
+ *	discarded by the idle sweep after `stagems' of no arrivals
+ *		(§3.6), which strips the handle and leaves the memory to
+ *		the clunk behind it.  `busy' says a handler is inside a
+ *		step on it, which is not an absence of arrivals.
+ *	freed by auxfree, which may run after the store has closed
+ *		(D16) and therefore releases memory and nothing else.
+ *
+ * The fid's own state lock (Sfid.lk) covers the slot; the list below
+ * is the server's, under Srvctx.stagelk, so that the sweep walks it
+ * without touching the fid registry.  A fid's lock may be held over
+ * stagelk and never the other way round.
+ */
+enum
+{
+	Stwrite	= 0,		/* layer-a §2.4's write */
+	Stcreate,		/* ... create */
+	Sttrunc,		/* ... truncate, extend and OTRUNC */
+	Stremove,		/* ... remove */
+	Stfull,			/* §5.5's op=full/op=create, through Stage */
+	Stpoint,		/* srvstagepoint's, which stages nothing */
+};
+
+struct Sstage
+{
+	Srvctx	*ctx;
+	int	kind;
+	uchar	oid[Oidmax];
+	int	oidlen;
+	uvlong	ver;		/* the key §5.4 step 3 chose */
+	uvlong	wepoch;
+	uvlong	off;
+	uchar	*a;		/* the staged bytes, this stage's copy */
+	long	n;
+	ulong	ngrain;		/* against §3.6's per-fid bound */
+	vlong	last;		/* nsec of the last arrival */
+	int	busy;		/* a handler is inside a step on it */
+	int	dead;		/* the sweep expired it, or step 7 took it */
+	int	released;	/* what it held has been given back */
+	int	linked;		/* it is on the context's list */
+	Stage	*g;		/* §5.5's engine handle, when it has one */
+	Sstage	*prev;
+	Sstage	*next;
+	Sstage	*nextdead;	/* the sweep's own list, off the lock */
+};
+
 struct Srvctx
 {
 	Srv	srv;
@@ -447,4 +536,16 @@ struct Srvctx
 	int	released;	/* lib9p has let go of the Srv (Srv.free) */
 
 	int	closed;		/* the store has been closed */
+
+	/*
+	 * The stages the live fids hold (obj.c).  A leaf lock: nothing is
+	 * taken under it, and a fid's own state lock is the one that may
+	 * be held over it.
+	 */
+	QLock	stagelk;
+	Sstage	*stages;
+	int	nstage;
+	int	stagept;	/* srvstagepoint */
+	uvlong	nstagedone;	/* stages given back */
+	uvlong	nstageopen;	/* ... of those that found the store open */
 };
