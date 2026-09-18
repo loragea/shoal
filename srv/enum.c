@@ -260,9 +260,18 @@ objdirfree(void *a)
 /*
  * layer-a §5.4.1 step 7 on a fid of this row, which is where a flushed
  * OPEN gives its snapshot back (above).  It runs under the fid's state
- * lock, from srvqdone on the queue proc that is unwinding the open, so
- * it does the give-back inline rather than through srvfidgive, which
- * takes that lock itself.
+ * lock — so it does the give-back inline rather than through
+ * srvfidgive, which takes that lock itself — and from either of step
+ * 7's two call sites: srvqdone, on the queue proc that is unwinding a
+ * request it was carrying, and srvqflush, on the SERVICE LOOP, for a
+ * request flushed while it was still queued.
+ *
+ * The give-back makes an engine call, objsnapclose, which is one of
+ * store.md §9's three and therefore one a hook may make from either
+ * site (dat.h): it takes the engine's state lock under the fid's, an
+ * order nothing runs the other way, and store.md §6 rule 2 keeps that
+ * lock off the device, so the loop waits for one queue proc's hold of
+ * it and no longer.
  *
  * The three tests are what keep it to the open it is for.  A Tread is
  * not it: a flushed read has advanced the cursor over a snapshot the

@@ -280,8 +280,27 @@ extern Sfile srvfiles[Nfile];
  *		  the request (from srvqdone), OR on the service loop
  *		  (from srvqflush, for a request flushed while it was
  *		  still queued — with that request's own Qreq.lk held, so
- *		  the hook takes neither that lock nor the registry lock
- *		  and must not block on anything a queue proc needs).
+ *		  the hook takes neither that lock nor the registry lock,
+ *		  and blocks on nothing a queue proc holds across device
+ *		  I/O or a park).
+ *
+ *		  Which ENGINE calls that leaves it.  store.md §9's three
+ *		  — objsnapent, objsnapcount and objsnapclose, the ones
+ *		  §9 also allows after the store has closed — are the ones
+ *		  a hook may make, and enum.c's makes the last of them.
+ *		  They take the engine's state lock and nothing else, and
+ *		  store.md §6 rule 2 keeps every state lock off the device
+ *		  and out of a park, so a hook on the service loop waits
+ *		  for one queue proc's hold of that lock and no longer.
+ *		  The lock order is one-directional and has no cycle: a
+ *		  hook takes the fid's state lock and then the engine's,
+ *		  a queued handler takes the same two in the same order,
+ *		  and no engine path takes a fid's state lock or a Qreq's
+ *		  — the engine knows nothing of either.  What a hook may
+ *		  NOT do is make a call from inside a LEAF lock of this
+ *		  server's, which is the rule the staged update's discard
+ *		  is parked by (Sstage below), or make one that reaches
+ *		  the device.
  *		  9P allows two requests to be outstanding on one fid,
  *		  and two requests naming one object share a queue, so
  *		  another request may be part-way through this same fid
@@ -534,19 +553,23 @@ extern int nsrvctls;
  *	discarded by step 7, through auxflush, whichever of the fid's
  *		requests was flushed: the stage is the fid's, and a stage
  *		spanning several Twrites has no one request to belong to.
- *		The hook makes no ENGINE call, and a builder filling `g'
- *		must not give it one: auxflush can run on the service loop
- *		under the flushed request's Qreq.lk (below), and every
- *		engine call takes the state lock a queue proc holds across
- *		its work.  The hook therefore takes the handle out of the
- *		slot and parks it, and obj.c's drain — at the head of every
- *		queued object operation, and once at the shutdown while the
- *		store is still open — is where the discard is made.  A park
- *		that cannot take the handle puts it BACK in the slot, dead
- *		but not released, rather than make the call the hook may
- *		not: auxclose below reaches the slot whatever the sweep has
- *		done with the stage.  So what the fid owes is that the
- *		handle is released by someone that is not the hook.
+ *		The hook does not make the ENGINE call that releases the
+ *		handle, and a builder filling `g' must not give it one.
+ *		Not because a hook may make no engine call — it may make
+ *		store.md §9's three, and the enumeration's hook makes one
+ *		of them (Sfid above) — but because of WHERE this one would
+ *		be made: the hook reaches the handle under `stagelk', the
+ *		context's leaf lock, and store.md §6 rule 1 takes no state
+ *		lock under a leaf.  The hook therefore takes the handle
+ *		out of the slot and parks it, and obj.c's drain — at the
+ *		head of every queued object operation, and once at the
+ *		shutdown while the store is still open — is where the
+ *		discard is made, outside every lock.  A park that cannot
+ *		take the handle puts it BACK in the slot, dead but not
+ *		released, rather than make the call there: auxclose below
+ *		reaches the slot whatever the sweep has done with the
+ *		stage.  So what the fid owes is that the handle is
+ *		released by someone that is not the hook.
  *	discarded at clunk and before the store closes, through
  *		auxclose, because releasing an engine stage is an engine
  *		call (store.md §9).
