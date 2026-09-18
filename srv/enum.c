@@ -462,9 +462,16 @@ dirfree(Dir *d)
  *		walk cannot move a fid that is OPEN, which this one is or
  *		lib9p would not have reached a read cell at all.
  *	auxflush frees it for a flushed OPEN alone (objdirflush), and no
- *		Topen can be outstanding on an open fid either: lib9p
- *		refuses one from Fid.omode.  A read's own step 7 does not
- *		free it, by the same test.
+ *		open of this fid can RUN while this read walks: both cells
+ *		are offloaded to the one reserved queue (srvqpushany), and
+ *		one Reqqueue is one proc taking its requests in order, so
+ *		an open behind this read starts only once the read has
+ *		left.  An open FLUSHED while it was still queued is the
+ *		other way objdirflush is reached, on the service loop —
+ *		and it finds Fid.omode set, by the open this read is
+ *		reading on, where objdirflush's first test answers.  A
+ *		read's own step 7 frees nothing either: that test asks for
+ *		a Topen and this is not one.
  *	the shutdown's sweep runs after the drain, which this request is
  *		part of, and this row's auxclose is nil in any case.
  *
