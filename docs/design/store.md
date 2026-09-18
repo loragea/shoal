@@ -5314,8 +5314,11 @@ name a half that is not built; each says which.
        object. `/tombs` is the same operator inspection path (§2.2)
        and F1 does not name it at all, so fencing the listing and not
        the tombstones would be a distinction with nothing behind it.
-       Every row that names an object stays fenced, which is what F1
-       is for: a deposed primary must not serve an object's bytes.
+       Every **read** of a row that names an object stays fenced,
+       which is what F1 is for: a deposed primary must not serve an
+       object's bytes. A `Tstat` of `/obj/<oid>` is not one — it
+       serves the length, mtime and qid version §2.3 defines, and
+       runs no gate at all.
 
     Only the first of those three positions is derivable. Rule 1 is:
     §2.1's operator rule reads the fid's role and the name alone, and
@@ -5342,8 +5345,11 @@ name a half that is not built; each says which.
 
     `/repl` and `/rpc` carry a gate of their own, and it is the fence
     alone: F1 fences "every `/repl` and `/rpc` operation", which is
-    every operation on those two rows and not the open alone. The
-    other two rules are not theirs — the operator rule is about an
+    carried here as every open, read and write of those two rows —
+    and the remove and wstat that reach the same gate — rather than
+    the open alone. A `Twalk`, a `Tstat` and a `Tclunk` run no gate,
+    so F1's "every operation" reaches as far as the gate does and no
+    further. The other two rules are not theirs — the operator rule is about an
     object's name, and F3's `down` is about `role=client` I/O, which
     neither row admits.
 

@@ -283,10 +283,12 @@ objgate(Srvctx *c, Sfid *f, Req *r, int op)
 
 /*
  * The channel rows' gate.  §6.4 F1 fences "every /repl and /rpc
- * operation", which is every operation on these two rows and not the
- * open alone: the work a channel carries is the replication work F1
- * exists to stop, and the fence can go on under a fid a peer already
- * holds open.
+ * operation", which is carried here as every open, read and write of
+ * these two rows — and the remove and wstat that reach the same gate —
+ * and not the open alone: the work a channel carries is the
+ * replication work F1 exists to stop, and the fence can go on under a
+ * fid a peer already holds open.  A walk, a stat and a clunk run no
+ * gate, so F1 reaches as far as the gate does and no further.
  *
  * Neither of §2.1's other two rules is theirs.  The operator rule is
  * about an object's name and these rows name none; F3's `down' is
