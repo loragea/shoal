@@ -307,13 +307,28 @@ void	srvcount(Srvctx*, uvlong *pushed, uvlong *done);
 void	srvhook(Srvctx*, char *name, uvlong n);
 
 /*
- * Where a new point goes.  A HOLD — a point that parks a request or a
- * proc — belongs in srvhook, because srvholdclear empties that set and
- * the shutdown runs it before the drain: a program that set a point
- * and stopped watching must not be able to hold the store's close.  An
- * OBSERVABLE, and a hold whose whole subject is what happens after the
- * shutdown has run, goes beside srvauxpoint below, where nothing
- * clears it; such a hold bounds itself, as the flush hold does.
+ * Where a new point goes, and what the shutdown does with it.
+ *
+ * srvholdclear, which the shutdown runs before it drains, clears the
+ * whole of srvhook's set and nothing else: objhold, objexit,
+ * flushhold, mapopen, walkhold, anyexit and step7.  A HOLD therefore
+ * belongs in srvhook — a program that set a point and stopped watching
+ * must not be able to hold the store's close.  (The shutdown also
+ * turns srvcellpoint off, by its own call and for its own reason: the
+ * file table those cells are in outlives the context that was given
+ * them.)  Clearing a point is not the same as reaching the proc
+ * that is parked in it: a parked QUEUE proc wakes when its point is
+ * cleared, but a parked SERVICE LOOP never reaches srvholdclear at all,
+ * because the shutdown runs from Srv.end, which lib9p calls on the
+ * loop.  A point that can park the loop — the flush hold, and the
+ * step 7 hold when the flushed request was still queued — therefore
+ * bounds its own park as well as being cleared here.
+ *
+ * What srvholdclear does NOT touch belongs beside srvauxpoint below:
+ * the fid-state point and its counts, and the end point, whose whole
+ * subject is what happens after the shutdown has run and which holds
+ * for the count of milliseconds its caller gave.  An OBSERVABLE goes
+ * there too, having nothing to clear.
  */
 
 /*
