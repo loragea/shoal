@@ -809,10 +809,13 @@ srvstagefull(Srvctx *c, Sfid *f, uchar *oid, int oidlen, uvlong flen,
  *
  * The refusals are §3.6's per-fid ones.  A chunk naming another object
  * is a SECOND stage on one fid and is `disk full', which is §3.6's
- * refusal for its per-fid bound (store.md §14(43)); so is one that
- * would take the transfer past `stagemax' staged grains.  A `len' or `force' that
- * differs from the transfer's own is a header §5.5 forbids a
- * conforming sender to send, so it is `bad ctl'.
+ * refusal for its per-fid bound (store.md §14(43)).  The GRAIN half of
+ * that bound is not counted here: the engine charges `stagemax' against
+ * the handle, exactly and grain by grain, and one handle is all a fid
+ * may hold, so a count on this side would only be a coarser one over
+ * the same reservations.  A `len' or `force' that differs from the
+ * transfer's own is a header §5.5 forbids a conforming sender to send,
+ * so it is `bad ctl'.
  *
  * A stage the idle sweep expired, or step 7 discarded, is refused
  * `stage expired' — and the refusal is what takes it out of the slot.
@@ -823,18 +826,16 @@ srvstagefull(Srvctx *c, Sfid *f, uchar *oid, int oidlen, uvlong flen,
  */
 Stage*
 srvstagemore(Srvctx *c, Sfid *f, uchar *oid, int oidlen, uvlong flen,
-	int force, uvlong off, long n, Sstage **sp, char **err)
+	int force, Sstage **sp, char **err)
 {
 	Sstage *s;
 	Stage *g;
-	uvlong gr;
 	int dead;
 
 	*err = nil;
 	*sp = nil;
 	g = nil;
 	dead = 0;
-	gr = stagegrains(c, off, n);
 	qlock(&f->lk);
 	if((s = f->aux) == nil){
 		qunlock(&f->lk);
@@ -853,10 +854,7 @@ srvstagemore(Srvctx *c, Sfid *f, uchar *oid, int oidlen, uvlong flen,
 		*err = Ediskfull;
 	else if(s->flen != flen || s->force != force)
 		*err = Ebadctl;
-	else if(s->ngrain + gr > stagemaxof(c))
-		*err = Ediskfull;
 	else{
-		s->ngrain += gr;
 		s->busy = 1;
 		s->last = nsec();
 		g = s->g;

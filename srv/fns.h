@@ -130,7 +130,7 @@ Stage*	srvstagefull(Srvctx*, Sfid*, uchar *oid, int oidlen, uvlong flen,
 		int force, uvlong ver, uvlong wepoch, uvlong off, long n,
 		Sstage**, char *buf, int nbuf, char **err);
 Stage*	srvstagemore(Srvctx*, Sfid*, uchar *oid, int oidlen, uvlong flen,
-		int force, uvlong off, long n, Sstage**, char **err);
+		int force, Sstage**, char **err);
 int	srvstagelive(Srvctx*, Sfid*, Sstage*);
 Stage*	srvstagefinal(Srvctx*, Sfid*, Sstage*);
 void	srvobjopen(Req*);

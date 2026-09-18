@@ -1123,7 +1123,9 @@ Out:
  * fid, and a chunk that would exceed it fails `disk full'.  A chunk's
  * offset is the sender's, so shortening it would publish a hole, which
  * is why this bound refuses where a client write is shortened
- * (store.md §14(37)).
+ * (store.md §14(37)).  One handle to a fid is what makes the engine's
+ * per-handle charge this per-fid bound (store.md §14(43)), so what
+ * this case drives is that charge, reached through the channel.
  */
 static void
 tstagemax(void)
@@ -1486,7 +1488,7 @@ tdropdiscard(void)
 	Fcall r;
 	Objinfo oi;
 	char *mine, *stray, *stray2;
-	int i, n;
+	int i;
 
 	clstage = "dropdiscard";
 	m = mkmap();
@@ -1503,7 +1505,7 @@ tdropdiscard(void)
 	for(i = 0; i < 64 && (mine == nil || stray == nil || stray2 == nil);
 		i++){
 		snprint(name, sizeof name, "o%d", i);
-		if((n = mapplace(srvmap(ctx), name, pl, nelem(pl))) < 1)
+		if(mapplace(srvmap(ctx), name, pl, nelem(pl)) < 1)
 			continue;
 		if(strcmp(pl[0]->iid, srviid(ctx)) == 0){
 			if(mine == nil)

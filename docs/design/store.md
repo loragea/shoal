@@ -5893,13 +5893,13 @@ name a half that is not built; each says which.
     staged is refused `disk full`, which is §3.6's own refusal for
     the per-fid bound, and a sender that wants two transfers at once
     opens two fids — which §5.5 already has it do per peer and which
-    costs nothing. The grains a chunk covers are added to the fid's
-    charge as the chunk names them, so a chunk that re-writes a block
-    an earlier chunk staged is counted twice and the bound is reached
-    sooner than the reservations alone would reach it. That is
-    back-pressure read conservatively; the exact count is the
-    engine's, which is what `stagetot` and `/status`'s `staged=`
-    report.
+    costs nothing. That single slot is also what makes §3.6's
+    per-**fid** grain bound the engine's per-**handle** one: the store
+    charges `stagemax` against the handle, grain by grain, and refuses
+    the chunk that would pass it with `disk full`, so with one handle
+    to a fid the two are the same bound and the 9P server counts
+    nothing of its own. `stagetot` and `/status`'s `staged=` report the
+    same reservations across the process.
 
 44. **`stage expired` is answered once, and the refusal is what takes
     the dead stage out of the slot.** §3.6 has the idle sweep mark a

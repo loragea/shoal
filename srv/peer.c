@@ -812,7 +812,7 @@ replfullq(Req *r, Srvctx *c, Sfid *f, Hdr *h)
 		return;
 	}
 	if((g = srvstagemore(c, f, h->oid, h->oidlen, h->len, h->force,
-		h->off, h->n, &s, &e)) == nil){
+		&s, &e)) == nil){
 		if(e != nil){
 			srvqdone(r, e);
 			return;
