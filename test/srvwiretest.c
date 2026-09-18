@@ -1118,6 +1118,123 @@ Out:
 	free(m);
 }
 
+/* one numeric attr= out of a fresh render of /status */
+static uvlong
+statusnum(Cl *cl, ulong root, ulong fid, char *attr)
+{
+	char buf[8192], val[64];
+	Fcall r;
+	uvlong v;
+
+	v = ~(uvlong)0;
+	if(clwalk1(cl, root, fid, "status", &r) != Rwalk
+	|| clopen(cl, fid, OREAD, &r) != Ropen){
+		fail("open /status: %s", clerr(&r));
+		return v;
+	}
+	if(clslurp(cl, fid, buf, sizeof buf) < 0)
+		fail("read /status: %r");
+	else if(clfield(buf, attr, val, sizeof val) == nil)
+		fail("/status names no %s=", attr);
+	else
+		v = strtoull(val, nil, 10);
+	clclunk(cl, fid, &r);
+	return v;
+}
+
+/*
+ * §1.3's divergence repair and what the receiver records of it.  An
+ * op=full force=1 that lands on an equal key whose content differs is
+ * the one case §1.3 calls a repaired invariant, and §5.5 makes the
+ * receiver that applies it record the event rather than repair
+ * silently; /status's `diverged=' is that record (store.md §14(15),
+ * §14(43)).  What is NOT a divergence: an equal key whose csum already
+ * matches, a lower key — which is `stale version' regardless of force
+ * — and a copy that fails local verification, which contributes no key
+ * to be equal to (D14).
+ */
+static void
+tdiverged(void)
+{
+	char *m, csb[Csumhexlen], csc[Csumhexlen], db[2*Blkdlen+1];
+	char dc[2*Blkdlen+1], *hdr;
+	uchar a[Tblksz], b[Tblksz], c[Tblksz];
+	Srvctx *ctx;
+	Store *st;
+	Dev *d;
+	Cl cl;
+	Fcall r;
+	int i;
+
+	clstage = "diverged";
+	m = mkmap();
+	d = newdisk(Tnslots, nil);
+	if((ctx = startsrv(d, m, 0, 0)) == nil)
+		return;
+	st = srvstore(ctx);
+	for(i = 0; i < Tblksz; i++){
+		a[i] = i;
+		b[i] = i*3 + 1;
+		c[i] = i*5 + 2;
+	}
+	ocsum(csb, b, sizeof b);
+	dcs(db, b, sizeof b);
+	ocsum(csc, c, sizeof c);
+	dcs(dc, c, sizeof c);
+	mkobj(st, "alpha", a, sizeof a, 2);
+	mkobj(st, "beta", a, sizeof a, 2);
+	clstart(&cl, ctx, Clmsize);
+	if(!chopen(&cl, ctx, Nrepl, Froot, Frepl, ~0UL))
+		goto Out;
+	if(clattach(&cl, Frepl2, Nadmin, &r) != Rattach){
+		fail("admin attach: %s", clerr(&r));
+		goto Out;
+	}
+	eqv("no repair has been applied", statusnum(&cl, Frepl2, Frpc2,
+		"diverged"), 0);
+
+	hdr = smprint("op=full oid=alpha epoch=7 ver=2 wepoch=7 len=%d off=0"
+		" n=%d dcsum=%s csum=%s final=1 force=1", Tblksz, Tblksz, db,
+		csb);
+	eqs("a force=1 repair at an equal key, differing content",
+		repler(&cl, Frepl, hdr, b, sizeof b), "ok");
+	eqv("... is recorded as a divergence", statusnum(&cl, Frepl2, Frpc2,
+		"diverged"), 1);
+	eqs("the same repair again, the content now equal",
+		repler(&cl, Frepl, hdr, b, sizeof b), "ok");
+	eqv("... repairs no invariant and records nothing",
+		statusnum(&cl, Frepl2, Frpc2, "diverged"), 1);
+	free(hdr);
+
+	hdr = smprint("op=full oid=alpha epoch=7 ver=1 wepoch=7 len=%d off=0"
+		" n=%d dcsum=%s csum=%s final=1 force=1", Tblksz, Tblksz, dc,
+		csc);
+	eqs("a force=1 push at a strictly lower key",
+		repler(&cl, Frepl, hdr, c, sizeof c), "stale version");
+	eqv("... records nothing, having applied nothing",
+		statusnum(&cl, Frepl2, Frpc2, "diverged"), 1);
+	free(hdr);
+
+	if(objcorrupt(st, (uchar*)"beta", 4, 1, nil, 0) < 0)
+		fail("objcorrupt beta: %r");
+	hdr = smprint("op=full oid=beta epoch=7 ver=2 wepoch=7 len=%d off=0"
+		" n=%d dcsum=%s csum=%s final=1 force=1", Tblksz, Tblksz, db,
+		csb);
+	eqs("a force=1 repair over a corrupt copy at an equal key",
+		repler(&cl, Frepl, hdr, b, sizeof b), "ok");
+	eqv("... is §7.5's reconcile and records nothing",
+		statusnum(&cl, Frepl2, Frpc2, "diverged"), 1);
+	free(hdr);
+	clclunk(&cl, Frepl, &r);
+	clclunk(&cl, Frepl2, &r);
+	clclunk(&cl, Froot, &r);
+Out:
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
 /*
  * §3.6's per-fid bound: at most `stagemax' grains staged on one /repl
  * fid, and a chunk that would exceed it fails `disk full'.  A chunk's
@@ -1821,6 +1938,7 @@ threadmain(int argc, char **argv)
 	tcreate();
 	tfull();
 	tcorrupt();
+	tdiverged();
 	tstagemax();
 	tstagelife();
 	tchannel();

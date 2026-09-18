@@ -5163,17 +5163,25 @@ name a half that is not built; each says which.
     §2.2's three values are not three states of one flag. `corrupt`
     is layer-a §7.5's local verification failure, which is the only
     one an instance decides by itself; `lost` is §7.5(4)'s "no peer
-    holds a verifying copy" and `diverged` is §1.3's equal key with
-    differing content, and both are verdicts about what peers hold.
-    This build has no peer client (§14(18)), so neither has been
-    reached, and the engine's flags say nothing about them: a slot
-    joins the lost list only when it is bad or carries `Icorrupt`
-    (§8), and the one path that sets either on an entry with an oid
-    sets both. *Not made:* an oid-bearing line renders `corrupt`
-    unconditionally, and the two peer verdicts land with the
-    replication surface. A condemned slot's line keeps `kind=lost`,
-    which is §9's wording for it and is §7.5(4)'s meaning with
-    nothing left to ask about: the copy cannot be read at all.
+    holds a verifying copy", a verdict about what peers hold, and
+    this build has no peer client (§14(18)), so it has not been
+    reached. `diverged` is §1.3's equal key with differing content,
+    and that one HAS been reached: §1.3 and §5.5 put the record on
+    the receiver that applies an `op=full force=1`, which is a
+    verdict about a repair this instance made itself and needs no
+    peer client to make. The engine holds no per-record divergence
+    flag for a line to render — a slot joins the lost list only when
+    it is bad or carries `Icorrupt` (§8), and the one path that sets
+    either on an entry with an oid sets both. *Not made:* an
+    oid-bearing line renders `corrupt` unconditionally and no line
+    reads `diverged` or `lost`; what records a repair is the count in
+    `/status`'s `diverged=` (§14(43)), which §1.3 asks for in the
+    same breath, and the durable line is the open half — it waits on
+    an engine record, since a count kept in the 9P server would not
+    survive the restart the file exists to outlive. A condemned
+    slot's line keeps `kind=lost`, which is §9's wording for it and
+    is §7.5(4)'s meaning with nothing left to ask about: the copy
+    cannot be read at all.
 
 16. **layer-a §5.5 requires the resulting-`csum` check but not that
     it precede the update.** §5.5 has the receiver "compute its own
@@ -5900,6 +5908,20 @@ name a half that is not built; each says which.
     to a fid the two are the same bound and the 9P server counts
     nothing of its own. `stagetot` and `/status`'s `staged=` report the
     same reservations across the process.
+
+    **What a `force=1` repair records.** §5.5 has a receiver that
+    applies one record the event in `/lost` as a divergence, and §1.3
+    adds "reported in `/status`". *Not made; recorded here as what the
+    server does:* the receiver counts it, at `final=1`, when `force=1`
+    was applied over a copy it holds at an **equal** key whose `csum`
+    differs from the one the operation leaves. An equal key with an
+    equal `csum` repairs nothing, and a lower local key is an ordinary
+    heal that needs no `force` at all; neither is §1.3's case. Nor is
+    a push over a copy that fails local verification, which
+    contributes no key to be equal to (D14) and is §7.5(3)'s
+    reconcile. The count is in memory and per process, rendered as
+    `/status`'s `diverged=`; the durable `/lost kind=diverged` line is
+    the open half, and §14(15) says what it waits on.
 
 44. **`stage expired` is answered once, and the refusal is what takes
     the dead stage out of the slot.** §3.6 has the idle sweep mark a

@@ -679,6 +679,7 @@ struct Srvctx
 	Lock	cntlk;
 	uvlong	npush;
 	uvlong	ndone;
+	uvlong	ndiverged;	/* §1.3's repairs, applied here (peer.c) */
 
 	QLock	holdlk;
 	uvlong	hold;		/* srvhook("objhold") */

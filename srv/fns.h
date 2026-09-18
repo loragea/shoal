@@ -150,3 +150,4 @@ void	srvreplread(Req*);
 void	srvrpcopen(Req*);
 void	srvrpcread(Req*);
 void	srvrpcwrite(Req*);
+uvlong	srvdiverged(Srvctx*);

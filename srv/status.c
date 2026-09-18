@@ -36,12 +36,17 @@
  * peer client and no monitor client, so there is no peer msize to take
  * the smallest of and no reconcile pass to have counted the rest; a
  * zero would be a measurement this instance has not made.  store.md
- * §14(23) records the omission.  Two fields beyond §2.2's list are
+ * §14(23) records the omission.  Three fields beyond §2.2's list are
  * rendered because something here has no other place to report them:
  * the open enumeration-snapshot count, which store.md §9 makes the
- * server's half of `objsnap=', and the queue pool's depth, which §7
- * asks /status to report so saturation is visible rather than folklore
- * — Reqqueue keeps no count, so these are the server's own.
+ * server's half of `objsnap=', the queue pool's depth, which §7 asks
+ * /status to report so saturation is visible rather than folklore —
+ * Reqqueue keeps no count, so these are the server's own — and
+ * `diverged=', the count of §1.3's repairs this process has applied
+ * (peer.c).  §1.3 requires a repair to be "reported in /status" and
+ * names no field, so the name is this server's; the count is in
+ * memory and per process, and store.md §14(15) has why the durable
+ * half of the same record is not built.
  */
 char*
 srvstatustext(Srvctx *c, Sfid *f, Text *t)
@@ -70,6 +75,7 @@ srvstatustext(Srvctx *c, Sfid *f, Text *t)
 	textprint(t, "objsnapopen=%llud\n", st.nobjsnap);
 	textprint(t, "dirty=%lud\n", dirtycount(c->store));
 	textprint(t, "lost=%llud\n", st.nlost);
+	textprint(t, "diverged=%llud\n", srvdiverged(c));
 	textprint(t, "staged=%llud\n", st.staged);
 	textprint(t, "queues=%d\n", c->nq);
 	textprint(t, "qdepth=%llud\n", np - nd);
@@ -202,12 +208,16 @@ srvstaletext(Srvctx *c, Sfid *f, Text *t)
  * §2.2's three values are not three states of one flag: `corrupt' is
  * §7.5's local verification failure, `lost' is §7.5(4)'s "no peer
  * holds a verifying copy" and `diverged' is §1.3's equal key with
- * differing content, and the last two are verdicts about what PEERS
- * hold.  This build has no peer client (store.md §14(18)), so neither
- * can have been reached, and the engine's own flag says nothing about
- * them: a slot joins the lost list only when it is bad or carries
- * Icorrupt, and the one path that sets either on an entry with an oid
- * sets both.  store.md §14(15) records it.
+ * differing content.  `lost' is a verdict about what PEERS hold and
+ * this build has no peer client (store.md §14(18)), so it cannot have
+ * been reached.  `diverged' can be: it is a verdict about a repair
+ * this receiver applied ITSELF, and /repl's op=full force=1 applies
+ * one (peer.c).  What records that today is /status's `diverged='
+ * count, because the engine holds no per-record divergence flag for a
+ * line here to render — a slot joins the lost list only when it is
+ * bad or carries Icorrupt, and the one path that sets either on an
+ * entry with an oid sets both.  So no line of this file reads
+ * `diverged' and none reads `lost'.  store.md §14(15) records it.
  */
 char*
 srvlosttext(Srvctx *c, Sfid *f, Text *t)

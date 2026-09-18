@@ -787,6 +787,50 @@ replcreateq(Req *r, Srvctx *c, Hdr *h)
  * chunk ends the transfer for the sender and the fid's own clunk is
  * what releases what it holds.
  */
+/*
+ * §1.3's divergence, decided before the commit that repairs it.  An
+ * `op=full force=1' driven to final=1 over a copy this receiver holds
+ * at an EQUAL key whose csum differs from the one the operation will
+ * leave IS §1.3's equal-key-differing-content case, and §5.5 has a
+ * receiver that applies one record the event "so the count of times an
+ * invariant was repaired is visible rather than silent".  An equal key
+ * whose csum already matches repairs nothing; a lower local key is an
+ * ordinary heal, which needs no force and is not a divergence; and a
+ * copy that fails local verification contributes no key at all (§1.3,
+ * D14), so a push over one is §7.5's reconcile.
+ *
+ * A failed objstat is not this operation's error to answer — the
+ * commit below makes its own — so it counts nothing and says nothing.
+ */
+static int
+divergedat(Srvctx *c, Hdr *h)
+{
+	char buf[ERRMAX], *e;
+	Objinfo oi;
+
+	if(!h->force || recof(c, h, &oi, buf, sizeof buf, &e) <= 0)
+		return 0;
+	return !oi.corrupt && keycmp(h->wepoch, h->ver, oi.wepoch, oi.ver) == 0
+		&& memcmp(oi.csum, h->csum, Csumlen) != 0;
+}
+
+/*
+ * What records a repair today: a counter in this process's memory,
+ * rendered by /status as `diverged='.  store.md §14(15) has the rest —
+ * why the durable `/lost kind=diverged' line §5.5 also asks for is the
+ * open half, and what it waits on.
+ */
+uvlong
+srvdiverged(Srvctx *c)
+{
+	uvlong n;
+
+	lock(&c->cntlk);
+	n = c->ndiverged;
+	unlock(&c->cntlk);
+	return n;
+}
+
 static void
 replfullq(Req *r, Srvctx *c, Sfid *f, Hdr *h)
 {
@@ -794,7 +838,7 @@ replfullq(Req *r, Srvctx *c, Sfid *f, Hdr *h)
 	Sstage *s;
 	Stage *g;
 	uvlong max;
-	int rc;
+	int rc, diverged;
 
 	max = c->sb.objmax;
 	if(h->len > max || h->off > max || (uvlong)h->n > max - h->off){
@@ -847,6 +891,7 @@ replfullq(Req *r, Srvctx *c, Sfid *f, Hdr *h)
 	 * known: a Tclunk behind a refused final=1 would otherwise
 	 * discard a stage that has already been discarded.
 	 */
+	diverged = divergedat(c, h);
 	if((g = srvstagefinal(c, f, s)) == nil){
 		srvqdone(r, Estageexp);
 		return;
@@ -855,6 +900,11 @@ replfullq(Req *r, Srvctx *c, Sfid *f, Hdr *h)
 		srvqexit(r);
 		srvrerror(r);
 		return;
+	}
+	if(diverged){
+		lock(&c->cntlk);
+		c->ndiverged++;
+		unlock(&c->cntlk);
 	}
 	replok(r);
 }
