@@ -899,10 +899,10 @@ srvobjwrite(Req *r)
 
 /*
  * layer-a §2.4's open.  The mode rules are the row's own, which is why
- * the row carries an open cell at all (dat.h): ORCLOSE MUST be
- * rejected with `bad open mode', and so is anything that is not OREAD,
- * OWRITE or ORDWR with or without OTRUNC — OEXEC on an object is not a
- * mode §2.4 admits.  §2.4's other mode rule, a write on a fid opened
+ * the row carries an open cell at all (dat.h): anything that is not
+ * OREAD, OWRITE or ORDWR with or without OTRUNC is `bad open mode',
+ * which is ORCLOSE — §2.4's own MUST, and a bit outside the mask like
+ * any other — and OEXEC, which is not a mode §2.4 admits.  §2.4's other mode rule, a write on a fid opened
  * OREAD, is lib9p's to answer and never reaches here (store.md
  * §14(32)).
  *
@@ -988,10 +988,6 @@ srvobjopen(Req *r)
 	c = r->srv->aux;
 	f = r->fid->aux;
 	m = r->ifcall.mode;
-	if((m & ORCLOSE) != 0){
-		respond(r, Ebadopen);
-		return;
-	}
 	if((m & ~(3|OTRUNC)) != 0){
 		respond(r, Ebadopen);
 		return;
@@ -1299,10 +1295,6 @@ srvobjcreate(Req *r)
 		respond(r, Ebadcreate);
 		return;
 	}
-	if((mode & ORCLOSE) != 0){
-		respond(r, Ebadopen);
-		return;
-	}
 	if((mode & ~(3|OTRUNC)) != 0){
 		respond(r, Ebadopen);
 		return;
@@ -1444,10 +1436,6 @@ srvmetaopen(Req *r)
 
 	c = r->srv->aux;
 	f = r->fid->aux;
-	if((r->ifcall.mode & ORCLOSE) != 0){
-		respond(r, Ebadopen);
-		return;
-	}
 	if(r->ifcall.mode != OREAD){
 		respond(r, Ebadopen);
 		return;
