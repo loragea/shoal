@@ -262,6 +262,43 @@ clientwant(Srvctx *ctx, char *oid, char *buf, int nbuf)
 	return buf;
 }
 
+/*
+ * Two ids the map places differently: one this instance is the serving
+ * primary for and one it is not.  A case that runs a role=client row
+ * against both takes both of clientwant's answers, which is what makes
+ * the row's `ok' half a driven path rather than an assumption about
+ * where blake2s happens to send one name.  `pfx' is so that a case
+ * wanting ids for a create and ids for an existing object gets two
+ * disjoint pairs.  Both nil on failure, which is a failed check.
+ */
+static void
+placeids(Srvctx *ctx, char *pfx, char **mine, char **theirs)
+{
+	char name[32];
+	Cinst *p;
+	int i;
+
+	*mine = *theirs = nil;
+	for(i = 0; i < 64 && (*mine == nil || *theirs == nil); i++){
+		snprint(name, sizeof name, "%s%d", pfx, i);
+		if((p = mapprimary(srvmap(ctx), name)) == nil)
+			continue;
+		if(strcmp(p->iid, srviid(ctx)) == 0){
+			if(*mine == nil)
+				*mine = strdup(name);
+		}else if(*theirs == nil)
+			*theirs = strdup(name);
+	}
+	checks++;
+	if(*mine == nil || *theirs == nil){
+		fail("the map places every `%s' id the same way: no case to"
+			" drive", pfx);
+		free(*mine);
+		free(*theirs);
+		*mine = *theirs = nil;
+	}
+}
+
 static int
 objinfoof(Store *s, char *name, Objinfo *oi)
 {
@@ -582,7 +619,7 @@ tmatrix(void)
 	if((ctx = startsrv(d, m, 4)) == nil)
 		return;
 	clstart(&cl, ctx, Clmsize);
-	for(role = 2; role >= 0; role--){
+	for(role = 0; role < 3; role++){
 		if(clattach(&cl, Froot, anames[role], &r) != Rattach){
 			fail("attach %s: %s", anames[role],
 				r.type == Rerror ? r.ename : "?");
@@ -652,8 +689,11 @@ tmatrix(void)
  * Each is gated on the row's write column; what a role=client
  * operation is then answered is §2.4's own and depends on where the
  * map places the id (clientwant), while the other two roles never
- * reach the content at all.  The roles run in reverse order because
- * the client's half may remove the object the other two walk to.
+ * reach the content at all.  Each operation therefore runs on an id
+ * this instance is the serving primary for and on one it is not, so
+ * both of clientwant's answers are on the wire.  The roles run in
+ * reverse order because the client's half may remove the object the
+ * other two walk to.
  */
 static void
 tmodes(void)
@@ -674,58 +714,85 @@ tmodes(void)
 		"permission denied",
 		"permission denied",
 	};
-	char what[64], buf[64], *m;
+	char what[96], buf[64], *m, *mine, *theirs, *newmine, *newtheirs;
+	char *id, *newid;
 	Srvctx *ctx;
 	Dev *d;
 	Cl cl;
 	Fcall r;
 	Dir dir;
-	int role;
+	int role, k;
 
 	clstage = "modes";
 	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
 	d = newdisk();
 	if((ctx = startsrv(d, m, 4)) == nil)
 		return;
-	mkobj(srvstore(ctx), "alpha", nil, 0, 1);
+	/*
+	 * Each operation is run on an id this instance is the serving
+	 * primary for and on one it is not, so the client row takes both
+	 * of clientwant's answers rather than whichever one the hash
+	 * happens to give one name.
+	 */
+	placeids(ctx, "obj", &mine, &theirs);
+	placeids(ctx, "new", &newmine, &newtheirs);
+	if(mine == nil || newmine == nil)
+		goto Out;
+	mkobj(srvstore(ctx), mine, nil, 0, 1);
+	mkobj(srvstore(ctx), theirs, nil, 0, 1);
 	clstart(&cl, ctx, Clmsize);
-	for(role = 0; role < 3; role++){
+	for(role = 2; role >= 0; role--){
 		if(clattach(&cl, Froot, anames[role], &r) != Rattach){
 			fail("attach %s: %s", anames[role],
 				r.type == Rerror ? r.ename : "?");
 			continue;
 		}
-		/* Tcreate in /obj */
-		if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk)
-			fail("walk /obj: %s", clerr(&r));
-		clcreate(&cl, Ffile, "newobj", 0666, OWRITE, &r);
-		snprint(what, sizeof what, "create in /obj as %s", anames[role]);
-		clerris(what, &r, role == 0 ?
-			clientwant(ctx, "newobj", buf, sizeof buf) : want[role]);
-		clclunk(&cl, Ffile, &r);
+		for(k = 0; k < 2; k++){
+			id = k == 0 ? mine : theirs;
+			newid = k == 0 ? newmine : newtheirs;
+			/* Tcreate in /obj */
+			if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk)
+				fail("walk /obj: %s", clerr(&r));
+			clcreate(&cl, Ffile, newid, 0666, OWRITE, &r);
+			snprint(what, sizeof what, "create %s in /obj as %s",
+				newid, anames[role]);
+			clerris(what, &r, role == 0 ?
+				clientwant(ctx, newid, buf, sizeof buf) :
+				want[role]);
+			clclunk(&cl, Ffile, &r);
 
-		/*
-		 * Twstat and Tremove on /obj/<oid>.  A Tremove clunks its fid
-		 * whether or not it removes anything, so Ffile2 is free again
-		 * for the next role's walk.
-		 */
-		if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk
-		|| clwalk1(&cl, Ffile, Ffile2, "alpha", &r) != Rwalk)
-			fail("walk /obj/alpha: %s", clerr(&r));
-		nulldir(&dir);
-		dir.length = 4096;
-		clwstat(&cl, Ffile2, &dir, &r);
-		snprint(what, sizeof what, "wstat /obj/alpha as %s", anames[role]);
-		clerris(what, &r, role == 0 ?
-			clientwant(ctx, "alpha", buf, sizeof buf) : want[role]);
-		clremove(&cl, Ffile2, &r);
-		snprint(what, sizeof what, "remove /obj/alpha as %s", anames[role]);
-		clerris(what, &r, role == 0 ?
-			clientwant(ctx, "alpha", buf, sizeof buf) : want[role]);
-		clclunk(&cl, Ffile, &r);
+			/*
+			 * Twstat and Tremove on /obj/<oid>.  A Tremove clunks
+			 * its fid whether or not it removes anything, so Ffile2
+			 * is free again for the next walk.
+			 */
+			if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk
+			|| clwalk1(&cl, Ffile, Ffile2, id, &r) != Rwalk)
+				fail("walk /obj/%s: %s", id, clerr(&r));
+			nulldir(&dir);
+			dir.length = 4096;
+			clwstat(&cl, Ffile2, &dir, &r);
+			snprint(what, sizeof what, "wstat /obj/%s as %s", id,
+				anames[role]);
+			clerris(what, &r, role == 0 ?
+				clientwant(ctx, id, buf, sizeof buf) :
+				want[role]);
+			clremove(&cl, Ffile2, &r);
+			snprint(what, sizeof what, "remove /obj/%s as %s", id,
+				anames[role]);
+			clerris(what, &r, role == 0 ?
+				clientwant(ctx, id, buf, sizeof buf) :
+				want[role]);
+			clclunk(&cl, Ffile, &r);
+		}
 		clclunk(&cl, Froot, &r);
 	}
 	clstop(&cl);
+Out:
+	free(mine);
+	free(theirs);
+	free(newmine);
+	free(newtheirs);
 	srvfree(ctx);
 	devclose(d);
 	free(m);
@@ -1455,12 +1522,14 @@ Out:
 static void
 tobjgate(void)
 {
-	char cbuf[64], *m;
+	char cbuf[64], what[96], *m, *mine, *theirs, *newmine, *newtheirs;
+	char *id, *newid;
 	Srvctx *ctx;
 	Dev *d;
 	Cl cl;
 	Fcall r;
 	char *w[2];
+	int k;
 
 	clstage = "objgate";
 	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
@@ -1469,6 +1538,17 @@ tobjgate(void)
 		return;
 	mkobj(srvstore(ctx), "alpha", nil, 0, 1);
 	mkobj(srvstore(ctx), "shoal.map.7", nil, 0, 1);
+	/* the client half below runs on one id placed here and one not */
+	placeids(ctx, "obj", &mine, &theirs);
+	placeids(ctx, "new", &newmine, &newtheirs);
+	if(mine == nil || newmine == nil){
+		srvfree(ctx);
+		devclose(d);
+		free(m);
+		return;
+	}
+	mkobj(srvstore(ctx), mine, nil, 0, 1);
+	mkobj(srvstore(ctx), theirs, nil, 0, 1);
 	clstart(&cl, ctx, Clmsize);
 	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
 		fail("attach admin: %s", clerr(&r));
@@ -1583,22 +1663,31 @@ tobjgate(void)
 		fail("attach client: %s", clerr(&r));
 		goto Out;
 	}
-	if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk)
-		fail("walk /obj as client: %s", clerr(&r));
-	clcreate(&cl, Ffile, "brandnew", 0666, OWRITE, &r);
-	clerris("client create of an id that is not reserved", &r,
-		clientwant(ctx, "brandnew", cbuf, sizeof cbuf));
-	clclunk(&cl, Ffile, &r);
-	w[1] = "alpha";
-	if(clwalk(&cl, Froot, Ffile, 2, w, &r) != Rwalk)
-		fail("walk /obj/alpha as client: %s", clerr(&r));
-	clopen(&cl, Ffile, OWRITE, &r);
-	clerris("client open of an object for writing", &r,
-		clientwant(ctx, "alpha", cbuf, sizeof cbuf));
-	clclunk(&cl, Ffile, &r);
+	w[0] = "obj";
+	for(k = 0; k < 2; k++){
+		id = k == 0 ? mine : theirs;
+		newid = k == 0 ? newmine : newtheirs;
+		if(clwalk1(&cl, Froot, Ffile, "obj", &r) != Rwalk)
+			fail("walk /obj as client: %s", clerr(&r));
+		clcreate(&cl, Ffile, newid, 0666, OWRITE, &r);
+		snprint(what, sizeof what, "client create of %s", newid);
+		clerris(what, &r, clientwant(ctx, newid, cbuf, sizeof cbuf));
+		clclunk(&cl, Ffile, &r);
+		w[1] = id;
+		if(clwalk(&cl, Froot, Ffile, 2, w, &r) != Rwalk)
+			fail("walk /obj/%s as client: %s", id, clerr(&r));
+		clopen(&cl, Ffile, OWRITE, &r);
+		snprint(what, sizeof what, "client open of %s for writing", id);
+		clerris(what, &r, clientwant(ctx, id, cbuf, sizeof cbuf));
+		clclunk(&cl, Ffile, &r);
+	}
 	clclunk(&cl, Froot, &r);
 Out:
 	clstop(&cl);
+	free(mine);
+	free(theirs);
+	free(newmine);
+	free(newtheirs);
 	srvfree(ctx);
 	devclose(d);
 	free(m);
