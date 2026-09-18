@@ -1719,7 +1719,6 @@ tiogate(void)
 		return;
 	mkobj(srvstore(ctx), "alpha", nil, 0, 1);
 	mkobj(srvstore(ctx), "shoal.map.7", nil, 0, 1);
-	srvcellpoint(ctx, 1);
 	clstart(&cl, ctx, Clmsize);
 	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
 		fail("attach admin: %s", clerr(&r));
@@ -1775,7 +1774,6 @@ tiogate(void)
 	clclunk(&cl, Ffile2, &r);
 	clclunk(&cl, Froot2, &r);
 Out:
-	srvcellpoint(ctx, 0);
 	clstop(&cl);
 	srvfree(ctx);
 	devclose(d);
@@ -1978,9 +1976,9 @@ Out:
  * back, and once /obj is enumerated the state a failed create dropped
  * would be that fid's own listing snapshot.
  *
- * The cell point's create cell is both halves -- it refuses a name
- * §1.1 forbids and retargets on any other -- and the fid-state point
- * counts the hooks.
+ * The create cell here is /obj's own (§2.4's create): it refuses a
+ * name §1.1 forbids and retargets the fid on any other, and the
+ * fid-state point is what counts the hooks.
  */
 static void
 tcreategive(void)
@@ -1998,7 +1996,6 @@ tcreategive(void)
 	if((ctx = startsrv(d, m, 4)) == nil)
 		return;
 	srvauxpoint(ctx, 1);
-	srvcellpoint(ctx, 1);
 	clstart(&cl, ctx, Clmsize);
 	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
 		fail("attach: %s", clerr(&r));
@@ -2031,7 +2028,6 @@ tcreategive(void)
 	eqv("the clunk behind it had nothing left to free", nf, 1);
 	clclunk(&cl, Froot, &r);
 Out:
-	srvcellpoint(ctx, 0);
 	clstop(&cl);
 	srvfree(ctx);
 	devclose(d);

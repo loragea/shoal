@@ -262,8 +262,9 @@ objgate(Srvctx *c, Sfid *f, Req *r, int op)
 		 * reserved, so an OREAD|ORCLOSE open admitted as a read would
 		 * be that remove arranged one message ahead.  (§2.4 refuses
 		 * ORCLOSE on an object outright, with `bad open mode'; that
-		 * belongs to the rows' open cell, which is not built, and
-		 * this rule does not wait for it.)
+		 * is the rows' open cell, and this gate runs first — so the
+		 * operator is told `permission denied' and everyone else the
+		 * mode is what is wrong.)
 		 */
 		m = r->ifcall.mode;
 		wr = (m&OMASK) == OWRITE || (m&OMASK) == ORDWR

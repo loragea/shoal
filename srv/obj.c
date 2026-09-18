@@ -401,7 +401,11 @@ srvstagesweep(Srvctx *c)
  * §5.4 step 3: stage the update on the fid.  The slot is single — a
  * fid stages one operation at a time — and a fid that already holds
  * one is refused `disk full', which is §3.6's refusal for its per-fid
- * bound; so is an update covering more grains than that bound allows.
+ * bound.  So is an update covering more grains than that bound
+ * allows, which no client path can reach: a client write is SHORTENED
+ * to the bound before it gets here (wclamp, store.md §14(33)), and
+ * the /repl surface whose chunks cannot be shortened is what will
+ * (dat.h's Sstage).
  *
  * The bytes of a write are NOT copied here: they stay the Req's, and
  * the commit reads them from it.  A client stage lives inside its one
