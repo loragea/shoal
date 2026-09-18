@@ -406,10 +406,10 @@ srvjobcount(Srvctx *c)
  * The reclaim timer is not one of the jobs above — it makes no engine
  * call — but it reads the context, and srvfree frees that as soon as
  * the shutdown is over.  So the shutdown waits for the proc to see
- * `stopping' and end.  The wait is bounded by the proc's own slice
- * (job.c) and no pass can be started behind it: srvjobstart refuses
- * once the shutdown has begun, which is the same gate every verb
- * meets.
+ * `stopping' and end.  The wait is bounded by the proc's own slice,
+ * which is half a second (job.c), and no pass can be started behind
+ * it: srvjobstart refuses once the shutdown has begun, which is the
+ * same gate every verb meets.
  */
 static void
 reclaimwait(Srvctx *c)

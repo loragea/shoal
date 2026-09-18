@@ -99,9 +99,16 @@ enum
 	 * shutdown is seen inside one rather than at the end of a period
 	 * measured in days: the timer proc is not a job, and the context
 	 * it reads outlives it only until srvshutdown says otherwise.
+	 * The slice is half a second rather than the scrub's twenty
+	 * milliseconds, because what it paces is a period of days and not
+	 * a walk of a disk: at twenty it would wake fifty times a second
+	 * for the life of the instance — some fifteen million times over
+	 * one default period — and all it does on waking is read two
+	 * words under joblk.  What the length costs is the shutdown's
+	 * wait for the proc (srv.c), which is bounded by one slice.
 	 */
 	Reclaimminms	= 12*3600*1000,
-	Reclaimslicems	= 20,
+	Reclaimslicems	= 500,
 
 	/* what qjob runs on the object's queue */
 	Jscrub		= 0,

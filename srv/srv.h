@@ -515,10 +515,14 @@ void	srvendpoint(Srvctx*, uvlong ms);
  * is waiting on — and the shortest a map can ask for is half a day,
  * which is longer than any test can wait for.  Set it to a few tens of
  * milliseconds to see the timer fire, and to 0 to put the map's own
- * period back.  Like srvendpoint and unlike the srvhook holds, the
- * shutdown does not clear it: it holds nothing up, since a pass the
- * timer starts once the shutdown has begun is refused the job it needs
- * and the timer proc itself ends with the shutdown either way.
+ * period back.  The value is re-read as the timer waits, so it
+ * shortens a wait already in progress — but the wait is slept in half-
+ * second slices, so a period below that is one tick per slice and the
+ * first tick comes within a slice of the call.  Like srvendpoint and
+ * unlike the srvhook holds, the shutdown does not clear it: it holds
+ * nothing up, since a pass the timer starts once the shutdown has
+ * begun is refused the job it needs and the timer proc itself ends
+ * with the shutdown either way.
  *
  * srvreclaimperiod is the period in force, which is what the knob
  * overrides: the map's `tombdays'/2, or the floor under it for a map
