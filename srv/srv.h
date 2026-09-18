@@ -253,11 +253,17 @@ void	srvcount(Srvctx*, uvlong *pushed, uvlong *done);
  *		lookup that found it and the flush itself, which is the
  *		window a completion racing a flush lives in.  This one
  *		holds the SERVICE LOOP, not a queue proc, so a test that
- *		leaves it set answers nothing else either.
+ *		leaves it set answers nothing else either — and it is the
+ *		one point the shutdown cannot clear, because the shutdown
+ *		runs on the loop it is holding.  It therefore lets go of
+ *		its own accord after a few seconds rather than wedging
+ *		the server for as long as the program lives.
  *
- * A held request leaves either hold when the point is cleared or when
- * its queue's flush flag is set, whichever is first; the shutdown
- * clears every point, so a request left holding cannot hold it up.
+ * A held request leaves a queue proc's hold when the point is cleared
+ * or, for the holds that name the request, when its queue's flush flag
+ * is set, whichever is first; the shutdown clears every point, so a
+ * request left holding cannot hold it up.  The flush hold above is the
+ * exception, and ends on its own deadline.
  *
  * These points are reachable in-process only.  store.md §13's -X flag
  * names the points of the device under the store — it is what drives

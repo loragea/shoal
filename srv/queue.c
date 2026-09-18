@@ -36,6 +36,20 @@
  */
 
 static void	qhold(Srvctx*, Qreq*, uvlong*);
+static void	holdflush(Srvctx*);
+
+enum
+{
+	/*
+	 * How long the flush hold parks the service loop before it lets
+	 * go of its own accord.  It is the one §13 point that holds the
+	 * loop rather than a queue proc, so it is the one the shutdown
+	 * cannot clear — srvholdclear runs from Srv.end, which lib9p
+	 * calls on the loop — and an unbounded park there would wedge
+	 * the server for as long as the program lived.
+	 */
+	Flushholdms	= 5000,
+};
 
 /*
  * The hash is this server's, not layer-a §4.2's: nothing on the wire
@@ -321,7 +335,7 @@ srvqflush(Req *r)
 		respond(r, nil);
 		return;
 	}
-	qhold(qr->ctx, nil, &qr->ctx->flushhold);
+	holdflush(qr->ctx);
 	qlock(&qr->lk);
 	if(!qr->done && qr->pushed){
 		if(!qr->running && !qr->step7){
@@ -345,16 +359,40 @@ srvqflush(Req *r)
  * answers the two causes apart (err.c).
  *
  * The §13 holds are here because this is where a request already
- * running can be made to stay running.  A hold ends when its point is
- * cleared or when this queue's flush flag is set, whichever is first,
- * so a held request is still flushable and the shutdown that clears
- * every point (srvholdclear) is not held up by one.
+ * running can be made to stay running.  A hold of a queue proc ends
+ * when its point is cleared or, for one that names the request, when
+ * this queue's flush flag is set, whichever is first — so a held
+ * request is still flushable and the shutdown that clears every point
+ * (srvholdclear) is not held up by one.  The flush hold below is the
+ * exception, and says why.
  */
 static void
 qhold(Srvctx *c, Qreq *qr, uvlong *pt)
 {
 	qlock(&c->holdlk);
 	while(*pt != 0 && (qr == nil || qr->q->flush == 0)){
+		qunlock(&c->holdlk);
+		sleep(5);
+		qlock(&c->holdlk);
+	}
+	qunlock(&c->holdlk);
+}
+
+/*
+ * The flush hold, which parks the SERVICE LOOP rather than a queue
+ * proc.  srvholdclear cannot reach it: the shutdown runs from Srv.end,
+ * which lib9p calls on the loop, so a loop parked here never gets
+ * there and nothing else would ever clear the point.  It therefore
+ * releases itself after Flushholdms, which is what keeps a point a
+ * program set and stopped watching from wedging the server for good.
+ */
+static void
+holdflush(Srvctx *c)
+{
+	int i;
+
+	qlock(&c->holdlk);
+	for(i = 0; c->flushhold != 0 && i < Flushholdms/5; i++){
 		qunlock(&c->holdlk);
 		sleep(5);
 		qlock(&c->holdlk);
@@ -626,6 +664,10 @@ srvhook(Srvctx *c, char *name, uvlong n)
  * is not necessarily watching when the connection drops, and a
  * request left holding would hold the drain — and with it the store's
  * close — for as long as the program lived.
+ *
+ * This reaches the queue procs' holds.  It does not reach a loop
+ * parked in the flush hold, because it is the loop that gets here;
+ * that hold ends on its own deadline instead (holdflush).
  */
 void
 srvholdclear(Srvctx *c)
