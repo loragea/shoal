@@ -2600,6 +2600,17 @@ terrors(void)
 		"checksum mismatch",
 		"bad ctl",
 	};
+	static struct {
+		char	*e;
+		int	is;
+	} intr[] = {
+		{"interrupted",			1},
+		{"shoalsrv: interrupted",	1},
+		{"x: flush: interrupted",	1},
+		{"x: interrupted by note",	1},
+		{"no such object",		0},
+		{"x: interrupted: y",		0},
+	};
 	static char *internal[] = {
 		"store closed",
 		"store condemned: a log write failed",
@@ -2641,6 +2652,23 @@ terrors(void)
 	eqs("a marked string is not marked twice",
 		srverrs(buf, sizeof buf, "shoalsrv: not built"),
 		"shoalsrv: not built");
+
+	/*
+	 * The other classifier: which strings are the interrupted class.
+	 * The rule is lib/dev.c's — the last `: '-separated segment, with
+	 * the word looked for inside it rather than matched whole — so a
+	 * device that says what it was doing is still that class, and a
+	 * segment that only mentions the word earlier is not.
+	 */
+	for(i = 0; i < nelem(intr); i++){
+		checks++;
+		if(srvintr(intr[i].e) != intr[i].is)
+			fail("srvintr(%#q) is %d", intr[i].e,
+				srvintr(intr[i].e));
+	}
+	checks++;
+	if(srvintr(nil) != 0)
+		fail("srvintr(nil) is %d", srvintr(nil));
 
 	/*
 	 * And on the wire: a store condemned under §3.2 answers the

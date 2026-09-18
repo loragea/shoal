@@ -114,6 +114,16 @@ int	textwrite(Text*, void*, long);
  *	srvrerror	the answer to the current %r.  A request the queue
  *			pool is carrying leaves through srvqdone instead,
  *			so this is safe to call from a queue proc.
+ *	srvintr		is this string the interrupted class?  store.md §0's
+ *			rule, applied as lib/dev.c applies it: the last
+ *			`: '-separated segment is taken and the word looked
+ *			for inside it, so a bare `interrupted', this
+ *			server's own `shoalsrv: interrupted' and a segment
+ *			that wraps the word once more are all that class,
+ *			and a string that merely mentions it earlier is
+ *			not.  srvqdone is what acts on it; it is here
+ *			because the rule is what tells a flush and a device
+ *			interrupt apart (err.c).
  *
  * Enotbuilt is the local refusal a file or a ctl verb whose body is
  * not built answers after its gates.  It is deliberately not a §2.6
@@ -125,6 +135,7 @@ char*	srv26(char*);
 char*	srverrs(char *buf, int nbuf, char *e);
 char*	srverr(char *buf, int nbuf);
 void	srvrerror(Req*);
+int	srvintr(char*);
 
 struct Srvcfg
 {
