@@ -3315,34 +3315,12 @@ Out:
  */
 static Srvctx *endctx;
 static int endfreed;		/* srvfree has returned */
-static int endrelseen;		/* ... and lib9p had let go before it did */
-static int endrelearly;		/* the release was seen after it returned */
-static int endwatching;		/* the watcher is up and polling */
-static vlong endreltime;
 
-/*
- * The moment lib9p lets go, watched from a proc of its own while
- * srvfree is inside its wait.  It reads the context only while srvfree
- * has not returned — that is what keeps the context there to read —
- * and what it records is the order of the two: srvfree must still be
- * waiting when the release fires.
- */
 static void
-endrelproc(void*)
+endfreeproc(void*)
 {
-	vlong end;
-
-	endwatching = 1;
-	end = nsec() + 20LL*1000*1000*1000;
-	while(!endfreed && nsec() < end){
-		if(srvreleased(endctx)){
-			endreltime = nsec();
-			endrelearly = endfreed;
-			endrelseen = 1;
-			return;
-		}
-		sleep(0);
-	}
+	srvfree(endctx);
+	endfreed = 1;
 }
 
 static void
@@ -3355,8 +3333,8 @@ tendwait(void)
 	Cl cl;
 	Fcall r;
 	char *w[1];
-	vlong ms;
-	int i;
+	vlong t0, ms;
+	int i, held;
 
 	clstage = "endwait";
 	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
@@ -3379,7 +3357,7 @@ tendwait(void)
 		return;
 	}
 
-	srvendpoint(ctx, 1500);
+	srvendpoint(ctx, 10000);
 	clwrite(&cl, Fctl, 0, "verify alpha", &r);
 	checks++;
 	if(r.type != Rwrite)
@@ -3387,7 +3365,10 @@ tendwait(void)
 
 	/*
 	 * Its queue proc is now between the completion count and lib9p's
-	 * release, so the drain converges and the loop ends under it.
+	 * release, so the drain converges and the loop ends under it.  It
+	 * stays there until the point is cleared, which is what makes the
+	 * moment lib9p is let go of this case's to choose rather than a
+	 * count of milliseconds to race.
 	 */
 	clhangup(&cl);
 	istrue("the service loop ends while a queue proc is still in lib9p",
@@ -3396,27 +3377,35 @@ tendwait(void)
 	istrue("lib9p has not let go when the service loop returns",
 		!srvreleased(ctx));
 
-	/*
-	 * What srvfree owes is not a wait of some length but this exact
-	 * order: the release first, its return after it.  The watcher
-	 * records the one, this proc times the other, and the gap between
-	 * them is what tells a wait on the release apart from a sleep long
-	 * enough to cover it.
-	 */
 	endctx = ctx;
-	endfreed = endrelseen = endrelearly = endwatching = 0;
-	endreltime = 0;
-	if(tspawn(endrelproc, nil) < 0)
+	endfreed = 0;
+	if(tspawn(endfreeproc, nil) < 0)
 		fail("tspawn: %r");
-	for(i = 0; i < 200 && !endwatching; i++)
-		sleep(5);
-	istrue("the watcher is polling before srvfree is called", endwatching);
-	srvfree(ctx);
-	ms = (nsec() - endreltime) / 1000000;
-	endfreed = 1;
-	istrue("srvfree was still waiting when lib9p let go of the service",
-		endrelseen && !endrelearly);
-	istrue("and returned as soon as it had", endrelseen && ms < 300);
+	sleep(300);
+	held = !endfreed;
+	istrue("srvfree does not return while lib9p holds the service", held);
+	/*
+	 * The context is there to ask only while srvfree has not returned;
+	 * a srvfree that returned early has already freed it.
+	 */
+	istrue("and lib9p was indeed still holding it",
+		held && !srvreleased(ctx));
+
+	/*
+	 * Let the queue proc out of lib9p.  What srvfree owes is to return
+	 * after the release and not before: it has not returned yet, and
+	 * from here it is a few milliseconds of its own polling away —
+	 * which is what tells it apart from a wait long enough to have
+	 * covered the window by the clock.
+	 */
+	t0 = nsec();
+	if(held)
+		srvendpoint(ctx, 0);
+	for(i = 0; i < 300 && !endfreed; i++)
+		sleep(10);
+	ms = (nsec() - t0) / 1000000;
+	istrue("and returns once lib9p has let go", endfreed);
+	istrue("as soon as it has", held && endfreed && ms < 300);
 	devclose(d);
 	free(m);
 }

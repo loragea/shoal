@@ -145,7 +145,7 @@ void
 srvqended(Qreq *qr)
 {
 	Srvctx *c;
-	uvlong ms;
+	uvlong ms, n;
 
 	c = qr->ctx;
 	lock(&c->cntlk);
@@ -157,12 +157,25 @@ srvqended(Qreq *qr)
 	 * own trailing release of the Srv, so the drain can converge and
 	 * the service loop end while this proc is still inside lib9p.
 	 * Nothing of the context is touched while it waits.
+	 *
+	 * The point is re-read as it waits, so clearing it ends the wait
+	 * as well: a test that has to say exactly when lib9p is let go of
+	 * — rather than guess a count of milliseconds and race it — sets a
+	 * long hold and clears it at the moment it means.  The count is
+	 * still the bound, because nothing clears this point for a program
+	 * that set it and stopped watching; the shutdown does not (srv.h).
 	 */
 	qlock(&c->holdlk);
 	ms = c->endhold;
 	qunlock(&c->holdlk);
-	if(ms > 0)
-		sleep(ms);
+	for(; ms >= 5; ms -= 5){
+		sleep(5);
+		qlock(&c->holdlk);
+		n = c->endhold;
+		qunlock(&c->holdlk);
+		if(n == 0)
+			break;
+	}
 }
 
 void

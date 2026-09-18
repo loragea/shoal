@@ -376,9 +376,12 @@ void	srvcellpoint(Srvctx*, int on);
  * end while a queue proc is still inside lib9p.  Set to a count of
  * milliseconds, it holds each completion there for that long, which is
  * how a test drives the window a caller freeing the context at that
- * moment falls into.  Like srvauxpoint and unlike the srvhook holds,
- * the shutdown does not clear it: what it is about happens after the
- * shutdown has run.
+ * moment falls into; setting it to 0 releases a completion already
+ * held, so a caller that has to name the moment lib9p is let go of
+ * sets a long hold and ends it where it means rather than timing one.
+ * Like srvauxpoint and unlike the srvhook holds, the shutdown does not
+ * clear it: what it is about happens after the shutdown has run, so
+ * the count is the only bound a program that forgets it gets.
  */
 void	srvendpoint(Srvctx*, uvlong ms);
 
