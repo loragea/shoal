@@ -2420,6 +2420,17 @@ tgivecreate(void)
 		goto Out;
 	}
 	cltagfree(&cl, to1);
+	/*
+	 * This wait is what makes the case discriminate: the second open
+	 * has to be parked at `dirgive', inside the window, before the
+	 * create is let go.  A create released any earlier finds the fid
+	 * still holding the first open's listing and is refused by
+	 * srvobjdirheld — with the same string, so every assertion below
+	 * would pass for a reason that has nothing to do with `Fid.omode'.
+	 * And `dirgive' counts opens instance-wide (srv/queue.c), so these
+	 * two must stay the only /obj opens this instance sees, or the
+	 * open the point parks is not the one this case drives.
+	 */
 	sleep(200);			/* the second open is in the window */
 	srvhook(ctx, "objclaim", 0);
 	clgettag(&cl, tc, &r);
