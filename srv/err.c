@@ -100,6 +100,18 @@ char Einterrupted[]	= "interrupted";
 char Edevintr[]		= "shoalsrv: interrupted";
 
 /*
+ * Not a §2.6 string either: lib9p's own refusal of a message that does
+ * not belong on this fid.  lib9p answers it from `Fid.omode' and so
+ * cannot see a conflict between two requests on one fid while the
+ * first of them is still offloaded and has not set that field — a
+ * Topen and a Tcreate pipelined on one /obj fid, which the two cells
+ * refuse between them instead (dat.h).  They answer this, because the
+ * condition is the one lib9p names and a client that could tell the
+ * two refusals apart would be reading which of them got there first.
+ */
+char Ebotch[]		= "9P protocol botch";
+
+/*
  * Is e the device's interrupted class (store.md §0)?  The rule is
  * deverr's, applied the same way, because this is the same condition
  * arriving one layer up: the last `: '-separated segment is taken —
@@ -193,6 +205,9 @@ srverrs(char *buf, int nbuf, char *e)
 	if(e == nil || *e == 0)
 		e = "unknown error";
 	if(srv26(e) != nil)
+		return e;
+	/* lib9p's own, which goes out as lib9p writes it (above) */
+	if(strcmp(e, Ebotch) == 0)
 		return e;
 	/* already marked: marking twice would say nothing twice */
 	if(strncmp(e, "shoalsrv: ", 10) == 0)

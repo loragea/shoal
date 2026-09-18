@@ -488,7 +488,10 @@ stagenew(Srvctx *c, Sfid *f, int kind, uchar *oid, int oidlen, uvlong ver,
 		 * The slot holds state that is not a stage.  Nothing on the
 		 * served surface can reach here — the rows that stage are
 		 * this file's, and a create, whose fid's state is the
-		 * enumeration's, stages nothing — so this is the T1 fid-state
+		 * enumeration's, stages nothing; the one way an enumeration's
+		 * snapshot could land on a fid of an object row is a Topen
+		 * and a Tcreate pipelined on one fid, and the two cells
+		 * refuse the second (dat.h).  So this is the T1 fid-state
 		 * point (srv.h), which fills every fid it makes.  It is not a
 		 * §2.6 condition and does not pretend to be one.
 		 */
@@ -1268,6 +1271,24 @@ srvobjwstat(Req *r)
 }
 
 /*
+ * Give the fid back to whatever asks for it next: a create that is not
+ * going to move it after all (below).  The error the caller is
+ * carrying survives, since one of the callers is the path that answers
+ * from %r.
+ */
+static void
+createdrop(Sfid *f)
+{
+	char err[ERRMAX];
+
+	rerrstr(err, sizeof err);
+	qlock(&f->lk);
+	f->moving = 0;
+	qunlock(&f->lk);
+	errstr(err, sizeof err);
+}
+
+/*
  * layer-a §2.4's create: a Tcreate in /obj naming the oid.  The mode
  * rules are §2.4's own — DMDIR, DMAPPEND, DMEXCL and DMTMP are
  * `bad create mode', ORCLOSE is `bad open mode' — and §1.1's reserved
@@ -1296,6 +1317,14 @@ srvobjwstat(Req *r)
  * window in which a stage of this operation exists for step 7 to
  * discard.  A flush lands before the call, where nothing is staged, or
  * after it, where the discard half is vacuous (store.md §14(10)).
+ *
+ * The claim is the other half of that meeting.  9P does not keep a
+ * Tcreate and a Topen apart on one fid while the open is offloaded
+ * (dat.h), so this cell refuses a fid that holds a listing's state or
+ * that another create is moving, and claims the fid for itself before
+ * its first engine call: the open cell tests the claim under the same
+ * lock as it installs, so the two cells cannot both win, and the
+ * claim is dropped again at whichever exit this cell takes.
  */
 static void
 objcreateq(Req *r)
@@ -1316,14 +1345,24 @@ objcreateq(Req *r)
 	c = r->srv->aux;
 	f = r->fid->aux;
 	qr = r->aux;
+	qlock(&f->lk);
+	if(f->file != Qobj || f->moving || srvobjdirheld(f)){
+		qunlock(&f->lk);
+		srvqdone(r, Ebotch);
+		return;
+	}
+	f->moving = 1;
+	qunlock(&f->lk);
 	srvstagesweep(c);
 	if((e = admit(c, f, qr->oid, qr->oidlen, buf, sizeof buf)) != nil){
+		createdrop(f);
 		srvqdone(r, e);
 		return;
 	}
 	if(objstat(c->store, qr->oid, qr->oidlen, &oi) < 0){
 		rerrstr(err, sizeof err);
 		if(srv26(err) != Enoobj){
+			createdrop(f);
 			srvqdone(r, srverrs(buf, sizeof buf, err));
 			return;
 		}
@@ -1331,15 +1370,18 @@ objcreateq(Req *r)
 	}else if(oi.state == Stomb)
 		ver = oi.ver + 1;
 	else{
+		createdrop(f);
 		srvqdone(r, Eexists);
 		return;
 	}
 	if((e = replicate(c, f, qr->oid, qr->oidlen, buf, sizeof buf)) != nil){
+		createdrop(f);
 		srvqdone(r, e);
 		return;
 	}
 	if(objcreate(c->store, qr->oid, qr->oidlen, ver, c->map->epoch, nil, 0,
 		&oi) < 0){
+		createdrop(f);
 		srvqexit(r);
 		srvrerror(r);
 		return;
@@ -1347,15 +1389,20 @@ objcreateq(Req *r)
 	/*
 	 * The create succeeded, so the fid moves: whatever it held as a
 	 * directory fid goes back through its own hooks first (dat.h), and
-	 * only then is the fid the object's.
+	 * only then is the fid the object's.  The claim is dropped in the
+	 * same hold of the lock that writes the fid's new identity, so
+	 * nothing sees the fid half moved.
 	 */
 	srvfidgive(f);
+	qlock(&f->lk);
 	f->file = Qobjfile;
 	memmove(f->oid, qr->oid, qr->oidlen);
 	f->oidlen = qr->oidlen;
 	srvobjqid(f, &oi, &q);
 	f->qidpath = q.path;
 	f->qidvers = q.vers;
+	f->moving = 0;
+	qunlock(&f->lk);
 	r->ofcall.qid = q;
 	srvqexit(r);
 	srvqdone(r, nil);

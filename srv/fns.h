@@ -37,9 +37,10 @@ extern char Eunknownctl[];
 extern char Ebadaname[];
 extern char Ebadmap[];
 
-/* not §2.6's: the two `interrupted' causes (err.c) */
+/* not §2.6's: the two `interrupted' causes, and lib9p's own (err.c) */
 extern char Einterrupted[];
 extern char Edevintr[];
+extern char Ebotch[];
 
 /* text.c */
 void	textread(Req*, Text*);
@@ -108,6 +109,7 @@ Objsnap* srvsnapopen(Store*, int kinds, char *buf, int nbuf);
 void	srvopenq(Req*);
 void	srvobjdiropen(Req*);
 void	srvobjdirread(Req*);
+int	srvobjdirheld(Sfid*);
 char*	srvtombstext(Srvctx*, Sfid*, Text*);
 char*	srvadverttext(Srvctx*, Sfid*, Text*);
 

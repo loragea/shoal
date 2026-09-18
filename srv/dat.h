@@ -165,6 +165,28 @@ enum
  * rendered Text, and fidgive drops it before either hook runs
  * (tree.c).
  *
+ * The two cells also meet on a fid where 9P does NOT keep them apart,
+ * and that is what `moving' below is for.  lib9p refuses a Tcreate on
+ * an open fid and a Topen on an open one from `Fid.omode', which its
+ * `ropen' sets only once the open has ANSWERED; the /obj open is
+ * offloaded, so a Tcreate pipelined behind a Topen on one fid — in
+ * either order — passes that guard and both cells run, on two queue
+ * procs at once.  Left alone both would succeed: the create moves the
+ * fid to Qobjfile while the open installs a listing's snapshot on it,
+ * and lib9p then writes the loser's qid and mode over the winner's.
+ * So the cells refuse the second themselves, under this fid's state
+ * lock, with lib9p's own Ebotch: the create refuses a fid that holds
+ * a listing's state or that another create is moving, and the open
+ * refuses to install over a fid a create has moved or is moving.  A
+ * create claims the fid with `moving' before its engine work and
+ * clears it at whichever exit it takes, so exactly one of the two can
+ * win however the two procs interleave; the price is that an open
+ * that arrives while a create that then FAILS holds the claim is
+ * refused as well, which is a client that pipelined the two.  A
+ * second Topen is not this case and is not refused: it leaves the fid
+ * a directory fid, and srvfidgive in the open cell is what gives the
+ * first open's snapshot back before the second's is installed.
+ *
  * The /meta directory row's open and read cells — and the aux a fid
  * of that row carries while it is a directory fid — are the
  * enumeration's too, and are the same two cells: it lists the same
@@ -232,8 +254,8 @@ extern Sfile srvfiles[Nfile];
  * file's own handlers touches aux.
  *
  * `lk' is that state's lock, and it is the one a builder of a row has
- * to hold in mind.  It covers aux, the three cells below it and
- * auxclosed, and every access a handler makes to what aux names is
+ * to hold in mind.  It covers aux, the three cells below it, auxclosed
+ * and `moving', and every access a handler makes to what aux names is
  * under it: the hooks below run under it, so a handler that holds it
  * across a step of its own work — the engine call that appends to a
  * stage, say — is a handler no hook can run in the middle of.  The
@@ -304,13 +326,14 @@ struct Sfid
 	uvlong	qidpath;
 	uvlong	qidvers;
 	Text	*text;		/* the render-at-open snapshot, once open */
-	QLock	lk;		/* over aux, the three cells and auxclosed */
+	QLock	lk;		/* over aux, the three cells, auxclosed, moving */
 	void	*aux;
 	void	(*auxflush)(Sfid*, Req*);
 	void	(*auxclose)(void*);
 	void	(*auxfree)(void*);
 	int	auxclosed;	/* auxclose has run for this state */
 	int	auxbusy;	/* srvauxpoint: a handler is mid-step on it */
+	int	moving;		/* a create cell is moving this fid (above) */
 	Srvctx	*ctx;		/* the registry's, and the hooks' */
 	Sfid	*prev;
 	Sfid	*next;

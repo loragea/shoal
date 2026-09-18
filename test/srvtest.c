@@ -2120,14 +2120,18 @@ Out:
  * created (obj.c).  One fid cannot hold both, and the state a create
  * would drop here is the listing the client is part-way through.
  *
- * It never has to choose, because 9P settles it a message earlier:
- * lib9p refuses a Tcreate on a fid that is already open, with its own
- * string, before any cell of this row is reached.  So the two halves
- * cannot meet on an open fid at all, and what this case pins is that
- * refusal and the listing carrying on from exactly where it was.  The
- * name it creates is a reserved one, which is the name this role may
- * create (§2.1): a name the gate would have refused anyway would make
- * the check pass for the wrong reason.
+ * For a fid whose open has ANSWERED, 9P settles it a message earlier:
+ * lib9p refuses a Tcreate on an open fid from Fid.omode, with its own
+ * string, before any cell of this row is reached.  That is what this
+ * case pins, together with the listing carrying on from exactly where
+ * it was.  The name it creates is a reserved one, which is the name
+ * this role may create (§2.1): a name the gate would have refused
+ * anyway would make the check pass for the wrong reason.
+ *
+ * lib9p's guard does not reach a create pipelined behind an open that
+ * has not answered yet, because the /obj open is offloaded and omode
+ * is set only when it answers; the two cells refuse the second
+ * themselves there, and tpipeopen below is that case.
  *
  * A create on another fid of the same directory is the case that IS
  * allowed, and it moves neither the cursor nor the snapshot -- the
@@ -2226,6 +2230,114 @@ Out:
 	srvfree(ctx);
 	devclose(d);
 	free(m);
+}
+
+/*
+ * A Topen and a Tcreate pipelined on ONE /obj fid, which is the seam
+ * 9P leaves open for this server.  lib9p refuses each of them on an
+ * open fid from Fid.omode, and its `ropen' sets that field only once
+ * the open has ANSWERED — while the /obj open is offloaded to a queue
+ * (srv/enum.c), so a second message sent before that answer passes the
+ * guard and both cells run, on two queue procs at once.
+ *
+ * One fid cannot hold a listing's snapshot and be the created object's
+ * at the same time, so exactly one of the two may win and the other is
+ * refused with lib9p's own `9P protocol botch' — the string lib9p
+ * itself answers wherever it can see the conflict, so a client cannot
+ * tell the two refusals apart.  WHICH of them wins is the two procs'
+ * race and is not the server's to settle; what this case asserts is
+ * that one answer is the operation and the other is the refusal, in
+ * both wire orders.
+ *
+ * §13's `objhold' point is what pipelines them: it parks every queued
+ * request at the head of its handler, so the first is held inside the
+ * pool while the second is sent, and clearing it starts both.
+ */
+static void
+pipeopen(char *what, int createfirst)
+{
+	char *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall t, r;
+	char *w[1];
+	ushort to, tc;
+	int i, ok, botch;
+
+	clstage = what;
+	m = mkmap(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid);
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4)) == nil)
+		return;
+	mkobj(srvstore(ctx), "alpha", nil, 0, 1);
+	w[0] = "obj";
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
+		fail("%s: attach: %s", what, clerr(&r));
+		goto Out;
+	}
+	if(clwalk(&cl, Froot, Ffile, 1, w, &r) != Rwalk){
+		fail("%s: walk /obj: %s", what, clerr(&r));
+		goto Out;
+	}
+	srvhook(ctx, "objhold", 1);
+	to = cltag(&cl);
+	tc = cltag(&cl);
+	for(i = 0; i < 2; i++){
+		memset(&t, 0, sizeof t);
+		t.fid = Ffile;
+		if((i == 0) == (createfirst != 0)){
+			t.type = Tcreate;
+			t.tag = tc;
+			t.name = "shoal.map.9";
+			t.perm = 0666;
+			t.mode = OWRITE;
+		}else{
+			t.type = Topen;
+			t.tag = to;
+			t.mode = OREAD;
+		}
+		clput(&cl, &t);
+		sleep(200);		/* it is parked at the point */
+	}
+	srvhook(ctx, "objhold", 0);
+
+	ok = botch = 0;
+	clgettag(&cl, to, &r);
+	if(r.type == Ropen)
+		ok++;
+	else if(r.type == Rerror && strcmp(r.ename, "9P protocol botch") == 0)
+		botch++;
+	else
+		fail("%s: the open answered: %s", what, clerr(&r));
+	cltagfree(&cl, to);
+	clgettag(&cl, tc, &r);
+	if(r.type == Rcreate)
+		ok++;
+	else if(r.type == Rerror && strcmp(r.ename, "9P protocol botch") == 0)
+		botch++;
+	else
+		fail("%s: the create answered: %s", what, clerr(&r));
+	cltagfree(&cl, tc);
+	eqv("exactly one of the two pipelined requests succeeded", ok, 1);
+	eqv("and the other is lib9p's own botch", botch, 1);
+
+	clclunk(&cl, Ffile, &r);
+	clclunk(&cl, Froot, &r);
+Out:
+	srvhook(ctx, "objhold", 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+static void
+tpipeopen(void)
+{
+	pipeopen("pipeopen: open then create", 0);
+	pipeopen("pipeopen: create then open", 1);
 }
 
 /*
@@ -3746,6 +3858,7 @@ threadmain(int argc, char **argv)
 	tfidstate();
 	tcreategive();
 	tdircreate();
+	tpipeopen();
 	tfidwalk();
 	tflush();
 	tstep7fid();

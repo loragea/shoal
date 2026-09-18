@@ -5705,6 +5705,36 @@ name a half that is not built; each says which.
     succeeds, so the key it chooses travels to the one engine call
     that publishes it and no stage of it exists for step 7 to find.
 
+    **A `Tcreate` and a `Topen` CAN be pipelined on one `/obj` fid,
+    and the cells refuse the second.** `lib9p` refuses each of them on
+    an open fid from `Fid.omode`, which its `ropen` sets only once the
+    open has answered; this server offloads the `/obj` open to a
+    queue, so a `Tcreate` sent behind a `Topen` on the same fid — or a
+    `Topen` sent behind a `Tcreate` — passes that guard and both cells
+    run, on two queue procs at once. Accepting both would move the fid
+    to the created object *and* install a listing's snapshot on it,
+    and `lib9p` would then write the loser's `qid` and mode over the
+    winner's. *Not made; recorded here as what the server does:* the
+    create cell refuses a fid that holds a listing's state or that
+    another create is moving, and the open cell refuses to install
+    over a fid a create has moved or is moving; both answer `lib9p`'s
+    own `9P protocol botch`, which is the string `lib9p` answers when
+    it *can* see the conflict, so a client cannot tell the two
+    refusals apart. The create claims the fid before its first engine
+    call and the open tests that claim under the lock it installs
+    under, so exactly one of the two wins whichever way the procs
+    interleave; an open that arrives while a create that then fails
+    holds the claim is refused too, which is the same client that
+    pipelined the pair. A create that succeeds gives the directory
+    fid's snapshot back through `srvfidgive` — the fid's own hooks,
+    run before the fid is the object's — and a create that fails
+    leaves the fid holding what it held.
+
+    A second `Topen` is not that case and is not refused: it leaves
+    the fid a directory fid, and the open cell's own give-back is
+    what releases the first open's snapshot before the second's is
+    installed.
+
 35. **No currency check is made, so `cur=` is 0 and `ready=` is
     `no`.** layer-a §5.1 serves a `role=client` read only from an
     instance that is (a) the serving primary, (b) past the handoff

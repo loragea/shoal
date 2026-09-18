@@ -276,10 +276,41 @@ objdirflush(Sfid *f, Req *r)			/* f->lk held */
 }
 
 /*
+ * Does this fid hold a listing's state?  obj.c's create cell asks
+ * before it moves the fid: a Tcreate pipelined with a Topen on one
+ * /obj fid reaches both cells, and this is how the create sees that
+ * the open got there first (dat.h).
+ */
+int
+srvobjdirheld(Sfid *f)				/* f->lk held */
+{
+	return f->aux != nil && f->auxfree == objdirfree;
+}
+
+/*
+ * Is this fid still one of the two directory rows', and is it the
+ * open's to write?  A create that has moved the fid to Qobjfile, and
+ * one that is part-way through moving it, are the two answers that
+ * make this open the second request on a fid 9P gives one (dat.h).
+ */
+static int
+objdirfid(Sfid *f)				/* f->lk held */
+{
+	return !f->moving && (f->file == Qobj || f->file == Qmeta);
+}
+
+/*
  * The /obj and /meta open, on the reserved queue.  The fid gives back
  * whatever it was holding first: a fid holds one state, and taking
  * the snapshot without giving the old one back would lose its hooks
  * (dat.h).
+ *
+ * The fid is tested twice against the create cell, before the
+ * give-back and again under the lock that installs: a create claims
+ * the fid before its engine work, so a claim raised after the first
+ * test is caught by the second and the two cells cannot both win.
+ * The give-back that ran in between costs nothing — the create that
+ * raised the claim gives the same state back itself.
  */
 static void
 objdiropenq(Req *r)
@@ -289,6 +320,7 @@ objdiropenq(Req *r)
 	Sfid *f;
 	Objdir *d;
 	Objsnap *sn;
+	int ok;
 
 	if(srvqcheck(r)){
 		srvqdone(r, nil);
@@ -296,6 +328,13 @@ objdiropenq(Req *r)
 	}
 	c = r->srv->aux;
 	f = r->fid->aux;
+	qlock(&f->lk);
+	ok = objdirfid(f);
+	qunlock(&f->lk);
+	if(!ok){
+		srvqdone(r, Ebotch);
+		return;
+	}
 	if((sn = srvsnapopen(c->store, Snaplive, buf, sizeof buf)) == nil){
 		srvqdone(r, buf);
 		return;
@@ -308,6 +347,12 @@ objdiropenq(Req *r)
 	d->sn = sn;
 	srvfidgive(f);
 	qlock(&f->lk);
+	if(!objdirfid(f)){
+		qunlock(&f->lk);
+		objdirfree(d);
+		srvqdone(r, Ebotch);
+		return;
+	}
 	f->aux = d;
 	f->auxflush = objdirflush;
 	f->auxclose = nil;
