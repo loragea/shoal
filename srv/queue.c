@@ -622,6 +622,14 @@ srvqwalkhold(Req *r)
  * this file's, and which windows are worth a point is the handler's
  * (obj.c holds two of the object write path's).  A request answered on
  * the service loop carries no Qreq and cannot be held.
+ *
+ * A background unit is not held here either, although it carries a
+ * Qreq: srvqjob's handler is the caller's own function and calls
+ * nothing in this file, and the flush flag that is one of the two
+ * exits above belongs to a tag — which a unit with no tag can neither
+ * raise nor be named by.  A point that parked one would therefore have
+ * only the clearing to wake it, which is what the shutdown does before
+ * it waits (srv.h).
  */
 void
 srvqhold(Req *r, uvlong *pt)
