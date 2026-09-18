@@ -260,11 +260,14 @@ dcs(char *buf, void *p, long n)
 }
 
 /*
- * One /repl or /rpc operation: the header line, a newline, and the
- * payload where the operation defines one.
+ * One /repl or /rpc operation at a named offset: the header line, a
+ * newline, and the payload where the operation defines one.  Neither
+ * channel gives the offset a meaning — §5.5 and §5.6 ignore it in both
+ * directions — so a case that asserts that sends its own.
  */
 static int
-chanop(Cl *c, ulong fid, char *hdr, void *data, long n, Fcall *r)
+chanopat(Cl *c, ulong fid, vlong off, char *hdr, void *data, long n,
+	Fcall *r)
 {
 	static uchar buf[32*1024];
 	Fcall t;
@@ -279,10 +282,17 @@ chanop(Cl *c, ulong fid, char *hdr, void *data, long n, Fcall *r)
 	t.type = Twrite;
 	t.tag = cltag(c);
 	t.fid = fid;
-	t.offset = 0;
+	t.offset = off;
 	t.count = hn + n;
 	t.data = (char*)buf;
 	return clrpc(c, &t, r);
+}
+
+/* the same at offset 0, which is what a sender writes */
+static int
+chanop(Cl *c, ulong fid, char *hdr, void *data, long n, Fcall *r)
+{
+	return chanopat(c, fid, 0, hdr, data, n, r);
 }
 
 /* a raw Twrite, for the cases about the message rather than the header */
@@ -954,6 +964,17 @@ tcreate(void)
 		eqv("... replaces the copy at the sender's key", oi.ver, 5);
 		eqv("... with a zero-length object", oi.len, 0);
 	}
+
+	/* §5.5 gives /repl no offset either: a Twrite at one applies */
+	hdr = smprint("op=create oid=offs epoch=7 ver=2 wepoch=7 csum=%s", cs);
+	eqs("a /repl operation written at a non-zero offset",
+		chanopat(&cl, Frepl, 8192, hdr, nil, 0, &r) == Rwrite ? "ok"
+		: clerr(&r), "ok");
+	free(hdr);
+	if(statof(st, "offs", &oi) < 0)
+		fail("objstat offs: %r");
+	else
+		eqv("... applies like any other", oi.ver, 2);
 	clclunk(&cl, Frepl, &r);
 	clclunk(&cl, Froot, &r);
 Out:
@@ -1548,7 +1569,8 @@ tchannel(void)
 		eqv("a Tread after the response was delivered", r.count, 0);
 
 	/* the offset is ignored in both directions */
-	if(chanop(&cl, Frpc, "op=meta oid=alpha epoch=7", nil, 0, &r) != Rwrite)
+	if(chanopat(&cl, Frpc, 4096, "op=meta oid=alpha epoch=7", nil, 0, &r)
+		!= Rwrite)
 		fail("a request at a non-zero offset: %s", clerr(&r));
 	if(clread(&cl, Frpc, 4096, 4096, &r) != Rread)
 		fail("a read at a non-zero offset: %s", clerr(&r));
