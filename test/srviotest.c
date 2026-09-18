@@ -1653,14 +1653,22 @@ Out:
 }
 
 /*
- * The sweep against the clunk of the fid it is sweeping.  The sweep
- * runs on a queue proc and holds no reference to a stage, while the
- * clunk runs on the service loop and frees whatever its fid holds, so
- * the two meet on one Sstage: the sweep must be done with a stage
- * before it lets go of the lock the clunk takes.  Both are driven
- * here at once — the clunk is sent while the open that drives the
- * sweep is still in flight — and what is asserted is that the stage
- * is given back exactly once and the server serves on.
+ * The sweep and the clunk of the fid it swept, in that order: §3.6 has
+ * the sweep strip a stage and never free it, because the stage is the
+ * fid's and the clunk behind it is what frees it.  The sweep runs at
+ * the head of the open below, on a queue proc; the clunk that follows
+ * runs on the service loop and takes the same Sstage through the free
+ * hook.  What is asserted is that the stage is given back EXACTLY once
+ * — the clunk's own release finds nothing left to release — and that
+ * the list the sweep unlinked from is whole, which the open of a fresh
+ * fid afterwards is what shows.
+ *
+ * The two are not made to overlap here.  The sweep is inside one hold
+ * of stagelk and holds no reference to a stage past it, so the window
+ * the clunk could land in is the engine call after the unlock, where
+ * what the sweep still holds is a handle of its own and nothing of the
+ * stage; nothing a T1 assertion can tell apart is on the other side of
+ * that.
  */
 static void
 tsweepclunk(void)
@@ -1704,12 +1712,12 @@ tsweepclunk(void)
 	t.fid = Ffile2;
 	t.mode = OREAD;
 	clput(&cl, &t);			/* the sweep runs at the head of this */
-	sleep(100);			/* ... and the clunk lands behind it */
+	sleep(100);			/* ... and has stripped the stage by now */
 	memset(&t, 0, sizeof t);
 	t.type = Tclunk;
 	t.tag = ct = cltag(&cl);
 	t.fid = Ffile;
-	clput(&cl, &t);			/* and this frees the stage it holds */
+	clput(&cl, &t);			/* and this frees the stage it stripped */
 	if(clgettag(&cl, ct, &r) < 0 || r.type != Rclunk)
 		fail("the clunk of the swept fid: %s", clerr(&r));
 	cltagfree(&cl, ct);
