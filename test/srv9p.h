@@ -35,6 +35,17 @@
  * queue is in play, so clgettag collects the one reply a tag is
  * waiting for and holds the others aside; clget then answers those in
  * arrival order, which is the order layer-a §5.4.1 is about.
+ *
+ * A tag is OUTSTANDING from the write of the request carrying it until
+ * its reply comes off the wire, and a reply held aside is one nobody
+ * has claimed yet.  A tag in either state is not free, and this client
+ * refuses to hand it out again — cltagfree says so where it happens,
+ * and cltag skips it.  Without that the reuse would hide the faults
+ * this client exists to catch: a second reply for a tag would be
+ * collected as the next request's answer, and a reply nobody was
+ * waiting for would be freed in silence at the end of the case.  So a
+ * reply for a tag with nothing outstanding fails at once, and a case
+ * that leaves a reply held aside fails when the client is closed.
  */
 
 enum
@@ -44,6 +55,7 @@ enum
 	Clwatchms	= 60*1000,	/* the whole program's budget */
 	Clmaxpend	= 16,		/* replies held aside for later */
 	Clmaxfree	= 64,		/* tags given back and not yet reused */
+	Clmaxtag	= 512,		/* tags run 1..Clmaxtag-1: out[] is by tag */
 };
 
 /*
@@ -79,8 +91,10 @@ struct Cl
 	ushort	tag;		/* the next tag never yet handed out */
 	ushort	freetag[Clmaxfree];
 	int	nfree;
+	uchar	out[Clmaxtag];	/* the reply for this tag has not arrived */
 	Clpend	pend[Clmaxpend];
 	int	npend;
+	int	botch;		/* a reply arrived that nothing was waiting for */
 	int	ended;		/* the service loop has returned */
 };
 
@@ -139,27 +153,63 @@ clerr(Fcall *r)
 	return "ok";
 }
 
+/* is a reply for this tag still to come, or still held aside? */
+static int
+clbusy(Cl *c, ushort tag)
+{
+	int i;
+
+	if(tag < Clmaxtag && c->out[tag])
+		return 1;
+	for(i = 0; i < c->npend; i++)
+		if(c->pend[i].tag == tag)
+			return 1;
+	return 0;
+}
+
 /*
  * A tag nothing is waiting for.  Tags are handed out from the free
  * list first, so a program that gives them back keeps reusing a
  * handful of them and the server's tag handling is exercised rather
- * than merely counted up past.
+ * than merely counted up past — but never one whose reply has not
+ * been accounted for, whatever the free list holds.
  */
 static ushort
 cltag(Cl *c)
 {
-	if(c->nfree > 0)
-		return c->freetag[--c->nfree];
-	if(c->tag == NOTAG)
-		c->tag = 1;
-	return c->tag++;
+	ushort t;
+
+	while(c->nfree > 0){
+		t = c->freetag[--c->nfree];
+		if(!clbusy(c, t))
+			return t;
+	}
+	for(;;){
+		if(c->tag == NOTAG || c->tag >= Clmaxtag)
+			c->tag = 1;
+		t = c->tag++;
+		if(!clbusy(c, t))
+			return t;
+	}
 }
 
-/* the reply carrying this tag has been read: it may be handed out again */
+/*
+ * The reply carrying this tag has been read: it may be handed out
+ * again.  A tag given back while its reply is still outstanding or
+ * still held aside is the error, not something to paper over — the
+ * next request would take it and collect the old reply as its own.
+ */
 static void
 cltagfree(Cl *c, ushort tag)
 {
-	if(tag != NOTAG && c->nfree < nelem(c->freetag))
+	if(tag == NOTAG)
+		return;
+	if(clbusy(c, tag)){
+		fail("%s: tag %ud given back with its reply uncollected",
+			clstage, tag);
+		return;
+	}
+	if(c->nfree < nelem(c->freetag))
 		c->freetag[c->nfree++] = tag;
 }
 
@@ -168,6 +218,13 @@ clput(Cl *c, Fcall *t)
 {
 	int n;
 
+	if(t->tag != NOTAG){
+		if(t->tag >= Clmaxtag)
+			fail("%s: tag %ud is above what this client tracks",
+				clstage, t->tag);
+		else
+			c->out[t->tag] = 1;
+	}
 	n = convS2M(t, c->wbuf, c->msize);
 	if(n <= 0)
 		sysfatal("convS2M: %r");
@@ -178,6 +235,11 @@ clput(Cl *c, Fcall *t)
 /*
  * The next message off the wire, into rbuf.  What r points into stays
  * valid until the next read.
+ *
+ * The tag settles here: a reply carrying one this client has nothing
+ * outstanding for is a second answer to a request, or an answer to
+ * none, and it fails where it arrives rather than being absorbed by
+ * whatever asks next.  The Rversion carries NOTAG, which is nobody's.
  */
 static int
 clrecv(Cl *c, Fcall *r)
@@ -192,6 +254,14 @@ clrecv(Cl *c, Fcall *r)
 	c->rlen = n;
 	if(convM2S(c->rbuf, n, r) != n)
 		sysfatal("convM2S: short message");
+	if(r->tag != NOTAG){
+		if(r->tag >= Clmaxtag || !c->out[r->tag]){
+			c->botch = 1;
+			fail("%s: a reply nothing is waiting for: type %d tag %ud",
+				clstage, r->type, r->tag);
+		}else
+			c->out[r->tag] = 0;
+	}
 	return r->type;
 }
 
@@ -247,6 +317,8 @@ clgettag(Cl *c, ushort tag, Fcall *r)
 			return -1;
 		if(r->tag == tag)
 			return r->type;
+		if(c->botch)		/* it is nobody's: do not wait on more */
+			return -1;
 		if(c->npend >= nelem(c->pend)){
 			fail("%s: %d replies held aside, none for tag %ud",
 				clstage, c->npend, tag);
@@ -349,6 +421,11 @@ clwaitend(Cl *c, int ms)
  * loop must already have ended — clstop is the one that waits for it,
  * and a case that drives the shutdown itself waits with clwaitend and
  * then comes here.
+ *
+ * A reply still held aside is a reply the case never claimed: either
+ * the server sent one nobody asked for, or the case stopped reading
+ * half way through what it pipelined.  Freeing it in silence is how
+ * both go unnoticed, so it is a failure of the case.
  */
 static void
 clclose(Cl *c)
@@ -366,6 +443,8 @@ clclose(Cl *c)
 	free(c->wbuf);
 	free(c->rbuf);
 	c->wbuf = c->rbuf = nil;
+	if(c->npend > 0)
+		fail("%s: %d replies nobody claimed", clstage, c->npend);
 	for(i = 0; i < c->npend; i++)
 		free(c->pend[i].m);
 	c->npend = 0;
@@ -491,20 +570,34 @@ clwstat(Cl *c, ulong fid, Dir *d, Fcall *r)
 }
 
 /*
- * §5.4.1's Tflush.  The reply this waits for is the Rflush; the
- * flushed request's own answer, which the server sends first, is held
- * aside for the clget or clgettag that asserts it.
+ * §5.4.1's Tflush, for a case with nothing else in flight: the Rflush
+ * is the next reply to arrive, and this asserts exactly that.  Waiting
+ * for it by tag instead would hold a wrong-tagged Rflush aside and go
+ * on reading for one that is never coming — the watchdog's whole
+ * budget spent where a failure on the spot belongs.  A case that has a
+ * flushed request still to be answered puts its own Tflush and reads
+ * the two replies in the order §5.4.1 sends them.
  */
 static int
 clflush(Cl *c, ushort oldtag, Fcall *r)
 {
 	Fcall t;
+	ushort tag;
 
 	memset(&t, 0, sizeof t);
 	t.type = Tflush;
-	t.tag = cltag(c);
+	t.tag = tag = cltag(c);
 	t.oldtag = oldtag;
-	return clrpc(c, &t, r);
+	clput(c, &t);
+	if(clget(c, r) < 0)
+		return -1;
+	if(r->tag != tag){
+		fail("%s: the Rflush for tag %ud came back on tag %ud",
+			clstage, tag, r->tag);
+		return -1;
+	}
+	cltagfree(c, tag);
+	return r->type;
 }
 
 static int
