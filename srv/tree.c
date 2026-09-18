@@ -1095,13 +1095,15 @@ mapopenq(Req *r)
 	Srvctx *c;
 
 	c = r->srv->aux;
-	if(srvqcheck(r)){
-		srvqdone(r, nil);
-		return;
-	}
 	while(srvpoint(c, "mapopen") == 1 && !srvqcheck(r))
 		sleep(5);
 	if(srvqcheck(r)){
+		/*
+		 * Held here, still inside the handler, so that the reserved
+		 * queue's flush flag stays raised while the service loop
+		 * prepares another request for that queue (queue.c).
+		 */
+		srvqanyexit(c);
 		srvqdone(r, nil);
 		return;
 	}

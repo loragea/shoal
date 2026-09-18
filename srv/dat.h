@@ -259,13 +259,25 @@ struct Sfid
  * srvqdone marks the request under this lock before it responds and
  * srvqflush holds the lock across reqqueueflush, so exactly one of the
  * two runs (queue.c).
+ *
+ * `pushed' says the request was handed to that Reqqueue.  It is not a
+ * formality: Reqqueue.flush is per QUEUE, raised for the queue's
+ * current request and cleared when its proc takes the next one, so a
+ * request that was prepared here and then answered on the service loop
+ * would otherwise read a flag raised for a stranger and answer itself
+ * `interrupted'.  `running' says the queue's proc is inside the
+ * handler, which is what decides where step 7 runs on a flush, and
+ * `step7' records that it has run, so the two places cannot both do it.
  */
 struct Qreq
 {
 	Srvctx	*ctx;
 	Reqqueue *q;
-	QLock	lk;		/* over done, against srvqflush */
+	QLock	lk;		/* over the four flags, against srvqflush */
 	int	done;		/* srvqdone has taken this request's exit */
+	int	pushed;		/* handed to the queue: its flush flag is ours */
+	int	running;	/* the queue's proc is inside the handler */
+	int	step7;		/* layer-a §5.4.1 step 7 has run for it */
 	void	(*f)(Req*);
 	Sctl	*ctl;		/* the verb row, for a queued ctl write */
 	Cmdbuf	*cb;		/* its parsed line */
@@ -359,6 +371,7 @@ struct Srvctx
 	uvlong	flushhold;	/* srvhook("flushhold") */
 	uvlong	mapopen;	/* srvhook("mapopen") */
 	uvlong	walkhold;	/* srvhook("walkhold") */
+	uvlong	anyexit;	/* srvhook("anyexit") */
 
 	/*
 	 * The background jobs of §9's quiesce: work that is inside the

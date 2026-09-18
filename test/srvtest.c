@@ -2182,7 +2182,7 @@ tanyq(void)
 	Cl cl;
 	Fcall t, r;
 	char *w[1];
-	uvlong np, nd;
+	uvlong np, nd, n7;
 	ushort ta, tb, tf;
 	long n;
 
@@ -2351,6 +2351,62 @@ tanyq(void)
 		fail("the reply that came first, read after it: type %d tag "
 			"%ud", r.type, r.tag);
 	clclunk(&cl, Ffile, &r);
+
+	/*
+	 * The flush flag belongs to the QUEUE, not to a request: it is
+	 * raised for the request the queue's proc is carrying and cleared
+	 * when that proc takes the next one.  A request merely prepared for
+	 * that queue and then answered on the service loop was never the
+	 * queue's, so it must not read the flag — here the first open is
+	 * flushed and held inside its handler, so the flag is still raised
+	 * while the loop prepares and answers the second one.
+	 */
+	srvauxpoint(ctx, 1);
+	srvhook(ctx, "mapopen", 1);
+	srvhook(ctx, "anyexit", 1);
+	if(clwalk1(&cl, Froot, Ffile, "map", &r) != Rwalk)
+		fail("walk /map a fifth time: %s", clerr(&r));
+	memset(&t, 0, sizeof t);
+	t.type = Topen;
+	t.tag = ta = cltag(&cl);
+	t.fid = Ffile;
+	t.mode = OREAD;
+	clput(&cl, &t);
+	sleep(200);			/* held on the reserved queue */
+	memset(&t, 0, sizeof t);
+	t.type = Tflush;
+	t.tag = tf = cltag(&cl);
+	t.oldtag = ta;
+	clput(&cl, &t);
+	sleep(200);			/* flushed, and held inside its handler */
+
+	srvhook(ctx, "mapopen", 2);
+	if(clwalk1(&cl, Froot, Ffile2, "map", &r) != Rwalk)
+		fail("walk /map for a second open: %s", clerr(&r));
+	clopen(&cl, Ffile2, OREAD, &r);
+	checks++;
+	if(r.type != Ropen)
+		fail("an open prepared for a queue whose flush flag is up: %s",
+			clerr(&r));
+	srvauxcount(ctx, &n7, nil, nil);
+	eqv("a request the queue never took runs no step 7", n7, 0);
+	clclunk(&cl, Ffile2, &r);
+
+	srvhook(ctx, "mapopen", 0);
+	srvhook(ctx, "anyexit", 0);
+	checks++;
+	if(clgettag(&cl, ta, &r) != Rerror || strcmp(r.ename, "interrupted") != 0)
+		fail("the held open, released and flushed: type %d %s", r.type,
+			clerr(&r));
+	cltagfree(&cl, ta);
+	checks++;
+	if(clgettag(&cl, tf, &r) != Rflush)
+		fail("the Rflush after it: type %d", r.type);
+	cltagfree(&cl, tf);
+	srvauxcount(ctx, &n7, nil, nil);
+	eqv("the request the queue did take runs step 7", n7, 1);
+	clclunk(&cl, Ffile, &r);
+	srvauxpoint(ctx, 0);
 Out:
 	srvhook(ctx, "mapopen", 0);
 	clstop(&cl);

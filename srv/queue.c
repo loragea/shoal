@@ -201,6 +201,11 @@ srvqpushany(Srvctx *c, Req *r, void (*f)(Req*))
  * to say — a ctl verb parsed on the service loop and run on the queue
  * — can fill the Qreq before the queue proc can see it.  After this
  * call the request is the queue's and nothing here may touch it.
+ *
+ * `pushed' is marked before the push and under the lock the exit reads
+ * it under, because the queue's proc can be inside the handler before
+ * reqqueuepush has returned.  Until it is marked, the queue's flush
+ * flag is not this request's to read (dat.h).
  */
 void
 srvqgo(Srvctx *c, Req *r)
@@ -209,6 +214,9 @@ srvqgo(Srvctx *c, Req *r)
 
 	USED(c);
 	qr = r->aux;
+	qlock(&qr->lk);
+	qr->pushed = 1;
+	qunlock(&qr->lk);
 	reqqueuepush(qr->q, r, qrun);
 }
 
@@ -250,6 +258,14 @@ srvqpush(Srvctx *c, uchar *oid, int oidlen, Req *r, void (*f)(Req*))
  * lib9p before the request answers or it is not made at all.  Either
  * way the Rflush follows, which is all 9P asks of a flush whose
  * request has already been answered.
+ *
+ * A request that carries a Qreq and was never pushed — prepared for a
+ * queue and answered on the service loop after all, which queue.c's
+ * head blesses — is not the queue's to flush either: reqqueueflush
+ * would not find it running, would find nothing to unlink, and would
+ * answer it `interrupted' behind the back of the loop that is
+ * answering it.  The loop is this proc, so the two cannot really
+ * overlap; `pushed' says so rather than leaving it to be re-derived.
  */
 void
 srvqflush(Req *r)
@@ -262,7 +278,7 @@ srvqflush(Req *r)
 	}
 	qhold(qr->ctx, nil, &qr->ctx->flushhold);
 	qlock(&qr->lk);
-	if(!qr->done)
+	if(!qr->done && qr->pushed)
 		reqqueueflush(qr->q, r->oldreq);
 	qunlock(&qr->lk);
 	respond(r, nil);
@@ -306,6 +322,21 @@ srvqcheck(Req *r)
 		return 0;
 	qhold(qr->ctx, qr, &qr->ctx->hold);
 	return qr->q->flush != 0;
+}
+
+/*
+ * The point that keeps the reserved queue's flush flag raised: an
+ * offloaded request that has found itself flushed is held here, before
+ * it leaves through srvqdone, so its proc is still inside the handler
+ * and has not looped round to clear the flag.  That is the one window
+ * in which the loop can prepare a second request for that queue while
+ * the flag of the first is still up, which is what a request that was
+ * never pushed must not read.
+ */
+void
+srvqanyexit(Srvctx *c)
+{
+	qhold(c, nil, &c->anyexit);
 }
 
 /*
@@ -424,10 +455,19 @@ srvqdone(Req *r, char *err)
 		 * under the same lock: a Tflush that arrives after this
 		 * takes the Rflush alone (srvqflush), and one that got in
 		 * first is seen here.
+		 *
+		 * The flag is the QUEUE's, raised for the request its proc
+		 * is carrying and cleared when that proc takes the next one,
+		 * so it says nothing about a request the queue never took:
+		 * without `pushed' a request prepared for a queue and
+		 * answered on the loop reads whatever flag the queue's own
+		 * current request left raised, and answers itself
+		 * `interrupted' with step 7 run on a fid whose stage the
+		 * client still owns.
 		 */
 		qlock(&qr->lk);
 		qr->done = 1;
-		flushed = qr->q->flush != 0;
+		flushed = qr->pushed && qr->q->flush != 0;
 		qunlock(&qr->lk);
 		if(flushed || srvintr(err)){
 			srvstep7(r);
@@ -500,6 +540,8 @@ srvhook(Srvctx *c, char *name, uvlong n)
 		c->mapopen = n;
 	else if(strcmp(name, "walkhold") == 0)
 		c->walkhold = n;
+	else if(strcmp(name, "anyexit") == 0)
+		c->anyexit = n;
 	qunlock(&c->holdlk);
 }
 
@@ -519,6 +561,7 @@ srvholdclear(Srvctx *c)
 	c->flushhold = 0;
 	c->mapopen = 0;
 	c->walkhold = 0;
+	c->anyexit = 0;
 	qunlock(&c->holdlk);
 }
 

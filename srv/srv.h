@@ -225,6 +225,13 @@ void	srvcount(Srvctx*, uvlong *pushed, uvlong *done);
  *		answers it on the service loop after all.  It is how a
  *		test drives the offload path before a row of the tree
  *		really needs one.
+ *	anyexit	n != 0 holds an offloaded request that has found itself
+ *		flushed, before it leaves through srvqdone.  Its proc is
+ *		then still inside the handler and has not looped round to
+ *		clear the reserved queue's flush flag, which is the one
+ *		window in which the loop can prepare a second request for
+ *		that queue while the first one's flag is up — and a
+ *		request that was never pushed must not read it.
  *	walkhold
  *		n != 0 holds a queued walk that moves its fid at the
  *		commit: after the fid's old state has been given back and
