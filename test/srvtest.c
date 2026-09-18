@@ -242,6 +242,26 @@ mkobj(Store *s, char *name, void *data, long n, uvlong ver)
 		fail("objwrite %s: %r", name);
 }
 
+/*
+ * What a role=client operation on this id is answered with.  §5.1 and
+ * §5.4 step 1 serve a client only from the object's serving primary,
+ * and this map places with two instances on one node, so which of them
+ * an id lands on is HRW's answer (§4.3) and not this case's: an id
+ * placed elsewhere is layer-a §2.6's `not primary' with that iid in
+ * the detail, and one placed here is served.
+ */
+static char*
+clientwant(Srvctx *ctx, char *oid, char *buf, int nbuf)
+{
+	Cinst *p;
+
+	p = mapprimary(srvmap(ctx), oid);
+	if(p != nil && strcmp(p->iid, srviid(ctx)) == 0)
+		return "ok";
+	snprint(buf, nbuf, "not primary: %s", p != nil ? p->iid : "");
+	return buf;
+}
+
 static int
 objinfoof(Store *s, char *name, Objinfo *oi)
 {
@@ -562,7 +582,7 @@ tmatrix(void)
 	if((ctx = startsrv(d, m, 4)) == nil)
 		return;
 	clstart(&cl, ctx, Clmsize);
-	for(role = 0; role < 3; role++){
+	for(role = 2; role >= 0; role--){
 		if(clattach(&cl, Froot, anames[role], &r) != Rattach){
 			fail("attach %s: %s", anames[role],
 				r.type == Rerror ? r.ename : "?");
@@ -629,8 +649,11 @@ tmatrix(void)
 /*
  * The same matrix over the three operations that are not walk and
  * open: §2.4's create in /obj, remove of /obj/<oid> and wstat of one.
- * Each is gated on the row's write column and then answers the local
- * `not built', because §2.4's content is the object-I/O surface's.
+ * Each is gated on the row's write column; what a role=client
+ * operation is then answered is §2.4's own and depends on where the
+ * map places the id (clientwant), while the other two roles never
+ * reach the content at all.  The roles run in reverse order because
+ * the client's half may remove the object the other two walk to.
  */
 static void
 tmodes(void)
@@ -647,11 +670,11 @@ tmodes(void)
 	 * `alpha' are not.
 	 */
 	static char *want[3] = {
-		"shoalsrv: not built",
+		nil,			/* clientwant's, per id */
 		"permission denied",
 		"permission denied",
 	};
-	char what[64], *m;
+	char what[64], buf[64], *m;
 	Srvctx *ctx;
 	Dev *d;
 	Cl cl;
@@ -677,7 +700,8 @@ tmodes(void)
 			fail("walk /obj: %s", clerr(&r));
 		clcreate(&cl, Ffile, "newobj", 0666, OWRITE, &r);
 		snprint(what, sizeof what, "create in /obj as %s", anames[role]);
-		clerris(what, &r, want[role]);
+		clerris(what, &r, role == 0 ?
+			clientwant(ctx, "newobj", buf, sizeof buf) : want[role]);
 		clclunk(&cl, Ffile, &r);
 
 		/*
@@ -692,10 +716,12 @@ tmodes(void)
 		dir.length = 4096;
 		clwstat(&cl, Ffile2, &dir, &r);
 		snprint(what, sizeof what, "wstat /obj/alpha as %s", anames[role]);
-		clerris(what, &r, want[role]);
+		clerris(what, &r, role == 0 ?
+			clientwant(ctx, "alpha", buf, sizeof buf) : want[role]);
 		clremove(&cl, Ffile2, &r);
 		snprint(what, sizeof what, "remove /obj/alpha as %s", anames[role]);
-		clerris(what, &r, want[role]);
+		clerris(what, &r, role == 0 ?
+			clientwant(ctx, "alpha", buf, sizeof buf) : want[role]);
 		clclunk(&cl, Ffile, &r);
 		clclunk(&cl, Froot, &r);
 	}
@@ -1422,13 +1448,14 @@ Out:
 /*
  * The object rows' gate, layer-a §2.1 and §6.4: the operator rule and
  * its reserved-id exemption, and the fence with the one read §2.1 lets
- * through it.  Every answer below that is not a refusal is the local
- * `not built', because §2.4's content is the object-I/O surface's.
+ * through it.  What the gate lets through is §2.4's content, which
+ * answers it: this case is about which operations reach that far, and
+ * srviotest is about what they do when they get there.
  */
 static void
 tobjgate(void)
 {
-	char *m;
+	char cbuf[64], *m;
 	Srvctx *ctx;
 	Dev *d;
 	Cl cl;
@@ -1456,7 +1483,7 @@ tobjgate(void)
 		"permission denied");
 	/* … except for §1.1's reserved ids, which it may create and write */
 	clcreate(&cl, Ffile, "shoal.map.8", 0666, OWRITE, &r);
-	clerris("admin create of a reserved id", &r, "shoalsrv: not built");
+	clerris("admin create of a reserved id", &r, "ok");
 	clclunk(&cl, Ffile, &r);
 
 	w[0] = "obj";
@@ -1466,21 +1493,26 @@ tobjgate(void)
 	clopen(&cl, Ffile, OWRITE, &r);
 	clerris("admin open of an unreserved object for writing", &r,
 		"permission denied");
-	clopen(&cl, Ffile, OREAD, &r);
-	clerris("admin open of an unreserved object for reading", &r,
-		"shoalsrv: not built");
-	/* ORCLOSE is the remove §2.1 refuses, one message earlier */
-	clopen(&cl, Ffile, OREAD|ORCLOSE, &r);
+	/*
+	 * ORCLOSE is the remove §2.1 refuses, one message earlier — asked
+	 * on a fid of its own, because an open that succeeds leaves the
+	 * fid open and 9P admits no second open of one.
+	 */
+	if(clwalk(&cl, Froot, Ffile2, 2, w, &r) != Rwalk)
+		fail("walk /obj/alpha again: %s", clerr(&r));
+	clopen(&cl, Ffile2, OREAD|ORCLOSE, &r);
 	clerris("admin open of an unreserved object for reading with ORCLOSE",
 		&r, "permission denied");
+	clclunk(&cl, Ffile2, &r);
+	clopen(&cl, Ffile, OREAD, &r);
+	clerris("admin open of an unreserved object for reading", &r, "ok");
 	clclunk(&cl, Ffile, &r);
 
 	w[1] = "shoal.map.7";
 	if(clwalk(&cl, Froot, Ffile, 2, w, &r) != Rwalk)
 		fail("walk /obj/shoal.map.7: %s", clerr(&r));
 	clopen(&cl, Ffile, OWRITE, &r);
-	clerris("admin open of a reserved object for writing", &r,
-		"shoalsrv: not built");
+	clerris("admin open of a reserved object for writing", &r, "ok");
 	clclunk(&cl, Ffile, &r);
 
 	/* the fence, and §2.1's sole exemption from it */
@@ -1495,18 +1527,19 @@ tobjgate(void)
 	w[1] = "shoal.map.7";
 	if(clwalk(&cl, Froot, Ffile, 2, w, &r) != Rwalk)
 		fail("walk /obj/shoal.map.7 while fenced: %s", clerr(&r));
-	clopen(&cl, Ffile, OREAD, &r);
-	clerris("fenced admin read of a reserved id", &r,
-		"shoalsrv: not built");
-	clopen(&cl, Ffile, OWRITE, &r);
+	if(clwalk(&cl, Froot, Ffile2, 2, w, &r) != Rwalk)
+		fail("walk /obj/shoal.map.7 again: %s", clerr(&r));
+	clopen(&cl, Ffile2, OWRITE, &r);
 	clerris("fenced admin write of a reserved id", &r, "fenced");
+	clclunk(&cl, Ffile2, &r);
+	clopen(&cl, Ffile, OREAD, &r);
+	clerris("fenced admin read of a reserved id", &r, "ok");
 	clclunk(&cl, Ffile, &r);
 	w[0] = "meta";
 	if(clwalk(&cl, Froot, Ffile, 2, w, &r) != Rwalk)
 		fail("walk /meta/shoal.map.7 while fenced: %s", clerr(&r));
 	clopen(&cl, Ffile, OREAD, &r);
-	clerris("fenced admin read of a reserved id through /meta", &r,
-		"shoalsrv: not built");
+	clerris("fenced admin read of a reserved id through /meta", &r, "ok");
 	clclunk(&cl, Ffile, &r);
 	w[0] = "obj";
 	w[1] = "alpha";
@@ -1554,14 +1587,14 @@ tobjgate(void)
 		fail("walk /obj as client: %s", clerr(&r));
 	clcreate(&cl, Ffile, "brandnew", 0666, OWRITE, &r);
 	clerris("client create of an id that is not reserved", &r,
-		"shoalsrv: not built");
+		clientwant(ctx, "brandnew", cbuf, sizeof cbuf));
 	clclunk(&cl, Ffile, &r);
 	w[1] = "alpha";
 	if(clwalk(&cl, Froot, Ffile, 2, w, &r) != Rwalk)
 		fail("walk /obj/alpha as client: %s", clerr(&r));
 	clopen(&cl, Ffile, OWRITE, &r);
 	clerris("client open of an object for writing", &r,
-		"shoalsrv: not built");
+		clientwant(ctx, "alpha", cbuf, sizeof cbuf));
 	clclunk(&cl, Ffile, &r);
 	clclunk(&cl, Froot, &r);
 Out:
@@ -1577,9 +1610,8 @@ Out:
  * through /obj or /meta, every /repl and /rpc operation" — and the
  * operator fence can go on while a fid is open.  So a Tread and a
  * Twrite are gated by the row exactly as an open is, and the two
- * channel rows are gated at all.  The write that the fence refuses
- * here is one that succeeds without it: the cell point gives
- * /obj/<oid> a write cell, since §2.4's own is not built.
+ * channel rows are gated at all.  The write the fence refuses here is
+ * one that succeeds without it, which is §2.4's own write cell.
  */
 static void
 tiogate(void)
@@ -1626,8 +1658,7 @@ tiogate(void)
 	if(clopenpath(&cl, Froot, Ffile2, 2, w, OREAD, &r) != Ropen)
 		fail("open /obj/alpha for reading: %s", clerr(&r));
 	clread(&cl, Ffile2, 0, 16, &r);
-	clerris("an admin read of an object while unfenced", &r,
-		"shoalsrv: not built");
+	clerris("an admin read of an object while unfenced", &r, "ok");
 
 	if(clwrite(&cl, Fctl, 0, "fence on", &r) != Rwrite)
 		fail("fence on: %s", clerr(&r));
@@ -1719,8 +1750,7 @@ tdown(char *status, char *up)
 	if(clwalk(&cl, Froot, Ffile, 2, w, &r) != Rwalk)
 		fail("walk /obj/alpha as admin: %s", clerr(&r));
 	clopen(&cl, Ffile, OREAD, &r);
-	clerris("an admin read on the same instance", &r,
-		"shoalsrv: not built");
+	clerris("an admin read on the same instance", &r, "ok");
 	clclunk(&cl, Ffile, &r);
 
 	/*

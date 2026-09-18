@@ -101,12 +101,20 @@ struct Cl
 static int clwdstop;
 static char *clstage = "starting";
 
+/*
+ * The whole program's budget.  Clwatchms is what a program gets if it
+ * says nothing; one whose run is longer sets this before clwatchon,
+ * since a watchdog that fires on a working test is a failure of the
+ * test and not of the server.
+ */
+static int clwatchms = Clwatchms;
+
 static void
 clwatch(void*)
 {
 	int i;
 
-	for(i = 0; i < Clwatchms/50; i++){
+	for(i = 0; i < clwatchms/50; i++){
 		if(clwdstop)
 			threadexits(nil);
 		sleep(50);
