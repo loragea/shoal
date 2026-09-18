@@ -511,16 +511,19 @@ stagenew(Srvctx *c, Sfid *f, int kind, uchar *oid, int oidlen, uvlong ver,
 	 * (§3.6), and a client operation continues nothing.  A stage that
 	 * is still live does stand in the way: one to a fid.
 	 *
-	 * So does a stage another queue proc is inside an engine call
-	 * THROUGH, dead or not (store.md §14(45)): the handle it holds is
-	 * that call's argument, and this is the only place the SLOT is
-	 * taken from under such a stage — which would leave the look that
-	 * is going to release the handle nothing to find.  Nothing on the
-	 * wire reaches that today: a fid whose stage is busy is one
-	 * mid-transfer, and every chunk on it goes through srvstagemore,
-	 * which answers one whose stage is dead and busy without ever
-	 * asking for a new stage.  The guard is here because the rule
-	 * belongs to the stage rather than to one of its callers.
+	 * So does a stage another queue proc is inside a STEP on, dead or
+	 * not (store.md §14(45)): that step ends in a look of its own, and
+	 * this is the only place the SLOT is taken from under such a stage
+	 * — which would leave that look nothing to find.  `busy' alone
+	 * says so, handle or not: the opening chunk of a transfer is busy
+	 * from here until the arm that fills `g', with stageopen running in
+	 * between under no lock, and a stage freed in that window is armed
+	 * and looked at after it has gone.  Nothing on the wire reaches
+	 * that today: a fid whose stage is busy is one mid-transfer, and
+	 * every chunk on it goes through srvstagemore, which answers one
+	 * whose stage is dead and busy without ever asking for a new stage.
+	 * The guard is here because the rule belongs to the stage rather
+	 * than to one of its callers.
 	 */
 	qlock(&f->lk);
 	old = f->aux;
@@ -544,8 +547,7 @@ stagenew(Srvctx *c, Sfid *f, int kind, uchar *oid, int oidlen, uvlong ver,
 	inuse = 0;
 	if(old != nil){
 		qlock(&c->stagelk);
-		inuse = (!old->dead && !old->released)
-			|| (old->busy && old->g != nil);
+		inuse = (!old->dead && !old->released) || old->busy;
 		qunlock(&c->stagelk);
 	}
 	if(inuse){
@@ -620,7 +622,7 @@ stagelive(Srvctx *c, Sfid *f, Sstage *s, Req *r)
 {
 	int ok;
 
-	srvqhold(r, &c->lookhold);
+	srvqhold(r, &c->lookhold, nil);
 	qlock(&f->lk);
 	qlock(&c->stagelk);
 	ok = f->aux == s && !s->dead && !s->released;
@@ -787,10 +789,19 @@ srvstagecount(Srvctx *c, uvlong *live, uvlong *done, uvlong *openat)
  * point above takes the same care for the same reason).  `busy' is
  * kept SET across the arm and stays set until the caller's look:
  * a handler between two steps of one chunk is not an absence of
- * arrivals (§3.6).
+ * arrivals (§3.6).  It is set from the stage below, so the whole of
+ * that window is a stage nobody else may take the slot from — the
+ * stage is in the slot and the handle is not in it yet, and a stage
+ * freed here is one this function arms and the caller looks at after
+ * it has gone.
+ *
+ * §13's point over exactly that window (srv.h's openhold) is held
+ * with no lock of the fid's or the stage list's, the stage call having
+ * returned, so the service loop is free to perform step 7 on this fid
+ * across it.
  */
 Stage*
-srvstagefull(Srvctx *c, Sfid *f, uchar *oid, int oidlen, uvlong flen,
+srvstagefull(Req *r, Srvctx *c, Sfid *f, uchar *oid, int oidlen, uvlong flen,
 	int force, uvlong ver, uvlong wepoch, uvlong off, long n, Sstage **sp,
 	char *buf, int nbuf, char **err)
 {
@@ -805,6 +816,7 @@ srvstagefull(Srvctx *c, Sfid *f, uchar *oid, int oidlen, uvlong flen,
 	s->flen = flen;
 	s->force = force;
 	qunlock(&c->stagelk);
+	srvqhold(r, &c->openhold, &c->openheld);
 	if((g = stageopen(c->store, oid, oidlen, flen, force)) == nil){
 		*err = srverr(buf, nbuf);
 		stagedone(f, s);
@@ -845,15 +857,17 @@ srvstagefull(Srvctx *c, Sfid *f, uchar *oid, int oidlen, uvlong flen,
  * (store.md §14(44)).
  *
  * With one exemption, the flush hook's own (store.md §14(45)): a dead
- * stage another queue proc is inside an engine call THROUGH is left
- * where it is.  This runs on a chunk naming a SECOND object, which
- * hashes to another queue and so runs beside the chunk that is inside
- * stagewrite with this stage's handle — and taking the stage here
- * would free that handle under the call.  The refusal is answered all
- * the same; what §14(44) asks of it, that the dead stage leave the
- * slot before the next transfer, is done a moment later by the busy
- * chunk's own look (srvstagelive below), which is the one place the
- * handle of a busy stage is ever released.
+ * stage another queue proc is inside a STEP on is left where it is.
+ * This runs on a chunk naming a SECOND object, which hashes to another
+ * queue and so runs beside a chunk that is inside stageopen or
+ * stagewrite on this stage — and taking it here would free the handle
+ * under the write, or free the stage itself under the arm that is
+ * about to store the handle in it.  The refusal is answered all the
+ * same; what §14(44) asks of it, that the dead stage leave the slot
+ * before the next transfer, is done a moment later by that chunk
+ * itself: its look when the write returns (srvstagelive below), or,
+ * for an opening chunk, the give-back behind an arm that finds the
+ * stage already gone (srvstagefull above).
  */
 Stage*
 srvstagemore(Srvctx *c, Sfid *f, uchar *oid, int oidlen, uvlong flen,
@@ -881,7 +895,7 @@ srvstagemore(Srvctx *c, Sfid *f, uchar *oid, int oidlen, uvlong flen,
 	qlock(&c->stagelk);
 	if(s->dead || s->released){
 		dead = 1;
-		inside = s->busy && s->g != nil;
+		inside = s->busy;
 	}else if(s->kind != Stfull || s->oidlen != oidlen
 	|| memcmp(s->oid, oid, oidlen) != 0)
 		*err = Ediskfull;
@@ -1159,7 +1173,7 @@ objwriteq(Req *r)
 	 * fid takes the stage out from under it, and the look is what turns
 	 * that into an answer instead of a commit (srv.h's objprelook).
 	 */
-	srvqhold(r, &c->prelookhold);
+	srvqhold(r, &c->prelookhold, nil);
 	if((e = replicate(c, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
 		stagedone(f, s);
 		srvqdone(r, e);
@@ -1170,7 +1184,7 @@ objwriteq(Req *r)
 		srvqdone(r, Estagegone);
 		return;
 	}
-	srvqhold(r, &c->stagehold);
+	srvqhold(r, &c->stagehold, nil);
 	/*
 	 * The bytes are the Req's and the key is the stage's.  lib9p keeps
 	 * the Req's buffer until this handler responds, so a step 7 that
@@ -1302,7 +1316,7 @@ objopenq(Req *r)
 			 * request on this fid strips the stage while it does
 			 * (srv.h's objarm).
 			 */
-			srvqhold(r, &c->armhold);
+			srvqhold(r, &c->armhold, nil);
 			stagepointarm(c, s, stageopen(c->store, f->oid,
 				f->oidlen, 0, 0));
 		}

@@ -409,6 +409,94 @@ waitpush(Srvctx *ctx, uvlong np0, uvlong n, uvlong *np, uvlong *nd)
 }
 
 /*
+ * Wait until `n' requests have reached a named point (srv.h's
+ * srvheld).  A case built around a window waits here rather than
+ * sleeping: what it needs is the request PARKED, and a sleep long
+ * enough on one machine is a wedge or a silent pass on the next.
+ */
+static void
+waitheld(Srvctx *ctx, char *name, uvlong n)
+{
+	int i;
+
+	for(i = 0; i < 400; i++){
+		if(srvheld(ctx, name) >= n)
+			return;
+		sleep(5);
+	}
+	fail("no request reached the %s point", name);
+}
+
+/*
+ * Are these two oids on different queues of the pool?  A case that
+ * needs one request running while another is parked needs two that
+ * hash apart: operations on ONE oid are serialized (store.md §7), so
+ * a case that picked two of the same queue would not fail, it would
+ * wait out the watchdog.  The hash is this server's own and free to
+ * change (queue.c), so the case asks rather than assumes.
+ */
+static int
+apart(Srvctx *ctx, char *a, char *b)
+{
+	if(srvqindex(ctx, (uchar*)a, strlen(a))
+	== srvqindex(ctx, (uchar*)b, strlen(b))){
+		fail("%s and %s share a queue: the case needs two", a, b);
+		return 0;
+	}
+	return 1;
+}
+
+/* one chunk pushed to /repl without waiting for its answer */
+static ushort
+pushchunk(Cl *cl, char *hdr, void *data, long n)
+{
+	Fcall t;
+	long hn;
+
+	memset(&t, 0, sizeof t);
+	t.type = Twrite;
+	t.tag = cltag(cl);
+	t.fid = Frepl;
+	hn = strlen(hdr);
+	t.count = hn + 1 + n;
+	if((t.data = malloc(t.count)) == nil)
+		sysfatal("malloc: %r");
+	memmove(t.data, hdr, hn);
+	t.data[hn] = '\n';
+	if(n > 0)
+		memmove(t.data + hn + 1, data, n);
+	clput(cl, &t);
+	free(t.data);
+	return t.tag;
+}
+
+/*
+ * What /status reports staged, over an admin attach of its own: the
+ * grains the process holds reserved (store.md §14(43)).  A reservation
+ * nothing gives back is the cost of a stage freed under its own
+ * handler, and this is where it shows.
+ */
+static char*
+statstaged(Cl *cl)
+{
+	static char val[64];
+	char buf[8192];
+	Fcall r;
+
+	if(clattach(cl, Frepl2, Nadmin, &r) != Rattach)
+		return "no attach";
+	if(clwalk1(cl, Frepl2, Frpc2, "status", &r) != Rwalk
+	|| clopen(cl, Frpc2, OREAD, &r) != Ropen)
+		return "no open";
+	if(clslurp(cl, Frpc2, buf, sizeof buf) < 0)
+		return "no read";
+	clfield(buf, "staged", val, sizeof val);
+	clclunk(cl, Frpc2, &r);
+	clclunk(cl, Frepl2, &r);
+	return val;
+}
+
+/*
  * The two fids every case wants: /repl under role=repl and /rpc under
  * the same attach.  Answers 0 when either could not be had.
  */
@@ -1685,6 +1773,124 @@ Out:
 }
 
 /*
+ * The same two actors over a stage that is busy before it holds
+ * ANYTHING: srvstagefull makes the stage, then calls stageopen with no
+ * lock held, so through that window the slot holds a stage marked
+ * `busy' whose `g' is still nil (obj.c).  §14(44) and §14(45) hold
+ * there too, and for a sharper reason — what a refusal would take out
+ * of the slot is not just the handle a call is using but the Sstage
+ * the opening chunk is about to arm and look at, so the chunk would
+ * arm a stage that had been freed under it and its own look would
+ * release nothing.  The transfer's reservation then outlives the
+ * process, which is what /status's staged= shows.
+ *
+ * `openhold' parks a chunk in exactly that window (srv.h).
+ */
+static void
+tstageopen(void)
+{
+	char *m, cs[Csumhexlen], ck[Csumhexlen], d0[2*Blkdlen+1];
+	char *h0, *h1, *hk;
+	uchar want[3*Tblksz];
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall tf, r;
+	uvlong live, done, openat, np0, nd0, np, nd;
+	ushort ta1, ta2, ft;
+	int i;
+
+	clstage = "stageopen";
+	m = mkmap();
+	d = newdisk(Tnslots, nil);
+	if((ctx = startsrv(d, m, 0, 60000)) == nil)	/* no idle sweep */
+		return;
+	for(i = 0; i < sizeof want; i++)
+		want[i] = i*11 + 5;
+	ocsum(cs, want, sizeof want);
+	ocsum(ck, want, Tblksz);
+	dcs(d0, want, Tblksz);
+	clstart(&cl, ctx, Clmsize);
+	if(!chopen(&cl, ctx, Nrepl, Froot, Frepl, ~0UL))
+		goto Out;
+	if(!apart(ctx, "alpha", "kappa"))
+		goto Out;
+	h0 = smprint("op=full oid=alpha epoch=7 ver=3 wepoch=7 len=%d off=0"
+		" n=%d dcsum=%s csum=%s final=0", 3*Tblksz, Tblksz, d0, cs);
+	h1 = smprint("op=full oid=alpha epoch=7 ver=3 wepoch=7 len=%d off=%d"
+		" n=%d dcsum=%s csum=%s final=0", 3*Tblksz, Tblksz, Tblksz, d0,
+		cs);
+	hk = smprint("op=full oid=kappa epoch=7 ver=3 wepoch=7 len=%d off=0"
+		" n=%d dcsum=%s csum=%s final=0", Tblksz, Tblksz, d0, ck);
+
+	waitidle(ctx, &np0, &nd0);
+	srvhook(ctx, "openhold", 1);
+
+	/* the opening chunk, parked with the stage made and `g' still nil */
+	ta1 = pushchunk(&cl, h0, want, Tblksz);
+	waitpush(ctx, np0, 1, &np, &nd);
+	waitheld(ctx, "openhold", 1);
+	srvstagecount(ctx, &live, &done, nil);
+	eqv("the opening chunk's stage is already the fid's", live, 1);
+	eqv("... and nothing has been released", done, 0);
+
+	/* a sibling queued behind it on the same object's queue, flushed */
+	ta2 = pushchunk(&cl, h1, want, Tblksz);
+	waitpush(ctx, np0, 2, &np, &nd);
+	memset(&tf, 0, sizeof tf);
+	tf.type = Tflush;
+	tf.tag = ft = cltag(&cl);
+	tf.oldtag = ta2;
+	clput(&cl, &tf);
+	if(clgettag(&cl, ta2, &r) < 0)
+		fail("no answer to the flushed sibling chunk");
+	else
+		eqs("the flushed sibling chunk", clerr(&r), "interrupted");
+	cltagfree(&cl, ta2);
+	if(clgettag(&cl, ft, &r) != Rflush)
+		fail("no Rflush: %s", clerr(&r));
+	cltagfree(&cl, ft);
+	srvstagecount(ctx, &live, &done, &openat);
+	eqv("step 7 marks the opening chunk's stage dead", done, 1);
+	eqv("... and has no handle to park", srvstagepend(ctx), 0);
+
+	/* the chunk for a second object, refused on another queue */
+	eqs("a chunk naming a second object, over an opening stage",
+		repler(&cl, Frepl, hk, want, Tblksz), "shoalsrv: stage expired");
+	srvstagecount(ctx, &live, &done, nil);
+	eqv("its refusal gives nothing back a second time", done, 1);
+
+	/* the opening chunk's own give-back, behind an arm that finds it gone */
+	srvhook(ctx, "openhold", 0);
+	if(clgettag(&cl, ta1, &r) < 0)
+		fail("no answer to the opening chunk");
+	else
+		eqs("the opening chunk", clerr(&r), "shoalsrv: stage expired");
+	cltagfree(&cl, ta1);
+	srvstagecount(ctx, &live, &done, &openat);
+	eqv("the slot is clear", live, 0);
+	eqv("the stage was given back exactly once", done, 1);
+	eqv("... with the store open", openat, 1);
+	eqv("and the handle it had taken went to the drain",
+		srvstagepend(ctx), 1);
+	eqs("so the transfer leaves no reservation behind",
+		statstaged(&cl), "0");
+	eqs("and the fid takes a fresh transfer",
+		repler(&cl, Frepl, h0, want, Tblksz), "ok");
+	free(h0);
+	free(h1);
+	free(hk);
+	clclunk(&cl, Frepl, &r);
+	clclunk(&cl, Froot, &r);
+Out:
+	srvhook(ctx, "openhold", 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * §5.6's channel rules: one outstanding request per fid, a response
  * prepared at Twrite time and delivered by exactly one Tread, and a
  * read with nothing buffered answering count 0.
@@ -2400,6 +2606,7 @@ threadmain(int argc, char **argv)
 	tstagemax();
 	tstagelife();
 	tstagebusy();
+	tstageopen();
 	tchannel();
 	trpcops();
 	tdropdiscard();

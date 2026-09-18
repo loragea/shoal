@@ -861,9 +861,9 @@ replfullq(Req *r, Srvctx *c, Sfid *f, Hdr *h)
 			srvqdone(r, e);
 			return;
 		}
-		if((g = srvstagefull(c, f, h->oid, h->oidlen, h->len, h->force,
-			h->ver, h->wepoch, h->off, h->n, &s, buf, sizeof buf,
-			&e)) == nil){
+		if((g = srvstagefull(r, c, f, h->oid, h->oidlen, h->len,
+			h->force, h->ver, h->wepoch, h->off, h->n, &s, buf,
+			sizeof buf, &e)) == nil){
 			srvqdone(r, e);
 			return;
 		}
@@ -878,7 +878,7 @@ replfullq(Req *r, Srvctx *c, Sfid *f, Hdr *h)
 	 * the service loop performs step 7 for this fid under the first of
 	 * them (srv.h).
 	 */
-	srvqhold(r, &c->fullhold);
+	srvqhold(r, &c->fullhold, &c->fullheld);
 	rc = 0;
 	buf[0] = 0;
 	if(h->n > 0 && (rc = stagewrite(g, h->data, h->n, h->off)) < 0)

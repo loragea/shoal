@@ -391,6 +391,18 @@ int	srvjobcount(Srvctx*);	/* jobs held: what the shutdown waits for */
  *		(obj.c).  The hold is taken with no lock held, the stage
  *		call having returned, so the service loop is free to
  *		perform step 7 on that fid across it.
+ *	openhold
+ *		n != 0 holds the OPENING chunk of an op=full transfer
+ *		between the stage it made and the stageopen that fills the
+ *		handle (obj.c's srvstagefull).  Through that window the
+ *		fid's stage is in the slot and marked `busy' with no handle
+ *		in it yet, which is the state the two actors above must
+ *		leave alone as surely as they leave a stage mid-write alone:
+ *		a stage taken from under an opening chunk is one the arm and
+ *		the look behind it reach after it has been freed.  Like
+ *		fullhold it is taken with no lock held, so the service loop
+ *		performs step 7 on that fid across it, and srvheld below is
+ *		how a test waits for a chunk to reach it.
  *	flushhold
  *		n != 0 holds a Tflush of a pooled request between the
  *		lookup that found it and the flush itself, which is the
@@ -422,13 +434,34 @@ int	srvjobcount(Srvctx*);	/* jobs held: what the shutdown waits for */
 void	srvhook(Srvctx*, char *name, uvlong n);
 
 /*
+ * How many requests have reached a named point, counted where they
+ * park and never reset.  It is what a test waits on instead of
+ * sleeping: a case built around a window is a case about what runs
+ * WHILE a request is parked, and a sleep long enough today is a wedge
+ * or a silent pass tomorrow.  A point counts only where a case needs
+ * the wait — today the two of the /repl transfer, fullhold and
+ * openhold — and an unnamed point answers 0.
+ */
+uvlong	srvheld(Srvctx*, char *name);
+
+/*
+ * Which queue of the pool an oid lands in.  Two operations on ONE oid
+ * are serialized by the pool (store.md §7), so a case that needs two
+ * requests running at once needs two oids that hash apart — and the
+ * hash is this server's own and free to change (queue.c), so the case
+ * asks rather than assumes.  An observable: it reads what srvqinit
+ * built and changes nothing.
+ */
+int	srvqindex(Srvctx*, uchar *oid, int oidlen);
+
+/*
  * Where a new point goes, and what the shutdown does with it.
  *
  * srvholdclear, which the shutdown runs before it drains, clears the
  * whole of srvhook's set and nothing else: objhold, objprelook,
- * objstage, objlook, objarm, objexit, fullhold, flushhold, mapopen,
- * walkhold, anyexit, step7, jobhold, slotfail, reclaimhold and
- * dirhold.  A HOLD
+ * objstage, objlook, objarm, objexit, fullhold, openhold, flushhold,
+ * mapopen, walkhold, anyexit, step7, jobhold, slotfail, reclaimhold
+ * and dirhold.  A HOLD
  * therefore belongs in srvhook — a program that set a point and
  * stopped watching must not be able to hold the store's close.  (The
  * shutdown also

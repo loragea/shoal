@@ -577,19 +577,27 @@ extern int nsrvctls;
  *		rather than make the call there: auxclose below reaches
  *		the slot whatever the sweep has done with the stage.
  *
- *		A stage that IS busy and holds a handle keeps it, and that
- *		chunk's own look, when its engine call returns, is what
- *		releases it — that look and NOBODY ELSE (store.md
- *		§14(45)).  Not the hook, whose park would be a discard
- *		made under the stagewrite the handle is an argument of;
- *		not the idle sweep, which `busy' holds off (§3.6); and not
- *		a refusal running on another queue — a chunk naming a
- *		second object finds the stage dead, answers `stage
- *		expired' and leaves the slot to that look for the same
- *		reason (obj.c's srvstagemore).  So what the fid owes is
- *		that the handle is released by someone that is not the
- *		hook, and while a handler is inside a call through it,
- *		that someone is the handler itself.
+ *		A stage that IS busy keeps what it holds, and that chunk's
+ *		own look, when its engine call returns, is what releases
+ *		it — that look and NOBODY ELSE (store.md §14(45)).  Not
+ *		the hook, whose park would be a discard made under the
+ *		stagewrite the handle is an argument of; not the idle
+ *		sweep, which `busy' holds off (§3.6); and not a refusal
+ *		running on another queue — a chunk naming a second object
+ *		finds the stage dead, answers `stage expired' and leaves
+ *		the slot to that look for the same reason (obj.c's
+ *		srvstagemore).  So what the fid owes is that the handle is
+ *		released by someone that is not the hook, and while a
+ *		handler is inside a step on it, that someone is the
+ *		handler itself.
+ *
+ *		`busy' says a handler is inside a step on the stage, handle
+ *		or NOT: the opening chunk of a transfer is busy from the
+ *		moment it stages until the arm that fills `g', and
+ *		stageopen runs in that window with no lock held.  A stage
+ *		taken out of the slot there is one the arm, and the look
+ *		behind it, reach after it has been freed — so what the
+ *		qualifier is on is the handler and not the handle.
  *	discarded at clunk and before the store closes, through
  *		auxclose, because releasing an engine stage is an engine
  *		call (store.md §9).
@@ -707,6 +715,15 @@ struct Srvctx
 	uvlong	exithold;	/* srvhook("objexit") */
 	uvlong	flushhold;	/* srvhook("flushhold") */
 	uvlong	fullhold;	/* srvhook("fullhold") */
+	uvlong	openhold;	/* srvhook("openhold") */
+	/*
+	 * How many requests have reached the two points of the /repl
+	 * transfer, counted where they park and never reset: a test waits
+	 * on one rather than on a sleep, and the window either point holds
+	 * open is exactly what the case is about (srv.h's srvheld).
+	 */
+	uvlong	fullheld;
+	uvlong	openheld;
 	uvlong	mapopen;	/* srvhook("mapopen") */
 	uvlong	walkhold;	/* srvhook("walkhold") */
 	uvlong	anyexit;	/* srvhook("anyexit") */

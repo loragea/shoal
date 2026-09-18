@@ -56,7 +56,7 @@ void	srvqpushany(Srvctx*, Req*, void (*)(Req*));
 void	srvqflush(Req*);
 Qreq*	srvqreq(Req*);
 int	srvqcheck(Req*);
-void	srvqhold(Req*, uvlong*);
+void	srvqhold(Req*, uvlong *pt, uvlong *cnt);
 void	srvqexit(Req*);
 void	srvqwalkhold(Req*);
 void	srvqanyexit(Srvctx*);
@@ -126,9 +126,9 @@ int	srvfencekind(Srvctx*);
 /* obj.c: layer-a §2.4's object I/O, and the per-fid stage (dat.h) */
 extern char Estageexp[];
 extern char Efidstate[];
-Stage*	srvstagefull(Srvctx*, Sfid*, uchar *oid, int oidlen, uvlong flen,
-		int force, uvlong ver, uvlong wepoch, uvlong off, long n,
-		Sstage**, char *buf, int nbuf, char **err);
+Stage*	srvstagefull(Req*, Srvctx*, Sfid*, uchar *oid, int oidlen,
+		uvlong flen, int force, uvlong ver, uvlong wepoch, uvlong off,
+		long n, Sstage**, char *buf, int nbuf, char **err);
 Stage*	srvstagemore(Srvctx*, Sfid*, uchar *oid, int oidlen, uvlong flen,
 		int force, Sstage**, char **err);
 int	srvstagelive(Srvctx*, Sfid*, Sstage*);
