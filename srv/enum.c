@@ -72,11 +72,24 @@
  * whose cursor and snapshot the next read needs (§14(33)), and
  * nothing for a fid whose open completed, which lib9p has given an
  * omode.
+ *
+ * `opener' is which Topen that was.  Two Topens can be outstanding on
+ * one fid — lib9p refuses the second from Fid.omode, which its `ropen'
+ * sets only once the first has answered, and this open is offloaded —
+ * so the hook is not the Topen's simply by being a Topen's: a flush of
+ * the SECOND would otherwise free the FIRST's snapshot and leave the
+ * fid open with nothing to read.  The hook discards only for the
+ * request that installed what is there.  The pointer is compared and
+ * never followed, and it cannot be a stale one that matches: the only
+ * exits from the open cell after the install are the flush, which
+ * discards here, and success, after which lib9p has set an omode and
+ * the test above has already answered.
  */
 typedef struct Objdir Objdir;
 struct Objdir
 {
 	Objsnap	*sn;
+	Req	*opener;	/* the Topen that installed it (objdirflush) */
 	uvlong	off;		/* the byte offset the cursor stands at */
 	ulong	pos;		/* the snapshot position that offset names */
 	uvlong	prevoff;	/* where the read before this one started */
@@ -251,12 +264,16 @@ objdirfree(void *a)
  * it does the give-back inline rather than through srvfidgive, which
  * takes that lock itself.
  *
- * The two tests are what keep it to the open it is for.  A Tread is
+ * The three tests are what keep it to the open it is for.  A Tread is
  * not it: a flushed read has advanced the cursor over a snapshot the
  * next read continues from, and discarding it would turn a flush into
  * a clunk.  An omode that is not -1 is not it either: lib9p sets the
  * mode in `ropen', which it runs only after a successful open, so a
  * fid that has one held this state before the flushed request arrived.
+ * Nor is a Topen that installed nothing: two of them can be
+ * outstanding on one fid, and the second — flushed while it was still
+ * queued, so that it never ran — would otherwise give the first's
+ * snapshot back and leave the fid open with nothing to read.
  */
 static void
 objdirflush(Sfid *f, Req *r)			/* f->lk held */
@@ -266,6 +283,8 @@ objdirflush(Sfid *f, Req *r)			/* f->lk held */
 	if(r->ifcall.type != Topen || r->fid == nil || r->fid->omode != -1)
 		return;
 	if(f->auxfree != objdirfree || (d = f->aux) == nil)
+		return;
+	if(d->opener != r)
 		return;
 	f->aux = nil;
 	f->auxflush = nil;
@@ -345,6 +364,7 @@ objdiropenq(Req *r)
 		return;
 	}
 	d->sn = sn;
+	d->opener = r;
 	srvfidgive(f);
 	qlock(&f->lk);
 	if(!objdirfid(f)){

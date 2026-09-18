@@ -90,7 +90,7 @@ enum
 	 * threadmain.  Every check this file makes is unconditional once
 	 * its case is entered, so the number is fixed.
 	 */
-	Nchecks	= 218,
+	Nchecks	= 222,
 
 	/* fids the cases use */
 	Froot	= 1,
@@ -1359,6 +1359,116 @@ tdiropenflush(void)
 		fail("the second open after a flushed one: %s", clerr(&r));
 	clclunk(&cl, Fdir2, &r);
 	clclunk(&cl, Fdir3, &r);
+	clclunk(&cl, Fdir, &r);
+Out:
+	srvhook(ctx, "objexit", 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
+ * A flushed SECOND Topen leaves the FIRST open's snapshot alone.
+ *
+ * Two Topens can be outstanding on one /obj fid: lib9p refuses the
+ * second from Fid.omode, which its `ropen' sets only once the first
+ * has answered, and this row's open is offloaded to a queue.  The
+ * second waits on that queue — one proc — so flushing it is the
+ * loop-side step 7, which calls this fid's flush hook with a request
+ * that installed nothing.  A hook keyed to the message type alone
+ * would give the FIRST open's snapshot back there, and the fid would
+ * open with nothing on it: every Tread answering `not built'.
+ *
+ * The listing read afterwards is what says the snapshot survived.
+ */
+static void
+tdiropen2(void)
+{
+	char buf[16*1024], name[32], *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall t, r;
+	char *w[1];
+	vlong off;
+	long n;
+	ushort ta, tb, tf;
+	int i;
+
+	clstage = "diropen2";
+	m = mkmap();
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4, 0)) == nil)
+		return;
+	for(i = 0; i < 10; i++){
+		snprint(name, sizeof name, "obj%.2d", i);
+		mkobj(srvstore(ctx), name, nil, 0, 1);
+	}
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, "role=admin", &r) != Rattach){
+		fail("attach: %s", clerr(&r));
+		goto Out;
+	}
+	w[0] = "obj";
+	if(clwalk(&cl, Froot, Fdir, 1, w, &r) != Rwalk){
+		fail("walk to /obj: %s", clerr(&r));
+		goto Out;
+	}
+
+	/* the first open, held at its exit with its snapshot installed */
+	srvhook(ctx, "objexit", 1);
+	memset(&t, 0, sizeof t);
+	t.type = Topen;
+	t.tag = ta = cltag(&cl);
+	t.fid = Fdir;
+	t.mode = OREAD;
+	clput(&cl, &t);
+	sleep(200);			/* it is now held at its exit */
+	t.tag = tb = cltag(&cl);
+	clput(&cl, &t);
+	sleep(200);			/* ... and the second is queued behind it */
+
+	/* the second is flushed while it is still queued: step 7 on the loop */
+	memset(&t, 0, sizeof t);
+	t.type = Tflush;
+	t.tag = tf = cltag(&cl);
+	t.oldtag = tb;
+	clput(&cl, &t);
+	checks++;
+	if(clgettag(&cl, tb, &r) != Rerror
+	|| strcmp(r.ename, "interrupted") != 0)
+		fail("the second open, flushed while queued: type %d %s",
+			r.type, clerr(&r));
+	cltagfree(&cl, tb);
+	checks++;
+	if(clget(&cl, &r) != Rflush || r.tag != tf)
+		fail("the Rflush after it: type %d tag %ud", r.type, r.tag);
+	cltagfree(&cl, tf);
+	srvhook(ctx, "objexit", 0);
+	checks++;
+	if(clgettag(&cl, ta, &r) != Ropen)
+		fail("the first open: %s", clerr(&r));
+	cltagfree(&cl, ta);
+
+	/* the first open's snapshot is still there, and still lists */
+	n = 0;
+	off = 0;
+	for(i = 0; i < 64; i++){
+		if(clread(&cl, Fdir, off, 4096, &r) != Rread){
+			fail("the listing after the flushed second open: %s",
+				clerr(&r));
+			goto Out;
+		}
+		if(r.count == 0)
+			break;
+		if(n + r.count > sizeof buf)
+			break;
+		memmove(buf+n, r.data, r.count);
+		n += r.count;
+		off += r.count;
+	}
+	wholedir("the first open's listing is whole", buf, n, 10);
 	clclunk(&cl, Fdir, &r);
 Out:
 	srvhook(ctx, "objexit", 0);
@@ -2889,6 +2999,7 @@ threadmain(int argc, char **argv)
 	tdirflush();
 	tdirstall();
 	tdiropenflush();
+	tdiropen2();
 	tsnaprefuse();
 	tscrub();
 	tlostslot();
