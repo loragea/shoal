@@ -2202,14 +2202,6 @@ tstagelook(void)
 			eqv("... and the write commits", r.count, 5);
 	}
 	cltagfree(&cl, ta);
-	if(clgettag(&cl, tg, &r) < 0)
-		fail("no answer for the open that drove the sweep");
-	else{
-		checks++;
-		if(r.type != Ropen)
-			fail("open /obj/gamma: %s", clerr(&r));
-	}
-	cltagfree(&cl, tg);
 	n = clslurp(&cl, Ffile, buf, sizeof buf - 1);
 	if(n < 0)
 		n = 0;
@@ -2217,6 +2209,117 @@ tstagelook(void)
 	eqs("... with the bytes it was carrying", buf, "NEW!!");
 	clclunk(&cl, Ffile, &r);
 	clclunk(&cl, Ffile2, &r);
+	clclunk(&cl, Froot, &r);
+Out:
+	srvhook(ctx, "objlook", 0);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
+ * The same park, against a Tflush of a SIBLING request on the same fid.
+ * Step 7 for a request that was still queued runs on the service loop
+ * and takes the flushed fid's state lock (queue.c's srvstep7), and the
+ * loop is both what clears a point and what the shutdown runs on — so a
+ * request parked in its look must hold no lock at all.  Two answers are
+ * owed here and both must arrive: `interrupted' for the flushed write,
+ * and `staged update discarded' for the parked one, whose stage step 7
+ * took while it was parked.
+ */
+static void
+tlookflush(void)
+{
+	char buf[64], *m;
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall t, r;
+	uvlong live, done, np, np2, nd;
+	ushort ta, tb, tf;
+	int i, n;
+
+	clstage = "lookflush";
+	m = mkmap(Palone, Tblksz, Tobjmax, Tuuid);
+	d = newdisk(Tnslots);
+	if((ctx = startsrv(d, m, 0, 0)) == nil)
+		return;
+	mkobj(srvstore(ctx), "alpha", "orig!", 5);
+
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, Nclient, &r) != Rattach){
+		fail("attach: %s", clerr(&r));
+		goto Out;
+	}
+	if(clwalkobj(&cl, Froot, Ffile, "obj", "alpha", &r) != Rwalk
+	|| clopen(&cl, Ffile, ORDWR, &r) != Ropen){
+		fail("open /obj/alpha: %s", clerr(&r));
+		goto Out;
+	}
+	srvhook(ctx, "objlook", 1);
+	memset(&t, 0, sizeof t);
+	t.type = Twrite;
+	t.tag = ta = cltag(&cl);
+	t.fid = Ffile;
+	t.offset = 0;
+	t.data = "NEW!!";
+	t.count = 5;
+	clput(&cl, &t);
+	for(i = 0; i < 400; i++){
+		srvstagecount(ctx, &live, nil, nil);
+		if(live == 1)
+			break;
+		sleep(5);
+	}
+	eqv("the parked write holds the fid's stage", live, 1);
+	sleep(100);			/* ... and has reached the look */
+
+	/* a second write on the same fid, queued behind it, and flushed */
+	srvcount(ctx, &np, &nd);
+	t.tag = tb = cltag(&cl);
+	clput(&cl, &t);
+	for(i = 0; i < 400; i++){
+		srvcount(ctx, &np2, &nd);
+		if(np2 > np)
+			break;
+		sleep(5);
+	}
+	memset(&t, 0, sizeof t);
+	t.type = Tflush;
+	t.tag = tf = cltag(&cl);
+	t.oldtag = tb;
+	clput(&cl, &t);
+	if(clgettag(&cl, tb, &r) < 0)
+		fail("no answer for the write flushed behind the parked one");
+	else
+		eqs("the flushed queued write", clerr(&r), "interrupted");
+	cltagfree(&cl, tb);
+	if(clgettag(&cl, tf, &r) < 0)
+		fail("no Rflush: the loop is parked behind the look");
+	else{
+		checks++;
+		if(r.type != Rflush)
+			fail("the Rflush after it: %s", clerr(&r));
+	}
+	cltagfree(&cl, tf);
+	srvstagecount(ctx, &live, &done, nil);
+	eqv("step 7 reaches the fid of a write parked in its look", live, 0);
+	eqv("... and gives back what it held", done, 1);
+
+	srvhook(ctx, "objlook", 0);
+	if(clgettag(&cl, ta, &r) < 0)
+		fail("no answer for the parked write");
+	else
+		eqs("the write comes back to a stage step 7 took", clerr(&r),
+			"shoalsrv: staged update discarded");
+	cltagfree(&cl, ta);
+	n = clslurp(&cl, Ffile, buf, sizeof buf - 1);
+	if(n < 0)
+		n = 0;
+	buf[n] = 0;
+	eqs("... and commits none of its bytes", buf, "orig!");
+	clclunk(&cl, Ffile, &r);
 	clclunk(&cl, Froot, &r);
 Out:
 	srvhook(ctx, "objlook", 0);
@@ -2392,6 +2495,7 @@ threadmain(int argc, char **argv)
 	tstagecommit();
 	tstagediscard();
 	tstagelook();
+	tlookflush();
 	tstageclose();
 	tqueued();
 

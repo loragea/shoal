@@ -451,7 +451,12 @@ extern int nsrvctls;
  * The fid's own state lock (Sfid.lk) covers the slot; the list below
  * is the server's, under Srvctx.stagelk, so that the sweep walks it
  * without touching the fid registry.  A fid's lock may be held over
- * stagelk and never the other way round.
+ * stagelk and never the other way round, and NEITHER is held across a
+ * park: a request parked under the fid's lock wedges the service loop,
+ * which takes that lock to perform step 7 for another request on the
+ * same fid (queue.c), and one parked under stagelk stalls every queued
+ * object operation, each of which sweeps at its head.  What keeps the
+ * sweep off a stage a handler is between two steps of is `busy'.
  */
 enum
 {
@@ -560,8 +565,8 @@ struct Srvctx
 
 	/*
 	 * The stages the live fids hold (obj.c).  A leaf lock: nothing is
-	 * taken under it, and a fid's own state lock is the one that may
-	 * be held over it.
+	 * taken under it and nothing parks under it, and a fid's own state
+	 * lock is the one that may be held over it.
 	 */
 	QLock	stagelk;
 	Sstage	*stages;

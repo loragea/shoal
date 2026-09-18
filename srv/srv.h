@@ -267,12 +267,16 @@ void	srvcount(Srvctx*, uvlong *pushed, uvlong *done);
  *		a stage it has finished looking at, so it is where a test
  *		drives step 7 — a Tflush of another request on the same
  *		fid — against a commit that is about to happen anyway.
- *	objlook	n != 0 holds a queued object request INSIDE that look,
- *		which it takes under the fid's state lock and the stage
- *		list's.  A handler between two steps of one operation is
- *		not an absence of arrivals (store.md §3.6), so it is where
- *		a test drives the idle sweep against a stage a handler is
- *		still inside.
+ *	objlook	n != 0 holds a queued object request AT that look, before
+ *		it takes the fid's state lock and the stage list's — a
+ *		request parked under either of those wedges the service
+ *		loop or stalls every other queue (obj.c).  What holds the
+ *		sweep off the stage across the park is the stage's own
+ *		`busy' mark, a handler between two steps of one operation
+ *		being no absence of arrivals (store.md §3.6), so this is
+ *		where a test drives the idle sweep against a stage a
+ *		handler is still inside — and where it drives a step 7 for
+ *		another request on the same fid against one.
  *	objexit	n != 0 holds every queued object request at the other
  *		end of its handler: after the engine call and before the
  *		exit, so a test can flush a request whose work is done

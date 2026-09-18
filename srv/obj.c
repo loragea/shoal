@@ -525,15 +525,24 @@ stagetake(Sfid *f, Sstage *s)
  * read under stagelk, which is where it writes them, and the slot
  * under the fid's state lock, which is where the hooks write it — in
  * that order, the only order the two locks are ever taken in (dat.h).
+ *
+ * The point is held BEFORE either lock, holding none of its own, and
+ * `busy' rather than a lock is what the sweep is kept off by.  A park
+ * under the fid's state lock wedges the server: a Tflush of another
+ * request QUEUED on this same fid performs step 7 on the service loop,
+ * which takes that lock (queue.c's srvstep7), and the loop is both what
+ * clears the point and what the shutdown runs on.  A park under stagelk
+ * stalls every other queue besides, since the sweep at the head of every
+ * queued object operation takes it.
  */
 static int
 stagelive(Srvctx *c, Sfid *f, Sstage *s, Req *r)
 {
 	int ok;
 
+	srvqhold(r, &c->lookhold);
 	qlock(&f->lk);
 	qlock(&c->stagelk);
-	srvqhold(r, &c->lookhold);
 	ok = f->aux == s && !s->dead && !s->released;
 	s->last = nsec();
 	qunlock(&c->stagelk);
