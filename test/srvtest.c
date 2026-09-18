@@ -2673,9 +2673,7 @@ tshutdown(void)
 	eqv("the store was closed once", freedseen, 1);
 	eqv("nothing was in flight when the store was freed",
 		freedqdepth, 0);
-	close(cl.rfd);
-	close(cl.sin);
-	close(cl.sout);
+	clclose(&cl);
 	srvfree(ctx);
 	devclose(d);
 	free(m);

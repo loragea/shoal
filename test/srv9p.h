@@ -343,6 +343,35 @@ clwaitend(Cl *c, int ms)
 	return c->ended;
 }
 
+/*
+ * Give back everything the client holds: both ends of both pipes, the
+ * two message buffers and any reply still held aside.  The service
+ * loop must already have ended — clstop is the one that waits for it,
+ * and a case that drives the shutdown itself waits with clwaitend and
+ * then comes here.
+ */
+static void
+clclose(Cl *c)
+{
+	int i;
+
+	clhangup(c);
+	if(c->rfd >= 0)
+		close(c->rfd);
+	if(c->sin >= 0)
+		close(c->sin);
+	if(c->sout >= 0)
+		close(c->sout);
+	c->rfd = c->sin = c->sout = -1;
+	free(c->wbuf);
+	free(c->rbuf);
+	c->wbuf = c->rbuf = nil;
+	for(i = 0; i < c->npend; i++)
+		free(c->pend[i].m);
+	c->npend = 0;
+}
+
+/* hang up, wait the service loop out, and let go */
 static void
 clstop(Cl *c)
 {
@@ -355,13 +384,7 @@ clstop(Cl *c)
 		fail("%s: the service loop did not end within 10s "
 			"(pushed %llud, done %llud)", clstage, np, nd);
 	}
-	close(c->rfd);
-	close(c->sin);
-	close(c->sout);
-	c->rfd = c->sin = c->sout = -1;
-	free(c->wbuf);
-	free(c->rbuf);
-	c->wbuf = c->rbuf = nil;
+	clclose(c);
 }
 
 /* the small conveniences every case uses */
