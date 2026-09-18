@@ -2691,8 +2691,10 @@ already there:
 **What the engine builds, and what the server still owes.** The
 engine holds the per-object primitives and the durable state; the
 pass that drives them — the proc, its rate limit, the queue it pushes
-through and the peer fetch — is the server's, and is not built yet;
-it lands with the server's 9P export. The primitives are:
+through and the peer fetch — is the server's. All of it but the peer
+fetch is built: `srv/job.c` runs the pass from layer-a §2.5's `scrub`
+verb, in a proc holding one of the server's background jobs, and
+paces itself over the bytes it hashes (§14(31)). The primitives are:
 
 - **verify** one object, as above, mutating nothing.
 - **scrub** one object: verify, then the one durable transition that
@@ -2775,7 +2777,8 @@ A corrupt copy loses arbitration against everything including absence
 (layer-a §1.3), which the server enforces by refusing to advertise
 it.
 
-**Scrub runs inside the queues.** *This is the half the server builds.*
+**Scrub runs inside the queues.** *This is the half the server
+builds, and it is built (§14(31)).*
 A background proc walks slots in order, but it does not read grains
 itself: for each object it pushes one verify request onto that
 object's `Reqqueue` and waits for the answer, exactly as a client
@@ -4268,7 +4271,7 @@ T1 formats a **small geometry** — a partition image of a few MiB with
 over one header sector, not over the whole store, and the cases that
 need `nslots = 2^20` are T2's.
 
-**What T1 covers today.** Fifteen programs. All but `maptest`, which
+**What T1 covers today.** Seventeen programs. All but `maptest`, which
 is pure text and reaches no device at all, run against the simulated
 disk except where a file-backed device is the point:
 `csumtest` (layer-a §1.4's block digests and object checksums against
@@ -4532,14 +4535,21 @@ and dropping and re-creating them behind itself, over a store
 formatted with more than `Listchunk` slots so that a page is more
 than one hold).
 
-Against the list below that is T1.1–T1.26 and T1.28–T1.33. One case
-is not covered and waits on something this store does not have yet:
-**T1.27** waits on the server's `Reqqueue` pool (§7), which is what it
-is about — the engine's own scrub and cursor take the same `qlstate`
-snapshot every other call takes and hold no lock across a verify, but
-*that a scrubber pushes through the object's queue rather than reading
-grains beside it* is a property of the server, and there is no server
-to hold it wrong yet. T1.21 is covered for the orderings and the
+Two more drive the 9P surface rather than the engine, over
+`test/srv9p.h`'s in-process client (`AGENTS.md`): `srvtest` (layer-a
+§2's framework — start-up and identity, §2.1's attach and role
+matrix, §2.2's tree, §2.3's qids, the render-at-open files, §2.5's
+ctl gates, §5.4.1's `Tflush` and step 7, the per-fid state hooks, and
+D16's shutdown order) and `srvenumtest` (what that framework carries:
+§2.5's `scrub`, `forget`, `drop` and `newmonid`, §2.2's `/dirty`,
+`/stale`, `/tombs`, `/lost`, `/advert` and `/jobs`, the `/obj` and
+`/meta` directory reads over a §9 snapshot with entries going
+live→tomb mid-read, D20's retry and the `objsnapmax` refusal, §7.5's
+scrub pass with T1.27 below, and §9's tombstone reclaim at both sides
+of its cutoff). The split is by layer and not by size: a failure in
+one says which half broke.
+
+Against the list below that is T1.1–T1.33. T1.21 is covered for the orderings and the
 fields, but drives the four publish triggers in sequence rather than
 from concurrent procs. **T1.15** is covered at T1's geometry and not
 at the scale its row names: `enumtest` walks a snapshot of 1500
@@ -4784,9 +4794,13 @@ what would close it.
   object while a commit on the same object frees that grain and
   another object stages into it; the scrub must not flag the object
   `corrupt`. *Mutation:* have the scrubber read grains directly
-  instead of pushing through the object's `Reqqueue`. Not covered:
-  the `Reqqueue` pool is the server's (§7) and is not built, so
-  neither is the thing this test discriminates between.
+  instead of pushing through the object's `Reqqueue`. Covered in
+  `srvenumtest` at the property the row rests on rather than at the
+  race: with §13's `objhold` point set, a client's `verify <oid>`
+  parks inside that oid's queue, and the pass's `/jobs` `done=` stops
+  at that object's slot with slots still ahead of it and moves again
+  only when the hold is cleared. The commit racing the read is T2's:
+  the server has no client write path to issue it with yet.
 - **T1.28 the online rebuild walk (§8, D18).** A store with a slot §5
   step 10 condemned, walked while it serves: the rebuilt bitmap
   equals a full scan of the live maps read off the media, `grainleak`
@@ -4978,16 +4992,16 @@ would be a wire change.
 
 *Policy, but read it before implementing anything.*
 
-Twenty-nine places where layer-a is silent, self-defeating, or
+Thirty-three places where layer-a is silent, self-defeating, or
 contradicted by the measurements or by the platform. Each entry
 states the tension, its resolution, and where the argument for it
 lives; nothing here repeats an argument made in a section above.
 Items 1–5, 8, 9, 11, 12, 13, 14 and 26 are amendments **made** to
-`docs/design/layer-a.md`; items 6, 7, 15, 17, 18–25 and 27–29 are
+`docs/design/layer-a.md`; items 6, 7, 15, 17, 18–25 and 27–33 are
 recorded here and not made there; items 10 and 16 are **proposals** rather
 than amendments, because they touch the wire.
 
-Items 18 to 29 are the object server's, and they describe what
+Items 18 to 33 are the object server's, and they describe what
 `srv/libshoalsrv.a` and `cmd/shoalsrv` **do today**. Several of them
 name a half that is not built; each says which.
 
@@ -5442,6 +5456,86 @@ name a half that is not built; each says which.
     of step 7 — what the request had staged is discarded either way —
     but only the queue's flush flag says a request was flushed, and
     the two answers keep that distinction where a client can see it.
+
+30. **`forget` is background work, which §2.5 does not say it is.**
+    layer-a §2.5 marks `scrub` as starting a job and says nothing of
+    the kind about `forget <iid>`, whose plain reading is that the
+    records are gone when the `Rwrite` comes back. Each record it
+    discards is one `dirtydel`, which is one durable commit (§2.6),
+    and the dirty region holds as many records as the disk was
+    formatted for — so a `forget` answered on the service loop parks
+    that loop for that many commits, and layer-a §5.4.1 requires a
+    `Tflush` to be answerable throughout. It cannot be a queued row
+    either: a queued row's `argv[0]` is an oid the framework hashes,
+    and `forget`'s is an instance id. *Not made:* the verb answers
+    success once the pass is accepted, in §2.5's own words for the
+    verbs that do start work, and `/jobs` carries a `job=forget` line
+    until the records are gone. An operator who reads `/dirty`
+    immediately after the `Rwrite` may still see them. What the verb
+    achieves is the discard alone: §7.1 has it mark the peer
+    `fullsync`, the engine has no setter for that flag, and §9
+    records that nothing clears it and that a peer is registered with
+    it already set — so the coarse half of §7.1's meaning is in force
+    for every peer before the verb runs.
+
+31. **The scrub's pace is this server's, and it carries the reclaim
+    walk (§8, §9; layer-a §2.5, §7.5).** layer-a §7.5 leaves
+    `scrubdays` and the rate to the implementation and sizes its own
+    example at "a default near 14 days ... ~4 MiB/s on a 4 TB disk".
+    *Not made:* `scrub rate=<n>` is in KiB/s as §2.5 says, the
+    default is 4096 KiB/s so that an operator who sets nothing gets
+    layer-a's own sizing, and the pace is over the bytes hashed —
+    each object charged its own `len` plus a 1 KiB floor, because an
+    object of no bytes still costs a queue push and an index read.
+    `scrub` with neither `start` nor `stop` changes nothing and
+    succeeds; a `start` while a pass runs is accepted and starts
+    nothing, since the job asked for is already running; the two
+    words are read in §2.5's own order and each at most once, so a
+    line that reorders or repeats them is `bad ctl`.
+
+    §9's tombstone reclaim runs at the end of a pass that was not
+    stopped, and has no verb of its own: §2.5 fixes the ctl grammar
+    and has no verb for it, so adding one would be a wire change
+    (§13's own argument for `-X` being a flag), and `scrub` is the
+    only verb §2.5 gives an instance for walking its own index on a
+    schedule. It is the walk §9 describes — a `/tombs` snapshot, each
+    entry's `mtime` against the map header's `tombdays` and its
+    `wepoch` against the map epoch, discarded by the entry's own key
+    — and every discard goes through that oid's queue, as the scrub's
+    own reads do.
+
+32. **`newmonid` cannot replace a pinned `monid`, and nothing logs
+    it (layer-a §2.5, §6.3).** §2.5 has the verb *replace* this
+    instance's pinned `monid` and MUST log it. The engine's publisher
+    for that value is `monidpin`, which pins a value on a store that
+    has none and refuses a **different** one on a store that has
+    (§2.2); every serving instance has one, since start-up pins the
+    map's. *Not made:* the verb is built as far as that call reaches
+    — the spelling, §2.5's gates, the durable publish and `/status`'s
+    `monid=` — and a value that differs from the pinned one is
+    refused with the engine's own words, which carry no layer-a §2.6
+    prefix. What §2.5 asks for needs a re-pin in `lib/` that does not
+    exist. The log is the second half of the gap: this build has no
+    operator log at all, so the record of the verb is the change to
+    `/status`'s `monid=`.
+
+33. **A directory read's cursor is the server's, behind lib9p's own
+    offset guard (§9).** §9 addresses a snapshot's entries by
+    position so that a server can map a `Tread` offset onto an entry
+    and restart from 0 on a re-read. lib9p's `dirread9p` cannot do
+    that here: it regenerates entry *n* per `Tread` from the
+    generator's index, and §9's two *gone* conditions mean the *n*'th
+    entry is not the entry it was, so a listing addressed by entry
+    number would skip or repeat around a discarded one. *Not made:*
+    the `/obj` and `/meta` rows carry their own (offset, position)
+    pair on the fid. lib9p refuses a directory read at an offset that
+    is neither 0 nor where the fid left off before the row's read
+    cell is reached (`/sys/src/lib9p/srv.c`'s `bad offset`, against
+    its own `Fid.diroffset`), so the cursor's own refusal is behind
+    that guard on the wire — reachable only where the two can
+    disagree, which is a read this server answered `interrupted`
+    after it had advanced the cursor. The cursor keeps the offset the
+    previous read started at and rewinds to it for exactly that case.
 
 ## 15. Alternatives considered
 

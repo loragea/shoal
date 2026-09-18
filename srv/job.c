@@ -500,6 +500,12 @@ forgetpass(Sjob *j)
 	lock(&c->joblk);
 	j->total = n;
 	unlock(&c->joblk);
+	/*
+	 * The delete names the VERB's peer and not the record's, which is
+	 * what keeps another peer's records out of it; the match above it
+	 * is a filter over engine calls rather than the rule, and a
+	 * mutation that removes it changes nothing a client can see.
+	 */
 	for(i = 0; i < n; i++){
 		if(srvstopping(c))
 			break;

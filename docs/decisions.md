@@ -886,3 +886,46 @@ the operator's next `fence off` is what clears it. An implementation
 that clears the operator half and answers `fenced` all the same
 conforms too: the fence still in force is the lease one either way,
 and neither reading lets a deposed instance unfence itself.
+
+## D26 — A whole-store pass is a background job, and the tombstone reclaim rides on `scrub` (2026-09-18)
+
+**Decision:** Every `ctl` verb whose work walks the whole store runs
+in a proc of its own that holds one of the server's background jobs,
+answers success once the job is accepted, and is read from `/jobs`.
+That is `scrub` (`design/layer-a.md` §2.5, §7.5) and also `forget`,
+which §2.5 does not describe as background work. `design/store.md`
+§9's tombstone reclaim gets no verb of its own: it runs at the end of
+a `scrub` pass that was not stopped. §14(30) and §14(31) record both.
+**Rationale:** lib9p's service loop is single-threaded, and layer-a
+§5.4.1 requires a `Tflush` to be answerable while anything else is in
+flight; a verb that made durable commits on that loop would park it
+for as long as the walk took. The queue pool is the other place work
+can go, and it is addressed by oid — a queued `ctl` row's `argv[0]`
+is the oid the framework hashes — so a verb naming an instance id or
+naming nothing has no queue to go to. A proc holding a job is what is
+left, and the shutdown already waits for those after it drains the
+requests, because `design/store.md` §9 forbids closing the store
+while anything is inside the engine and the drain cannot see a proc
+that is not a request. For the reclaim walk the argument is narrower:
+layer-a §2.5 fixes the ctl grammar and requires an unknown verb to
+fail `unknown ctl`, so a `reclaim` verb would be a wire change for a
+walk no protocol consumer drives — the same argument §13 makes for
+`-X` being a command-line flag rather than a verb — and §8 already
+makes the scrub pass the walk other whole-index work rides on.
+**Considered and rejected:** answering `forget` synchronously, which
+is the plain reading of §2.5 and costs the loop one durable commit
+per record, unbounded by anything but the disk's dirty region;
+running the reclaim from a timer of its own, which adds a second
+whole-index walk with no way for an operator to see or stop it, where
+`scrub stop` already stops the pass that carries it; and a
+`reclaim` ctl verb, which is the wire change above.
+**Normative:** nothing. layer-a §2.5's grammar, its role and fence
+columns, and its rule that a verb starting background work returns on
+acceptance are what a reimplementation matches; none of them is
+changed here.
+**Implementation policy:** all of it — which verbs are passes, that
+one pass carries the reclaim walk, the scrub's rate default and the
+bytes it charges itself (§14(31)), `/jobs`'s line format, and that a
+second `scrub start` while a pass runs starts nothing. An
+implementation that answers `forget` synchronously, or that reclaims
+tombstones from a timer, conforms.
