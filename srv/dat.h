@@ -154,9 +154,13 @@ enum
  * succeeded.  So the give-back goes after the last refusal the cell
  * can answer, not before it; a cell that gave it back first would drop
  * the directory fid's Objsnap on a create the client will retry.
- * srvfidgive (fns.h) is that give-back: it runs the two hooks in
- * order under the registry lock, which is where the shutdown's own
- * sweep runs them, so the two cannot both close one state.
+ * srvfidgive (fns.h) is that give-back: it runs auxclose under the
+ * FID's state lock, with the cells cleared under it, and auxfree
+ * behind it; `auxclosed', set there, is what keeps it and the
+ * shutdown's own sweep from both closing one state.  The registry
+ * lock is not what excludes the two — it covers the list and the
+ * fid's rendered Text, and fidgive drops it before either hook runs
+ * (tree.c).
  *
  * The rows this file leaves unnamed above, by the same rule.  The
  * /meta directory row's open and read cells — and the aux a fid of
@@ -225,8 +229,11 @@ extern Sfile srvfiles[Nfile];
  * registry lock (Srvctx.fidlk) is a different lock over different
  * things: the list the fids are on, the fid-state point, and the
  * rendered Text.  A caller may take `lk' while holding fidlk, never
- * the other way round, and nothing in srv/ holds fidlk across a hook
- * or across an engine call.
+ * the other way round.  One caller holds both: the shutdown's sweep
+ * (srvfidsclose) runs auxclose with fidlk held, which it may because
+ * the service loop has ended and the drain has finished by then, so
+ * no attach, clunk or clone-walk is behind it.  Nothing else in srv/
+ * holds fidlk across a hook or across an engine call.
  *
  *	auxflush  runs from srvstep7, on the fid of a request that is
  *		  unwinding flushed (layer-a §5.4.1 step 7), once per
