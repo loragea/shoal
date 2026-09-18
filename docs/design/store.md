@@ -5296,13 +5296,16 @@ other files cite, so a gap is cheaper than a renumbering.
     None of the four can be computed without the peers and the
     reconcile pass §14(18) says are not built, and a zero would be a
     measurement this instance has not made. *Not made:* they are
-    absent from the file rather than present and wrong. Three fields
+    absent from the file rather than present and wrong. Four fields
     beyond §2.2's list are present because nothing else reports them:
     `objsnapopen=`, which §9 makes the server's half of `objsnap=`;
     the queue pool's `queues=`, `qdepth=`, `qpushed=` and
     `qdone=`, which §7 asks `/status` to report and which `Reqqueue`
-    does not count for itself; and `diverged=`, the count of layer-a
-    §1.3's repairs this process has applied, which §1.3 requires to be
+    does not count for itself; `staged=`, the grains this process has
+    reserved against §3.6's `stagetot`, which §3.6 asks `/status` to
+    report and which is read straight off `Storestat.staged`; and
+    `diverged=`, the count of layer-a §1.3's repairs this process has
+    applied, which §1.3 requires to be
     "reported in `/status`" without naming a field, so the name is
     this server's. §14(15) has the rest of that record: the count is
     in memory and per process, and the durable `/lost kind=diverged`
