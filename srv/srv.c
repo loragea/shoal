@@ -282,6 +282,15 @@ srvnew(Srvcfg *cfg)
 	c->srv.destroyreq = srvdestroyreq;
 	c->srv.end = srvend;
 	c->srv.free = srvfreed;
+
+	/*
+	 * The tombstone reclaim walk's timer (job.c), started last: it
+	 * reads this context for as long as it runs, and every refusal
+	 * above it frees the context.  It needs the adopted map, whose
+	 * `tombdays' is its period, and the store, which its passes walk.
+	 */
+	if(srvreclaimproc(c) < 0)
+		goto Fail;
 	return c;
 
 Fail:
@@ -391,6 +400,22 @@ srvjobcount(Srvctx *c)
 	return n;
 }
 
+/*
+ * The reclaim timer is not one of the jobs above — it makes no engine
+ * call — but it reads the context, and srvfree frees that as soon as
+ * the shutdown is over.  So the shutdown waits for the proc to see
+ * `stopping' and end.  The wait is bounded by the proc's own slice
+ * (job.c) and no pass can be started behind it: srvjobstart refuses
+ * once the shutdown has begun, which is the same gate every verb
+ * meets.
+ */
+static void
+reclaimwait(Srvctx *c)
+{
+	while(srvreclaimlive(c))
+		sleep(5);
+}
+
 static void
 jobwait(Srvctx *c)
 {
@@ -409,9 +434,13 @@ jobwait(Srvctx *c)
 /*
  * D16's order, which store.md §9 derives from the close contract
  * rather than from taste: stop accepting requests, let the ones in
- * flight drain, wait for the background jobs, and only then close the
- * store.  The loop is what stops first here — this runs from Srv.end,
- * which lib9p calls once the connection has gone — and the two waits
+ * flight drain, wait for the reclaim timer and then for the background
+ * jobs, and only then close the store.  The timer goes before the jobs
+ * because it is the one thing that could still start one; once it has
+ * ended, nothing can add to what jobwait waits for.  The loop is what
+ * stops first here — this runs from Srv.end,
+ * which lib9p calls once the connection has gone — and the drain and
+ * the job wait
  * are what make the engine's "quiesce, then close" true: no call
  * taking the Store* may still be in flight when storeclose runs,
  * because such a call blocks on the state lock holding nothing that
@@ -466,6 +495,7 @@ srvshutdown(Srvctx *c)
 	srvholdclear(c);
 	srvcellpoint(c, 0);
 	srvqdrain(c);
+	reclaimwait(c);
 	jobwait(c);
 	srvfidsclose(c);
 	srvstagedrain(c);		/* the last moment §9 allows one */

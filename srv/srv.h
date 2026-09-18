@@ -233,6 +233,11 @@ void	srvshutdown(Srvctx*);
  * shutdown has begun, which is the answer a verb turns into its
  * refusal.  A pass already running SHOULD test srvstopping between
  * units of work and give up rather than leave the shutdown waiting.
+ *
+ * The tombstone reclaim walk's timer is the one proc here that is NOT
+ * a job: it starts passes and makes no engine call of its own, so it
+ * holds nothing the store's close must wait behind.  What it does hold
+ * is the context it reads, and the shutdown waits for it separately.
  */
 int	srvjobstart(Srvctx*);
 void	srvjobend(Srvctx*);
@@ -367,15 +372,17 @@ int	srvjobcount(Srvctx*);	/* jobs held: what the shutdown waits for */
  *		step 7 for and must answer without waiting for the walk.
  *		Set to n+1, like slotfail.
  *	reclaimhold
- *		n != 0 holds the tombstone reclaim walk that rides on a
- *		scrub before its n-1'th entry, with the entries before
- *		that one already counted.  Nothing else can stop that walk
- *		part-way: it starts only once the scrub is past its index
- *		walk, and it is paced by nothing and asks no queue.  So it
- *		is where a test raises `scrub stop', or takes the server
+ *		n != 0 holds the tombstone reclaim walk before its n-1'th
+ *		entry, with the entries before that one already counted.
+ *		Nothing else can hold that walk still: it is paced by
+ *		nothing and asks no queue, so a walk over any index a test
+ *		can build is over before the next ctl write lands.  So it
+ *		is where a test raises `reclaim stop', or takes the server
  *		down, over a walk that has counted a prefix of the
- *		snapshot.  Set to n+1, like slotfail.  It parks a pass
- *		proc, so it carries jobhold's hazard above entire.
+ *		snapshot — and where it holds one still long enough to
+ *		write the next verb at all.  Set to n+1, like slotfail.  It
+ *		parks a pass proc, so it carries jobhold's hazard above
+ *		entire.
  *	flushhold
  *		n != 0 holds a Tflush of a pooled request between the
  *		lookup that found it and the flush itself, which is the
@@ -488,15 +495,16 @@ void	srvcellpoint(Srvctx*, int on);
 void	srvendpoint(Srvctx*, uvlong ms);
 
 /*
- * The period the tombstone reclaim walk will run its passes on, in
- * ms, overriding the map's own.  Nothing reads it yet: the walk runs
- * at the end of a scrub pass and has no period of its own, so a T1
- * that drives it starts a scrub (job.c).  The knob is here because
- * the period a walk of its own would take is `tombdays'/2 and the
- * shortest a map can ask for is half a day, which is longer than any
- * test can wait for.  0 puts the map's own period back.  Like
- * srvendpoint and unlike the srvhook holds, the shutdown does not
- * clear it.
+ * The period between the tombstone reclaim walk's passes, in ms,
+ * overriding the map's own.  That period is `tombdays'/2 — layer-a
+ * §8.3's epoch-bump cadence, since §1.5's condition 3 is what the walk
+ * is waiting on — and the shortest a map can ask for is half a day,
+ * which is longer than any test can wait for.  Set it to a few tens of
+ * milliseconds to see the timer fire, and to 0 to put the map's own
+ * period back.  Like srvendpoint and unlike the srvhook holds, the
+ * shutdown does not clear it: it holds nothing up, since a pass the
+ * timer starts once the shutdown has begun is refused the job it needs
+ * and the timer proc itself ends with the shutdown either way.
  */
 void	srvreclaimms(Srvctx*, uvlong ms);
 

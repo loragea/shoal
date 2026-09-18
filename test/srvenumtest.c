@@ -11,9 +11,10 @@
  * T1: the parts of the storage instance's 9P surface that report and
  * walk this instance's own index — layer-a §2.2's status files and
  * the /obj and /meta enumerations, §2.5's ctl verbs that are not
- * object I/O, §7.5's scrub pass and store.md §9's tombstone reclaim.
- * store.md §13's T1.27 is here too: that a scrub read of one object
- * is held inside that object's queue.
+ * object I/O, §7.5's scrub pass and store.md §9's tombstone reclaim —
+ * the last both as `reclaim [start|stop]' and as the timer that runs
+ * it with no verb written.  store.md §13's T1.27 is here too: that a
+ * scrub read of one object is held inside that object's queue.
  *
  * It is a second program beside srvtest rather than more cases in it.
  * srvtest is the framework's — attach, the tree, the role matrix, the
@@ -90,7 +91,7 @@ enum
 	 * threadmain.  Every check this file makes is unconditional once
 	 * its case is entered, so the number is fixed.
 	 */
-	Nchecks	= 225,
+	Nchecks	= 259,
 
 	/* fids the cases use */
 	Froot	= 1,
@@ -391,6 +392,12 @@ tparse(void)
 		{"scrub start stop",		"bad ctl"},
 		{"scrub start start",		"bad ctl"},
 		{"scrub start rate=5 more",	"bad ctl"},
+		{"reclaim",			nil},
+		{"reclaim start",		nil},
+		{"reclaim stop",		nil},
+		{"reclaim go",			"bad ctl"},
+		{"reclaim start stop",		"bad ctl"},
+		{"reclaim rate=1",		"bad ctl"},	/* not its grammar */
 		{"newmonid 00112233445566778899aabbccddeeff",	nil},
 		{"newmonid 00112233445566778899aabbccddeef",	"bad ctl"},
 		{"newmonid 00112233445566778899aabbccddeeff0",	"bad ctl"},
@@ -403,6 +410,7 @@ tparse(void)
 		{"drop",			"bad ctl"},
 	};
 	static char *fenced[] = {
+		"reclaim start",	/* it will discard, so it is fenced */
 		"forget n1.1",
 		"drop whatever",
 		"pull alpha n1.1",
@@ -2031,8 +2039,8 @@ jobparked(Cl *cl, char *attr, char *val, int nval)
 }
 
 /*
- * store.md §9's tombstone reclaim walk, which rides on the scrub pass
- * and discards NOTHING.
+ * store.md §9's tombstone reclaim walk, which §2.5's `reclaim start'
+ * drives and which discards NOTHING.
  *
  * layer-a §1.5 licenses a discard only when all three of its
  * conditions hold, and the two the walk can test are local: the
@@ -2071,13 +2079,18 @@ treclaim(void)
 	if(!adminctl(&cl, "role=admin"))
 		goto Out;
 	srvhook(ctx, "jobhold", 1);
-	if(clwrite(&cl, Fctl, 0, "scrub start rate=1000000", &r) != Rwrite)
-		fail("scrub start: %s", clerr(&r));
+	if(clwrite(&cl, Fctl, 0, "reclaim start", &r) != Rwrite)
+		fail("reclaim start: %s", clerr(&r));
 	if(jobparked(&cl, "reclaimable", val, sizeof val) == nil)
 		fail("the pass never reached its hold");
 	else
 		eqs("a tombstone younger than tombdays is not reclaimable",
 			val, "0");
+	if(slurpfile(&cl, Ffile2, "jobs", buf, sizeof buf) > 0)
+		istrue("the walk is a job of its own at /jobs",
+			haspfx(buf, "job=reclaim "));
+	else
+		fail("the parked reclaim pass left no /jobs line");
 	srvhook(ctx, "jobhold", 0);
 	for(i = 0; i < 400 && jobrunning(&cl); i++)
 		sleep(20);
@@ -2112,8 +2125,8 @@ Out:
 	if(!adminctl(&cl, "role=admin"))
 		goto Out2;
 	srvhook(ctx, "jobhold", 1);
-	if(clwrite(&cl, Fctl, 0, "scrub start rate=1000000", &r) != Rwrite)
-		fail("scrub start: %s", clerr(&r));
+	if(clwrite(&cl, Fctl, 0, "reclaim start", &r) != Rwrite)
+		fail("reclaim start: %s", clerr(&r));
 	if(jobparked(&cl, "reclaimable", val, sizeof val) == nil)
 		fail("the pass never reached its hold");
 	else
@@ -2133,18 +2146,16 @@ Out:
 		statof(st, "old", &oi) == 0);
 
 	/*
-	 * The same walk cut short.  `done=' and `total=' are the index
-	 * walk's and read done=T/T by the time the reclaim runs, so a
-	 * prefix of the snapshot counted would otherwise be read as the
-	 * whole store's answer — the very line the whole pass above
-	 * left.  §13's `reclaimhold' is what stops the walk part-way:
-	 * nothing else can, since it starts only once the scrub is past
-	 * its index walk and is paced by nothing.
+	 * The same walk cut short: a prefix of the snapshot counted, with
+	 * an `err=' beside it saying so.  §13's `reclaimhold' is what
+	 * stops the walk part-way — it is paced by nothing and asks no
+	 * queue, so nothing else can hold it still long enough for the
+	 * case to write the verb.
 	 */
 	srvhook(ctx, "reclaimhold", 2);		/* held before the 2nd entry */
 	srvhook(ctx, "jobhold", 1);
-	if(clwrite(&cl, Fctl, 0, "scrub start rate=1000000", &r) != Rwrite)
-		fail("a third scrub start: %s", clerr(&r));
+	if(clwrite(&cl, Fctl, 0, "reclaim start", &r) != Rwrite)
+		fail("a third reclaim start: %s", clerr(&r));
 	for(i = 0; i < 500; i++){
 		if(jobfield(&cl, "reclaimable", val, sizeof val) != nil
 		&& strcmp(val, "1") == 0)
@@ -2152,8 +2163,8 @@ Out:
 		sleep(20);
 	}
 	istrue("the reclaim walk counted an entry and parked", i < 500);
-	if(clwrite(&cl, Fctl, 0, "scrub stop", &r) != Rwrite)
-		fail("scrub stop over the reclaim walk: %s", clerr(&r));
+	if(clwrite(&cl, Fctl, 0, "reclaim stop", &r) != Rwrite)
+		fail("reclaim stop over the walk: %s", clerr(&r));
 	srvhook(ctx, "reclaimhold", 0);
 	if(!joberred(&cl, val, sizeof val))
 		fail("a reclaim walk stopped part-way reported nothing");
@@ -2170,6 +2181,252 @@ Out2:
 	for(i = 0; i < 400 && jobrunning(&cl); i++)
 		sleep(20);
 	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
+ * The walk's own timer (store.md §14(39)), which is what runs it on an
+ * instance nobody writes a verb to.
+ *
+ * The period is `tombdays'/2 and the shortest a map can ask for is
+ * half a day, so srv.h's `srvreclaimms' knob is what a T1 can drive:
+ * set to a few tens of milliseconds, the next tick starts the same
+ * pass the verb starts.  No `reclaim' is written in this case at all —
+ * the /jobs line it reads is the timer's.  §13's `jobhold' keeps that
+ * pass listed once its walk is over, as it does for a verb's, and the
+ * knob goes back before the hold is cleared so that a second tick does
+ * not start a pass behind the case.
+ */
+static void
+treclaimtimer(void)
+{
+	char buf[8192], val[64], *m;
+	Srvctx *ctx;
+	Store *st;
+	Dev *d;
+	Cl cl;
+	int i;
+
+	clstage = "reclaimtimer";
+	m = mkmapd(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid, 0);
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4, 0)) == nil)
+		return;
+	st = srvstore(ctx);
+	mkobj(st, "old", nil, 0, 1);
+	rmobj(st, "old", 9, 3);			/* past both local cutoffs */
+	sleep(1100);				/* past the cutoff's second */
+	clstart(&cl, ctx, Clmsize);
+	if(!adminctl(&cl, "role=admin"))
+		goto Out;
+	istrue("no pass runs before the timer fires", !jobrunning(&cl));
+	srvhook(ctx, "jobhold", 1);
+	srvreclaimms(ctx, 50);
+	if(jobparked(&cl, "reclaimable", val, sizeof val) == nil)
+		fail("no pass reached the hold: the timer never fired");
+	else
+		eqs("the pass the timer started counts what the verb's "
+			"would", val, "1");
+	if(slurpfile(&cl, Ffile2, "jobs", buf, sizeof buf) > 0){
+		istrue("and it is a reclaim job", haspfx(buf, "job=reclaim "));
+		eqv("the ticks behind it started no second walk",
+			nlines(buf, "job="), 1);
+	}else
+		fail("the parked pass left no /jobs line");
+	srvreclaimms(ctx, 0);
+Out:
+	srvhook(ctx, "jobhold", 0);
+	for(i = 0; i < 400 && jobrunning(&cl); i++)
+		sleep(20);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
+ * `reclaim [start|stop]' as a grammar with effects: what a second
+ * `start' does to a running walk, what `stop' does to one, and what a
+ * `start' over a walk that is stopping or over a full job list is
+ * answered.  They are `scrub's three answers (store.md §14(31)) over
+ * this verb's own flag.
+ *
+ * §13's `reclaimhold' is what holds a walk still while the case writes
+ * the next verb: the walk asks no queue and is paced by nothing, so
+ * without it a walk over any index a test can build is over before the
+ * second write lands.  It parks before the walk's first entry here,
+ * which needs an index that has one.
+ */
+static void
+treclaimctl(void)
+{
+	char buf[16*1024], name[32], line[64], *m;
+	Srvctx *ctx;
+	Store *st;
+	Dev *d;
+	Cl cl;
+	Fcall r;
+	int i;
+
+	clstage = "reclaimctl";
+	m = mkmap();
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4, 0)) == nil)
+		return;
+	st = srvstore(ctx);
+	for(i = 0; i < 8; i++){
+		snprint(name, sizeof name, "obj%.2d", i);
+		mkobj(st, name, nil, 0, 1);
+		rmobj(st, name, 9, 3);
+	}
+	clstart(&cl, ctx, Clmsize);
+	if(!adminctl(&cl, "role=admin"))
+		goto Out;
+
+	/* the form with neither word starts nothing and succeeds */
+	if(clwrite(&cl, Fctl, 0, "reclaim", &r) != Rwrite)
+		fail("bare reclaim: %s", clerr(&r));
+	istrue("a bare reclaim starts no walk", !jobrunning(&cl));
+
+	srvhook(ctx, "reclaimhold", 1);		/* held before the 1st entry */
+	if(clwrite(&cl, Fctl, 0, "reclaim start", &r) != Rwrite)
+		fail("reclaim start: %s", clerr(&r));
+	for(i = 0; i < 400 && !jobrunning(&cl); i++)
+		sleep(5);
+	if(slurpfile(&cl, Ffile, "jobs", buf, sizeof buf) > 0)
+		eqv("a walk is listed at /jobs", nlines(buf, "job=reclaim"), 1);
+	else
+		fail("/jobs is empty with a walk started");
+	if(clwrite(&cl, Fctl, 0, "reclaim start", &r) != Rwrite)
+		fail("a second reclaim start: %s", clerr(&r));
+	if(slurpfile(&cl, Ffile, "jobs", buf, sizeof buf) > 0)
+		eqv("a second start puts no second walk over one index",
+			nlines(buf, "job="), 1);
+	else
+		fail("/jobs is empty after a second reclaim start");
+
+	/* a `start' over a walk that has been told to stop is refused */
+	if(clwrite(&cl, Fctl, 0, "reclaim stop", &r) != Rwrite)
+		fail("reclaim stop over a held walk: %s", clerr(&r));
+	clwrite(&cl, Fctl, 0, "reclaim start", &r);
+	clerris("a reclaim start while a walk is stopping", &r,
+		"shoalsrv: reclaim stopping");
+	srvhook(ctx, "reclaimhold", 0);
+	for(i = 0; i < 400 && jobrunning(&cl); i++)
+		sleep(20);
+	istrue("a walk stops when it is told to", !jobrunning(&cl));
+
+	/* and the refusal latched nothing: this one really starts */
+	srvhook(ctx, "reclaimhold", 1);
+	if(clwrite(&cl, Fctl, 0, "reclaim start", &r) != Rwrite)
+		fail("a reclaim start after a stopping one: %s", clerr(&r));
+	for(i = 0; i < 400 && !jobrunning(&cl); i++)
+		sleep(5);
+	istrue("a reclaim start after a stopping one starts a walk",
+		jobrunning(&cl));
+	if(clwrite(&cl, Fctl, 0, "reclaim stop", &r) != Rwrite)
+		fail("reclaim stop after it: %s", clerr(&r));
+	srvhook(ctx, "reclaimhold", 0);
+	for(i = 0; i < 400 && jobrunning(&cl); i++)
+		sleep(20);
+
+	/*
+	 * The job cap refuses a walk like any other pass, and the flag it
+	 * raised before asking for the job has to go back with the
+	 * refusal: a flag left raised makes every later start answer
+	 * success and start nothing, and stops the timer with it.
+	 */
+	srvhook(ctx, "jobhold", 1);
+	for(i = 0; i < 12; i++){
+		snprint(line, sizeof line, "forget peer%.2d", i);
+		if(clwrite(&cl, Fctl, 0, line, &r) != Rwrite)
+			fail("%#q: %s", line, clerr(&r));
+	}
+	clwrite(&cl, Fctl, 0, "reclaim start", &r);
+	clerris("a reclaim start with no job to be had", &r,
+		"shoalsrv: too many jobs");
+	srvhook(ctx, "jobhold", 0);
+	for(i = 0; i < 400 && jobrunning(&cl); i++)
+		sleep(20);
+	srvhook(ctx, "reclaimhold", 1);
+	if(clwrite(&cl, Fctl, 0, "reclaim start", &r) != Rwrite)
+		fail("a reclaim start after a refused one: %s", clerr(&r));
+	for(i = 0; i < 400 && !jobrunning(&cl); i++)
+		sleep(5);
+	if(slurpfile(&cl, Ffile, "jobs", buf, sizeof buf) > 0)
+		eqv("a reclaim start after a refused one starts a walk",
+			nlines(buf, "job=reclaim"), 1);
+	else
+		fail("a reclaim start after a refused one started nothing");
+	if(clwrite(&cl, Fctl, 0, "reclaim stop", &r) != Rwrite)
+		fail("final reclaim stop: %s", clerr(&r));
+Out:
+	srvhook(ctx, "reclaimhold", 0);
+	srvhook(ctx, "jobhold", 0);
+	for(i = 0; i < 400 && jobrunning(&cl); i++)
+		sleep(20);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
+ * D16's shutdown over a reclaim walk parked at §13's `reclaimhold'.
+ *
+ * That point holds a pass proc, so it carries `jobhold's hazard
+ * (srv.h): the pass holds one of the jobs the shutdown waits for, and
+ * the wait is unbounded because store.md §9 forbids closing the store
+ * while a pass is inside the engine.  What keeps it from wedging is
+ * srvholdclear, which the shutdown runs before it drains — the walk
+ * wakes, reads srvstopping between its entries, and gives the job
+ * back.  The case also leaves the timer's proc to that same shutdown,
+ * which waits for it separately.
+ */
+static void
+treclaimdown(void)
+{
+	char name[32], *m;
+	Srvctx *ctx;
+	Store *st;
+	Dev *d;
+	Cl cl;
+	Fcall r;
+	int i;
+
+	clstage = "reclaimdown";
+	m = mkmapd(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid, 0);
+	d = newdisk();
+	freedseen = 0;
+	freedjobs = -1;
+	if((ctx = startsrv(d, m, 4, 0)) == nil)
+		return;
+	st = srvstore(ctx);
+	for(i = 0; i < 8; i++){
+		snprint(name, sizeof name, "obj%.2d", i);
+		mkobj(st, name, nil, 0, 1);
+		rmobj(st, name, 9, 3);
+	}
+	clstart(&cl, ctx, Clmsize);
+	if(!adminctl(&cl, "role=admin"))
+		goto Out;
+	srvhook(ctx, "reclaimhold", 1);
+	if(clwrite(&cl, Fctl, 0, "reclaim start", &r) != Rwrite){
+		fail("reclaim start: %s", clerr(&r));
+		goto Out;
+	}
+	for(i = 0; i < 400 && !jobrunning(&cl); i++)
+		sleep(5);
+	istrue("the walk is listed at /jobs", jobrunning(&cl));
+	eqv("the parked walk holds a job", srvjobcount(ctx), 1);
+Out:
+	clstop(&cl);			/* the loop ends; the shutdown runs */
+	eqv("the store was closed once", freedseen, 1);
+	istrue("the parked walk ended before the store closed",
+		freedjobs == 1);
+	eqv("no job is left held", srvjobcount(ctx), 0);
 	srvfree(ctx);
 	devclose(d);
 	free(m);
@@ -2250,27 +2507,28 @@ Out:
 }
 
 /*
- * A pass that fails says so, and a scrub that failed reclaims
- * nothing.
+ * A pass that fails says so — and a scrub counts no tombstones,
+ * whether it failed or not.
  *
  * Every error inside a pass used to be swallowed: the walk broke off
  * and the verb had already answered success, so the wire said the
- * index had been scrubbed.  Worse, the reclaim walk ran after a scrub
- * that had broken off at slot 0, and reported its count as a whole
- * pass's.
+ * index had been scrubbed.
  *
  * Three points drive it.  `slotfail' fails one index read with the
  * store under it healthy, which is what tells a broken-off walk from
- * a walk whose store has gone: the tombstone here is past both of
- * §1.5's local cutoffs, so a whole pass counts it and a pass that
- * broke off must not.  `fatal' condemns the engine outright, which is
- * how a `dirtydel' is made to fail.  The simulated disk's own read
- * fault over the data region is how ONE object is made unreadable
+ * a walk whose store has gone.  `fatal' condemns the engine outright,
+ * which is how a `dirtydel' is made to fail.  The simulated disk's own
+ * read fault over the data region is how ONE object is made unreadable
  * with the index and the rest of the store healthy — that pass walks
- * to the end of the index and carries an `err=' all the same, which
- * is the one case in which the reclaim's gate turns on the error
- * rather than on the slot count.  `jobhold' keeps the pass listed
- * long enough to read what it gave up with in every case.
+ * to the end of the index and carries an `err=' all the same.
+ * `jobhold' keeps the pass listed long enough to read what it gave up
+ * with in every case.
+ *
+ * The tombstone here is past both of §1.5's local cutoffs, so the
+ * whole store's `reclaimable=' is 1: the scrub's line carries 0 all
+ * the same, at the end of the case, and the `reclaim' beside it
+ * carries 1 over the same index.  That pair is what says the walk no
+ * longer rides on the scrub.
  */
 static void
 tpassfail(void)
@@ -2314,15 +2572,9 @@ tpassfail(void)
 	}
 	if(!joberred(&cl, val, sizeof val))
 		fail("a scrub that broke off reported nothing at /jobs");
-	else{
+	else
 		eqs("/jobs says what the pass gave up with", val,
 			"shoalsrv: index read refused at the point");
-		if(jobfield(&cl, "reclaimable", val, sizeof val) == nil)
-			fail("the failed pass left no /jobs line");
-		else
-			eqs("and a scrub that broke off reclaims nothing",
-				val, "0");
-	}
 	srvhook(ctx, "slotfail", 0);
 	srvhook(ctx, "jobhold", 0);
 	for(i = 0; i < 400 && jobrunning(&cl); i++)
@@ -2349,8 +2601,8 @@ tpassfail(void)
 		dirtyhas(st, (uchar*)"obj00", 5, "n1.1"));
 
 	/*
-	 * one object the pass cannot read: it says so, it walks the rest
-	 * of the index all the same, and the reclaim does not ride on it
+	 * one object the pass cannot read: it says so, and it walks the
+	 * rest of the index all the same
 	 */
 	if(superselect(d, &sel) < 0 || sel.start < 0)
 		fail("superselect: %r");
@@ -2370,29 +2622,40 @@ tpassfail(void)
 		else
 			eqs("/jobs says which object read failed", val,
 				"i/o error");
-		if(jobfield(&cl, "reclaimable", val, sizeof val) == nil)
-			fail("that pass left no /jobs line");
-		else
-			eqs("and a scrub that could not read an object "
-				"reclaims nothing", val, "0");
 		simfault(d, Sfnone, 0);
 		srvhook(ctx, "jobhold", 0);
 		for(i = 0; i < 400 && jobrunning(&cl); i++)
 			sleep(20);
 	}
 
-	/* a whole pass over the same index does report a reclaimable one */
+	/*
+	 * A whole scrub over the same index counts no tombstone, and the
+	 * reclaim walk over that same index counts the one there is.
+	 */
 	srvhook(ctx, "jobhold", 1);
 	if(clwrite(&cl, Fctl, 0, "scrub start rate=1000000", &r) != Rwrite)
 		fail("second scrub start: %s", clerr(&r));
 	if(jobparked(&cl, "reclaimable", val, sizeof val) == nil)
 		fail("the whole pass never reached its hold");
 	else
-		eqs("a scrub that completed does reclaim-count", val, "1");
-	if(slurpfile(&cl, Ffile2, "jobs", buf, sizeof buf) > 0)
+		eqs("a scrub that completed counts no tombstones", val, "0");
+	if(slurpfile(&cl, Ffile2, "jobs", buf, sizeof buf) > 0){
 		istrue("and carries no err=", strstr(buf, "err=") == nil);
-	else
+		eqv("and started no walk of its own",
+			nlines(buf, "job=reclaim"), 0);
+	}else
 		fail("the parked whole pass left no /jobs line");
+	srvhook(ctx, "jobhold", 0);
+	for(i = 0; i < 400 && jobrunning(&cl); i++)
+		sleep(20);
+	srvhook(ctx, "jobhold", 1);
+	if(clwrite(&cl, Fctl, 0, "reclaim start", &r) != Rwrite)
+		fail("reclaim start over the same index: %s", clerr(&r));
+	if(jobparked(&cl, "reclaimable", val, sizeof val) == nil)
+		fail("the reclaim walk never reached its hold");
+	else
+		eqs("the walk over that same index counts the tombstone",
+			val, "1");
 Out:
 	storehook(srvstore(ctx), "fatal", 0);
 	srvhook(ctx, "slotfail", 0);
@@ -2659,7 +2922,6 @@ tscrubctl(void)
 		fail("a scrub whose walk ends at the hold: %s", clerr(&r));
 	if(jobparked(&cl, "done", val, sizeof val) == nil)
 		fail("the pass never reached its hold");
-	sleep(200);			/* and is past its reclaim walk */
 	if(clwrite(&cl, Fctl, 0, "scrub stop", &r) != Rwrite)
 		fail("scrub stop over a parked pass: %s", clerr(&r));
 	checks++;
@@ -3039,6 +3301,9 @@ threadmain(int argc, char **argv)
 	tqueued();
 	tqjobcount();
 	treclaim();
+	treclaimtimer();
+	treclaimctl();
+	treclaimdown();
 	tforget();
 	tscrubctl();
 	tscrubrate();

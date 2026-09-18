@@ -125,6 +125,14 @@ Sctl srvctls[] =
 	.fn	= srvctlscrub,
 },
 {
+	.verb	= "reclaim",
+	.roles	= Aadmin,
+	.fenced	= 1,
+	.nargmin= 0,
+	.nargmax= 1,
+	.fn	= srvctlreclaim,
+},
+{
 	.verb	= "forget",
 	.roles	= Aadmin,
 	.fenced	= 1,

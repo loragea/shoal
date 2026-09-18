@@ -577,11 +577,11 @@ srvslotfail(Srvctx *c, uvlong slot)
 
 /*
  * The point inside the tombstone reclaim walk (job.c), which nothing
- * else here can stop part-way: the scrub that carries it is already
- * past its index walk when the walk begins, and the walk itself is
- * paced by nothing and asks no queue.  n != 0 parks it before its
+ * else here can hold still: the walk is paced by nothing and asks no
+ * queue, so it is over before a second ctl write can land on it.
+ * n != 0 parks it before its
  * n-1'th entry, with the entries before that one counted, so a test
- * can raise `scrub stop' or take the server down over a walk that
+ * can raise `reclaim stop' or take the server down over a walk that
  * has counted a prefix of the snapshot.  Set to n+1, like slotfail; 0
  * is off, and srvholdclear turns it off with the rest.
  */

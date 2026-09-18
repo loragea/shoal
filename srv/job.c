@@ -10,17 +10,22 @@
 #include "fns.h"
 
 /*
- * The background passes, /jobs, and the two ctl verbs that start one:
- * `scrub' (layer-a §2.5, §7.5, store.md §8) and `forget' (§2.5, §7.1).
+ * The background passes, /jobs, and the three ctl verbs that start
+ * one: `scrub' (layer-a §2.5, §7.5, store.md §8), `reclaim' (§2.5,
+ * store.md §9) and `forget' (§2.5, §7.1).  The reclaim pass also has
+ * a timer of its own, started at srvnew, which is the only pass here
+ * that runs without a verb having asked for it.
  *
  * §2.5: "Commands that start background work return success once the
- * job is accepted; progress is read from /jobs."  Both verbs here do
- * exactly that, and both run in a proc of their own outside every
+ * job is accepted; progress is read from /jobs."  Every verb here does
+ * exactly that, and every pass runs in a proc of its own outside every
  * queue, holding one of srv.h's jobs for the whole run so that the
  * shutdown waits for them: store.md §9 forbids storeclose while
  * anything is still inside the engine, and the request drain cannot
  * see a proc that is not a request.  A pass tests srvstopping between
- * objects and gives up rather than leave the shutdown waiting.
+ * units of work and gives up rather than leave the shutdown waiting.
+ * The timer is the one proc here that holds no job, because it walks
+ * nothing itself: it only starts passes (srv.h).
  *
  * WHY `forget' IS A PASS.  §2.5 does not call it background work, and
  * this server makes it so.  Each record it discards is one dirtydel,
@@ -74,6 +79,30 @@ enum
 	 */
 	Njobmax		= 12,
 
+	/*
+	 * The tombstone reclaim walk's own timer (store.md §14(39)).  The
+	 * period is `tombdays'/2, the cadence at which layer-a §8.3 has
+	 * the monitor bump the epoch even on an idle cluster: §1.5's
+	 * condition 3 wants the current epoch strictly above the
+	 * tombstone's, so a walk that looks more often than the epoch
+	 * moves asks a question whose answer cannot have changed.
+	 *
+	 * The floor is what a map with `tombdays=0' gets.  Such a map
+	 * retains nothing — the cutoff is the present (§14(31)) — and
+	 * `tombdays'/2 is then no period at all, so the walk would spin
+	 * over the index for as long as the instance served.  Twelve
+	 * hours is what the shortest non-zero retention a map can carry
+	 * gives, and it is orders above the walk's own cost, which is one
+	 * /tombs snapshot and a walk of it.
+	 *
+	 * The wait is slept in slices, as the scrub's pace is, so that a
+	 * shutdown is seen inside one rather than at the end of a period
+	 * measured in days: the timer proc is not a job, and the context
+	 * it reads outlives it only until srvshutdown says otherwise.
+	 */
+	Reclaimminms	= 12*3600*1000,
+	Reclaimslicems	= 20,
+
 	/* what qjob runs on the object's queue */
 	Jscrub		= 0,
 };
@@ -118,6 +147,7 @@ static char Eshutting[] = "shoalsrv: shutting down";
 static char Enomem[] = "shoalsrv: out of memory";
 static char Ejobs[] = "shoalsrv: too many jobs";
 static char Escrubstopping[] = "shoalsrv: scrub stopping";
+static char Ereclaimstopping[] = "shoalsrv: reclaim stopping";
 
 static void	scrubpass(Sjob*);
 static void	reclaimpass(Sjob*);
@@ -252,11 +282,15 @@ jobproc(void *a)
 	 * otherwise be refused `scrub stopping' for a pass that has
 	 * finished walking, which is a job that is not running and is not
 	 * going to be.  The record stays linked either way, so /jobs
-	 * still lists what the pass finished with.
+	 * still lists what the pass finished with.  `reclaim' carries the
+	 * same flag for the same reason, and its timer reads it too: a
+	 * tick that finds it raised starts nothing.
 	 */
 	lock(&c->joblk);
 	if(strcmp(j->verb, "scrub") == 0)
 		c->scrubbing = 0;
+	else if(strcmp(j->verb, "reclaim") == 0)
+		c->reclaiming = 0;
 	unlock(&c->joblk);
 	/*
 	 * §13's point, while the record is still on the list: /jobs lists
@@ -380,9 +414,10 @@ scrubrate(Srvctx *c)
 
 /*
  * What ends a pass early: the shutdown, or that pass's own stop flag.
- * The flag is named rather than read straight, because a pass that can
- * be stopped has one of its own — `scrub stop' names the scrub's walk
- * and nothing else — and the reader is the same either way.
+ * The two passes that can be stopped have a flag each, because a
+ * `scrub stop' and a `reclaim stop' name different work — the walks
+ * run at once and neither is the other's — and the timer below starts
+ * a reclaim whether or not a scrub is running.
  */
 static int
 stopflag(Srvctx *c, int *fl)
@@ -399,6 +434,12 @@ static int
 scrubover(Srvctx *c)
 {
 	return srvstopping(c) || stopflag(c, &c->scrubstop);
+}
+
+static int
+reclaimover(Srvctx *c)
+{
+	return srvstopping(c) || stopflag(c, &c->reclaimstop);
 }
 
 /*
@@ -471,11 +512,12 @@ scrubpace(Srvctx *c, uvlong *bytes, vlong *t0, ulong *last, uvlong len)
  * instance's own record removed last — lands with that surface.
  * store.md §14(31) and decisions.md D26 record it.
  *
- * It runs from the scrub pass and has no verb of its own.  layer-a
- * §2.5 fixes the ctl grammar and has no verb for it, so a new one
- * would be a wire change; `scrub' is the only verb §2.5 gives an
- * instance for walking its own index on a schedule, and store.md §8
- * already makes that pass the place other whole-index work rides on.
+ * It is a pass of its own, on its own timer and under §2.5's `reclaim'
+ * verb (store.md §14(39)).  It walks the index in seconds and the
+ * scrub takes about `scrubdays' — layer-a §7.5 sizes its own example
+ * at 14 — so a walk that rode on the scrub gave a mass delete's space
+ * back only after a whole pass, forfeited the count to a `scrub stop',
+ * and could not be driven at all without one.
  */
 static void
 reclaimpass(Sjob *j)
@@ -499,24 +541,33 @@ reclaimpass(Sjob *j)
 		return;
 	}
 	n = objsnapcount(sn);
+	lock(&c->joblk);
+	j->total = n;
+	unlock(&c->joblk);
 	for(i = 0; i < n; i++){
 		srvreclaimhold(c, i);
 		/*
 		 * A walk told to stop, or one the shutdown broke off, has
-		 * counted a PREFIX of the snapshot, and nothing else on the
-		 * line says so: `done=' and `total=' are the index walk's
-		 * and by here read done=T/T.  So the pass is marked, and
-		 * `reclaimable=' is read beside an `err=' rather than as
-		 * the whole store's answer.  One string covers both causes
-		 * — what an operator has to know is that the number is a
-		 * prefix, not which of the two cut it short.
+		 * counted a PREFIX of the snapshot.  `done=' and `total='
+		 * are this walk's own — the snapshot's entries, not the
+		 * index's slots, since this pass walks no index — so a
+		 * prefix shows there as well; the pass is marked all the
+		 * same, because `done=' short of `total=' is also what a
+		 * walk still running reads, and the mark is what says the
+		 * walk is over and its count is not the whole store's.  One
+		 * string covers both causes — what an operator has to know
+		 * is that the number is a prefix, not which of the two cut
+		 * it short.
 		 */
-		if(scrubover(c)){
+		if(reclaimover(c)){
 			werrstr("shoalsrv: stopped");
 			joberr(j);
 			break;
 		}
 		rc = objsnapent(sn, i, oid, &oidlen, &oi);
+		lock(&c->joblk);
+		j->done = i+1;
+		unlock(&c->joblk);
 		if(rc < 0){
 			joberr(j);
 			break;
@@ -535,8 +586,148 @@ reclaimpass(Sjob *j)
 }
 
 /*
- * The T1 knob over the period the reclaim walk will run on (srv.h).
- * 0 puts the map's own period back.
+ * Start a reclaim pass, for the verb and for the timer alike: the two
+ * share one "a pass is running" flag, so a tick that lands on a pass
+ * an operator started starts nothing, and a `reclaim start' written
+ * over a pass the timer started is the same no-op as one written over
+ * a pass the verb started.
+ *
+ * The flag is raised before jobstart is called, because raising it
+ * after the proc exists would race the proc's own clearing of it, so
+ * every way jobstart can refuse puts it back — a flag left raised
+ * makes every later start answer success and start nothing, and stops
+ * the timer for good besides.  The stop flag goes back with it.
+ */
+static char*
+reclaimgo(Srvctx *c)
+{
+	char *e;
+	int wasstop;
+
+	lock(&c->joblk);
+	if(c->reclaiming){
+		/*
+		 * A pass that has been told to stop is not the job a start
+		 * asks for: it will read the flag between two entries and
+		 * give up.  This is `scrub's rule (§14(31)) for the same
+		 * reason — clearing the stop flag instead races the pass's
+		 * own read of it — and the timer is answered it too, which
+		 * costs a tick: the pass winding down is about to end, and
+		 * the next tick starts a whole walk.
+		 */
+		if(c->reclaimstop){
+			unlock(&c->joblk);
+			return Ereclaimstopping;
+		}
+		unlock(&c->joblk);
+		return nil;
+	}
+	wasstop = c->reclaimstop;
+	c->reclaiming = 1;
+	c->reclaimstop = 0;
+	unlock(&c->joblk);
+	if((e = jobstart(c, "reclaim", reclaimpass, nil)) == nil)
+		return nil;
+	lock(&c->joblk);
+	c->reclaiming = 0;
+	c->reclaimstop = wasstop;
+	unlock(&c->joblk);
+	return e;
+}
+
+/*
+ * The period between reclaim passes, in ms: `tombdays'/2, which is
+ * layer-a §8.3's own cadence for the epoch bump §1.5's condition 3
+ * needs, floored so that a map retaining nothing does not spin
+ * (Reclaimminms above).  It is read fresh each slice, so a test that
+ * sets the knob after srvnew shortens the wait it is already in.
+ */
+static uvlong
+reclaimperiod(Srvctx *c)
+{
+	uvlong ms;
+
+	lock(&c->joblk);
+	ms = c->reclaimms;
+	unlock(&c->joblk);
+	if(ms != 0)
+		return ms;
+	ms = (uvlong)c->map->tombdays * (86400000/2);
+	if(ms < Reclaimminms)
+		ms = Reclaimminms;
+	return ms;
+}
+
+/*
+ * The timer.  It is not a job — it makes no engine call, and a job
+ * the shutdown waits for would have to end before jobwait rather than
+ * with it — so the shutdown waits for this proc separately, and the
+ * proc reads srvstopping between slices to be there to be waited for.
+ * The context is this proc's to read until then and not after: nothing
+ * else keeps it alive.
+ *
+ * The first pass comes one period after start-up rather than at it.
+ * An instance restarted often would otherwise walk its index at every
+ * start, and the walk answers a question — which tombstones are past
+ * §1.5's retention and epoch — whose answer moves at the period, not
+ * at the restart.
+ */
+static void
+reclaimtimer(void *a)
+{
+	Srvctx *c;
+	uvlong t;
+
+	c = a;
+	for(;;){
+		for(t = 0; t < reclaimperiod(c); t += Reclaimslicems){
+			if(srvstopping(c)){
+				lock(&c->joblk);
+				c->reclaimup = 0;
+				unlock(&c->joblk);
+				threadexits(nil);
+			}
+			sleep(Reclaimslicems);
+		}
+		reclaimgo(c);
+	}
+}
+
+/*
+ * Start it, from srvnew once the map is adopted and the store is open
+ * (srv.h).  It is the last thing start-up does, so no refusal below it
+ * can free the context under a proc that is reading it.
+ */
+int
+srvreclaimproc(Srvctx *c)
+{
+	lock(&c->joblk);
+	c->reclaimup = 1;
+	unlock(&c->joblk);
+	if(proccreate(reclaimtimer, c, Srvstack) < 0){
+		lock(&c->joblk);
+		c->reclaimup = 0;
+		unlock(&c->joblk);
+		return -1;
+	}
+	return 0;
+}
+
+/* whether that proc is still reading the context: the shutdown's wait */
+int
+srvreclaimlive(Srvctx *c)
+{
+	int n;
+
+	lock(&c->joblk);
+	n = c->reclaimup;
+	unlock(&c->joblk);
+	return n;
+}
+
+/*
+ * The T1 knob over the period (srv.h).  0 puts the map's own period
+ * back.
  */
 void
 srvreclaimms(Srvctx *c, uvlong ms)
@@ -599,10 +790,9 @@ scrubpass(Sjob *j)
 		 * An object whose read failed is the pass's failure and is
 		 * recorded as one — it is the only record there is, and a
 		 * scrub that could not read an object has not verified the
-		 * index it says it walked, so the reclaim below must not
-		 * ride on it.  The walk goes on all the same: one object
-		 * that would not read says nothing about the next, and
-		 * stopping here would leave the rest of the index
+		 * index it says it walked.  The walk goes on all the same:
+		 * one object that would not read says nothing about the
+		 * next, and stopping here would leave the rest of the index
 		 * unverified as well.  An object that has merely gone is
 		 * not a failure (objgone) and is counted apart.
 		 */
@@ -622,19 +812,6 @@ scrubpass(Sjob *j)
 		}
 		scrubpace(c, &bytes, &t0, &lastrate, oi.len);
 	}
-	/*
-	 * The reclaim walk rides on a scrub that COMPLETED and found
-	 * everything it walked readable, and on no other: it counts what
-	 * a whole walk of the index found, and a walk that stopped
-	 * part-way — told to stop, shutting down, or broken off by an
-	 * index read that failed — has counted a prefix.  Reporting that
-	 * prefix as the pass's answer would make a partial pass
-	 * indistinguishable from a whole one.  The `err' test is the
-	 * live one of the three for a walk that ran to the end with an
-	 * object it could not read.
-	 */
-	if(slot >= st.nslots && !scrubover(c) && j->err[0] == 0)
-		reclaimpass(j);
 }
 
 /*
@@ -729,6 +906,9 @@ ratearg(char *s, ulong *rate)
  * with the local `shoalsrv: scrub stopping' (§14(29)): the job asked
  * for is not running and is not going to be.  A `stop' with no pass
  * running is accepted too and clears itself at the next `start'.
+ *
+ * `reclaim' below reads the same rules off the same table row shape;
+ * what differs is the fence and the timer.
  */
 char*
 srvctlscrub(Srvctx *c, Sfid *f, int argc, char **argv)
@@ -809,6 +989,59 @@ srvctlscrub(Srvctx *c, Sfid *f, int argc, char **argv)
 	c->scrubstop = wasstop;
 	unlock(&c->joblk);
 	return e;
+}
+
+/*
+ * §2.5's `reclaim [start|stop]' (store.md §14(39)): the tombstone
+ * reclaim walk, started by hand.  The grammar is `scrub's without the
+ * `rate=' — the walk reads no grains and is paced by nothing — and
+ * the three answers are the same three: a line with neither word
+ * changes nothing and succeeds, a `start' over a running pass is
+ * accepted and starts nothing, and a `start' over a pass that has
+ * been told to stop is refused `shoalsrv: reclaim stopping'.
+ *
+ * `stop' stops the pass that is running.  It does not turn the timer
+ * off: the next tick starts a pass exactly as a `reclaim start'
+ * would, since the flag it clears is the pass's and §2.5's form has
+ * no word for a schedule.  An operator who wants the walk off has no
+ * verb for it (§14(39)).
+ *
+ * The row is admin and FENCED.  §2.5's fenced set is "every verb that
+ * mutates data or replication state", and this walk will: §1.5's
+ * discard is what it is a walk for, and it removes records as soon as
+ * the replication surface can answer condition 1.  A fenced instance
+ * is one whose map may be stale, which is exactly the state in which
+ * a discard decided against `tombdays' and an epoch must not be made.
+ * The timer is not gated by the fence — it starts no discard either,
+ * and a count taken under a fence is a count and not a mutation —
+ * so what the fence refuses today is the verb, which is the surface
+ * §2.5 governs.
+ */
+char*
+srvctlreclaim(Srvctx *c, Sfid *f, int argc, char **argv)
+{
+	int start, stop;
+
+	USED(f);
+	start = stop = 0;
+	if(argc > 1)
+		return Ebadctl;
+	if(argc == 1){
+		if(strcmp(argv[0], "start") == 0)
+			start = 1;
+		else if(strcmp(argv[0], "stop") == 0)
+			stop = 1;
+		else
+			return Ebadctl;
+	}
+	if(stop){
+		lock(&c->joblk);
+		c->reclaimstop = 1;
+		unlock(&c->joblk);
+	}
+	if(!start)
+		return nil;
+	return reclaimgo(c);
 }
 
 /*
