@@ -1053,6 +1053,26 @@ ninecreate(Nine *c, ulong fid, char *name, ulong perm, int mode, int ms,
  * path shortens a write and a reader of `/rpc' MUST offer a whole
  * msize−IOHDRSZ (§5.6).  r->count is what the reply reported.
  */
+/*
+ * An Rread or Rwrite whose count overruns the request's is the peer
+ * breaking 9P, not a refusal, so it kills the connection like every
+ * other botch: a client that answered the NEXT call Nineok would be
+ * handing the caller replies from a stream it no longer understands.
+ * Called with the reply already freed, under no lock.
+ */
+static int
+ninecountbotch(Nine *c, Ninerep *r, char *rep, ulong count, char *req, long n)
+{
+	char buf[ERRMAX];
+
+	snprint(buf, sizeof buf, "ninep: an %s of %lud bytes for a %s of %ld",
+		rep, count, req, n);
+	qlock(&c->lk);
+	ninedied(c, Ninebotch, buf);
+	qunlock(&c->lk);
+	return nineout(r, Ninebotch, "%s", buf);
+}
+
 int
 nineread(Nine *c, ulong fid, vlong off, void *a, long n, int ms, Ninerep *r)
 {
@@ -1073,8 +1093,7 @@ nineread(Nine *c, ulong fid, vlong off, void *a, long n, int ms, Ninerep *r)
 		return r->out;
 	if(f.count > (ulong)n){
 		free(m);
-		return nineout(r, Ninebotch, "ninep: an Rread of %lud bytes"
-			" for a Tread of %ld", f.count, n);
+		return ninecountbotch(c, r, "Rread", f.count, "Tread", n);
 	}
 	if(f.count > 0)
 		memmove(a, f.data, f.count);
@@ -1102,6 +1121,10 @@ ninewrite(Nine *c, ulong fid, vlong off, void *a, long n, int ms, Ninerep *r)
 	t.data = a;
 	if(ninerpc(c, &t, fid, 1, ms, r, &f, &m) != Nineok)
 		return r->out;
+	if(f.count > (ulong)n){
+		free(m);
+		return ninecountbotch(c, r, "Rwrite", f.count, "Twrite", n);
+	}
 	r->count = f.count;
 	free(m);
 	return Nineok;

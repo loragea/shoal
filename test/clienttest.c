@@ -1258,6 +1258,57 @@ cwritestall(void)
 	stubstop(&s);
 }
 
+/*
+ * A peer whose Rread or Rwrite claims more bytes than the request
+ * asked for.  That is a 9P violation like any other and it kills the
+ * connection: a client that answered the NEXT call Nineok would be
+ * handing the caller replies from a stream it no longer understands.
+ * Two connections, because the first does not survive its own case.
+ */
+static void
+covercount(void)
+{
+	char buf[256];
+	Ninerep r;
+	Stub s;
+	Nine *c;
+
+	stage = "an Rread over its Tread";
+	stubstart(&s, Stover, 0);
+	if((c = opencl(&s.p, Ninemsizefloor)) == nil){
+		close(s.p.cin);
+		close(s.p.cout);
+		stubstop(&s);
+		return;
+	}
+	nineread(c, Fa, 0, buf, Sover, Tms, &r);
+	eqv("an Rread over the count asked for is a protocol violation",
+		r.out, Ninebotch);
+	eqs("... and says which", r.err,
+		"ninep: an Rread of 65 bytes for a Tread of 64");
+	nineclunk(c, Fb, Tms, &r);
+	eqv("the connection does not survive it", r.out, Ninebotch);
+	closecl(c);
+	stubstop(&s);
+
+	stage = "an Rwrite over its Twrite";
+	stubstart(&s, Stover, 0);
+	if((c = opencl(&s.p, Ninemsizefloor)) == nil){
+		close(s.p.cin);
+		close(s.p.cout);
+		stubstop(&s);
+		return;
+	}
+	ninewrite(c, Fa, 0, buf, Sover, Tms, &r);
+	eqv("an Rwrite of more than was written is one too", r.out, Ninebotch);
+	eqs("... and says which", r.err,
+		"ninep: an Rwrite of 65 bytes for a Twrite of 64");
+	nineclunk(c, Fb, Tms, &r);
+	eqv("the connection does not survive it either", r.out, Ninebotch);
+	closecl(c);
+	stubstop(&s);
+}
+
 void
 threadmain(int argc, char **argv)
 {
@@ -1276,6 +1327,7 @@ threadmain(int argc, char **argv)
 	cmutepeer();
 	clocalrefuse();
 	cwritestall();
+	covercount();
 
 	watchoff();
 	if(fails > 0){
