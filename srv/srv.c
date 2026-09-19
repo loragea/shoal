@@ -286,7 +286,6 @@ srvnew(Srvcfg *cfg)
 		return nil;
 	c->cfg = *cfg;
 	c->dev = cfg->dev;
-	map = nil;
 	len = cfg->maplen;
 	if((text = malloc(len)) == nil){
 		free(c);
