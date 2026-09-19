@@ -736,7 +736,7 @@ struct Sstage
  *	srvmapswap	publishes a new snapshot and gives the old one's
  *		installed reference back (srv.h).  It is T1's alone: this
  *		build has no monitor client, so nothing swaps in
- *		production (store.md §14(18), §14(52)).
+ *		production (store.md §14(18), §14(48)).
  *
  * What a swap guarantees to a request already in flight is that its
  * own snapshot does not change under it.  A holder therefore reads
@@ -789,7 +789,7 @@ struct Sstage
  * (obj.c), and a /repl or /rpc write is epoch-checked on the loop
  * before the operation is pushed (peer.c).  Each half is one map's,
  * which is what the rule above buys; the pair is not.  Nothing swaps
- * in this build, so nothing observes it — store.md §14(52) records it
+ * in this build, so nothing observes it — store.md §14(48) records it
  * as the refresh loop's to close.
  *
  * The WRITE PATH's epoch is the rule this exists for.  A write is

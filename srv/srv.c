@@ -139,7 +139,7 @@ srvmapput(Srvctx *c, Smap *s)
  * start-up does and refuses a text that fails either, leaving the old
  * snapshot in force; nothing durable is written, because §6.3's
  * adoption decision belongs to the refresh loop that is not built
- * (store.md §14(18), §14(52)).
+ * (store.md §14(18), §14(48)).
  *
  * The error string is this call's own buffer, valid until the next
  * call — like status.c's render error, and for the same reason: there
@@ -182,7 +182,7 @@ srvmapswap(Srvctx *c, char *text, long len)
 	 * from everywhere without a hold, so a map that gives this uuid
 	 * a different iid is refused rather than served under a name
 	 * half the server no longer agrees with.  A refresh has to
-	 * decide what such a map means (store.md §14(52)).
+	 * decide what such a map means (store.md §14(48)).
 	 */
 	if(strcmp(s->self->iid, c->iid) != 0){
 		snprint(swaperr, sizeof swaperr,
@@ -415,7 +415,7 @@ srvnew(Srvcfg *cfg)
 	 * of the map here and read from the Fence afterwards, so it is
 	 * the one map value a refresh would have to carry across a swap
 	 * as well; srvmapswap does not, because F1's clock is inert
-	 * while nothing refreshes (store.md §14(19), §14(52)).
+	 * while nothing refreshes (store.md §14(19), §14(48)).
 	 */
 	c->fence.leasems = c->smap->map->leasems;
 	fencerefresh(&c->fence, 0);

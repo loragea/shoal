@@ -665,7 +665,7 @@ uvlong	srvreclaimperiod(Srvctx*);
  *
  * What it is NOT is an adoption: layer-a §6.3's decision, its two
  * durable values and the geometry checks start-up makes are start-up's
- * alone, and a refresh loop is what owes them (store.md §14(52)).  So
+ * alone, and a refresh loop is what owes them (store.md §14(48)).  So
  * a swap MAY install a map this instance would have refused to start
  * under, which is what lets a case drive the window rather than the
  * policy.

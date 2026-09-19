@@ -8,7 +8,7 @@
 #include "../srv/srv.h"
 
 /*
- * T1: the adopted map's handle — store.md §14(52), and srv/dat.h's
+ * T1: the adopted map's handle — store.md §14(48), and srv/dat.h's
  * contract beside the Smap it describes.
  *
  * The map this server serves under is an immutable snapshot behind a

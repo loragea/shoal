@@ -6231,7 +6231,7 @@ name a half that is not built; each says which.
     the rule has its own operations serialised in arrival order
     rather than refused.
 
-52. **The adopted map is read through a refcounted snapshot, and it
+48. **The adopted map is read through a refcounted snapshot, and it
     can be swapped under a running server (§7; layer-a §6.3, §5.4).**
     Item 18 has the map adopted once at start-up and never refreshed,
     and the fields that held it — the text, the parse and a bare
