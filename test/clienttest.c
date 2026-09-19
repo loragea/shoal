@@ -933,11 +933,15 @@ struct Stub
  * read it has parked in.  The end it WRITES is drained and not
  * closed: `pipewrite' posts `sys: write on closed pipe' to a proc
  * blocked writing a pipe whose reader has gone
- * (/sys/src/9/port/devpipe.c:310), and libthread answers a `sys:'
- * note with noted(NDFLT), so closing it would kill the client's
- * caller outright rather than break its write.  It may be called more
- * than once, so the end goes at most once and stubstop finds nothing
- * left.
+ * (/sys/src/9/port/devpipe.c:310), and that note kills the proc it
+ * lands on — on the write path the client's own caller — rather than
+ * failing its write.  It kills it in both of this library's homes: a
+ * plain-libc program with no handler dies by the kernel's default
+ * action for the note, and a libthread program's handler answers a
+ * `sys:' note with noted(NDFLT), which is that same action.  So
+ * closing that end would take the caller down instead of breaking
+ * its write.  It may be called more than once, so the end goes at
+ * most once and stubstop finds nothing left.
  */
 static void
 stubhangup(void *v)
