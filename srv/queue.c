@@ -643,7 +643,8 @@ srvreclaimhold(Srvctx *c, uvlong i)
 }
 
 /*
- * The point inside the reclaim timer's own start of a pass (job.c):
+ * The point inside a timer's own start of a pass (job.c) — the
+ * reclaim timer's and the scrub timer's alike, one point for both:
  * n != 0 parks the tick after it has decided to start one and before
  * the pass's proc exists.  That window is where a `reclaim start'
  * written on the service loop meets a tick in flight, and it is too

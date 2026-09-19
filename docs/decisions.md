@@ -932,7 +932,9 @@ scrub's, so neither should its schedule. Victor authorised the
 grammar change on 2026-09-18: the walk is its own job on its own
 timer, and `reclaim [start|stop]` is a new admin verb in §2.5, fenced
 because the walk will discard (§14(39)). The scrub's own "continuously"
-(§7.5) is a separate matter and is not built.
+(§7.5) is a separate matter, settled separately: it has a timer of its
+own on a period of `scrubdays` (§8), and the two `stop`s mean the same
+thing — stop the pass that is running, leave the schedule alone.
 **Considered and rejected:** answering `forget` synchronously, which
 is the plain reading of §2.5 and costs the loop one durable commit
 per record, unbounded by anything but the disk's dirty region; and

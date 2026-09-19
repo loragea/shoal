@@ -65,6 +65,15 @@ srvstatustext(Srvctx *c, Sfid *f, Text *t)
 	textprint(t, "dirty=%lud\n", dirtycount(c->store));
 	textprint(t, "lost=%llud\n", st.nlost);
 	textprint(t, "diverged=%llud\n", srvdiverged(c));
+	/*
+	 * How long until the scrub timer's next tick, in ms (job.c).
+	 * layer-a §7.5 has the pass run continuously and §2.5's verb says
+	 * nothing about when the next one is due, so this is where an
+	 * operator reads the schedule rather than inferring it from a
+	 * `job=scrub' line that has not appeared yet.  store.md §14(23)
+	 * has it with the rest of the fields beyond §2.2's list.
+	 */
+	textprint(t, "scrubnext=%llud\n", srvscrubnextms(c));
 	textprint(t, "staged=%llud\n", st.staged);
 	textprint(t, "queues=%d\n", c->nq);
 	textprint(t, "qdepth=%llud\n", np - nd);

@@ -31,8 +31,8 @@ enum
 void
 usage(void)
 {
-	fprint(2, "usage: %s [-w] [-X point[,n]] [-q queues] [-s srvname] "
-		"-m mapfile /dev/sdXX/name\n", argv0);
+	fprint(2, "usage: %s [-w] [-X point[,n]] [-q queues] [-d scrubdays] "
+		"[-s srvname] -m mapfile /dev/sdXX/name\n", argv0);
 	threadexitsall("usage");
 }
 
@@ -81,6 +81,17 @@ threadmain(int argc, char **argv)
 		break;
 	case 'q':
 		cfg.nqueue = atoi(EARGF(usage()));
+		break;
+	/*
+	 * layer-a §7.5's `scrubdays': how long a full scrub pass should
+	 * take, which is also the period between passes (srv/job.c).  A
+	 * whole positive number of days or nothing — 0 and a negative are
+	 * not a period, and the default is what the flag is absent for.
+	 */
+	case 'd':
+		cfg.scrubdays = atoi(EARGF(usage()));
+		if(cfg.scrubdays <= 0)
+			usage();
 		break;
 	case 's':
 		srvname = EARGF(usage());

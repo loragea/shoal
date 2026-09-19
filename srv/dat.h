@@ -800,21 +800,31 @@ struct Srvctx
 	 * rate `scrub rate=' sets, in KiB/s, and the flag `scrub stop'
 	 * raises, which a running pass tests between objects exactly as
 	 * it tests srvstopping.  `scrubbing' is what keeps a second
-	 * `scrub start' from putting two passes over one index.
+	 * `scrub start' — or a tick of the scrub's own timer — from
+	 * putting two passes over one index.
 	 *
 	 * The tombstone reclaim walk carries the same pair of flags, for
 	 * the same two jobs — one pass over one index, and a stop a
 	 * running pass reads between entries — and they are its own, not
 	 * the scrub's: the two walks run at once and neither stops the
-	 * other (job.c).  `reclaimms' is the T1 knob over the timer's
-	 * period and `reclaimup' says the timer proc is still reading
-	 * this context, which is what the shutdown waits for; the timer
-	 * holds no job, since it makes no engine call.
+	 * other (job.c).
+	 *
+	 * Each of the two has a timer, and the last three words of each
+	 * pair are that timer's: `...ms' is the T1 knob over its period,
+	 * `...up' says the proc is still reading this context — which is
+	 * what the shutdown waits for, since a timer holds no job, making
+	 * no engine call — and the scrub's `scrubnext' is when its next
+	 * tick is due, as an absolute millisecond, which is what /status
+	 * renders as `scrubnext=' (job.c, status.c).  The reclaim timer
+	 * has no such word because no file reports its schedule.
 	 */
 	Sjob	*jobs;
 	int	scrubbing;
 	int	scrubstop;
 	ulong	scrubrate;
+	int	scrubup;
+	uvlong	scrubms;
+	uvlong	scrubnext;
 	int	reclaiming;
 	int	reclaimstop;
 	int	reclaimup;

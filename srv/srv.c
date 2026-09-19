@@ -22,6 +22,7 @@
  */
 
 static void	srvserved(Srvctx*);
+static void	reclaimwait(Srvctx*);
 
 static void
 hexof(char *out, uchar *p, int n)
@@ -284,13 +285,28 @@ srvnew(Srvcfg *cfg)
 	c->srv.free = srvfreed;
 
 	/*
-	 * The tombstone reclaim walk's timer (job.c), started last: it
-	 * reads this context for as long as it runs, and every refusal
-	 * above it frees the context.  It needs the adopted map, whose
-	 * `tombdays' is its period, and the store, which its passes walk.
+	 * The two timers (job.c), started last: each reads this context
+	 * for as long as it runs, and every refusal above them frees the
+	 * context.  They need the adopted map, whose `tombdays' is the
+	 * reclaim timer's period, and the store, which their passes walk.
+	 *
+	 * Which leaves the refusal BETWEEN them, the second proccreate's.
+	 * The first timer is by then reading a context Fail would free,
+	 * so the start-up does what the shutdown does: raise `stopping',
+	 * which the proc reads between slices, and wait for it to end.
+	 * Nothing else has to be undone, because nothing else was done —
+	 * no pass can have been started behind it either, jobadmit
+	 * reading that same flag.
 	 */
 	if(srvreclaimproc(c) < 0)
 		goto Fail;
+	if(srvscrubproc(c) < 0){
+		lock(&c->joblk);
+		c->stopping = 1;
+		unlock(&c->joblk);
+		reclaimwait(c);
+		goto Fail;
+	}
 	return c;
 
 Fail:
@@ -403,18 +419,28 @@ srvjobcount(Srvctx *c)
 }
 
 /*
- * The reclaim timer is not one of the jobs above — it makes no engine
- * call — but it reads the context, and srvfree frees that as soon as
- * the shutdown is over.  So the shutdown waits for the proc to see
- * `stopping' and end.  The wait is bounded by the proc's own slice,
- * which is half a second (job.c), and no pass can be started behind
- * it: jobadmit reads `stopping' under joblk and refuses once the
- * shutdown has begun, which is the same gate every verb meets.
+ * The two timers are not jobs of the kind above — neither makes an
+ * engine call — but each reads the context, and srvfree frees that as
+ * soon as the shutdown is over.  So the shutdown waits for each proc
+ * to see `stopping' and end.  Each wait is bounded by that proc's own
+ * slice, which is half a second (job.c), and no pass can be started
+ * behind either: jobadmit reads `stopping' under joblk and refuses
+ * once the shutdown has begun, which is the same gate every verb
+ * meets.  They are two waits rather than one loop over both because
+ * each proc has its own flag and the two run at once: whichever ends
+ * second is what the pair costs, not the sum.
  */
 static void
 reclaimwait(Srvctx *c)
 {
 	while(srvreclaimlive(c))
+		sleep(5);
+}
+
+static void
+scrubwait(Srvctx *c)
+{
+	while(srvscrublive(c))
 		sleep(5);
 }
 
@@ -436,10 +462,11 @@ jobwait(Srvctx *c)
 /*
  * D16's order, which store.md §9 derives from the close contract
  * rather than from taste: stop accepting requests, let the ones in
- * flight drain, wait for the reclaim timer and then for the background
- * jobs, and only then close the store.  The timer goes before the jobs
- * because it is the one thing that could still start one; once it has
- * ended, nothing can add to what jobwait waits for.  The loop is what
+ * flight drain, wait for the two timers and then for the background
+ * jobs, and only then close the store.  The timers go before the jobs
+ * because they are the two things that could still start one; once
+ * both have ended, nothing can add to what jobwait waits for.  The
+ * loop is what
  * stops first here — this runs from Srv.end,
  * which lib9p calls once the connection has gone — and the drain and
  * the job wait
@@ -498,6 +525,7 @@ srvshutdown(Srvctx *c)
 	srvcellpoint(c, 0);
 	srvqdrain(c);
 	reclaimwait(c);
+	scrubwait(c);
 	jobwait(c);
 	srvfidsclose(c);
 	srvstagedrain(c);		/* the last moment §9 allows one */
