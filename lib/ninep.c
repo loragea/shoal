@@ -512,7 +512,14 @@ ninereader(void *a)
 		qunlock(&c->lk);
 		n = ninereadmsg(c, msize, &botch, e, sizeof e);
 		qlock(&c->lk);
-		if(c->closed)
+		/*
+		 * Dead as well as closed: the timer kills a connection whose
+		 * write stalled while this proc is inside the read, and
+		 * ninegot on a dead connection would count a reply against
+		 * slots ninedied has already settled and a nexpect it has
+		 * already zeroed.
+		 */
+		if(c->closed || c->dead)
 			break;
 		if(n == 0){
 			ninedied(c, Ninedead, Ehangup);
