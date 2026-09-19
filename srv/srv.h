@@ -675,8 +675,10 @@ uvlong	srvreclaimperiod(Srvctx*);
  * lets go (srv/dat.h).  srvmapcount is the observable over that:
  * `nsnap' is how many snapshots exist — one when nothing is parked
  * across a swap — and `nref' how many holders the snapshot in force
- * has, the context's own installed reference included, so an idle
- * server reads 1 and 1.  Either pointer may be nil.
+ * has, the context's own installed reference included.  `nsnap' is
+ * what a case asserts exactly; `nref' is a floor, because the reclaim
+ * timer takes a snapshot of its own on every slice of its wait and a
+ * case cannot say it is not mid-read.  Either pointer may be nil.
  */
 char*	srvmapswap(Srvctx*, char *text, long len);
 void	srvmapcount(Srvctx*, int *nsnap, int *nref);
