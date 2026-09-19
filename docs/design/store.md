@@ -2827,6 +2827,17 @@ verb's own path exactly (`scrubgo` in `srv/job.c`, which the verb and
 the timer share), down to the refusals: a tick meeting the job cap is
 turned back like a `scrub start` meeting it.
 
+The timer arms tick to tick and not from the end of a pass, which is
+what settles the gap on the far side of an overlong one: a pass that
+outlasts its period ends at no fixed point in the tick it is in, so
+the wait between it ending and the next pass starting is anywhere in
+[0, `scrubdays`] — the tick it was still running for was a no-op, and
+the one after that starts the next pass. That is **implementation
+policy** and it is the cheap reading: an index that takes longer than
+`scrubdays` to walk is one whose rate is set too low for its size, and
+§7.5's continuity is met by a pass always being due rather than by any
+particular spacing between them.
+
 **Neither word of the verb touches the schedule.** `scrub start`
 starts a pass now and leaves the timer where it was; `scrub stop`
 stops the pass that is running, and the next tick starts another. The
@@ -4162,9 +4173,9 @@ queue-pool size, whose sizing rule is §7's; `-d` is layer-a §7.5's
 `scrubdays`, a whole positive number of days, which is how long a
 full scrub pass should take and so the period between passes (§8) —
 the default is 14 and anything else is refused with the usage; `-s`
-names the posted service. `-m` is the cluster map, as a file: this build has no
-monitor client, so the map is read once at start and never refreshed
-(§14(18)). The monitor is `cmd/shoalmon`.
+names the posted service. `-m` is the cluster map, as a file: this
+build has no monitor client, so the map is read once at start and
+never refreshed (§14(18)). The monitor is `cmd/shoalmon`.
 
 ## 13. Test plan
 

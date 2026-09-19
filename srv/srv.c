@@ -466,12 +466,10 @@ jobwait(Srvctx *c)
  * jobs, and only then close the store.  The timers go before the jobs
  * because they are the two things that could still start one; once
  * both have ended, nothing can add to what jobwait waits for.  The
- * loop is what
- * stops first here — this runs from Srv.end,
- * which lib9p calls once the connection has gone — and the drain and
- * the job wait
- * are what make the engine's "quiesce, then close" true: no call
- * taking the Store* may still be in flight when storeclose runs,
+ * loop is what stops first here — this runs from Srv.end, which
+ * lib9p calls once the connection has gone — and the drain and the
+ * job wait are what make the engine's "quiesce, then close" true: no
+ * call taking the Store* may still be in flight when storeclose runs,
  * because such a call blocks on the state lock holding nothing that
  * keeps the Store alive.
  *

@@ -723,9 +723,13 @@ reclaimgo(Srvctx *c, int bytimer)
 		 * asks for: it will read the flag between two entries and
 		 * give up.  This is `scrub's rule (§14(31)) for the same
 		 * reason — clearing the stop flag instead races the pass's
-		 * own read of it — and the timer is answered it too, which
-		 * costs a tick: the pass winding down is about to end, and
-		 * the next tick starts a whole walk.
+		 * own read of it — and the timer is answered it too.  What
+		 * that costs is a whole period: `tombdays'/2, which is half
+		 * a day at the shortest and days for any map an operator
+		 * would write, with no walk over the entries the stopped
+		 * one never reached.  The tick cannot be spent on the pass
+		 * winding down instead — that pass is about to end — and a
+		 * walk started behind it is what `reclaiming' forbids.
 		 */
 		if(c->reclaimstop){
 			unlock(&c->joblk);
@@ -1007,8 +1011,14 @@ scrubgo(Srvctx *c, int bytimer)
 		 * A pass that has been told to stop is not the job a start
 		 * asks for: it reads the flag between two objects and gives
 		 * up (store.md §14(31)).  The timer is answered that too,
-		 * which costs a tick — the pass winding down is about to
-		 * end, and the next tick starts a whole pass.
+		 * and what that costs is a whole period — `scrubdays', 14
+		 * days unless `shoalsrv -d' said otherwise — with no pass
+		 * running over the tail the stopped one never reached.  The
+		 * tick cannot be spent on the pass winding down instead:
+		 * that pass is about to end, and a tick answered with it is
+		 * a tick answered with nothing.  Starting one behind it is
+		 * what `scrubbing' forbids, since the two would be over one
+		 * index at once.
 		 */
 		if(c->scrubstop){
 			unlock(&c->joblk);
