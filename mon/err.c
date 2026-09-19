@@ -28,6 +28,15 @@
  * design (mon.h) and neither links the other, so §2.6's block appears
  * twice; what keeps the two copies honest is that §2.6 is a closed
  * normative list and e26 below is that list read as data.
+ *
+ * Who calls it.  Every wire error this server composes rather than
+ * names — the allocation failures in the attach, the walk and the
+ * render-at-open — goes out through monsrverrs, so the prefix is the
+ * classifier's decision and not a string typed by hand; and
+ * monsrvnew's two start-up refusals go through monsrverr, because
+ * what they carry is libshoal's (mon.c).  The strings this file
+ * declares are answered by name, which is why the classifier passes
+ * an already-marked string through unchanged.
  */
 
 /*

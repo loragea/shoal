@@ -279,6 +279,7 @@ rootread(Req *r)
 static void
 mapsopen(Req *r)
 {
+	char errb[ERRMAX];
 	Monctx *c;
 	Mfid *f;
 	Mdirent *dir;
@@ -294,7 +295,7 @@ mapsopen(Req *r)
 	n = 0;
 	if((dir = mallocz((st.retain+1)*sizeof *dir, 1)) == nil){
 		monsrvunlock(c);
-		respond(r, "shoalmon: out of memory");
+		respond(r, monsrverrs(errb, sizeof errb, "out of memory"));
 		return;
 	}
 	for(i = 0; i <= st.retain; i++){
@@ -485,6 +486,7 @@ walk1(Monctx *c, Mfid *f, char *name, Qid *q)
 void
 monsrvwalk(Req *r)
 {
+	char errb[ERRMAX];
 	Monctx *c;
 	Mfid *f, *nf, g;
 	char *e;
@@ -529,7 +531,8 @@ monsrvwalk(Req *r)
 			f->qidvers = g.qidvers;
 		}else if(r->fid != r->newfid){
 			if((nf = mallocz(sizeof *nf, 1)) == nil){
-				respond(r, "shoalmon: out of memory");
+				respond(r, monsrverrs(errb, sizeof errb,
+					"out of memory"));
 				return;
 			}
 			*nf = g;
@@ -549,7 +552,7 @@ monsrvwalk(Req *r)
 static void
 opentext(Req *r)
 {
-	char *e;
+	char errb[ERRMAX], *e;
 	Monctx *c;
 	Mfid *f;
 	Mfile *file;
@@ -559,7 +562,7 @@ opentext(Req *r)
 	f = r->fid->aux;
 	file = &monfiles[f->file];
 	if((t = montextnew()) == nil){
-		respond(r, "shoalmon: out of memory");
+		respond(r, monsrverrs(errb, sizeof errb, "out of memory"));
 		return;
 	}
 	monsrvlock(c);
@@ -567,12 +570,12 @@ opentext(Req *r)
 	monsrvunlock(c);
 	if(e != nil){
 		montextfree(t);
-		respond(r, e);
+		respond(r, monsrverrs(errb, sizeof errb, e));
 		return;
 	}
 	if(t->err){
 		montextfree(t);
-		respond(r, "shoalmon: out of memory");
+		respond(r, monsrverrs(errb, sizeof errb, "out of memory"));
 		return;
 	}
 	montextfree(f->text);

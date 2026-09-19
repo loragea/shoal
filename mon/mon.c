@@ -84,9 +84,22 @@ monsrvremap(Monctx *c)
 	return 0;
 }
 
+/*
+ * Start-up's two refusals go out through §3.7's classifier, because
+ * what they carry comes from libshoal and not from here.  The slot
+ * store answers `no valid monitor header: …' and `no valid
+ * current-map slot: …', which name no §2.6 condition and are marked
+ * `shoalmon: '; it also answers `disk full: …', which IS one and
+ * passes verbatim.  mapparse answers `bad map: …' for a text that
+ * does not conform — §2.6's own — and whatever mallocz left for an
+ * allocation failure, which lib/shoal.h warns is NOT `bad map' and
+ * which §3.7 forbids dressing as one.  One classifier decides which
+ * of those a string is (store.md §14(59)).
+ */
 Monctx*
 monsrvnew(Moncfg *cfg)
 {
+	char err[ERRMAX];
 	Monctx *c;
 
 	if((c = mallocz(sizeof *c, 1)) == nil)
@@ -105,13 +118,17 @@ monsrvnew(Moncfg *cfg)
 	 * partition.
 	 */
 	if((c->mon = monopen(c->dev)) == nil){
+		monsrverr(err, sizeof err);
 		free(c);
+		werrstr("%s", err);
 		return nil;
 	}
 	if(monsrvremap(c) < 0){
+		monsrverr(err, sizeof err);
 		monclose(c->mon);
 		mapfree(c->map);
 		free(c);
+		werrstr("%s", err);
 		return nil;
 	}
 

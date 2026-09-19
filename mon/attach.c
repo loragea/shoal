@@ -103,10 +103,11 @@ monaname(Mfid *f, char *aname)
 void
 monsrvattach(Req *r)
 {
+	char errb[ERRMAX];
 	Mfid *f;
 
 	if((f = mallocz(sizeof *f, 1)) == nil){
-		respond(r, "shoalmon: out of memory");
+		respond(r, monsrverrs(errb, sizeof errb, "out of memory"));
 		return;
 	}
 	r->fid->aux = f;

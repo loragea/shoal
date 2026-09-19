@@ -437,6 +437,7 @@ tempty(void)
 static void
 tbadmap(void)
 {
+	char err[ERRMAX];
 	Monctx *ctx;
 	Moncfg cfg;
 	Dev *d;
@@ -457,9 +458,114 @@ tbadmap(void)
 	ctx = monsrvnew(&cfg);
 	istrue("a current map that does not parse refuses the start",
 		ctx == nil);
-	if(ctx != nil)
+	if(ctx == nil){
+		/*
+		 * mapparse's refusal IS §2.6's `bad map', so §3.7 has it
+		 * pass verbatim rather than under this server's prefix.
+		 */
+		rerrstr(err, sizeof err);
+		eqs("... with mapparse's §2.6 reason", monsrv26(err),
+			"bad map");
+	}else
 		monsrvfree(ctx);
 	devclose(d);
+
+	/*
+	 * The other side of the same classifier: the slot store's own
+	 * refusals name no §2.6 condition, so they go out marked
+	 * (store.md §14(59)).  An unformatted partition is the cheapest
+	 * one to reach.
+	 */
+	if((d = simopen(Tsecsz, Tnsec, Tseed)) == nil)
+		sysfatal("simopen: %r");
+	memset(&cfg, 0, sizeof cfg);
+	cfg.dev = d;
+	ctx = monsrvnew(&cfg);
+	istrue("an unformatted partition refuses the start", ctx == nil);
+	if(ctx == nil){
+		rerrstr(err, sizeof err);
+		istrue("... under this server's own prefix",
+			strncmp(err, "shoalmon: ", 10) == 0);
+		istrue("... and under no §2.6 prefix", monsrv26(err) == nil);
+	}else
+		monsrvfree(ctx);
+	devclose(d);
+}
+
+/*
+ * store.md §3.7's mapping rule, which is normative, and mon/err.c's
+ * classifier over layer-a §2.6's set.  The two halves are checked
+ * where each lives: the classifier over the strings this monitor's
+ * libraries actually produce, and the wire over a start-up refusal
+ * that carries one of them.
+ *
+ * The inputs are real.  `bad map: …' is mapparse's, `disk full: …'
+ * is moncommit's on an oversize map, and the two `no valid …' lines
+ * are monopen's; §2.6 owns two of those three prefixes and not the
+ * third, which is the whole reason a classifier exists rather than a
+ * blanket prefix.
+ */
+static void
+terrors(void)
+{
+	static char *wire[] = {
+		"permission denied",
+		"bad ctl",
+		"unknown ctl",
+		"bad aname",
+		"no rename",
+		"bad map",
+		"bad map: epoch 0 is not a u64",
+		"disk full: a 9000-byte map needs 9512 bytes of a 4096-byte "
+			"slot",
+	};
+	static char *internal[] = {
+		"no valid monitor header: copy 0 bad magic; copy 1 bad magic",
+		"no valid current-map slot: slot 0 bad magic; slot 1 bad magic",
+		"the header copies differ: retain 4 and 8",
+		"out of memory",
+		"i/o error",
+		"bad maps here",		/* a prefix is not a match */
+		"bad ctlx",
+		"permission deniedx",
+	};
+	char buf[ERRMAX];
+	int i;
+
+	clstage = "errors";
+	for(i = 0; i < nelem(wire); i++){
+		eqs("a §2.6 string passes verbatim",
+			monsrverrs(buf, sizeof buf, wire[i]), wire[i]);
+		checks++;
+		if(monsrv26(wire[i]) == nil)
+			fail("%#q is not recognised as §2.6's", wire[i]);
+	}
+	for(i = 0; i < nelem(internal); i++){
+		checks++;
+		if(monsrv26(internal[i]) != nil)
+			fail("%#q was taken for a §2.6 condition", internal[i]);
+		monsrverrs(buf, sizeof buf, internal[i]);
+		checks++;
+		if(monsrv26(buf) != nil)
+			fail("%#q was answered as %#q, which carries a §2.6 "
+				"prefix", internal[i], buf);
+		checks++;
+		if(strncmp(buf, "shoalmon: ", 10) != 0)
+			fail("%#q was answered as %#q", internal[i], buf);
+	}
+	eqs("a marked string is not marked twice",
+		monsrverrs(buf, sizeof buf, "shoalmon: not built"),
+		"shoalmon: not built");
+	eqs("an empty error is still an error",
+		monsrverrs(buf, sizeof buf, ""), "shoalmon: unknown error");
+	eqs("and so is a nil one", monsrverrs(buf, sizeof buf, nil),
+		"shoalmon: unknown error");
+	istrue("monsrv26(nil) is nil", monsrv26(nil) == nil);
+	istrue("this server's own strings carry no §2.6 prefix",
+		monsrv26(Emonnotbuilt) == nil
+		&& monsrv26(Emonnofile) == nil
+		&& monsrv26(Emonnomap) == nil
+		&& monsrv26(Emonnoepoch) == nil);
 }
 
 /* §8.1's attach grammar, and store.md §14(58)'s fills */
@@ -1531,6 +1637,7 @@ threadmain(int argc, char **argv)
 
 	tempty();
 	tbadmap();
+	terrors();
 	tattach();
 	ttree();
 	tmatrix();

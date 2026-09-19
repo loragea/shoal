@@ -52,7 +52,7 @@ monmaptext(Monctx *c, Mfid *f, Mtext *t)
 	if(!moncurrent(c->mon, &mm))
 		return Emonnomap;
 	if(montextwrite(t, mm.text, mm.len) < 0)
-		return "shoalmon: out of memory";
+		return "out of memory";
 	f->mapseq = mm.seq;
 	return nil;
 }
@@ -74,7 +74,7 @@ monmapfiletext(Monctx *c, Mfid *f, Mtext *t)
 	if(!monlookup(c->mon, f->epoch, &mm))
 		return Emonnoepoch;
 	if(montextwrite(t, mm.text, mm.len) < 0)
-		return "shoalmon: out of memory";
+		return "out of memory";
 	return nil;
 }
 
