@@ -4117,7 +4117,24 @@ present in every build and inert without the flag; `-q` sets the
 queue-pool size, whose sizing rule is §7's; `-s` names the posted
 service. `-m` is the cluster map, as a file: this build has no
 monitor client, so the map is read once at start and never refreshed
-(§14(18)). The monitor is `cmd/shoalmon`.
+(§14(18)).
+
+The monitor is `cmd/shoalmon`, and it gets a synopsis here for the
+same reason: its one argument is the raw partition §10 formats and
+`shoalmonfmt` writes.
+
+    shoalmon [-X point[,n]] [-s srvname] /dev/sdXX/mon
+
+There is no `-m` and no map file — the monitor's map is the one in
+its own partition, which `monopen` reads whole at start — and no
+`-w`, because this build issues no write to that partition at all.
+`-X` and `-s` are as above. What the process serves is layer-a
+§8.1's read surface and §8.3's framework: the tree, the role matrix,
+the status files and §8.4's liveness evidence. No verb of §8.3 has
+an effect, nothing is staged at `/map.next`, no epoch is published
+and no automatic transition or timer runs, so `moncommit` is never
+called and the partition is opened, read and left alone. Items 54 to
+61 of §14 are what that surface decides where layer-a §8 is silent.
 
 ## 13. Test plan
 
@@ -5012,18 +5029,20 @@ would be a wire change.
 
 *Policy, but read it before implementing anything.*
 
-Forty-seven places where layer-a is silent, self-defeating, or
-contradicted by the measurements or by the platform. Each entry
-states the tension, its resolution, and where the argument for it
-lives; nothing here repeats an argument made in a section above.
-Items 1–5, 8, 9, 11, 12, 13, 14, 26 and 39 are amendments **made** to
-`docs/design/layer-a.md`; items 6, 7, 15, 17, 18–25, 27–38 and 40–47
-are recorded here and not made there; items 10 and 16 are **proposals**
-rather than amendments, because they touch the wire.
+The places where layer-a is silent, self-defeating, or contradicted
+by the measurements or by the platform. Each entry states the
+tension, its resolution, and where the argument for it lives; nothing
+here repeats an argument made in a section above. Items 1–5, 8, 9,
+11, 12, 13, 14, 26 and 39 are amendments **made** to
+`docs/design/layer-a.md`; items 6, 7, 15, 17, 18–25, 27–38, 40–47 and
+54–61 are recorded here and not made there; items 10 and 16 are
+**proposals** rather than amendments, because they touch the wire.
 
 Items 18 to 47 are the object server's, and they describe what
-`srv/libshoalsrv.a` and `cmd/shoalsrv` **do today**. Several of them
-name a half that is not built; each says which.
+`srv/libshoalsrv.a` and `cmd/shoalsrv` **do today**. Items 54 to 61
+are the monitor's, and they describe what `mon/libshoalmon.a` and
+`cmd/shoalmon` do today. Several items in each group name a half that
+is not built; each says which.
 
 1. **`cur` cannot usefully be durable (layer-a §5.2).** Layer-a
    required currency recorded "durably as `cur=<epoch>`" and, two
@@ -6230,6 +6249,361 @@ name a half that is not built; each says which.
     same queue and run one after the other — so a sender that breaks
     the rule has its own operations serialised in arrival order
     rather than refused.
+
+54. **A monitor holding no map, and one whose map does not parse
+    (layer-a §8.1, §8.2).** §8.1 lists `/map` as "current map, text"
+    and says nothing about the monitor that has not published one:
+    a partition `shoalmonfmt` has just written holds two valid
+    current-map slots at `len` 0 (§10), which is a store in good
+    health with no map in it. Nor does §8.1 say what happens when
+    the text that IS there cannot be parsed, which a partition
+    restored by hand or written by another implementation can
+    produce. *Not made; recorded here as what the monitor does:*
+
+    - **No map at all is not a refusal to start.** `monsrvnew`
+      succeeds, and the surface says so: `/map`'s open is refused
+      with this server's own `shoalmon: no map` (§14(59)),
+      `/instances`, `/stale` and `/health` render no records, `/maps`
+      lists nothing, and `/status` reads `hasmap=no` with every
+      map-derived field absent (§14(61)).
+    - **`/map` is a refusal rather than zero bytes.** An empty read
+      is indistinguishable from a successful read of an empty file;
+      an instance would feed it to `mapparse` and be told `bad map`,
+      which is a false statement about the monitor's condition; and,
+      because §8.4's evidence is a read that transferred bytes
+      (§14(56)), an empty answer would leave the polling instance's
+      lease unrenewed with nothing on the wire to say why. The
+      refusal says the one true thing. It is at the OPEN, because
+      that is where §8.1's snapshot is taken.
+    - **A current map that does not parse refuses the start.**
+      `monsrvnew` answers nil with `mapparse`'s own string, marked
+      (§14(59)). Every file of §8.1 but `/map` itself is rendered out
+      of the parse, and a monitor that cannot read its own map has no
+      business publishing an epoch against it — the same judgement
+      `srvnew` makes about a map an instance may not adopt (§14(22)).
+
+    `ledger=lost` is **not** this condition: see §14(61).
+
+55. **`/maps` is a directory, and what a name in it answers (layer-a
+    §8.1, §8.2, §5.2 clause 2).** §8.1 writes the row as
+    `/maps/<epoch>` and §8.2 requires the last `retain` published
+    maps to be kept "under `/maps`", so `/maps` is a directory; §8.1
+    names no error for an element of it, and §2.6 has none for a file
+    that is not there. *Not made; recorded here as what the monitor
+    does:*
+
+    - An element that is a run of decimal digits naming a u64 is an
+      epoch, read the way `srv/attach.c` reads `epoch=`: leading
+      zeros are part of the number, so `/maps/007` and `/maps/7` name
+      epoch 7. An element that is not is `shoalmon: no such file`.
+    - An epoch the ring no longer retains is
+      `shoalmon: no such epoch`. The two are separate strings on
+      purpose: §5.2 clause 2 has an instance walk to `/maps/<E−1>`,
+      and an instance told that the epoch has aged out of §8.2's ring
+      has learned something quite different from one that spelled a
+      name wrong.
+    - The listing is snapshot-at-open like every other file of §8.1
+      and for a reason directories have of their own: `dirread9p`
+      regenerates entry *n* per `Tread` (§2.2's argument), so a
+      publish landing between two reads of a live listing would shift
+      every index below it. What the fid holds is the ring's
+      positions, not its bytes. A **walk** still asks the store, so
+      an epoch that ages out between the listing and the walk is
+      refused rather than served from whatever now occupies the slot.
+    - `forceepoch` and §8.6's rebuild path may publish one epoch
+      twice (§10, `monlookup`), which would put one name in the
+      listing twice. The newest publish — the greater `seq`, which is
+      the one `monlookup` answers — is listed and the older is
+      dropped, so the listing and the walk agree.
+
+56. **What "a successful read of `/map`" is (layer-a §8.4).**
+    *Normative in its consequence, implementation policy in its
+    wording.* §8.4 makes `lastseen(i)` "the time of instance *i*'s
+    most recent successful read of the monitor's `/map`, or its most
+    recent `register`, on an attach with `role=instance,peer=i`", and
+    the whole of the automatic demotion stands on it — but 9P has no
+    "read of a file", only a `Topen` and a sequence of `Tread`s, and
+    §8.4 does not say which of them is the event. *Not made; recorded
+    here as the definition this monitor records evidence by:*
+
+    > A `Tread` of `/map`, on a fid whose **attach** carried
+    > `role=instance,peer=i`, answered with a count **greater than
+    > zero**.
+
+    Every such read moves `lastseen(i)` to the moment it is answered.
+    The open does not, a count of zero does not — that is end of
+    data, not a transfer — a read of any other file does not, and a
+    read on a `reader` or `admin` fid moves nothing whatever it
+    names. The role is the attach's and rides on every fid derived
+    from it, so a walk clones it and the rule is decidable per fid.
+
+    Why a transfer and not the open: an open proves the instance
+    asked, a transfer proves it was given the map, and on a store
+    with no map there is no open to have (§14(54)). Why every such
+    read and not only the first: §8.4 asks for the most recent, and
+    an instance that re-reads one long-lived fid every `pollms` is
+    refreshing exactly the channel §8.4 is about. The residual is
+    stated rather than engineered around: because the file is
+    snapshot-at-open, such an instance renews its lease while reading
+    a map that may be old. That is consistent rather than a hole —
+    F1 has the instance fence *itself* when it cannot refresh, and an
+    instance re-reading a snapshot believes it has refreshed, so
+    neither side acts — and it is a broken instance in any case,
+    which is not what `deadms` is for.
+
+    The `register` half of §8.4's rule is not built: the verb is not
+    (§8.3's table, `mon/ctl.c`), and the unit that builds it records
+    evidence through the same call. The consumer — §8.4's demotion —
+    is not built either. `lastseen(i)` is recorded for any iid an
+    attach names, including one no map carries, because §3.4 step 2
+    has an unregistered disk attach `role=instance` before any map
+    knows it (§14(58)); evidence for such an iid is held and rendered
+    nowhere until a map carries the record.
+
+    The clock is `time(2)`'s seconds, which is what §8.1's
+    `lastseen=<u64 seconds>` asks for; §14(61) has what that costs
+    `/health`'s `silent=<ms>`.
+
+57. **`registered=` is recorded nowhere, and `conflict=node` cannot
+    be detected (layer-a §8.1, §3.4 step 5).** §8.1 makes
+    `/instances`' field names normative — it is the operator's
+    conflict-resolution surface — and two of them are facts this
+    monitor does not hold. `registered=<u64 seconds>` is the time of
+    the instance's last registration, and nothing durable records
+    one: §3.1's `instance` record has no such attribute, the map is
+    the monitor's only durable state (§10), and `register` is not
+    built. `conflict=node` marks a disk that registered from a node
+    other than the one it is bound to, which needs the node a
+    `register` arrived *from*. *Not made; recorded here as what the
+    file says:*
+
+    - `registered=0` on every line. The field name is normative and a
+      parser of this file is entitled to find it, so it is present;
+      `0` is not a time and MUST be read as "this monitor holds no
+      registration record". The contrast with §14(23), where four
+      `/status` fields are absent rather than zero, is deliberate:
+      those are SHOULD-present fields whose absence is a legal
+      reading, and this one's name is normative.
+    - `conflict=` absent from every line, which by §8.1's own grammar
+      — the field is conditional there — means "no conflict". That is
+      honest as far as it goes: this monitor cannot detect one and
+      never claims to have. The unit that builds `register` owns both
+      halves, and `rehome` (§8.3) is unreachable until it does.
+
+    `lastseen=` on the same line is live and is §8.4's evidence
+    (§14(56)), rendered `0` for an instance never seen.
+
+58. **§8.1's attach grammar and role matrix have cells §8.1 does not
+    state.** §8.1 gives the grammar
+    `aname = attr *("," attr)`, `attr = "role=" (…) / "peer=" iid`,
+    says `role` defaults to `reader` and `role=instance` MUST carry
+    `peer=`, and grants `reader` and `instance` "/map, any
+    /maps/<epoch> … and the status files, and nothing else". It names
+    no attach error, says nothing about what `admin` may reach, and
+    §8.3's verb tables require `role=instance` to reach `/ctl` for
+    writing — which "nothing else" read as a statement about the
+    whole surface would forbid. *Not made; recorded here as this
+    server's grammar and matrix,* which is one table in
+    `mon/tree.c` with a column each for walk, open-for-read and
+    open-for-write:
+
+    | file | walk | open for read | open for write |
+    |---|---|---|---|
+    | `/` | all | all | — |
+    | `/ctl` | all | all | instance, admin |
+    | `/map` | all | all | — |
+    | `/map.next` | admin | admin | admin |
+    | `/maps` | all | all | — |
+    | `/maps/<epoch>` | all | all | — |
+    | `/instances`, `/stale`, `/health`, `/status` | all | all | — |
+
+    - **`/ctl` is writable by `instance` and `admin` and not by
+      `reader`.** §8.3's two tables are exactly those two roles and
+      `reader` has no verb in either, so its refusal belongs at the
+      open. For the two that do have verbs the gate that decides is
+      §8.3's per-verb Role column, answering `permission denied` —
+      which is a rule with meaning only if an `instance` fid can hold
+      `/ctl` open and be refused an operator verb, and the converse.
+      That is the same reading §14(24) takes of §2.5 for the
+      instance's `/ctl`, narrowed by one role because §8.3, unlike
+      §2.5, has rows that are not `admin`.
+    - **`/map.next` is `admin` alone in all three columns.** It is
+      the operator's staging surface (§8.3), not one of §8.1's status
+      files, and an uncommitted map is not something a reader or an
+      instance has any use for. Being outside the walk column, it
+      does not appear in a non-admin fid's listing of `/`.
+    - **`admin` may read everything `reader` may.** §8.1 grants the
+      operator role nothing explicitly; an operator role that could
+      not read the map it is editing would be unusable.
+    - **`/ctl` is readable by every role and reads as no bytes.** The
+      verbs are a write surface.
+    - The refused cell is always `permission denied`, §2.5's
+      convention, at the open — or at the walk for `/map.next`, where
+      the row is outside the role's walk column and the answer is the
+      same string.
+
+    The attach grammar's fills, all answering §2.6's `bad aname`, are
+    the reading §14(25) takes of §2.1 applied to §8.1's own grammar:
+    an unknown attribute, a repeated attribute, a role spelling that
+    is not one of the three, and `role=instance` with no `peer=`.
+    `epoch=` is an unknown attribute here and not a parsed-and-
+    ignored one — "no epoch appears in the monitor's `aname`: the
+    monitor is where epochs come from" — while a `peer=` on a role
+    that does not need it parses and is ignored, because the grammar
+    permits it on any attr list. Two fills go the other way:
+
+    - **An absent or empty `aname` is `role=reader`**, not a refusal.
+      That is what "role defaults to reader" has to mean for the
+      caller that sends no attributes — a plain `mount`, or a client
+      library that only reads `/map`. It is the one place this
+      grammar is more permissive than §2.1's, where an empty `aname`
+      omits an epoch `role=client` REQUIRES.
+    - **`peer=` is not checked against the map.** §3.4 step 2 has a
+      disk that has never been registered attach `role=instance` to
+      write `register`, so it is by construction in no map, and a
+      membership check would make registration impossible. This is
+      the opposite of §6.4 F3's receiver half in `srv/`, where a
+      `role=repl` `peer=` that is not a non-dead instance of the
+      current map is exactly the attach to refuse — and the
+      difference is which direction the attach runs in.
+
+59. **The monitor's local error prefix, and its four strings (layer-a
+    §2.6, §3.7).** §2.6 is explicitly ONE prefix-free set shared by
+    storage instances and the monitor, and §3.7's mapping rule is
+    normative: a condition §2.6 names MUST be answered with §2.6's
+    prefix and nothing else, and an internal or device error MUST
+    NEVER begin with one. §14(29) gives the object server the local
+    prefix `shoalsrv: ` for the second class; the monitor needs one
+    of its own. *Not made; recorded here as this server's policy:*
+    every error that is not a §2.6 condition goes on the wire under
+    the prefix `shoalmon: `. It shares no prefix with any §2.6 entry
+    and none with `shoalsrv: `, so the three sets stay prefix-free
+    against each other and a client library that talks to both
+    servers parses errors with one rule. `no valid current-map slot:
+    …` and `no valid monitor header: …` from §10, and an allocation
+    failure out of `mapparse` — which `lib/shoal.h` warns is not
+    `bad map` — are that case.
+
+    Four local strings are this server's own, and each is the answer
+    after the role gate, never instead of it:
+
+    - `shoalmon: not built` — a file or a ctl verb whose body is not
+      built. In this build that is every verb of §8.3 and the
+      `/map.next` write, and nothing else.
+    - `shoalmon: no such file` — a name in `/` or in `/maps` that
+      this tree does not have (§14(55)).
+    - `shoalmon: no such epoch` — a `/maps` element that is a u64 and
+      names a map the ring no longer retains (§14(55)).
+    - `shoalmon: no map` — a `/map` open on a store holding no map
+      (§14(54)).
+
+    Six of §2.6's strings are the monitor's own to emit:
+    `permission denied` (§8.1's roles and §8.3's per-verb gate),
+    `bad ctl` and `unknown ctl` (§8.3), `bad aname` (§8.1's attach),
+    `bad map` (§8.1's commit validation, not built) and `disk full`
+    (an oversize map, §10). The whole of §2.6 is written down in
+    `mon/err.c` all the same, for the reason `srv/err.c` gives: a
+    unit that builds one of the remaining handlers names a string
+    that is already there.
+
+60. **Qids and stat for the monitor's tree (layer-a §8.1, §2.3).**
+    §8.1 fixes no qids and §2.3's rules are written for an instance's
+    `/obj`. *Not made; recorded here as what the monitor answers:*
+
+    - A `/maps/<epoch>` entry's `qid.path` is the published map's
+      `seq` — §10's one seq space for the whole slot store, strictly
+      increasing, never reused, and 1 at the first publish. The
+      epoch is the wrong value: `forceepoch` (§8.3) and §8.6's
+      rebuild path can publish one epoch twice, and §2.3's "MUST
+      differ between distinct" entries would fail. `seq` satisfies
+      §2.3's spirit for free — it is allocated, monotonic and
+      durable, which is what §2.3 requires of an object's path and
+      forbids a hash from claiming.
+    - The fixed files take paths above every value a `seq` can reach
+      in this design, so no two names of this tree share one.
+    - `qid.vers` is 0 everywhere. §2.3 makes it the low 32 bits of
+      `ver`, which is an object's; nothing in this tree has one, and
+      a published map never changes once it is in the ring. A file
+      whose contents move — `/map` across a publish — is a different
+      file at the next open, which is what snapshot-at-open means,
+      and 9P's version field is not how a client learns that: it
+      re-reads.
+    - `qid.type` is `QTDIR` for `/` and `/maps`, `QTFILE` for
+      everything else.
+    - `stat` reports `length` 0 for **every** file of this tree,
+      including `/maps/<epoch>`, whose length is known and fixed.
+      Every file here is synthetic — its bytes are composed when the
+      fid is opened — and 0 is the Plan 9 convention for exactly
+      that. One rule for the whole tree is worth more than a byte
+      count on one row; a reader that wants the size reads the file.
+      `mode` is the row's, `mtime`/`atime` are 0, and
+      `uid`/`gid`/`muid` are `shoal`, as `srv/` answers them.
+
+61. **What `/status` and `/health` report, and the fields that are
+    not measurements (layer-a §8.1, §8.4, §8.6).** §8.1 asks
+    `/status` for `epoch=`, `monid=`, `uptime=`, "the timer
+    attributes in force", `retain=`, `ledger=ok|lost` and
+    `pending=<n>`, and makes the format otherwise implementation
+    policy; it asks `/health` for
+    `iid= lastrefresh= silent= reports=` per instance and makes
+    everything past those names implementation policy too, "and so is
+    the whole file's content in the sense that matters: nothing in
+    this design reads it except a human". *Not made; recorded here as
+    what the two files say:*
+
+    `/status`, one attribute per line:
+
+    - `hasmap=yes|no` first, because every field below it that comes
+      from the map is present only in the `yes` case (§14(54)). A
+      monitor that has not published has no epoch, no `monid` and no
+      timers, and a zero for each would be a claim about a cluster
+      that does not exist.
+    - `epoch=` is the map TEXT's, not the slot's stamp: §10 records
+      the stamped epoch "for the operator's benefit" and the text is
+      the authority.
+    - The timers in force, as the map carries them: `pollms=`,
+      `leasems=`, `replms=`, `deadms=`, `outmins=`, `tombdays=`,
+      plus `mincopies=` and `replicas=`, which are not timers but are
+      the other two numbers an operator reads this file to check.
+    - `retain=` is the map header's attribute — the retention §8.2
+      requires of the monitor — and `slots=` is the ring the
+      partition was formatted with (§10), which is what this monitor
+      can actually keep. The two are set independently, so an
+      operator who raised `retain` above `slots` can see it here.
+      `maps=` is how many published maps the ring holds right now and
+      `seq=` is the current map's, both beyond §8.1's list and
+      present because nothing else reports the slot store's state.
+    - `ledger=ok`, always. §8.6's `lost` is the verdict of a monitor
+      **rebuilt** with no recoverable map, reached by the §8.6
+      start-up that reads every registered instance's `/status` and
+      `/stale`; that path is not built, so nothing here can have
+      reached it. An empty store is not that verdict — a fresh
+      cluster and a lost ledger are different facts, and `hasmap=no`
+      is the one this monitor knows. §8.6's other `/status` report,
+      the unreachable-instance condition that MUST block publishing,
+      belongs to the same unbuilt path.
+    - `pending=0`, always: staging is `/map.next`'s and the next unit
+      builds it.
+
+    `/health`, one line per instance record in the current map:
+
+    - `lastrefresh=` is §8.4's `lastseen(iid)` in seconds (§14(56)),
+      `0` for an instance never seen.
+    - `silent=` is the milliseconds since, which is the quantity
+      §8.4's demotion compares against `deadms` — so this file is
+      where that rule will be able to show its working. Because the
+      evidence clock is `time(2)`'s seconds (§14(56)), the value is
+      always a multiple of 1000; `deadms` defaults to 10000, so the
+      granularity costs the rule nothing.
+    - An instance never seen has no `lastrefresh` to subtract from,
+      and its `silent=` is the milliseconds since this service
+      started. That is a true lower bound on how long the channel has
+      been quiet, and a `0` there would read as "heard from just
+      now", which is the one thing it must not say.
+    - `reports=` is empty on every line. It is the instances that
+      currently claim they cannot reach this one, which the
+      `unreachable`/`reachable` verbs of §8.3 record; those are the
+      unit after next's. The field is present because §8.1 names it.
 
 ## 15. Alternatives considered
 

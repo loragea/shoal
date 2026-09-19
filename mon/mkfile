@@ -1,0 +1,20 @@
+</$objtype/mkfile
+
+LIB=libshoalmon.a$O
+
+OFILES=\
+	attach.$O\
+	ctl.$O\
+	err.$O\
+	mon.$O\
+	status.$O\
+	text.$O\
+	tree.$O\
+
+HFILES=\
+	mon.h\
+	dat.h\
+	fns.h\
+	../lib/shoal.h\
+
+</sys/src/cmd/mklib

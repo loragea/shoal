@@ -1,0 +1,15 @@
+</$objtype/mkfile
+
+TARG=shoalmon
+
+OFILES=\
+	main.$O\
+
+HFILES=\
+	../../lib/shoal.h\
+	../../mon/mon.h\
+
+LIB=../../mon/libshoalmon.a$O ../../lib/libshoal.a$O
+BIN=/$objtype/bin
+
+</sys/src/cmd/mkone

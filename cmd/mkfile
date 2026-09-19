@@ -1,6 +1,6 @@
 </$objtype/mkfile
 
-DIRS=shoalcsum shoalck shoalfmt shoalmonfmt shoalsrv
+DIRS=shoalcsum shoalck shoalfmt shoalmon shoalmonfmt shoalsrv
 
 default:V:
 	mk all

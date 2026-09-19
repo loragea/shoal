@@ -36,7 +36,7 @@ the decisions it rests on.
 | `docs/target.md` | The ratified deliverable target: layers, semantics contract, milestones, design envelope. |
 | `docs/decisions.md` | Design decisions with rationale; each row marked normative vs implementation policy. |
 | `docs/design/layer-a.md` | The ratified Layer A contract: object model, storage-server 9P export, cluster map, placement, write/read path, epoch/fencing, heal, monitor. Wire truth lives here. |
-| `docs/design/store.md` | The per-instance local object store and the monitor's map store: on-disk format, write/read paths, recovery, space, concurrency and group commit, tooling, and the store's test plan. On-disk truth lives here. |
+| `docs/design/store.md` | The per-instance local object store, the monitor's map store and the monitor's deviations: on-disk format, write/read paths, recovery, space, concurrency and group commit, tooling, and the store's test plan. On-disk truth lives here. |
 | `docs/platform/9front-storage.md` | Verified 9front storage facts: file-server durability, the sd(3) raw path and flush behaviour, measured costs. |
 
 `docs/platform/` holds facts about the target platform rather than
@@ -49,23 +49,25 @@ shoal is written in the Plan 9 C dialect and built on 9front with
 `6c`/`6l` under `mk` (decisions.md D12). From the repo root:
 
 - `mk` — build `lib/libshoal.a$O`, then `srv/libshoalsrv.a$O`, then
-  every command in `cmd/`, then the T1 test programs in `test/`.
+  `mon/libshoalmon.a$O`, then every command in `cmd/`, then the T1
+  test programs in `test/`.
 - `mk test` — build everything, then run T1 (below).
 - `mk clean`, `mk nuke` — remove build products in every
   subdirectory.
 
 | Path | Holds |
 |---|---|
-| `mkfile` | Root. Iterates `lib srv cmd test` for `all`, `clean` and `nuke`, and runs T1 for `test`. |
+| `mkfile` | Root. Iterates `lib srv mon cmd test` for `all`, `clean` and `nuke`, and runs T1 for `test`. |
 | `lib/` | `libshoal.a$O`: code shared by servers, commands and tests. `lib/shoal.h` is its header; includers name it by relative path after `<u.h>`, `<libc.h>`, `<libsec.h>` and `<fcall.h>` — the last for the GBIT/PBIT macros every on-disk integer is packed with. `lib/store.h` is private to `lib/`: it holds the store engine's own structures, which are opaque to everything else. Built by `/sys/src/cmd/mklib`. libshoal depends on neither lib9p nor libthread and must not come to: the same engine runs under a plain-libc T1 program and under the libthread 9P server (`docs/design/store.md` §7). |
 | `srv/` | `libshoalsrv.a$O`: the storage instance's 9P service (`docs/design/layer-a.md` §2) — attach, the file tree, the `Reqqueue` pool, `Tflush`, the ctl framework, start-up and shutdown. `srv/srv.h` is its header, included after `<thread.h>`, `<9p.h>` and `lib/shoal.h`; `srv/dat.h` and `srv/fns.h` are private to `srv/`. It is a library for the same reason `lib/` is: a T1 test links libraries and execs nothing, and §2 is what T1 has to drive. Built by `/sys/src/cmd/mklib`. |
+| `mon/` | `libshoalmon.a$O`: the monitor's 9P service (`docs/design/layer-a.md` §8) — attach, the file tree, the status renders, §8.4's liveness evidence and the ctl framework. `mon/mon.h` is its header, included after `<thread.h>`, `<9p.h>` and `lib/shoal.h`; `mon/dat.h` and `mon/fns.h` are private to `mon/`. It is a library for the same reason `srv/` is, and it is independent of `srv/`: the two serve different trees with different role matrices and share no code, so the render-at-open helper exists in both under different names. Its durable state is `lib/mon.c`'s map slot store (`docs/design/store.md` §10). Built by `/sys/src/cmd/mklib`. |
 | `cmd/` | One directory per command, each built by `/sys/src/cmd/mkone` — so it produces `$O.out` and installs as `$TARG` in `/$objtype/bin`. `cmd/mkfile` lists them in `DIRS`. |
 | `test/` | T1 test programs. |
 
 Every mkfile starts with `</$objtype/mkfile`. A new command is a
 directory under `cmd/` with an `mkone` mkfile plus its name in
 `cmd/mkfile`'s `DIRS`; a new library source file is a name in
-`lib/mkfile`'s or `srv/mkfile`'s `OFILES`.
+`lib/mkfile`'s, `srv/mkfile`'s or `mon/mkfile`'s `OFILES`.
 
 ## Test tiers
 
