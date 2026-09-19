@@ -23,6 +23,7 @@ TESTS=\
 	srvenumtest\
 	srviotest\
 	srvwiretest\
+	clienttest\
 
 LIB=../lib/libshoal.a$O
 SRVLIB=../srv/libshoalsrv.a$O
@@ -38,7 +39,7 @@ all:V:	$PROGS
 $O.%:	%.$O $LIB
 	$LD $LDFLAGS -o $target $prereq
 
-# The four programs that drive the 9P surface link the server library
+# The five programs that drive the 9P surface link the server library
 # too and are libthread programs; every other test's link line is
 # unchanged.
 $O.srvtest:	srvtest.$O $SRVLIB $LIB
@@ -64,6 +65,14 @@ $O.srvwiretest:	srvwiretest.$O $SRVLIB $LIB
 
 srvwiretest.$O:	srvwiretest.c srv9p.h ../srv/srv.h $HFILES
 	$CC $CFLAGS srvwiretest.c
+
+# clienttest drives lib/ninep.c against that same service, so it links
+# the server library too but speaks no raw 9P: it has no srv9p.h.
+$O.clienttest:	clienttest.$O $SRVLIB $LIB
+	$LD $LDFLAGS -o $target $prereq
+
+clienttest.$O:	clienttest.c ../srv/srv.h $HFILES
+	$CC $CFLAGS clienttest.c
 
 %.$O:	%.c $HFILES
 	$CC $CFLAGS $stem.c
