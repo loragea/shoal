@@ -6546,11 +6546,15 @@ is not built; each says which.
     - `shoalmon: no map` — a `/map` open on a store holding no map
       (§14(54)).
 
-    Six of §2.6's strings are the monitor's own to emit:
+    Eight of §2.6's strings are the monitor's own to emit:
     `permission denied` (§8.1's roles and §8.3's per-verb gate),
     `bad ctl` and `unknown ctl` (§8.3), `bad aname` (§8.1's attach),
-    `bad map` (§8.1's commit validation, not built) and `disk full`
-    (an oversize map, §10). The whole of §2.6 is written down in
+    `bad open mode` (an open carrying a bit outside `OMASK|OTRUNC` —
+    `ORCLOSE` is a remove arranged one message ahead and no row of
+    this tree removes anything, and the gate is the one `srv/`'s
+    object rows apply), `no rename` (a `Twstat` that changes the
+    name), `bad map` (§8.1's commit validation, not built) and
+    `disk full` (an oversize map, §10). The whole of §2.6 is written down in
     `mon/err.c` all the same, for the reason `srv/err.c` gives: a
     unit that builds one of the remaining handlers names a string
     that is already there.
@@ -6643,13 +6647,25 @@ is not built; each says which.
       where that rule will be able to show its working. Because the
       evidence clock is `time(2)`'s seconds (§14(56)), the value is
       always a multiple of 1000; `deadms` defaults to 10000, so the
-      granularity costs the rule nothing.
+      granularity costs the rule nothing. An instance that has just
+      refreshed reads `silent=0`, which is the truth about it.
     - An instance never seen has no `lastrefresh` to subtract from,
       and its `silent=` is the milliseconds since this service
-      started. That is a true lower bound on how long the channel has
-      been quiet; a flat `0` would read as "heard from just now"
+      started, **floored at one second**. The milliseconds since the
+      start are a true lower bound on how long the channel has been
+      quiet, and a flat `0` would read as "heard from just now"
       however long the monitor had been up, which is the one thing it
-      must not say.
+      must not say — but on a clock of whole seconds that
+      subtraction IS `0` for the monitor's first second, so the floor
+      is what makes the sentence true rather than true-after-a-while.
+      It understates the silence by under a second against a `deadms`
+      that defaults to ten, and only for an instance the demotion
+      rule has no reading for anyway.
+    - Neither subtraction can run backwards. `time(2)` is not
+      monotonic, and an unsigned wrap on a clock that went back
+      between the reading recorded and the reading taken would render
+      a silence of some hundred million years; both answer `0`
+      instead.
     - `reports=` is empty on every line. It is the instances that
       currently claim they cannot reach this one, which the
       `unreachable`/`reachable` verbs of §8.3 record; those are the

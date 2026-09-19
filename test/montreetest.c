@@ -285,7 +285,7 @@ ctlsay(Cl *c, ulong fid, char *line, char *buf, int nbuf)
 		return buf;
 	}
 	if(r.count != (ulong)strlen(line))
-		snprint(buf, nbuf, "short write %lud", r.count);
+		snprint(buf, nbuf, "short write %ud", r.count);
 	else
 		snprint(buf, nbuf, "ok");
 	return buf;
@@ -335,6 +335,25 @@ direntqids(char *p, long n, char **names, uvlong *paths, int maxn)
 		k++;
 	}
 	return k;
+}
+
+/*
+ * The `silent=' of the /health line for one iid, in ms, or -1.  The
+ * value is the milliseconds since a wall clock reading, so a case
+ * asserts the rule it is about rather than a literal: what §14(61)
+ * fixes is that an instance never heard from is never `silent=0'.
+ */
+static vlong
+healthsilent(char *buf, char *iid)
+{
+	char pat[64], *p, *q;
+
+	snprint(pat, sizeof pat, "iid=%s ", iid);
+	if((p = strstr(buf, pat)) == nil)
+		return -1;
+	if((q = strstr(p, " silent=")) == nil)
+		return -1;
+	return strtoll(q + 8, nil, 10);
 }
 
 static int
@@ -856,6 +875,41 @@ tmatrix(void)
 				v[i].mode, buf, sizeof buf), v[i].want[j]);
 		}
 	/*
+	 * The mode, which is not the role.  §8.1's matrix has three
+	 * columns and 9P's open mode carries more than that: ORCLOSE is
+	 * a remove arranged one message ahead and nothing in this tree
+	 * removes anything, and OCEXEC is the caller's own business and
+	 * not a mode this server serves.  Both are §2.6's
+	 * `bad open mode', which is what srv/ answers for a mode outside
+	 * OMASK|OTRUNC.  The role gate runs first, so a role that may not
+	 * open the row at all still hears that instead.  (OEXCL cannot be
+	 * driven from here: Fcall.mode is a uchar and OEXCL is 0x1000, so
+	 * it never reaches the wire.)
+	 */
+	for(j = 0; j < 3; j++){
+		snprint(what, sizeof what, "%s opens /status OREAD|ORCLOSE",
+			rname[j]);
+		eqs(what, opencell(&cl, root[j], Ff, "status", OREAD|ORCLOSE,
+			buf, sizeof buf), "bad open mode");
+	}
+	eqs("an admin opens /ctl OWRITE|ORCLOSE",
+		opencell(&cl, Froot3, Ff, "ctl", OWRITE|ORCLOSE, buf,
+			sizeof buf), "bad open mode");
+	eqs("a reader opens /ctl OWRITE|ORCLOSE",
+		opencell(&cl, Froot, Ff, "ctl", OWRITE|ORCLOSE, buf,
+			sizeof buf), "permission denied");
+	eqs("an admin opens /map OREAD|OCEXEC",
+		opencell(&cl, Froot3, Ff, "map", OREAD|OCEXEC, buf,
+			sizeof buf), "bad open mode");
+	/* OTRUNC is in the matrix and not in this rule */
+	eqs("an admin opens /status OREAD|OTRUNC",
+		opencell(&cl, Froot3, Ff, "status", OREAD|OTRUNC, buf,
+			sizeof buf), "permission denied");
+	eqs("an admin opens /map.next OREAD|OTRUNC",
+		opencell(&cl, Froot3, Ff, "map.next", OREAD|OTRUNC, buf,
+			sizeof buf), "ok");
+
+	/*
 	 * The walk column is a gate of its own and not a restatement of
 	 * the read one.  A Tstat runs no role gate — 9P settles the role
 	 * at the open, and a stat needs no open — so a row a role may not
@@ -1014,6 +1068,8 @@ tmaps(void)
 		clopen(&cl, Ff2, OREAD, &r);
 		n = clslurp(&cl, Ff2, buf, sizeof buf);
 		want = mkmap(i);
+		snprint(what, sizeof what, "/maps/%d length", i);
+		eqv(what, n, strlen(want));
 		snprint(what, sizeof what, "/maps/%d is that epoch's map", i);
 		eqs(what, buf, want);
 		free(want);
@@ -1031,6 +1087,7 @@ tmaps(void)
 		clopen(&cl, Ff2, OREAD, &r);
 		n = clslurp(&cl, Ff2, buf, sizeof buf);
 		want = mkmap(15);
+		eqv("/maps/015 length", n, strlen(want));
 		eqs("/maps/015 is epoch 15's map", buf, want);
 		free(want);
 		if(clstat(&cl, Ff2, &r) == Rstat
@@ -1172,9 +1229,15 @@ tfiles(void)
 	n = slurpname(&cl, Froot, Ff, "health", buf, sizeof buf, err,
 		sizeof err);
 	USED(n);
-	eqs("/health before anything has refreshed", buf,
-		"iid=n1.0 lastrefresh=0 silent=0 reports=\n"
-		"iid=n2.0 lastrefresh=0 silent=0 reports=\n");
+	istrue("/health lines both instances, neither ever heard from",
+		strstr(buf, "iid=n1.0 lastrefresh=0 silent=") != nil
+		&& strstr(buf, "iid=n2.0 lastrefresh=0 silent=") != nil);
+	istrue("... with a silence of at least a second, never zero",
+		healthsilent(buf, "n1.0") >= 1000
+		&& healthsilent(buf, "n2.0") >= 1000);
+	istrue("... and a silence that is a whole number of seconds",
+		healthsilent(buf, "n1.0") % 1000 == 0);
+	istrue("... and an empty reports=", strstr(buf, " reports=\n") != nil);
 
 	n = slurpname(&cl, Froot, Ff, "status", buf, sizeof buf, err,
 		sizeof err);
@@ -1358,9 +1421,9 @@ tseen(void)
 		"iid=n1.0 lastrefresh=") != nil);
 	istrue("... at a time and not zero",
 		strstr(buf, "iid=n1.0 lastrefresh=0 ") == nil);
-	istrue("/health still shows the other instance silent",
-		strstr(buf, "iid=n2.0 lastrefresh=0 silent=0 reports=\n")
-			!= nil);
+	istrue("/health still shows the other instance never heard from",
+		strstr(buf, "iid=n2.0 lastrefresh=0 silent=") != nil);
+	istrue("... and never silent=0", healthsilent(buf, "n2.0") >= 1000);
 
 	n = slurpname(&cl, Froot, Ff, "instances", buf, sizeof buf, err,
 		sizeof err);

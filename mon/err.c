@@ -68,11 +68,13 @@ char Emonnoepoch[]	= "shoalmon: no such epoch";
  * appending to this block.  e26 below is the same set read as data for
  * the classifier, so the two cannot drift apart.
  *
- * Six of them are the monitor's own to emit: `permission denied' for
- * a role violation (§8.1), `bad ctl' and `unknown ctl' for §8.3,
- * `bad aname' for §8.1's attach grammar, `bad map' for §8.1's commit
- * validation, and `disk full' for an oversize map (store.md §10).
- * The other twenty-three are a storage instance's.
+ * Eight of them are the monitor's own to emit: `permission denied'
+ * for a role violation (§8.1), `bad ctl' and `unknown ctl' for §8.3,
+ * `bad aname' for §8.1's attach grammar, `bad open mode' for an open
+ * mode this tree has no meaning for and `no rename' for a Twstat that
+ * changes the name (tree.c), `bad map' for §8.1's commit validation,
+ * and `disk full' for an oversize map (store.md §10).  The other
+ * twenty-one are a storage instance's.
  */
 char Emnoobj[]		= "no such object";
 char Emexists[]		= "object exists";

@@ -291,7 +291,9 @@ mapsopen(Req *r)
 	c = r->srv->aux;
 	f = r->fid->aux;
 	monsrvlock(c);
-	monstat(c->mon, &st);
+	memset(&st, 0, sizeof st);
+	if(c->mon != nil)
+		monstat(c->mon, &st);
 	n = 0;
 	if((dir = mallocz((st.retain+1)*sizeof *dir, 1)) == nil){
 		monsrvunlock(c);
@@ -299,7 +301,7 @@ mapsopen(Req *r)
 		return;
 	}
 	for(i = 0; i <= st.retain; i++){
-		if(!monhistory(c->mon, i, &mm))
+		if(c->mon == nil || !monhistory(c->mon, i, &mm))
 			break;
 		dup = 0;
 		for(j = 0; j < (int)n; j++)
@@ -362,7 +364,7 @@ mapcurrent(Monctx *c, Mfid *f)
 	int ok;
 
 	monsrvlock(c);
-	ok = moncurrent(c->mon, &mm) && mm.seq == f->mapseq;
+	ok = c->mon != nil && moncurrent(c->mon, &mm) && mm.seq == f->mapseq;
 	monsrvunlock(c);
 	return ok;
 }
@@ -444,7 +446,7 @@ walk1(Monctx *c, Mfid *f, char *name, Qid *q)
 		if(u64(name, &epoch) < 0)
 			return Emonnofile;
 		monsrvlock(c);
-		ok = monlookup(c->mon, epoch, &mm);
+		ok = c->mon != nil && monlookup(c->mon, epoch, &mm);
 		monsrvunlock(c);
 		if(!ok)
 			return Emonnoepoch;
@@ -584,12 +586,23 @@ opentext(Req *r)
 }
 
 /*
- * Open.  §8.1's role gate first, then the row's open hook, or its
- * render-at-open snapshot, or the local `not built'.  There is no
- * per-row gate here and no fence: the monitor is where the epochs come
- * from, so nothing in §6.4 fences it, and the only state that could
- * refuse an open is the map's own absence, which /map's render
- * answers.
+ * Open.  §8.1's role gate first, then the mode, then the row's open
+ * hook, or its render-at-open snapshot, or the local `not built'.
+ * There is no per-row gate here and no fence: the monitor is where the
+ * epochs come from, so nothing in §6.4 fences it, and the only state
+ * that could refuse an open is the map's own absence, which /map's
+ * render answers.
+ *
+ * The mode gate is §2.6's `bad open mode' over every bit outside
+ * OMASK|OTRUNC, which is the rule srv/'s object rows apply.  The role
+ * matrix has three columns and 9P's mode carries more: ORCLOSE is a
+ * remove arranged one message ahead and no row of this tree removes
+ * anything, OCEXEC is the caller's own business and not a mode this
+ * server serves, and masking them away — as gating on `mode & OMASK'
+ * alone does — would let an open that asked for something this server
+ * does not do be answered Ropen as though it did.  It runs after the
+ * role gate, so a role that may not open the row hears that first, as
+ * it does in srv/.  (OEXCL cannot arrive: Fcall.mode is a uchar.)
  */
 void
 monsrvopen(Req *r)
@@ -621,6 +634,10 @@ monsrvopen(Req *r)
 		need &= file->wr;
 	if((need & b) == 0){
 		respond(r, Emperm);
+		return;
+	}
+	if((r->ifcall.mode & ~(OMASK|OTRUNC)) != 0){
+		respond(r, Embadopen);
 		return;
 	}
 	if(file->open != nil){

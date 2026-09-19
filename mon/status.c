@@ -49,7 +49,7 @@ monmaptext(Monctx *c, Mfid *f, Mtext *t)
 {
 	Monmap mm;
 
-	if(!moncurrent(c->mon, &mm))
+	if(c->mon == nil || !moncurrent(c->mon, &mm))
 		return Emonnomap;
 	if(montextwrite(t, mm.text, mm.len) < 0)
 		return "out of memory";
@@ -71,7 +71,7 @@ monmapfiletext(Monctx *c, Mfid *f, Mtext *t)
 {
 	Monmap mm;
 
-	if(!monlookup(c->mon, f->epoch, &mm))
+	if(c->mon == nil || !monlookup(c->mon, f->epoch, &mm))
 		return Emonnoepoch;
 	if(montextwrite(t, mm.text, mm.len) < 0)
 		return "out of memory";
@@ -166,7 +166,17 @@ monstaletext(Monctx *c, Mfid *f, Mtext *t)
  * at all, and its silence is rendered as the milliseconds since this
  * service started: that is a true lower bound on how long the channel
  * has been quiet, and a 0 there would read as "heard from just now",
- * which is the one thing it must not say.
+ * which is the one thing it must not say.  Within the monitor's first
+ * second that subtraction IS 0 on a clock of whole seconds, so it is
+ * floored at one second — an understatement of the silence by under a
+ * second, against a `deadms' that defaults to ten (store.md §14(61)).
+ * An instance that HAS refreshed is not floored: `silent=0' there is
+ * the truth, and it is what a fresh refresh should read as.
+ *
+ * Both subtractions are guarded against a clock that went backwards
+ * between the reading recorded and the reading taken here — time(2)
+ * is not monotonic and an unsigned wrap would render a silence of
+ * some hundred million years.
  *
  * `reports=' is the instances that currently claim they cannot reach
  * this one.  It is empty on every line and will stay so until the
@@ -188,7 +198,13 @@ monhealthtext(Monctx *c, Mfid *f, Mtext *t)
 	for(i = 0; i < c->map->ninst; i++){
 		in = &c->map->inst[i];
 		seen = monsrvlastseen(c, in->iid);
-		silent = seen > 0 ? now - seen : now - c->t0;
+		if(seen > 0)
+			silent = seen > now ? 0 : now - seen;
+		else{
+			silent = c->t0 > now ? 0 : now - c->t0;
+			if(silent == 0)
+				silent = 1;
+		}
 		montextprint(t, "iid=%s lastrefresh=%llud silent=%llud "
 			"reports=\n", in->iid, seen, silent*1000);
 	}
@@ -233,7 +249,9 @@ monstatustext(Monctx *c, Mfid *f, Mtext *t)
 	Cmap *m;
 
 	USED(f);
-	monstat(c->mon, &st);
+	memset(&st, 0, sizeof st);
+	if(c->mon != nil)
+		monstat(c->mon, &st);
 	m = c->map;
 	montextprint(t, "hasmap=%s\n", m != nil ? "yes" : "no");
 	if(m != nil){

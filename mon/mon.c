@@ -206,6 +206,20 @@ monsrvpost(Monctx *c, char *name)
  * the same call as destroyfid before it.  srv/'s shutdown has to sweep
  * its live fids before storeclose because a fid there can hold an
  * engine handle; nothing here can.
+ *
+ * The seam this leaves is `mon' going nil under the lock.  No handler
+ * can see it today — Srv.end runs after the loop has returned, so
+ * there is no request in flight — but every accessor in lib/mon.c
+ * dereferences its Mon unguarded, so a later unit that runs a
+ * shutdown while a handler is on another proc (a Reqqueue for the
+ * durable publish is the obvious one) would fault rather than answer.
+ * Every reader of `mon' in this library therefore takes it under
+ * monlk and treats nil as a store holding no map: /map and
+ * /maps/<epoch> refuse, /maps lists nothing, /status renders
+ * `hasmap=no' and a /map read renews no lease.  That is the cheap
+ * half of the guarantee, taken now; the expensive half — whether a
+ * shutdown may run at all while a handler is outstanding — belongs
+ * to the unit that creates the second proc.
  */
 void
 monsrvshutdown(Monctx *c)
