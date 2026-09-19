@@ -1923,12 +1923,11 @@ int	maprefresh(Adopt*, Fence*, Cmap*, vlong now);
  * write on closed pipe' to the proc blocked writing it, and a note
  * kills that proc — the caller's own — instead of failing its write.
  * `hangup' MAY be called more than once, and after it a read or a
- * write on those fds comes back rather than blocking.  It is what lets
- * this
- * library recall a proc parked in read(2) or write(2), which plain
- * libc cannot do by itself — nineclose calls it, a nineopen that
- * fails calls it, and the timer calls it when a write has stalled
- * past its deadline.  It is optional: with no `hangup', a close
+ * write on those fds comes back rather than blocking.  It is what
+ * lets this library recall a proc parked in read(2) or write(2),
+ * which plain libc cannot do by itself: nineclose calls it, a
+ * nineopen that fails calls it, and the timer calls it when a write
+ * has stalled past its deadline.  It is optional: with no `hangup', a close
  * leaves a parked reader where it is until the peer speaks or hangs
  * up, a stalled write stays parked until the peer reads, and the
  * memory, the fds and the procs go only then (§14(50)).

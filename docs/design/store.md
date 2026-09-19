@@ -6323,28 +6323,7 @@ the 9P client's (§12), which nothing in this build dials with.
     passes answers `Ninetimeout` within one timer tick of it, and the
     client sends a `Tflush` for that tag itself **without waiting for
     the `Rflush`** — so the call costs the deadline, one tick and one
-    write, and no more. That bound holds only because **a stalled
-    write kills the connection**. `write(2)` on a peer that has
-    stopped reading blocks until the peer reads, which is layer-a
-    §5.4's own dead-peer scenario arriving on the sending side, and it
-    blocks holding the one write lock, so every other exchange on the
-    connection piles up behind it and the `Tflush` above — which is on
-    the timeout path — could never be written at all. A peer that will
-    not ACCEPT a message within the exchange's deadline therefore
-    counts as dead: there is nothing to flush, because nothing was
-    sent, and nothing to wait for. The writer records the write's
-    deadline before entering `write(2)`; the timer, finding a write
-    outstanding past it, kills the connection `Ninedead` with a string
-    naming the stalled `T`-message and calls `Ninecfg.hangup`
-    (§14(50)) so that the blocked `write` returns, and the waiter
-    collects `Ninedead` rather than `Ninetimeout`. The `Tflush`'s own
-    write is bounded the same way, by a fixed 1000 ms rather than by
-    an exchange's deadline: it has no exchange of its own and nobody
-    waits for it, and the number has only to be far above a busy
-    peer's read of six bytes and far below the life of a connection.
-    With no `hangup` callback the connection still dies and the
-    waiters are still answered; what waits is the writer's own proc,
-    until the peer reads or the fds go. Until that `Rflush` arrives the tag is not
+    write, and no more. Until that `Rflush` arrives the tag is not
     handed out again and the fid it named stays busy (§14(51)); a
     reply that arrives for it meanwhile is read off the wire and
     **discarded where it arrives**, which is what 9P has a client do
@@ -6356,6 +6335,29 @@ the 9P client's (§12), which nothing in this build dials with.
     the life of the connection: the client will not reuse a tag the
     peer may still answer, and a caller that wants them back closes
     the connection.
+
+    **That bound holds only because a stalled write kills the
+    connection.** `write(2)` on a peer that has stopped reading blocks
+    until the peer reads, which is layer-a §5.4's own dead-peer
+    scenario arriving on the sending side, and it blocks holding the
+    one write lock, so every other exchange on the connection piles up
+    behind it and the `Tflush` above, which is on the timeout path,
+    could never be written at all. A peer that will not ACCEPT a
+    message within the exchange's deadline therefore counts as dead:
+    there is nothing to flush, because nothing was sent, and nothing
+    to wait for. The writer records the write's deadline before
+    entering `write(2)`; the timer, finding a write outstanding past
+    it, kills the connection `Ninedead` with a string naming the
+    stalled `T`-message and calls `Ninecfg.hangup` (§14(50)) so that
+    the blocked `write` returns, and the waiter collects `Ninedead`
+    rather than `Ninetimeout`. The `Tflush`'s own write is bounded the
+    same way, by a fixed 1000 ms rather than by an exchange's
+    deadline: it has no exchange of its own and nobody waits for it,
+    and the number has only to be far above a busy peer's read of six
+    bytes and far below the life of a connection. With no `hangup`
+    callback the connection still dies and the waiters are still
+    answered; what waits is the writer's own proc, until the peer
+    reads or the fds go.
 
 50. **Four ways an exchange can end that are not an `Rerror`, and
     when a closed connection's memory goes (layer-a §2.6, §3.7).**
@@ -6402,9 +6404,9 @@ the 9P client's (§12), which nothing in this build dials with.
     failed, a peer whose `Rversion` broke 9P and a `Tversion` that
     timed out are silent alike, because a caller cannot be told the
     release of something it was never given. The rule about calls is
-    `storeclose`'s: one in flight
-    when the close runs is safe, since the exchange holds a reference
-    of its own, and one STARTED after it is undefined.
+    `storeclose`'s: one in flight when the close runs is safe, since
+    the exchange holds a reference of its own, and one STARTED after
+    it is undefined.
 
     **Whose moment that is depends on `Ninecfg.hangup`.** A proc
     parked in `read(2)` or `write(2)` cannot be recalled from inside
@@ -6457,8 +6459,8 @@ the 9P client's (§12), which nothing in this build dials with.
     — the second is refused here rather than racing for a fid the
     server would give to one of them. A fid a timed-out exchange
     abandoned counts as busy until its `Rflush` (§14(49)), because the
-    peer may still be working on it. The refusal is local and is NOT §2.6's
-    `bad ctl`: nothing was sent, so no receiver refused anything.
+    peer may still be working on it. The refusal is local and is NOT
+    §2.6's `bad ctl`: nothing was sent, so no receiver refused anything.
 
 ## 15. Alternatives considered
 
