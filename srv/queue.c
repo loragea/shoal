@@ -1140,6 +1140,8 @@ srvheld(Srvctx *c, char *name)
 		n = c->finalheld;
 	else if(strcmp(name, "newhold") == 0)
 		n = c->newheld;
+	else if(strcmp(name, "objprelook") == 0)
+		n = c->prelookheld;
 	qunlock(&c->holdlk);
 	return n;
 }

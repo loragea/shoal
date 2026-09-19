@@ -1249,7 +1249,7 @@ objwriterun(Req *r, Srvctx *c, Smap *m)
 	 * moves neither the epoch this write was keyed with nor the
 	 * placement step 5 is about to read (dat.h).
 	 */
-	srvqhold(r, &c->prelookhold, nil);
+	srvqhold(r, &c->prelookhold, &c->prelookheld);
 	if((e = replicate(c, m, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
 		stagedone(f, s);
 		srvqdone(r, e);

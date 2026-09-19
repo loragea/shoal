@@ -525,8 +525,9 @@ void	srvhook(Srvctx*, char *name, uvlong n);
  * WHILE a request is parked, and a sleep long enough today is a wedge
  * or a silent pass tomorrow.  A point counts only where a case needs
  * the wait — today the three of the /repl transfer, fullhold, openhold
- * and finalhold, and the stage slot's newhold — and an unnamed point
- * answers 0.
+ * and finalhold, the stage slot's newhold, and the client write path's
+ * objprelook, which is where a case parks a write across a map swap
+ * (srvmapswap above) — and an unnamed point answers 0.
  */
 uvlong	srvheld(Srvctx*, char *name);
 

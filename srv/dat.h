@@ -881,6 +881,13 @@ struct Srvctx
 	uvlong	openheld;
 	uvlong	finalheld;
 	uvlong	newheld;
+	/*
+	 * ... and at the client write path's own, which is the window a
+	 * map swap has to be driven against: a write parked there has
+	 * been admitted and keyed and has not yet read the placement
+	 * (srv.h's objprelook, and the map handle below).
+	 */
+	uvlong	prelookheld;
 	uvlong	mapopen;	/* srvhook("mapopen") */
 	uvlong	walkhold;	/* srvhook("walkhold") */
 	uvlong	anyexit;	/* srvhook("anyexit") */
