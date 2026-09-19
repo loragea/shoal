@@ -908,6 +908,7 @@ enum
 	Stdeaf,			/* answer the Tversion, then stop reading */
 	Stover,			/* answer an Rread/Rwrite over the count asked for */
 	Stlong,			/* answer an Rread over the negotiated msize */
+	Stflushdead,		/* hold a request, botch another, hold the Tflush */
 
 	Stubbuf	= 16384,	/* the stub's own message buffer */
 	Sover	= 64,		/* Stover: what the case asks a read for */
@@ -923,6 +924,8 @@ struct Stub
 	int	deafafter;	/* Stdeaf: requests it reads before going deaf */
 	int	deaf;		/* Stdeaf: the Tversion is answered, no more reads */
 	int	drain;		/* ... until a hangup, which resumes them */
+	ushort	ftag;		/* Stflushdead: the tag its Tflush arrived under */
+	int	hasflush;	/* ... and that it has arrived at all */
 	int	got;		/* requests read past the Tversion */
 	int	ended;
 };
@@ -1036,6 +1039,31 @@ stubproc(void *v)
 			f.tag = t.tag;
 			f.count = s->over;
 			f.data = (char*)data;
+			if((n = convS2M(&f, buf, Stubbuf)) > 0)
+				write(s->p.sout, buf, n);
+			break;
+		case Stflushdead:
+			/*
+			 * Everything is held and never answered, so the first
+			 * request times out and the client leaves a Tflush
+			 * behind; the Tflush's own tag is recorded and it too
+			 * is left unanswered, for cflushdead to answer by hand
+			 * once the connection is dead.  A Tclunk is the
+			 * exception: it is answered with a reply of the wrong
+			 * type, which is a violation the WAITER judges, so the
+			 * reader is still inside read(2) when the connection
+			 * dies of it.
+			 */
+			if(t.type == Tflush){
+				s->ftag = t.tag;
+				s->hasflush = 1;
+				break;
+			}
+			if(t.type != Tclunk)
+				break;
+			f.type = Rattach;
+			f.tag = t.tag;
+			f.qid.type = QTDIR;
 			if((n = convS2M(&f, buf, Stubbuf)) > 0)
 				write(s->p.sout, buf, n);
 			break;
@@ -1167,6 +1195,74 @@ cbotch(void)
 		" for");
 	nineclunk(c, Froot, Tms, &r);
 	eqv("the connection does not survive it", r.out, Ninebotch);
+	closecl(c);
+	stubstop(&s);
+}
+
+/*
+ * An Rflush that arrives on a connection which died while the flush
+ * was outstanding.  A request is held until it times out, so the
+ * client leaves a Tflush behind and the reader goes back into read(2)
+ * with two tags owed; a Tclunk is then answered with a reply of the
+ * wrong type, which the WAITER judges rather than the reader, so the
+ * connection dies with the reader still parked in that read.  The
+ * Rflush is written onto the wire by hand after that death, which is
+ * the only way to order the two.
+ *
+ * A dead connection takes nothing more off the wire: the reader
+ * leaves where it finds the connection dead instead of running the
+ * reply through the demultiplexer, whose Nflushing arm would settle
+ * both slots and decrement a nexpect the death has already zeroed.
+ * The tags staying held is what makes that observable — nothing else
+ * of it is — and the close that follows still reclaiming everything
+ * is what says the reader did leave.
+ */
+enum
+{
+	Cdeadms		= 100,		/* the held request's deadline */
+	Cdeadwaitms	= 500,		/* ... and how long the Rflush is given */
+};
+
+static void
+cflushdead(void)
+{
+	uchar wbuf[64];
+	Ninerep r;
+	Fcall f;
+	Stub s;
+	Nine *c;
+	int i, n;
+
+	stage = "an Rflush onto a dead connection";
+	stubstart(&s, Stflushdead, 0);
+	if((c = opencl(&s.p, Ninemsizefloor)) == nil){
+		close(s.p.cin);
+		close(s.p.cout);
+		stubstop(&s);
+		return;
+	}
+	nineopenfid(c, Fa, OREAD, Cdeadms, &r);
+	eqv("an open the peer is holding times out", r.out, Ninetimeout);
+	for(i = 0; i*10 < Twaitms && !s.hasflush; i++)
+		sleep(10);
+	istrue("... leaving a Tflush the peer has not answered", s.hasflush);
+	eqv("the tag and the tag of its Tflush are held", nineheld(c), 2);
+
+	nineclunk(c, Fb, Tms, &r);
+	eqv("a reply of the wrong type kills the connection", r.out, Ninebotch);
+	eqs("... and says which", r.err, "ninep: a reply of type 105 to a T120");
+	eqv("the flush's two tags are held across the death", nineheld(c), 2);
+
+	memset(&f, 0, sizeof f);
+	f.type = Rflush;
+	f.tag = s.ftag;
+	if((n = convS2M(&f, wbuf, sizeof wbuf)) <= 0)
+		fail("%s: an Rflush will not encode", stage);
+	else if(write(s.p.sout, wbuf, n) != n)
+		fail("%s: writing the Rflush: %r", stage);
+	for(i = 0; i*10 < Cdeadwaitms && nineheld(c) == 2; i++)
+		sleep(10);
+	eqv("a dead connection takes the Rflush off nothing", nineheld(c), 2);
 	closecl(c);
 	stubstop(&s);
 }
@@ -1556,6 +1652,7 @@ threadmain(int argc, char **argv)
 	cclosebusy();
 	cdeath();
 	cbotch();
+	cflushdead();
 	cmutepeer();
 	clocalrefuse();
 	cwritestall();
