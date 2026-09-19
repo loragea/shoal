@@ -339,8 +339,9 @@ ninetake(Nine *c, int notag)
 }
 
 /*
- * One message off the wire, already read into rbuf.  Called under the
- * lock; answers 0 to go on reading and -1 once the connection is gone.
+ * One message off the wire, already read into rbuf and already judged
+ * a legal length by ninereadmsg.  Called under the lock; answers 0 to
+ * go on reading and -1 once the connection is gone.
  */
 static int
 ninegot(Nine *c, int n)
@@ -351,16 +352,6 @@ ninegot(Nine *c, int n)
 	ushort tag;
 	int i;
 
-	if((ulong)n > c->msize){
-		snprint(buf, sizeof buf, "ninep: a reply of %d bytes over the"
-			" negotiated msize %lud", n, c->msize);
-		ninedied(c, Ninebotch, buf);
-		return -1;
-	}
-	if(n < BIT32SZ+BIT8SZ+BIT16SZ){
-		ninedied(c, Ninebotch, "ninep: a short reply");
-		return -1;
-	}
 	tag = GBIT16(c->rbuf+BIT32SZ+BIT8SZ);
 	i = tag == NOTAG ? 0 : tag;
 	if(i < 0 || i >= c->nslot || c->req[i].tag != tag
@@ -428,18 +419,72 @@ ninegot(Nine *c, int n)
 }
 
 /*
- * The reader proc.  It reads only while the peer owes a reply, so a
+ * One message into rbuf: read9pmsg(2)'s job, done here instead.
+ * read9pmsg judges the length against the buffer it was given and
+ * answers a message longer than it with the same -1 a broken
+ * transport gives, and those are two different outcomes to a caller
+ * (§14(50)): a peer that hangs up is one to dial again, and a peer
+ * that sends more than the negotiated msize has broken 9P and is not.
+ * Judging the length here also makes the judgement the NEGOTIATED
+ * msize's rather than the proposed buffer's, so a peer that lowered
+ * the msize and one that did not are answered alike.
+ *
+ * Answers the message's length, 0 at end of file, or -1 with the
+ * reason in e and *botch set for a protocol violation and clear for
+ * transport death.  `msize' is passed in because it is the caller's
+ * to read under the lock.
+ */
+static int
+ninereadmsg(Nine *c, ulong msize, int *botch, char *e, int ne)
+{
+	ulong len;
+	int n;
+
+	*botch = 0;
+	if((n = readn(c->infd, c->rbuf, BIT32SZ)) != BIT32SZ){
+		if(n == 0)
+			return 0;
+		if(n < 0)
+			snprint(e, ne, "ninep: %r");
+		else
+			snprint(e, ne, "ninep: %d bytes of a reply header", n);
+		return -1;
+	}
+	len = GBIT32(c->rbuf);
+	if(len > msize){
+		*botch = 1;
+		snprint(e, ne, "ninep: a reply of %lud bytes over the negotiated"
+			" msize %lud", len, msize);
+		return -1;
+	}
+	if(len < BIT32SZ+BIT8SZ+BIT16SZ){
+		*botch = 1;
+		snprint(e, ne, "ninep: a short reply");
+		return -1;
+	}
+	n = readn(c->infd, c->rbuf+BIT32SZ, len-BIT32SZ);
+	if(n < 0){
+		snprint(e, ne, "ninep: %r");
+		return -1;
+	}
+	if((ulong)n < len-BIT32SZ)	/* end of file inside a message */
+		return 0;
+	return len;
+}
+
+/*
+ * The reader proc.  It reads only while a request is on the wire, so a
  * connection with nothing outstanding is one whose reader is parked on
- * a Rendez and can be stopped at once; a reader inside read(2) cannot
- * be recalled in plain libc (§14(50)), and this is what keeps that
- * case to a connection the caller closed with work still in flight.
+ * a Rendez and can be stopped at once; a reader inside read(2) comes
+ * back only when the peer speaks or `hangup' breaks the fds (§14(50)).
  */
 static void
 ninereader(void *a)
 {
 	char e[ERRMAX];
 	Nine *c;
-	int n;
+	ulong msize;
+	int n, botch;
 
 	c = a;
 	qlock(&c->lk);
@@ -448,10 +493,9 @@ ninereader(void *a)
 			rsleep(&c->rdrz);
 		if(c->closed || c->dead)
 			break;
+		msize = c->msize;
 		qunlock(&c->lk);
-		n = read9pmsg(c->infd, c->rbuf, c->bufsz);
-		if(n < 0)
-			snprint(e, sizeof e, "ninep: %r");
+		n = ninereadmsg(c, msize, &botch, e, sizeof e);
 		qlock(&c->lk);
 		if(c->closed)
 			break;
@@ -460,7 +504,7 @@ ninereader(void *a)
 			break;
 		}
 		if(n < 0){
-			ninedied(c, Ninedead, e);
+			ninedied(c, botch ? Ninebotch : Ninedead, e);
 			break;
 		}
 		if(ninegot(c, n) < 0)

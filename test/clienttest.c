@@ -1309,6 +1309,70 @@ covercount(void)
 	stubstop(&s);
 }
 
+/*
+ * A reply longer than the negotiated msize, both ways round: against
+ * a peer that took the msize as proposed, and against one that
+ * lowered it.  The violation is the same and so is the outcome — the
+ * length is judged here, off the header, and not left to read9pmsg,
+ * which cannot tell an over-long message from a broken transport.
+ * The proposals are small so that the stub's own buffer holds the
+ * over-long reply it has to build.
+ */
+enum
+{
+	Cpropose	= 4096,		/* what these two connections propose */
+	Clower		= 2048,		/* ... and what the second peer answers */
+	Clong1		= 4200,		/* an Rread count over the first msize */
+	Clong2		= 2200,		/* ... and over the second */
+	Crdhdr		= BIT32SZ+BIT8SZ+BIT16SZ+BIT32SZ,
+};
+
+static void
+clongreply(void)
+{
+	char buf[256], want[256];
+	Ninerep r;
+	Stub s;
+	Nine *c;
+
+	stage = "a reply over a msize the peer took as proposed";
+	stubstart(&s, Stlong, 0);
+	s.over = Clong1;
+	if((c = opencl(&s.p, Cpropose)) == nil){
+		close(s.p.cin);
+		close(s.p.cout);
+		stubstop(&s);
+		return;
+	}
+	eqv("the msize is the one proposed", ninemsize(c), Cpropose);
+	nineread(c, Fa, 0, buf, Sover, Tms, &r);
+	eqv("a reply over the negotiated msize is a protocol violation",
+		r.out, Ninebotch);
+	snprint(want, sizeof want, "ninep: a reply of %d bytes over the"
+		" negotiated msize %d", Clong1+Crdhdr, Cpropose);
+	eqs("... and says which", r.err, want);
+	closecl(c);
+	stubstop(&s);
+
+	stage = "a reply over a msize the peer lowered";
+	stubstart(&s, Stlong, Clower);
+	s.over = Clong2;
+	if((c = opencl(&s.p, Cpropose)) == nil){
+		close(s.p.cin);
+		close(s.p.cout);
+		stubstop(&s);
+		return;
+	}
+	eqv("the msize is the one the peer answered", ninemsize(c), Clower);
+	nineread(c, Fa, 0, buf, Sover, Tms, &r);
+	eqv("the same violation is the same outcome", r.out, Ninebotch);
+	snprint(want, sizeof want, "ninep: a reply of %d bytes over the"
+		" negotiated msize %d", Clong2+Crdhdr, Clower);
+	eqs("... and says which", r.err, want);
+	closecl(c);
+	stubstop(&s);
+}
+
 void
 threadmain(int argc, char **argv)
 {
@@ -1328,6 +1392,7 @@ threadmain(int argc, char **argv)
 	clocalrefuse();
 	cwritestall();
 	covercount();
+	clongreply();
 
 	watchoff();
 	if(fails > 0){

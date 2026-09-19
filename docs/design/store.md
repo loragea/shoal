@@ -6291,7 +6291,15 @@ the 9P client's (§12), which nothing in this build dials with.
     number is spelled once. What the client does refuse is what 9P
     itself forbids: a version it did not offer, and an `msize` ABOVE
     the proposal, which is a peer answering with something that was
-    never on the table. The server's half of the same rule is
+    never on the table, and a REPLY longer than the negotiated
+    `msize`. That last one is judged from the four-byte length header
+    before the rest of the message is read, rather than left to
+    `read9pmsg`(2): `read9pmsg` judges the length against the buffer
+    it was handed and answers an over-long message with the same `-1`
+    a broken transport gives, so the same violation would be
+    `Ninebotch` when the peer had lowered the `msize` and `Ninedead`
+    — "dial me again" — when it had not, which is the common case.
+    It is `Ninebotch` either way. The server's half of the same rule is
     §14(20), which enforces the floor at `Tattach` — so a connection
     below it negotiates, and is refused at the attach with a string
     the client hands the caller verbatim.
