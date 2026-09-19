@@ -6231,6 +6231,86 @@ name a half that is not built; each says which.
     the rule has its own operations serialised in arrival order
     rather than refused.
 
+52. **The adopted map is read through a refcounted snapshot, and it
+    can be swapped under a running server (§7; layer-a §6.3, §5.4).**
+    Item 18 has the map adopted once at start-up and never refreshed,
+    and the fields that held it — the text, the parse and a bare
+    `Cinst*` into the parse's instance array — were under no lock at
+    all, which is sound only for as long as nothing ever replaces
+    them. The refresh loop item 18 names as its open half would
+    replace them under perhaps fifty readers spread across the
+    attach, the write path, the ctl verbs, the two peer channels, the
+    status files and the reclaim walk, and freeing the old parse
+    would invalidate every one of them mid-request. *Not made; this
+    is the server's own memory discipline, and it is implementation
+    policy:* nothing here is on the wire or on the disk, and a
+    conforming implementation may hold its map any way that gives a
+    request one map.
+
+    What the server does today. The map lives in an **immutable
+    snapshot** — the adopted bytes, the `Cmap` they parsed to, and
+    this instance's own record resolved inside that `Cmap` — behind a
+    reference count. A reader takes a reference, reads, and gives it
+    back; a swap publishes a new snapshot and gives the old one's
+    installed reference back, so the old snapshot is freed by
+    whichever reader lets go of it last. The lock over all of this is
+    a **leaf** in §7's order: it is a spin `Lock` held across a
+    pointer copy and an integer, never across an engine call, a
+    device access, a park or another lock, and no lock is taken under
+    it — §7 rules 1 and 2, on the one structure in the 9P server that
+    every other structure's readers touch.
+
+    A **hold is not a lock**. It blocks no swap and excludes no other
+    reader; all it does is keep that snapshot's memory alive. So a
+    reader may hold one across an engine call and across one of
+    §13's `-X` hold points, which is what makes the rule below
+    affordable: a queued object operation holds one from the head of
+    its handler to its last exit, a render holds one for the whole of
+    what it renders, and a pass or a timer tick takes one per pass or
+    per tick rather than per read. What a swap guarantees a reader is
+    therefore that its own map does not move: the epoch, the
+    placement and the `self` a placement member is compared against
+    are one map's, and a pointer into that map's instance array stays
+    live for exactly as long as the hold that answered it.
+
+    **The epoch a write is keyed with is the epoch it was admitted
+    under.** It is read once, at layer-a §5.4 step 3's stage, carried
+    in the stage to the engine call that commits (`/meta`'s
+    `wepoch=`), and never re-read; a create, which §14(10) gives no
+    stage, stamps the epoch of the same snapshot its admission used.
+    A swap landing between admission and commit — including one
+    landing while the request is parked — therefore produces a commit
+    stamped with the OLD epoch, and the next operation on that object
+    takes the new one, because its own admission does. The
+    alternative, re-reading at the commit, would let one request be
+    admitted under one epoch's placement and write under another's,
+    which is precisely the split the epoch exists to detect.
+
+    **`/map` renders one snapshot's text entire**, so the file is
+    never a mix of two maps, and `/status`'s `status=` and `up=` are
+    one record's pair.
+
+    Where one 9P message is two readers, it may read two maps: a
+    row's gate runs on the service loop before the queued handler
+    behind it, `/meta`'s open admits on the queue and then calls a
+    render that takes its own snapshot, and a `/repl` or `/rpc` write
+    is epoch-checked on the loop before the operation is pushed. Each
+    half is one map's; the pair is not.
+
+    **Nothing swaps in production.** The only caller is a T1 entry
+    point, `srvmapswap`, which parses, resolves this instance's
+    record by the uuid the disk carries exactly as start-up does, and
+    refuses — leaving the map in force untouched — a text that does
+    not parse, that names no record with this uuid, or that gives
+    this uuid a different iid. It is deliberately **not** an
+    adoption: §6.3's decision (`mapadoptable`), the `monid` pin, the
+    durable `epochadopt`, §14(8)'s geometry checks against the
+    superblock and the copy of `leasems` into §6.4's fence state are
+    start-up's, and the refresh loop of item 18's open half is what
+    owes them. So the memory discipline is built and adoption policy
+    is not, and item 18's "adopted once at start-up and never
+    refreshed" still describes what a running server does.
+
 ## 15. Alternatives considered
 
 *Policy.*

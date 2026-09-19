@@ -575,6 +575,7 @@ reclaimpass(Sjob *j)
 	Srvctx *c;
 	Objsnap *sn;
 	Objinfo oi;
+	Smap *m;
 	uchar oid[Oidmax];
 	uvlong epoch;
 	vlong cutoff;
@@ -582,8 +583,19 @@ reclaimpass(Sjob *j)
 	int oidlen, rc;
 
 	c = j->ctx;
-	cutoff = time(0) - (vlong)c->map->tombdays*86400;
-	epoch = c->map->epoch;
+	/*
+	 * §1.5's conditions 2 and 3, off ONE snapshot of the map taken
+	 * for the whole pass (dat.h): the retention the walk measures
+	 * against and the epoch it compares to are the same map's, so a
+	 * swap part-way through a walk cannot make one entry pass under a
+	 * rule no other entry was judged by.  A pass that runs while the
+	 * map moves therefore reports the map it started under; the next
+	 * pass reports the new one.
+	 */
+	m = srvmapget(c);
+	cutoff = time(0) - (vlong)m->map->tombdays*86400;
+	epoch = m->map->epoch;
+	srvmapput(c, m);
 	if((sn = srvsnapopen(c->store, Snaptomb, buf, sizeof buf)) == nil){
 		werrstr("%s", buf);
 		joberr(j);
@@ -722,14 +734,20 @@ reclaimgo(Srvctx *c, int bytimer)
 uvlong
 srvreclaimperiod(Srvctx *c)
 {
+	Smap *m;
 	uvlong ms;
+	ulong tombdays;
 
 	lock(&c->joblk);
 	ms = c->reclaimms;
 	unlock(&c->joblk);
 	if(ms != 0)
 		return ms;
-	ms = (uvlong)c->map->tombdays * (86400000/2);
+	/* one snapshot per call, which is one per slice of the wait */
+	m = srvmapget(c);
+	tombdays = m->map->tombdays;
+	srvmapput(c, m);
+	ms = (uvlong)tombdays * (86400000/2);
 	if(ms < Reclaimminms)
 		ms = Reclaimminms;
 	return ms;

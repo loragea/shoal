@@ -1036,18 +1036,24 @@ srvstagefinal(Srvctx *c, Sfid *f, Sstage *s)
  *
  * The detail after `not primary' is §2.6's own form, and the iid in it
  * is the instance the map sends the client to.
+ *
+ * The map is the caller's snapshot and not one taken here: the
+ * admission, the epoch the stage is keyed with and step 5's placement
+ * are three reads of ONE map, and the handler is what holds it across
+ * all three (dat.h).
  */
 static char*
-admit(Srvctx *c, Sfid *f, uchar *oid, int oidlen, char *buf, int nbuf)
+admit(Srvctx *c, Smap *m, Sfid *f, uchar *oid, int oidlen, char *buf, int nbuf)
 {
 	char id[Oidmax+1];
 	Cinst *p;
 
+	USED(c);
 	if(f->role != Rclient)
 		return nil;
 	oidstr(id, oid, oidlen);
-	p = mapprimary(c->map, id);
-	if(p == c->self)
+	p = mapprimary(m->map, id);
+	if(p == m->self)
 		return nil;
 	if(p == nil){
 		/*
@@ -1057,7 +1063,7 @@ admit(Srvctx *c, Sfid *f, uchar *oid, int oidlen, char *buf, int nbuf)
 		 * answer (lib/shoal.h) and is answered as the internal
 		 * error it is.
 		 */
-		if(mapunderrep(c->map, id) < 0)
+		if(mapunderrep(m->map, id) < 0)
 			return srverr(buf, nbuf);
 		return Eunavail;
 	}
@@ -1082,16 +1088,18 @@ admit(Srvctx *c, Sfid *f, uchar *oid, int oidlen, char *buf, int nbuf)
  * path, and an operator's write of a reserved id is not on it.
  */
 static char*
-replicate(Srvctx *c, Sfid *f, uchar *oid, int oidlen, char *buf, int nbuf)
+replicate(Srvctx *c, Smap *m, Sfid *f, uchar *oid, int oidlen, char *buf,
+	int nbuf)
 {
 	char id[Oidmax+1];
 	Cinst *p[Maxplace];
 	int n;
 
+	USED(c);
 	if(f->role != Rclient)
 		return nil;
 	oidstr(id, oid, oidlen);
-	if((n = mapplace(c->map, id, p, nelem(p))) < 0)
+	if((n = mapplace(m->map, id, p, nelem(p))) < 0)
 		return srverr(buf, nbuf);
 	if(n <= 1)
 		return nil;
@@ -1117,23 +1125,22 @@ objkey(Srvctx *c, Sfid *f, Objinfo *oi, char *buf, int nbuf)
  * layer-a §2.4's read.  The clamp to `len', the zeroes a hole reads as
  * and the short read at the end are the engine's (store.md §4); what
  * is here is the queue, the gate having already run, and the one exit.
+ *
+ * Every queued object handler below has this shape: the pushed
+ * function takes the map snapshot at the head and gives it back when
+ * the body has returned, so the body reads one map from its admission
+ * to its last exit — engine calls, -X hold points and all (dat.h).
  */
 static void
-objreadq(Req *r)
+objreadrun(Req *r, Srvctx *c, Smap *m)
 {
 	char buf[ERRMAX], *e;
-	Srvctx *c;
 	Sfid *f;
 	long n;
 
-	if(srvqcheck(r)){
-		srvqdone(r, nil);
-		return;
-	}
-	c = r->srv->aux;
 	f = r->fid->aux;
 	srvstagesweep(c);
-	if((e = admit(c, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
+	if((e = admit(c, m, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
 		srvqdone(r, e);
 		return;
 	}
@@ -1147,6 +1154,22 @@ objreadq(Req *r)
 	r->ofcall.count = n;
 	srvqexit(r);
 	srvqdone(r, nil);
+}
+
+static void
+objreadq(Req *r)
+{
+	Srvctx *c;
+	Smap *m;
+
+	if(srvqcheck(r)){
+		srvqdone(r, nil);
+		return;
+	}
+	c = r->srv->aux;
+	m = srvmapget(c);
+	objreadrun(r, c, m);
+	srvmapput(c, m);
 }
 
 void
@@ -1184,24 +1207,18 @@ srvobjread(Req *r)
  * `checksum mismatch' like any other client access (store.md §3.7).
  */
 static void
-objwriteq(Req *r)
+objwriterun(Req *r, Srvctx *c, Smap *m)
 {
 	char buf[ERRMAX], *e;
-	Srvctx *c;
 	Sfid *f;
 	Sstage *s;
 	Objinfo oi;
 	uvlong off, max;
 	long n;
 
-	if(srvqcheck(r)){
-		srvqdone(r, nil);
-		return;
-	}
-	c = r->srv->aux;
 	f = r->fid->aux;
 	srvstagesweep(c);
-	if((e = admit(c, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
+	if((e = admit(c, m, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
 		srvqdone(r, e);
 		return;
 	}
@@ -1218,7 +1235,7 @@ objwriteq(Req *r)
 		return;
 	}
 	if((s = stagenew(r, c, f, Stwrite, f->oid, f->oidlen, oi.ver+1,
-		c->map->epoch, n, off, &e)) == nil){
+		m->map->epoch, n, off, &e)) == nil){
 		srvqdone(r, e);
 		return;
 	}
@@ -1227,9 +1244,13 @@ objwriteq(Req *r)
 	 * from here to the look below, a step 7 for another request on this
 	 * fid takes the stage out from under it, and the look is what turns
 	 * that into an answer instead of a commit (srv.h's objprelook).
+	 *
+	 * The snapshot is held across the park, so a swap landing here
+	 * moves neither the epoch this write was keyed with nor the
+	 * placement step 5 is about to read (dat.h).
 	 */
 	srvqhold(r, &c->prelookhold, nil);
-	if((e = replicate(c, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
+	if((e = replicate(c, m, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
 		stagedone(f, s);
 		srvqdone(r, e);
 		return;
@@ -1259,6 +1280,22 @@ objwriteq(Req *r)
 	r->ofcall.count = n;
 	srvqexit(r);
 	srvqdone(r, nil);
+}
+
+static void
+objwriteq(Req *r)
+{
+	Srvctx *c;
+	Smap *m;
+
+	if(srvqcheck(r)){
+		srvqdone(r, nil);
+		return;
+	}
+	c = r->srv->aux;
+	m = srvmapget(c);
+	objwriterun(r, c, m);
+	srvmapput(c, m);
 }
 
 /*
@@ -1303,23 +1340,17 @@ srvobjwrite(Req *r)
  * queue like every other operation naming it.
  */
 static void
-objopenq(Req *r)
+objopenrun(Req *r, Srvctx *c, Smap *m)
 {
 	char buf[ERRMAX], *e;
-	Srvctx *c;
 	Sfid *f;
 	Sstage *s;
 	Objinfo oi;
 	Qid q;
 
-	if(srvqcheck(r)){
-		srvqdone(r, nil);
-		return;
-	}
-	c = r->srv->aux;
 	f = r->fid->aux;
 	srvstagesweep(c);
-	if((e = admit(c, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
+	if((e = admit(c, m, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
 		srvqdone(r, e);
 		return;
 	}
@@ -1329,11 +1360,11 @@ objopenq(Req *r)
 	}
 	if((r->ifcall.mode & OTRUNC) != 0 && oi.len != 0){
 		if((s = stagenew(r, c, f, Sttrunc, f->oid, f->oidlen, oi.ver+1,
-			c->map->epoch, 0, 0, &e)) == nil){
+			m->map->epoch, 0, 0, &e)) == nil){
 			srvqdone(r, e);
 			return;
 		}
-		if((e = replicate(c, f, f->oid, f->oidlen, buf,
+		if((e = replicate(c, m, f, f->oid, f->oidlen, buf,
 			sizeof buf)) != nil){
 			stagedone(f, s);
 			srvqdone(r, e);
@@ -1378,6 +1409,22 @@ objopenq(Req *r)
 	srvqdone(r, nil);
 }
 
+static void
+objopenq(Req *r)
+{
+	Srvctx *c;
+	Smap *m;
+
+	if(srvqcheck(r)){
+		srvqdone(r, nil);
+		return;
+	}
+	c = r->srv->aux;
+	m = srvmapget(c);
+	objopenrun(r, c, m);
+	srvmapput(c, m);
+}
+
 void
 srvobjopen(Req *r)
 {
@@ -1411,22 +1458,16 @@ srvobjopen(Req *r)
  * the fid pool before this runs, so nothing here arranges that.
  */
 static void
-objremoveq(Req *r)
+objremoverun(Req *r, Srvctx *c, Smap *m)
 {
 	char buf[ERRMAX], *e;
-	Srvctx *c;
 	Sfid *f;
 	Sstage *s;
 	Objinfo oi;
 
-	if(srvqcheck(r)){
-		srvqdone(r, nil);
-		return;
-	}
-	c = r->srv->aux;
 	f = r->fid->aux;
 	srvstagesweep(c);
-	if((e = admit(c, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
+	if((e = admit(c, m, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
 		srvqdone(r, e);
 		return;
 	}
@@ -1435,11 +1476,11 @@ objremoveq(Req *r)
 		return;
 	}
 	if((s = stagenew(r, c, f, Stremove, f->oid, f->oidlen, oi.ver+1,
-		c->map->epoch, 0, 0, &e)) == nil){
+		m->map->epoch, 0, 0, &e)) == nil){
 		srvqdone(r, e);
 		return;
 	}
-	if((e = replicate(c, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
+	if((e = replicate(c, m, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
 		stagedone(f, s);
 		srvqdone(r, e);
 		return;
@@ -1459,6 +1500,22 @@ objremoveq(Req *r)
 	stagedone(f, s);
 	srvqexit(r);
 	srvqdone(r, nil);
+}
+
+static void
+objremoveq(Req *r)
+{
+	Srvctx *c;
+	Smap *m;
+
+	if(srvqcheck(r)){
+		srvqdone(r, nil);
+		return;
+	}
+	c = r->srv->aux;
+	m = srvmapget(c);
+	objremoverun(r, c, m);
+	srvmapput(c, m);
 }
 
 void
@@ -1489,23 +1546,17 @@ srvobjremove(Req *r)
  * (nulldir), so what the client asked for is what differs from those.
  */
 static void
-objwstatq(Req *r)
+objwstatrun(Req *r, Srvctx *c, Smap *m)
 {
 	char buf[ERRMAX], *e;
-	Srvctx *c;
 	Sfid *f;
 	Sstage *s;
 	Objinfo oi;
 	uvlong len;
 
-	if(srvqcheck(r)){
-		srvqdone(r, nil);
-		return;
-	}
-	c = r->srv->aux;
 	f = r->fid->aux;
 	srvstagesweep(c);
-	if((e = admit(c, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
+	if((e = admit(c, m, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
 		srvqdone(r, e);
 		return;
 	}
@@ -1523,11 +1574,11 @@ objwstatq(Req *r)
 		return;
 	}
 	if((s = stagenew(r, c, f, Sttrunc, f->oid, f->oidlen, oi.ver+1,
-		c->map->epoch, 0, 0, &e)) == nil){
+		m->map->epoch, 0, 0, &e)) == nil){
 		srvqdone(r, e);
 		return;
 	}
-	if((e = replicate(c, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
+	if((e = replicate(c, m, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
 		stagedone(f, s);
 		srvqdone(r, e);
 		return;
@@ -1547,6 +1598,22 @@ objwstatq(Req *r)
 	stagedone(f, s);
 	srvqexit(r);
 	srvqdone(r, nil);
+}
+
+static void
+objwstatq(Req *r)
+{
+	Srvctx *c;
+	Smap *m;
+
+	if(srvqcheck(r)){
+		srvqdone(r, nil);
+		return;
+	}
+	c = r->srv->aux;
+	m = srvmapget(c);
+	objwstatrun(r, c, m);
+	srvmapput(c, m);
 }
 
 void
@@ -1646,10 +1713,9 @@ createdrop(Sfid *f)
  * on this fid — is what the create sees there (dat.h).
  */
 static void
-objcreateq(Req *r)
+objcreaterun(Req *r, Srvctx *c, Smap *m)
 {
 	char buf[ERRMAX], err[ERRMAX], *e;
-	Srvctx *c;
 	Sfid *f;
 	Sstage *s;
 	Objinfo oi;
@@ -1657,11 +1723,6 @@ objcreateq(Req *r)
 	uvlong ver;
 	Qid q;
 
-	if(srvqcheck(r)){
-		srvqdone(r, nil);
-		return;
-	}
-	c = r->srv->aux;
 	f = r->fid->aux;
 	qr = r->aux;
 	srvqhold(r, &c->claimhold, nil);
@@ -1675,7 +1736,7 @@ objcreateq(Req *r)
 	f->moving = 1;
 	qunlock(&f->lk);
 	srvstagesweep(c);
-	if((e = admit(c, f, qr->oid, qr->oidlen, buf, sizeof buf)) != nil){
+	if((e = admit(c, m, f, qr->oid, qr->oidlen, buf, sizeof buf)) != nil){
 		createdrop(f);
 		srvqdone(r, e);
 		return;
@@ -1695,12 +1756,19 @@ objcreateq(Req *r)
 		srvqdone(r, Eexists);
 		return;
 	}
-	if((e = replicate(c, f, qr->oid, qr->oidlen, buf, sizeof buf)) != nil){
+	if((e = replicate(c, m, f, qr->oid, qr->oidlen, buf,
+		sizeof buf)) != nil){
 		createdrop(f);
 		srvqdone(r, e);
 		return;
 	}
-	if(objcreate(c->store, qr->oid, qr->oidlen, ver, c->map->epoch, nil, 0,
+	/*
+	 * The create commits with the epoch of the map it was admitted
+	 * under: one snapshot has answered the admission, step 5 and this
+	 * stamp, and §14(10) is why there is no stage between them to
+	 * carry it (dat.h).
+	 */
+	if(objcreate(c->store, qr->oid, qr->oidlen, ver, m->map->epoch, nil, 0,
 		&oi) < 0){
 		createdrop(f);
 		srvqexit(r);
@@ -1727,6 +1795,22 @@ objcreateq(Req *r)
 	r->ofcall.qid = q;
 	srvqexit(r);
 	srvqdone(r, nil);
+}
+
+static void
+objcreateq(Req *r)
+{
+	Srvctx *c;
+	Smap *m;
+
+	if(srvqcheck(r)){
+		srvqdone(r, nil);
+		return;
+	}
+	c = r->srv->aux;
+	m = srvmapget(c);
+	objcreaterun(r, c, m);
+	srvmapput(c, m);
 }
 
 /*
@@ -1817,6 +1901,7 @@ srvmetatext(Srvctx *c, Sfid *f, Text *t)
 	char buf[ERRMAX], id[Oidmax+1], csum[Csumhexlen];
 	Objinfo oi;
 	Cinst *p[Maxplace], *pr;
+	Smap *m;
 	int i, n;
 
 	if(objstat(c->store, f->oid, f->oidlen, &oi) < 0)
@@ -1825,8 +1910,17 @@ srvmetatext(Srvctx *c, Sfid *f, Text *t)
 		return Edeleted;
 	oidstr(id, f->oid, f->oidlen);
 	csumfmt(csum, oi.csum);
-	if((n = mapplace(c->map, id, p, nelem(p))) < 0)
+	/*
+	 * `placement=' and `primary=' are two answers of one map, so they
+	 * come out of one snapshot held to the end of the line (dat.h):
+	 * a primary that is in no rendered placement would be a record of
+	 * a cluster that never existed.
+	 */
+	m = srvmapget(c);
+	if((n = mapplace(m->map, id, p, nelem(p))) < 0){
+		srvmapput(c, m);
 		return srverr(buf, sizeof buf);
+	}
 	/*
 	 * One physical line, which is what §2.4's "one attr=value line per
 	 * object" asks for: the example there is wrapped typographically
@@ -1841,8 +1935,9 @@ srvmetatext(Srvctx *c, Sfid *f, Text *t)
 		textprint(t, "-");
 	for(i = 0; i < n; i++)
 		textprint(t, "%s%s", i > 0 ? "," : "", p[i]->iid);
-	pr = mapprimary(c->map, id);
+	pr = mapprimary(m->map, id);
 	textprint(t, " primary=%s ready=no\n", pr != nil ? pr->iid : "-");
+	srvmapput(c, m);
 	return nil;
 }
 
@@ -1861,24 +1956,34 @@ srvmetatext(Srvctx *c, Sfid *f, Text *t)
  * /meta is untouched.
  */
 static void
-metaopenq(Req *r)
+metaopenrun(Req *r, Srvctx *c, Smap *m)
 {
 	char buf[ERRMAX], *e;
-	Srvctx *c;
 	Sfid *f;
+
+	f = r->fid->aux;
+	srvstagesweep(c);
+	if((e = admit(c, m, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
+		srvqdone(r, e);
+		return;
+	}
+	srvopentext(r);
+}
+
+static void
+metaopenq(Req *r)
+{
+	Srvctx *c;
+	Smap *m;
 
 	if(srvqcheck(r)){
 		srvqdone(r, nil);
 		return;
 	}
 	c = r->srv->aux;
-	f = r->fid->aux;
-	srvstagesweep(c);
-	if((e = admit(c, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
-		srvqdone(r, e);
-		return;
-	}
-	srvopentext(r);
+	m = srvmapget(c);
+	metaopenrun(r, c, m);
+	srvmapput(c, m);
 }
 
 /*

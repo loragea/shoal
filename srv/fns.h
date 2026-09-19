@@ -42,6 +42,10 @@ extern char Einterrupted[];
 extern char Edevintr[];
 extern char Ebotch[];
 
+/* srv.c: the adopted map's handle, dat.h's contract */
+Smap*	srvmapget(Srvctx*);
+void	srvmapput(Srvctx*, Smap*);
+
 /* text.c */
 void	textread(Req*, Text*);
 

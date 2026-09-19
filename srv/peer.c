@@ -527,9 +527,15 @@ hdrparse(Hdr *h, int chan, void *a, long count)
 static char*
 epochck(Srvctx *c, uvlong e)
 {
-	if(e < c->map->epoch)
+	Smap *m;
+	uvlong ours;
+
+	m = srvmapget(c);
+	ours = m->map->epoch;
+	srvmapput(c, m);
+	if(e < ours)
 		return Estaleepoch;
-	if(e > c->map->epoch)
+	if(e > ours)
 		return Efutureepoch;
 	return nil;
 }
@@ -1358,16 +1364,31 @@ rpcdropop(Srvctx *c, Hdr *h, Text *t, char *buf, int nbuf)
 {
 	char name[Oidmax+1];
 	Cinst *pl[Maxplace];
-	int i, n;
+	Smap *m;
+	int i, n, placed;
 
 	oidstr(name, h->oid, h->oidlen);
-	if((n = mapplace(c->map, name, pl, nelem(pl))) < 0)
-		return srverr(buf, nbuf);
-	if(n > nelem(pl))
-		n = nelem(pl);
-	for(i = 0; i < n; i++)
-		if(pl[i] == c->self)
-			return Estillplaced;
+	/*
+	 * The placement and the `self' it is compared against come out of
+	 * one snapshot (dat.h): a guard that took them from two maps
+	 * could drop a copy no single map says is strayed.
+	 */
+	m = srvmapget(c);
+	placed = 0;
+	if((n = mapplace(m->map, name, pl, nelem(pl))) < 0)
+		srverr(buf, nbuf);
+	else{
+		if(n > nelem(pl))
+			n = nelem(pl);
+		for(i = 0; i < n; i++)
+			if(pl[i] == m->self)
+				placed = 1;
+	}
+	srvmapput(c, m);
+	if(n < 0)
+		return buf;
+	if(placed)
+		return Estillplaced;
 	if(objdrop(c->store, h->oid, h->oidlen) < 0)
 		return srverr(buf, nbuf);
 	textprint(t, "ok op=drop oid=%s\n", name);

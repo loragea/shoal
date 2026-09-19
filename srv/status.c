@@ -42,19 +42,22 @@ srvstatustext(Srvctx *c, Sfid *f, Text *t)
 {
 	Storestat st;
 	uvlong np, nd;
+	Smap *m;
 	int kind;
 
 	USED(f);
 	storestat(c->store, &st);
 	srvcount(c, &np, &nd);
 	kind = srvfencekind(c);
+	m = srvmapget(c);
 	textprint(t, "iid=%s\n", c->iid);
 	textprint(t, "uuid=%s\n", c->uuid);
 	textprint(t, "monid=%s\n", c->monid);
 	textprint(t, "monidmismatch=%s\n",
 		(c->adoptflags & Mapmonid) ? "yes" : "no");
-	textprint(t, "status=%s\n", statusname(c->self->status));
-	textprint(t, "up=%s\n", upname(c->self->up));
+	textprint(t, "status=%s\n", statusname(m->self->status));
+	textprint(t, "up=%s\n", upname(m->self->up));
+	srvmapput(c, m);
 	textprint(t, "fence=%s\n", fencename(kind));
 	textprint(t, "epoch=%llud\n", st.epochhigh);
 	textprint(t, "epochregress=%s\n",
@@ -80,12 +83,23 @@ srvstatustext(Srvctx *c, Sfid *f, Text *t)
  * /map is the instance's cached cluster map, read-only: the bytes it
  * adopted, verbatim.  A client's own map comes from the monitor
  * (§6.3); this is the operator's view of what this instance believes.
+ *
+ * The whole text comes out of ONE snapshot (dat.h), so what the file
+ * answers is the map in force at the moment the render began and never
+ * a mix of two: a swap landing part-way through the write installs a
+ * map this render will not see, and the next open is what sees it.
  */
 char*
 srvmaptext(Srvctx *c, Sfid *f, Text *t)
 {
+	Smap *m;
+	int ok;
+
 	USED(f);
-	if(textwrite(t, c->maptext, c->maplen) < 0)
+	m = srvmapget(c);
+	ok = textwrite(t, m->text, m->len) >= 0;
+	srvmapput(c, m);
+	if(!ok)
 		return "shoalsrv: out of memory";
 	return nil;
 }
@@ -160,23 +174,27 @@ srvdirtytext(Srvctx *c, Sfid *f, Text *t)
  * monitor client the adopted map never changes (store.md §14(18)), so
  * what this file answers is fixed for the life of the instance: the
  * marks the map it was started with carried.  A refresh loop makes it
- * move without changing anything here.
+ * move without changing anything here — the walk is over ONE snapshot
+ * (dat.h), so a ledger it renders is one map's whole ledger.
  */
 char*
 srvstaletext(Srvctx *c, Sfid *f, Text *t)
 {
-	Cstale *m;
+	Cstale *ml;
+	Smap *m;
 	int i;
 
 	USED(f);
-	for(i = 0; i < c->map->nstale; i++){
-		m = &c->map->stale[i];
-		if(strcmp(m->subject, c->iid) != 0
-		&& strcmp(m->reporter, c->iid) != 0)
+	m = srvmapget(c);
+	for(i = 0; i < m->map->nstale; i++){
+		ml = &m->map->stale[i];
+		if(strcmp(ml->subject, c->iid) != 0
+		&& strcmp(ml->reporter, c->iid) != 0)
 			continue;
 		textprint(t, "stale=%s reporter=%s since=%llud\n",
-			m->subject, m->reporter, m->since);
+			ml->subject, ml->reporter, ml->since);
 	}
+	srvmapput(c, m);
 	return nil;
 }
 

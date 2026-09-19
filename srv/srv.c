@@ -60,6 +60,159 @@ unhex(uchar *out, char *s, int n)
 }
 
 /*
+ * The adopted map's snapshots (dat.h).  smapmk takes a map already
+ * parsed and the text it was parsed from, resolves this instance's own
+ * record in it by layer-a §3.4's uuid, and wraps the three in a
+ * snapshot with one reference — the installed one.  On success the
+ * snapshot owns the map and the text; on failure the caller still does.
+ */
+static Smap*
+smapmk(Cmap *m, char *text, long len, char *uuid)
+{
+	Smap *s;
+	int i;
+
+	for(i = 0; i < m->ninst; i++)
+		if(strcmp(m->inst[i].uuid, uuid) == 0)
+			break;
+	if(i == m->ninst){
+		werrstr("no instance record in the map carries uuid %s", uuid);
+		return nil;
+	}
+	if((s = mallocz(sizeof *s, 1)) == nil)
+		return nil;
+	s->map = m;
+	s->text = text;
+	s->len = len;
+	s->self = &m->inst[i];
+	s->ref = 1;
+	return s;
+}
+
+static void
+smapfree(Smap *s)
+{
+	if(s == nil)
+		return;
+	mapfree(s->map);
+	free(s->text);
+	free(s);
+}
+
+/*
+ * A reference on the snapshot in force, and the giving back of one.
+ * The lock is held across a pointer copy and an int and nothing else;
+ * the free below it runs OUTSIDE the lock, which is safe because a
+ * snapshot whose count has reached zero is one that is no longer in
+ * force and that nobody can reach to count up again (dat.h).
+ */
+Smap*
+srvmapget(Srvctx *c)
+{
+	Smap *s;
+
+	lock(&c->maplk);
+	s = c->smap;
+	s->ref++;
+	unlock(&c->maplk);
+	return s;
+}
+
+void
+srvmapput(Srvctx *c, Smap *s)
+{
+	int n;
+
+	if(s == nil)
+		return;
+	lock(&c->maplk);
+	n = --s->ref;
+	if(n == 0)
+		c->nsmap--;
+	unlock(&c->maplk);
+	if(n == 0)
+		smapfree(s);
+}
+
+/*
+ * The swap, T1's alone (srv.h).  It parses, resolves `self' exactly as
+ * start-up does and refuses a text that fails either, leaving the old
+ * snapshot in force; nothing durable is written, because §6.3's
+ * adoption decision belongs to the refresh loop that is not built
+ * (store.md §14(18), §14(52)).
+ *
+ * The error string is this call's own buffer, valid until the next
+ * call — like status.c's render error, and for the same reason: there
+ * is one caller and it is a test program.
+ */
+static char swaperr[ERRMAX];
+
+static char*
+swapwhy(void)
+{
+	rerrstr(swaperr, sizeof swaperr);
+	return swaperr;
+}
+
+char*
+srvmapswap(Srvctx *c, char *text, long len)
+{
+	Cmap *m;
+	Smap *s, *old;
+	char *t;
+
+	if(len <= 0){
+		snprint(swaperr, sizeof swaperr, "shoalsrv: empty map text");
+		return swaperr;
+	}
+	if((t = malloc(len)) == nil)
+		return swapwhy();
+	memmove(t, text, len);
+	if((m = mapparse(t, len)) == nil){
+		free(t);
+		return swapwhy();
+	}
+	if((s = smapmk(m, t, len, c->uuid)) == nil){
+		mapfree(m);
+		free(t);
+		return swapwhy();
+	}
+	/*
+	 * `iid' is a copy of the record's, taken at start-up and read
+	 * from everywhere without a hold, so a map that gives this uuid
+	 * a different iid is refused rather than served under a name
+	 * half the server no longer agrees with.  A refresh has to
+	 * decide what such a map means (store.md §14(52)).
+	 */
+	if(strcmp(s->self->iid, c->iid) != 0){
+		snprint(swaperr, sizeof swaperr,
+			"shoalsrv: map names uuid %s as %s, not %s",
+			c->uuid, s->self->iid, c->iid);
+		smapfree(s);
+		return swaperr;
+	}
+	lock(&c->maplk);
+	old = c->smap;
+	c->smap = s;
+	c->nsmap++;
+	unlock(&c->maplk);
+	srvmapput(c, old);
+	return nil;
+}
+
+/* the T1 observable over the two (srv.h) */
+void
+srvmapcount(Srvctx *c, int *nsnap, int *nref)
+{
+	lock(&c->maplk);
+	if(nsnap != nil)
+		*nsnap = c->nsmap;
+	if(nref != nil)
+		*nref = c->smap->ref;
+	unlock(&c->maplk);
+}
+
+/*
  * store.md §7: in the server every proc is a proccreate, the Reqqueue
  * procs included, and the engine takes its spawn callback rather than
  * making procs itself so that the same engine runs under a plain-libc
@@ -102,25 +255,27 @@ srvfreed(Srv *s)
 Srvctx*
 srvnew(Srvcfg *cfg)
 {
-	char want[64];
+	char want[64], *text;
 	Srvctx *c;
 	Sbsel sel;
 	Adopt ad;
-	Cinst *in;
+	Cmap *map;
 	uchar monid[16];
-	int i, fl;
+	long len;
+	int fl;
 
 	if((c = mallocz(sizeof *c, 1)) == nil)
 		return nil;
 	c->cfg = *cfg;
 	c->dev = cfg->dev;
-	c->maplen = cfg->maplen;
-	if((c->maptext = malloc(c->maplen)) == nil){
+	map = nil;
+	len = cfg->maplen;
+	if((text = malloc(len)) == nil){
 		free(c);
 		return nil;
 	}
-	memmove(c->maptext, cfg->maptext, c->maplen);
-	if((c->map = mapparse(c->maptext, c->maplen)) == nil)
+	memmove(text, cfg->maptext, len);
+	if((map = mapparse(text, len)) == nil)
 		goto Fail;
 
 	/*
@@ -144,20 +299,20 @@ srvnew(Srvcfg *cfg)
 	 * formatted with — csumalg because a mismatch invalidates every
 	 * stored digest.
 	 */
-	if(c->map->blksz != c->sb.blksz){
+	if(map->blksz != c->sb.blksz){
 		werrstr("map blksz %lud is not the disk's %lud",
-			c->map->blksz, c->sb.blksz);
+			map->blksz, c->sb.blksz);
 		goto Fail;
 	}
-	if(c->map->objmax != c->sb.objmax){
+	if(map->objmax != c->sb.objmax){
 		werrstr("map objmax %llud is not the disk's %llud",
-			c->map->objmax, c->sb.objmax);
+			map->objmax, c->sb.objmax);
 		goto Fail;
 	}
 	snprint(want, sizeof want, "%s", csumalgname(c->sb.csumalg));
-	if(strcmp(c->map->csumalg, want) != 0){
+	if(strcmp(map->csumalg, want) != 0){
 		werrstr("map csumalg %s is not the disk's %s",
-			c->map->csumalg, want);
+			map->csumalg, want);
 		goto Fail;
 	}
 
@@ -167,23 +322,20 @@ srvnew(Srvcfg *cfg)
 	 * is no other way for an instance to learn its own iid, and the
 	 * whole of §6.4's self-state and §4.3's primaryship is asked of
 	 * that record.
+	 *
+	 * That resolution is what makes the first snapshot (dat.h), and
+	 * from here on the map is reached through it: the snapshot owns
+	 * the parse and the text, and the installed reference is the
+	 * context's until the shutdown gives it back.
 	 */
 	hexof(c->uuid, c->sb.uuid, 16);
-	c->self = nil;
-	for(i = 0; i < c->map->ninst; i++){
-		in = &c->map->inst[i];
-		if(strcmp(in->uuid, c->uuid) == 0){
-			c->self = in;
-			break;
-		}
-	}
-	if(c->self == nil){
-		werrstr("no instance record in the map carries uuid %s",
-			c->uuid);
+	if((c->smap = smapmk(map, text, len, c->uuid)) == nil)
 		goto Fail;
-	}
-	strcpy(c->iid, c->self->iid);
-	strcpy(c->monid, c->map->monid);
+	c->nsmap = 1;
+	map = nil;
+	text = nil;
+	strcpy(c->iid, c->smap->self->iid);
+	strcpy(c->monid, c->smap->map->monid);
 
 	/*
 	 * layer-a §6.3's adoption decision, over the pair the superblock
@@ -219,7 +371,7 @@ srvnew(Srvcfg *cfg)
 			"monitor identity", c->sb.epochhigh);
 		goto Fail;
 	}
-	if((fl = mapadoptable(&ad, c->map)) != Mapok){
+	if((fl = mapadoptable(&ad, c->smap->map)) != Mapok){
 		werrstr("map may not be adopted: %s%s%s",
 			(fl&Mapregress) ? adoptwhy(Mapregress) : "",
 			(fl&Mapregress) && (fl&Mapmonid) ? " " : "",
@@ -246,22 +398,26 @@ srvnew(Srvcfg *cfg)
 	 * refused above.
 	 */
 	if(!ad.pinned){
-		if(unhex(monid, c->map->monid, 16) < 0){
+		if(unhex(monid, c->smap->map->monid, 16) < 0){
 			werrstr("map monid %s is not 32 hex digits",
-				c->map->monid);
+				c->smap->map->monid);
 			goto Fail;
 		}
 		if(monidpin(c->store, monid) < 0)
 			goto Fail;
 	}
-	if(epochadopt(c->store, c->map->epoch) < 0)
+	if(epochadopt(c->store, c->smap->map->epoch) < 0)
 		goto Fail;
 
 	/*
 	 * §6.4's fence state.  The adoption above is this instance's one
-	 * successful refresh; F4 starts clear.
+	 * successful refresh; F4 starts clear.  `leasems' is copied out
+	 * of the map here and read from the Fence afterwards, so it is
+	 * the one map value a refresh would have to carry across a swap
+	 * as well; srvmapswap does not, because F1's clock is inert
+	 * while nothing refreshes (store.md §14(19), §14(52)).
 	 */
-	c->fence.leasems = c->map->leasems;
+	c->fence.leasems = c->smap->map->leasems;
 	fencerefresh(&c->fence, 0);
 
 	if(srvqinit(c, cfg->nqueue) < 0)
@@ -299,8 +455,13 @@ Fail:
 		storeclose(c->store);
 		c->store = nil;
 	}
-	mapfree(c->map);
-	free(c->maptext);
+	/*
+	 * Either the snapshot was made and owns the two, or it was not
+	 * and the locals still do.
+	 */
+	srvmapput(c, c->smap);
+	mapfree(map);
+	free(text);
 	free(c);
 	return nil;
 }
@@ -559,8 +720,14 @@ srvfree(Srvctx *c)
 		return;
 	srvshutdown(c);
 	waitreleased(c);
-	mapfree(c->map);
-	free(c->maptext);
+	/*
+	 * The installed reference, given back last: lib9p has let go of
+	 * the Srv, so every request that could have been holding one has
+	 * finished (srvfreed above), and this put is therefore the one
+	 * that frees the snapshot.
+	 */
+	srvmapput(c, c->smap);
+	c->smap = nil;
 	free(c);
 }
 
@@ -573,7 +740,12 @@ srvstore(Srvctx *c)
 Cmap*
 srvmap(Srvctx *c)
 {
-	return c->map;
+	Cmap *m;
+
+	lock(&c->maplk);
+	m = c->smap->map;
+	unlock(&c->maplk);
+	return m;
 }
 
 char*

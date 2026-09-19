@@ -253,6 +253,25 @@ reservedid(uchar *oid, int oidlen)
  *
  * store.md §14(24) carries the same order for a reader outside srv/.
  */
+
+/*
+ * F3's pair, read off ONE snapshot of the map: `up=no' and
+ * `status=out' are two fields of this instance's own record, and a
+ * gate that read them from two maps could answer a state neither map
+ * describes (dat.h).
+ */
+static int
+selfdown(Srvctx *c)
+{
+	Smap *m;
+	int down;
+
+	m = srvmapget(c);
+	down = m->self->up == Uno || m->self->status == Sout;
+	srvmapput(c, m);
+	return down;
+}
+
 static char*
 objgate(Srvctx *c, Sfid *f, Req *r, int op)
 {
@@ -296,8 +315,7 @@ objgate(Srvctx *c, Sfid *f, Req *r, int op)
 	rsvd = reservedid(oid, oidlen);
 	if(wr && f->role == Radmin && !rsvd)
 		return Eperm;
-	if(f->role == Rclient
-	&& (c->self->up == Uno || c->self->status == Sout))
+	if(f->role == Rclient && selfdown(c))
 		return Edown;
 	if(srvfencekind(c) != Fencenone){
 		if(!wr && (f->file == Qobj || f->file == Qmeta))
