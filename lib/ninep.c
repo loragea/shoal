@@ -446,8 +446,10 @@ ninegot(Nine *c, int n)
  *
  * Answers the message's length, 0 at end of file, or -1 with the
  * reason in e and *botch set for a protocol violation and clear for
- * transport death.  `msize' is passed in because it is the caller's
- * to read under the lock.
+ * transport death.  `msize' is settled once, in nineopen, before the
+ * handle escapes to its caller, and is read without the lock
+ * everywhere afterwards; this one is passed in because the reader
+ * has it to hand from the loop it came out of.
  */
 static int
 ninereadmsg(Nine *c, ulong msize, int *botch, char *e, int ne)
