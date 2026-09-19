@@ -1127,38 +1127,46 @@ objkey(Srvctx *c, Sfid *f, Objinfo *oi, char *buf, int nbuf)
  * is here is the queue, the gate having already run, and the one exit.
  *
  * Every queued object handler below has this shape: the pushed
- * function takes the map snapshot at the head and gives it back when
- * the body has returned, so the body reads one map from its admission
- * to its last exit — engine calls, -X hold points and all (dat.h).
+ * function takes the map snapshot at the head, runs the body, gives
+ * the snapshot back and only then answers.  So the body reads one map
+ * from its admission to its last exit — engine calls, -X hold points
+ * and all — and the hold has ended before the reply goes out (dat.h).
+ *
+ * That ordering is what makes the body answer by RETURNING its error
+ * string rather than by responding: the answer travels in the caller's
+ * `buf', which outlives the body's frame, and `nil' is success.  A
+ * reply is where lib9p counts the request complete (srvdestroyreq,
+ * from closereq, inside respond) and where it releases the service, so
+ * a handler still holding a snapshot across its respond is one the
+ * shutdown's drain and srvfree can both run past — and the put it then
+ * makes would be on a freed context (srv.c).
  */
-static void
-objreadrun(Req *r, Srvctx *c, Smap *m)
+static char*
+objreadrun(Req *r, Srvctx *c, Smap *m, char *buf, int nbuf)
 {
-	char buf[ERRMAX], *e;
+	char *e;
 	Sfid *f;
 	long n;
 
 	f = r->fid->aux;
 	srvstagesweep(c);
-	if((e = admit(c, m, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
-		srvqdone(r, e);
-		return;
-	}
+	if((e = admit(c, m, f, f->oid, f->oidlen, buf, nbuf)) != nil)
+		return e;
 	n = objread(c->store, f->oid, f->oidlen, r->ofcall.data,
 		r->ifcall.count, r->ifcall.offset);
 	if(n < 0){
 		srvqexit(r);
-		srvrerror(r);
-		return;
+		return srverr(buf, nbuf);
 	}
 	r->ofcall.count = n;
 	srvqexit(r);
-	srvqdone(r, nil);
+	return nil;
 }
 
 static void
 objreadq(Req *r)
 {
+	char buf[ERRMAX], *e;
 	Srvctx *c;
 	Smap *m;
 
@@ -1168,8 +1176,9 @@ objreadq(Req *r)
 	}
 	c = r->srv->aux;
 	m = srvmapget(c);
-	objreadrun(r, c, m);
+	e = objreadrun(r, c, m, buf, sizeof buf);
 	srvmapput(c, m);
+	srvqdone(r, e);
 }
 
 void
@@ -1206,10 +1215,10 @@ srvobjread(Req *r)
  * so, since a copy whose corrupt flag is set answers one
  * `checksum mismatch' like any other client access (store.md §3.7).
  */
-static void
-objwriterun(Req *r, Srvctx *c, Smap *m)
+static char*
+objwriterun(Req *r, Srvctx *c, Smap *m, char *buf, int nbuf)
 {
-	char buf[ERRMAX], *e;
+	char *e;
 	Sfid *f;
 	Sstage *s;
 	Objinfo oi;
@@ -1218,27 +1227,19 @@ objwriterun(Req *r, Srvctx *c, Smap *m)
 
 	f = r->fid->aux;
 	srvstagesweep(c);
-	if((e = admit(c, m, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
-		srvqdone(r, e);
-		return;
-	}
+	if((e = admit(c, m, f, f->oid, f->oidlen, buf, nbuf)) != nil)
+		return e;
 	off = r->ifcall.offset;
 	n = r->ifcall.count;
 	max = objmaxof(c);
-	if(off > max || (uvlong)n > max - off){
-		srvqdone(r, Etoobig);
-		return;
-	}
+	if(off > max || (uvlong)n > max - off)
+		return Etoobig;
 	n = wclamp(c, off, n);
-	if((e = objkey(c, f, &oi, buf, sizeof buf)) != nil){
-		srvqdone(r, e);
-		return;
-	}
+	if((e = objkey(c, f, &oi, buf, nbuf)) != nil)
+		return e;
 	if((s = stagenew(r, c, f, Stwrite, f->oid, f->oidlen, oi.ver+1,
-		m->map->epoch, n, off, &e)) == nil){
-		srvqdone(r, e);
-		return;
-	}
+		m->map->epoch, n, off, &e)) == nil)
+		return e;
 	/*
 	 * The window this handler owns a stage it has not yet looked at:
 	 * from here to the look below, a step 7 for another request on this
@@ -1250,15 +1251,13 @@ objwriterun(Req *r, Srvctx *c, Smap *m)
 	 * placement step 5 is about to read (dat.h).
 	 */
 	srvqhold(r, &c->prelookhold, &c->prelookheld);
-	if((e = replicate(c, m, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
+	if((e = replicate(c, m, f, f->oid, f->oidlen, buf, nbuf)) != nil){
 		stagedone(f, s);
-		srvqdone(r, e);
-		return;
+		return e;
 	}
 	if(!stagelive(c, f, s, r)){
 		stagedone(f, s);
-		srvqdone(r, Estagegone);
-		return;
+		return Estagegone;
 	}
 	srvqhold(r, &c->stagehold, nil);
 	/*
@@ -1273,18 +1272,18 @@ objwriterun(Req *r, Srvctx *c, Smap *m)
 		s->ver, s->wepoch, nil, 0) < 0){
 		stagedone(f, s);
 		srvqexit(r);
-		srvrerror(r);
-		return;
+		return srverr(buf, nbuf);
 	}
 	stagedone(f, s);
 	r->ofcall.count = n;
 	srvqexit(r);
-	srvqdone(r, nil);
+	return nil;
 }
 
 static void
 objwriteq(Req *r)
 {
+	char buf[ERRMAX], *e;
 	Srvctx *c;
 	Smap *m;
 
@@ -1294,8 +1293,9 @@ objwriteq(Req *r)
 	}
 	c = r->srv->aux;
 	m = srvmapget(c);
-	objwriterun(r, c, m);
+	e = objwriterun(r, c, m, buf, sizeof buf);
 	srvmapput(c, m);
+	srvqdone(r, e);
 }
 
 /*
@@ -1339,10 +1339,10 @@ srvobjwrite(Req *r)
  * entire, key and all, which is one reason the open is on the object's
  * queue like every other operation naming it.
  */
-static void
-objopenrun(Req *r, Srvctx *c, Smap *m)
+static char*
+objopenrun(Req *r, Srvctx *c, Smap *m, char *buf, int nbuf)
 {
-	char buf[ERRMAX], *e;
+	char *e;
 	Sfid *f;
 	Sstage *s;
 	Objinfo oi;
@@ -1350,43 +1350,33 @@ objopenrun(Req *r, Srvctx *c, Smap *m)
 
 	f = r->fid->aux;
 	srvstagesweep(c);
-	if((e = admit(c, m, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
-		srvqdone(r, e);
-		return;
-	}
-	if((e = objkey(c, f, &oi, buf, sizeof buf)) != nil){
-		srvqdone(r, e);
-		return;
-	}
+	if((e = admit(c, m, f, f->oid, f->oidlen, buf, nbuf)) != nil)
+		return e;
+	if((e = objkey(c, f, &oi, buf, nbuf)) != nil)
+		return e;
 	if((r->ifcall.mode & OTRUNC) != 0 && oi.len != 0){
 		if((s = stagenew(r, c, f, Sttrunc, f->oid, f->oidlen, oi.ver+1,
-			m->map->epoch, 0, 0, &e)) == nil){
-			srvqdone(r, e);
-			return;
-		}
+			m->map->epoch, 0, 0, &e)) == nil)
+			return e;
 		if((e = replicate(c, m, f, f->oid, f->oidlen, buf,
-			sizeof buf)) != nil){
+			nbuf)) != nil){
 			stagedone(f, s);
-			srvqdone(r, e);
-			return;
+			return e;
 		}
 		if(!stagelive(c, f, s, r)){
 			stagedone(f, s);
-			srvqdone(r, Estagegone);
-			return;
+			return Estagegone;
 		}
 		if(objtrunc(c->store, s->oid, s->oidlen, 0, s->ver, s->wepoch,
 			nil, 0) < 0){
 			stagedone(f, s);
 			srvqexit(r);
-			srvrerror(r);
-			return;
+			return srverr(buf, nbuf);
 		}
 		stagedone(f, s);
 		if(objstat(c->store, f->oid, f->oidlen, &oi) < 0){
 			srvqexit(r);
-			srvrerror(r);
-			return;
+			return srverr(buf, nbuf);
 		}
 	}
 	srvobjqid(f, &oi, &q);
@@ -1406,12 +1396,13 @@ objopenrun(Req *r, Srvctx *c, Smap *m)
 			stagepointarm(c, s, stageopen(c->store, f->oid,
 				f->oidlen, 0, 0));
 		}
-	srvqdone(r, nil);
+	return nil;
 }
 
 static void
 objopenq(Req *r)
 {
+	char buf[ERRMAX], *e;
 	Srvctx *c;
 	Smap *m;
 
@@ -1421,8 +1412,9 @@ objopenq(Req *r)
 	}
 	c = r->srv->aux;
 	m = srvmapget(c);
-	objopenrun(r, c, m);
+	e = objopenrun(r, c, m, buf, sizeof buf);
 	srvmapput(c, m);
+	srvqdone(r, e);
 }
 
 void
@@ -1457,54 +1449,46 @@ srvobjopen(Req *r)
  * whether or not the remove succeeds, and lib9p has taken it out of
  * the fid pool before this runs, so nothing here arranges that.
  */
-static void
-objremoverun(Req *r, Srvctx *c, Smap *m)
+static char*
+objremoverun(Req *r, Srvctx *c, Smap *m, char *buf, int nbuf)
 {
-	char buf[ERRMAX], *e;
+	char *e;
 	Sfid *f;
 	Sstage *s;
 	Objinfo oi;
 
 	f = r->fid->aux;
 	srvstagesweep(c);
-	if((e = admit(c, m, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
-		srvqdone(r, e);
-		return;
-	}
-	if((e = objkey(c, f, &oi, buf, sizeof buf)) != nil){
-		srvqdone(r, e);
-		return;
-	}
+	if((e = admit(c, m, f, f->oid, f->oidlen, buf, nbuf)) != nil)
+		return e;
+	if((e = objkey(c, f, &oi, buf, nbuf)) != nil)
+		return e;
 	if((s = stagenew(r, c, f, Stremove, f->oid, f->oidlen, oi.ver+1,
-		m->map->epoch, 0, 0, &e)) == nil){
-		srvqdone(r, e);
-		return;
-	}
-	if((e = replicate(c, m, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
+		m->map->epoch, 0, 0, &e)) == nil)
+		return e;
+	if((e = replicate(c, m, f, f->oid, f->oidlen, buf, nbuf)) != nil){
 		stagedone(f, s);
-		srvqdone(r, e);
-		return;
+		return e;
 	}
 	if(!stagelive(c, f, s, r)){
 		stagedone(f, s);
-		srvqdone(r, Estagegone);
-		return;
+		return Estagegone;
 	}
 	if(objremove(c->store, s->oid, s->oidlen, s->ver, s->wepoch,
 		nil, 0) < 0){
 		stagedone(f, s);
 		srvqexit(r);
-		srvrerror(r);
-		return;
+		return srverr(buf, nbuf);
 	}
 	stagedone(f, s);
 	srvqexit(r);
-	srvqdone(r, nil);
+	return nil;
 }
 
 static void
 objremoveq(Req *r)
 {
+	char buf[ERRMAX], *e;
 	Srvctx *c;
 	Smap *m;
 
@@ -1514,8 +1498,9 @@ objremoveq(Req *r)
 	}
 	c = r->srv->aux;
 	m = srvmapget(c);
-	objremoverun(r, c, m);
+	e = objremoverun(r, c, m, buf, sizeof buf);
 	srvmapput(c, m);
+	srvqdone(r, e);
 }
 
 void
@@ -1545,10 +1530,10 @@ srvobjremove(Req *r)
  * convM2D leaves a field the client did not set at its null value
  * (nulldir), so what the client asked for is what differs from those.
  */
-static void
-objwstatrun(Req *r, Srvctx *c, Smap *m)
+static char*
+objwstatrun(Req *r, Srvctx *c, Smap *m, char *buf, int nbuf)
 {
-	char buf[ERRMAX], *e;
+	char *e;
 	Sfid *f;
 	Sstage *s;
 	Objinfo oi;
@@ -1556,53 +1541,41 @@ objwstatrun(Req *r, Srvctx *c, Smap *m)
 
 	f = r->fid->aux;
 	srvstagesweep(c);
-	if((e = admit(c, m, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
-		srvqdone(r, e);
-		return;
-	}
+	if((e = admit(c, m, f, f->oid, f->oidlen, buf, nbuf)) != nil)
+		return e;
 	len = r->d.length;
-	if(len > objmaxof(c)){
-		srvqdone(r, Etoobig);
-		return;
-	}
-	if((e = objkey(c, f, &oi, buf, sizeof buf)) != nil){
-		srvqdone(r, e);
-		return;
-	}
-	if(len == oi.len){
-		srvqdone(r, nil);
-		return;
-	}
+	if(len > objmaxof(c))
+		return Etoobig;
+	if((e = objkey(c, f, &oi, buf, nbuf)) != nil)
+		return e;
+	if(len == oi.len)
+		return nil;
 	if((s = stagenew(r, c, f, Sttrunc, f->oid, f->oidlen, oi.ver+1,
-		m->map->epoch, 0, 0, &e)) == nil){
-		srvqdone(r, e);
-		return;
-	}
-	if((e = replicate(c, m, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
+		m->map->epoch, 0, 0, &e)) == nil)
+		return e;
+	if((e = replicate(c, m, f, f->oid, f->oidlen, buf, nbuf)) != nil){
 		stagedone(f, s);
-		srvqdone(r, e);
-		return;
+		return e;
 	}
 	if(!stagelive(c, f, s, r)){
 		stagedone(f, s);
-		srvqdone(r, Estagegone);
-		return;
+		return Estagegone;
 	}
 	if(objtrunc(c->store, s->oid, s->oidlen, len, s->ver, s->wepoch,
 		nil, 0) < 0){
 		stagedone(f, s);
 		srvqexit(r);
-		srvrerror(r);
-		return;
+		return srverr(buf, nbuf);
 	}
 	stagedone(f, s);
 	srvqexit(r);
-	srvqdone(r, nil);
+	return nil;
 }
 
 static void
 objwstatq(Req *r)
 {
+	char buf[ERRMAX], *e;
 	Srvctx *c;
 	Smap *m;
 
@@ -1612,8 +1585,9 @@ objwstatq(Req *r)
 	}
 	c = r->srv->aux;
 	m = srvmapget(c);
-	objwstatrun(r, c, m);
+	e = objwstatrun(r, c, m, buf, sizeof buf);
 	srvmapput(c, m);
+	srvqdone(r, e);
 }
 
 void
@@ -1712,10 +1686,10 @@ createdrop(Sfid *f)
  * open answered, and which is exactly the record that an open has won
  * on this fid — is what the create sees there (dat.h).
  */
-static void
-objcreaterun(Req *r, Srvctx *c, Smap *m)
+static char*
+objcreaterun(Req *r, Srvctx *c, Smap *m, char *buf, int nbuf)
 {
-	char buf[ERRMAX], err[ERRMAX], *e;
+	char err[ERRMAX], *e;
 	Sfid *f;
 	Sstage *s;
 	Objinfo oi;
@@ -1730,37 +1704,31 @@ objcreaterun(Req *r, Srvctx *c, Smap *m)
 	if(f->file != Qobj || r->fid->omode != -1 || f->moving ||
 		srvobjdirheld(f)){
 		qunlock(&f->lk);
-		srvqdone(r, Ebotch);
-		return;
+		return Ebotch;
 	}
 	f->moving = 1;
 	qunlock(&f->lk);
 	srvstagesweep(c);
-	if((e = admit(c, m, f, qr->oid, qr->oidlen, buf, sizeof buf)) != nil){
+	if((e = admit(c, m, f, qr->oid, qr->oidlen, buf, nbuf)) != nil){
 		createdrop(f);
-		srvqdone(r, e);
-		return;
+		return e;
 	}
 	if(objstat(c->store, qr->oid, qr->oidlen, &oi) < 0){
 		rerrstr(err, sizeof err);
 		if(srv26(err) != Enoobj){
 			createdrop(f);
-			srvqdone(r, srverrs(buf, sizeof buf, err));
-			return;
+			return srverrs(buf, nbuf, err);
 		}
 		ver = 1;
 	}else if(oi.state == Stomb)
 		ver = oi.ver + 1;
 	else{
 		createdrop(f);
-		srvqdone(r, Eexists);
-		return;
+		return Eexists;
 	}
-	if((e = replicate(c, m, f, qr->oid, qr->oidlen, buf,
-		sizeof buf)) != nil){
+	if((e = replicate(c, m, f, qr->oid, qr->oidlen, buf, nbuf)) != nil){
 		createdrop(f);
-		srvqdone(r, e);
-		return;
+		return e;
 	}
 	/*
 	 * The create commits with the epoch of the map it was admitted
@@ -1772,8 +1740,7 @@ objcreaterun(Req *r, Srvctx *c, Smap *m)
 		&oi) < 0){
 		createdrop(f);
 		srvqexit(r);
-		srvrerror(r);
-		return;
+		return srverr(buf, nbuf);
 	}
 	/*
 	 * The create succeeded, so the fid moves: whatever it held as a
@@ -1794,12 +1761,13 @@ objcreaterun(Req *r, Srvctx *c, Smap *m)
 	qunlock(&f->lk);
 	r->ofcall.qid = q;
 	srvqexit(r);
-	srvqdone(r, nil);
+	return nil;
 }
 
 static void
 objcreateq(Req *r)
 {
+	char buf[ERRMAX], *e;
 	Srvctx *c;
 	Smap *m;
 
@@ -1809,8 +1777,9 @@ objcreateq(Req *r)
 	}
 	c = r->srv->aux;
 	m = srvmapget(c);
-	objcreaterun(r, c, m);
+	e = objcreaterun(r, c, m, buf, sizeof buf);
 	srvmapput(c, m);
+	srvqdone(r, e);
 }
 
 /*
@@ -1955,24 +1924,23 @@ srvmetatext(Srvctx *c, Sfid *f, Text *t)
  * for every other role), so the operator's inspection path through
  * /meta is untouched.
  */
-static void
-metaopenrun(Req *r, Srvctx *c, Smap *m)
+static char*
+metaopenrun(Req *r, Srvctx *c, Smap *m, char *buf, int nbuf)
 {
-	char buf[ERRMAX], *e;
+	char *e;
 	Sfid *f;
 
 	f = r->fid->aux;
 	srvstagesweep(c);
-	if((e = admit(c, m, f, f->oid, f->oidlen, buf, sizeof buf)) != nil){
-		srvqdone(r, e);
-		return;
-	}
-	srvopentext(r);
+	if((e = admit(c, m, f, f->oid, f->oidlen, buf, nbuf)) != nil)
+		return e;
+	return nil;
 }
 
 static void
 metaopenq(Req *r)
 {
+	char buf[ERRMAX], *e;
 	Srvctx *c;
 	Smap *m;
 
@@ -1982,8 +1950,18 @@ metaopenq(Req *r)
 	}
 	c = r->srv->aux;
 	m = srvmapget(c);
-	metaopenrun(r, c, m);
+	e = metaopenrun(r, c, m, buf, sizeof buf);
 	srvmapput(c, m);
+	if(e != nil){
+		srvqdone(r, e);
+		return;
+	}
+	/*
+	 * The render takes a snapshot of its own (srvmetatext), and
+	 * this one is already given back: the reply this call ends in
+	 * is the moment no hold may span (dat.h).
+	 */
+	srvopentext(r);
 }
 
 /*

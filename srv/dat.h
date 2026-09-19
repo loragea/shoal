@@ -749,12 +749,12 @@ struct Sstage
  * Who may hold one, and for how long:
  *
  *	A QUEUED OBJECT OPERATION takes one at the head of its handler
- *		and holds it to the end of that handler, across its engine
- *		calls and across every -X hold point it parks at (srv.h).
- *		That is the hold the rule above is for: §5.4 step 1's
- *		admission, the epoch the stage is keyed with and step 5's
- *		placement are three reads of one map, and a swap landing
- *		between any two of them moves none of them.
+ *		and holds it to the end of that handler's BODY, across its
+ *		engine calls and across every -X hold point it parks at
+ *		(srv.h).  That is the hold the rule above is for: §5.4
+ *		step 1's admission, the epoch the stage is keyed with and
+ *		step 5's placement are three reads of one map, and a swap
+ *		landing between any two of them moves none of them.
  *	A RENDER takes one for the whole of what it renders and gives it
  *		back before it answers: /map writes `text' entire, so the
  *		file is one snapshot's bytes and never a mix of two
@@ -768,6 +768,19 @@ struct Sstage
  *		bars no other reader — but it does keep the memory alive,
  *		so a hold left behind is a leak, and one kept in a fid or
  *		a stage would be a snapshot outliving its reader.
+ *
+ * A HOLD NEVER SPANS THE REPLY.  Every hold above ends before the
+ * respond that answers the message it was taken for — the queued
+ * handlers give theirs back in the wrapper and answer from what the
+ * body returned (obj.c), a render gives it back before it returns to
+ * srvopentext, and the loop's own readers (tree.c's F3, attach.c,
+ * peer.c's epoch check) get and put strictly before they answer.  The
+ * reason is that the reply is where lib9p counts the request complete
+ * — srvdestroyreq, from closereq, INSIDE respond — and where it then
+ * releases the service, which is what srvqdrain converges on and what
+ * srvfree waits for.  A hold that outlived the respond would therefore
+ * be a hold outliving the context: srvfree's put would leak the
+ * snapshot and the holder's own put would run on freed memory (srv.c).
  *
  * One 9P message may be more than one reader, and where it is, it may
  * read two maps.  Three places: a row's GATE runs on the service loop

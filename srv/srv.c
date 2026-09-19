@@ -721,10 +721,15 @@ srvfree(Srvctx *c)
 	srvshutdown(c);
 	waitreleased(c);
 	/*
-	 * The installed reference, given back last: lib9p has let go of
-	 * the Srv, so every request that could have been holding one has
-	 * finished (srvfreed above), and this put is therefore the one
-	 * that frees the snapshot.
+	 * The installed reference, given back last.  What makes this put
+	 * safe is not the wait above but the rule that a hold never spans
+	 * a reply (dat.h): lib9p counts a request complete from inside
+	 * respond and releases the service at the end of it, so a handler
+	 * still holding a snapshot when it answers could be between its
+	 * respond and its put while the drain converges, this wait ends
+	 * and the context is freed under it.  Every handler therefore lets
+	 * go before it answers, and the procs the shutdown waits for
+	 * (reclaimwait, jobwait) have ended; this put is the last one.
 	 */
 	srvmapput(c, c->smap);
 	c->smap = nil;

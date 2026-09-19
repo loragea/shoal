@@ -29,7 +29,10 @@
  *	a text that does not parse, or that names no record with this
  *		instance's uuid, is refused and leaves the map in force
  *		untouched;
- *	/map answers the new text in full once the swap has landed.
+ *	/map answers the new text in full once the swap has landed;
+ *	a handler has let go of its snapshot BEFORE it answers, which is
+ *		what keeps the last put srvfree makes the last one there
+ *		is (srv/dat.h).
  *
  * A whole instance runs inside this program, as in srvtest: a
  * simulated disk, the store engine over it, srv/libshoalsrv.a over
@@ -787,6 +790,111 @@ Out:
 	free(m1);
 }
 
+/*
+ * (v) A hold never spans the reply (srv/dat.h).  A queued handler's
+ * snapshot must be given back BEFORE the handler answers, because the
+ * answer is where lib9p counts the request complete — srvdestroyreq,
+ * from closereq, inside respond and before the reply is even written —
+ * and where respond then releases the service.  A handler still
+ * holding one across its respond is therefore a handler the drain
+ * converges past and srvfree's wait ends under: srvfree's own put
+ * leaks the snapshot it was meant to free, and the handler's put,
+ * arriving after free(c), takes `maplk' and decrements `nsmap' on
+ * freed memory.
+ *
+ * The window is microseconds wide against waitreleased's 5 ms poll, so
+ * it is not a thing to race.  Two points open it instead:
+ *
+ *	objprelook parks a client write between its stage and step 5's
+ *		placement read, and a swap under it leaves the OLD
+ *		snapshot alive with exactly one holder — that write.  The
+ *		snapshot count is then the observable: 2 while the write
+ *		holds it, 1 the moment it lets go.
+ *	the END point (srv.h's srvendpoint) parks the completion inside
+ *		respond, just past the count the drain converges on.  With
+ *		the write's proc parked there, the case can ask the
+ *		question at exactly the moment the reply is going out,
+ *		with no clock in it.
+ *
+ * So: park the write, swap under it, arm the end point, and hang the
+ * client up — which is how the window is reached in earnest, D16's
+ * drain releasing a queued request the client is no longer there for.
+ * The shutdown's srvholdclear frees the write, it runs to its answer,
+ * and its proc stops inside respond.  A handler that gave its snapshot
+ * back before answering has already freed the old one and the count
+ * reads 1; one that still holds it reads 2.
+ */
+static void
+treplyhold(void)
+{
+	char *m0, *m1, *a;
+	uchar data[64];
+	Srvctx *ctx;
+	Dev *d;
+	Cl cl;
+	Fcall r;
+	ushort ta;
+	uvlong np, nd;
+	int ns;
+
+	clstage = "replyhold";
+	m0 = mkself(Tepoch, Palone);
+	m1 = mkself(Tepoch2, Palone);
+	d = newdisk();
+	if((ctx = startsrv(d, m0)) == nil)
+		return;
+	a = "reply";
+	mkobj(srvstore(ctx), a);
+	memset(data, 0x77, sizeof data);
+
+	clstart(&cl, ctx, Clmsize);
+	if(clattach(&cl, Froot, Nclient, &r) != Rattach){
+		fail("attach: %s", clerr(&r));
+		goto Out;
+	}
+	if(clwalkobj(&cl, Froot, Fa, "obj", a, &r) != Rwalk
+	|| clopen(&cl, Fa, ORDWR, &r) != Ropen){
+		fail("open /obj/%s: %s", a, clerr(&r));
+		goto Out;
+	}
+	waitidle(ctx, &np, &nd);
+
+	srvhook(ctx, "objprelook", 1);
+	putwrite(&cl, ta = cltag(&cl), Fa, 0, data, sizeof data);
+	waitheld(ctx, "objprelook", 1);
+	eqs("the swap under the parked write is accepted",
+		srvmapswap(ctx, m1, strlen(m1)), nil);
+	srvmapcount(ctx, &ns, nil);
+	eqv("the parked write is the old snapshot's one holder", ns, 2);
+
+	/*
+	 * Nothing but the shutdown releases the write from here: the point
+	 * is left set, and srvholdclear is what clears it.
+	 */
+	srvendpoint(ctx, 60*1000);
+	clhangup(&cl);
+	waitidle(ctx, &np, &nd);
+	istrue("the drain converges with the write's proc still in lib9p",
+		!srvreleased(ctx));
+	srvmapcount(ctx, &ns, nil);
+	eqv("the handler let go of its snapshot before it answered", ns, 1);
+
+	srvendpoint(ctx, 0);
+	checks++;
+	if(clgettag(&cl, ta, &r) < 0 || r.type != Rwrite)
+		fail("the write the shutdown released: %s",
+			r.type == Rerror ? r.ename : "no reply");
+	else
+		eqv("... having written what it asked to", r.count,
+			sizeof data);
+Out:
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m0);
+	free(m1);
+}
+
 void
 threadmain(int argc, char **argv)
 {
@@ -800,6 +908,7 @@ threadmain(int argc, char **argv)
 	tsnaplife();
 	trefuse();
 	tmaptext();
+	treplyhold();
 
 	clwatchoff();
 	if(fails > 0){

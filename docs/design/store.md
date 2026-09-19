@@ -6265,9 +6265,10 @@ name a half that is not built; each says which.
     reader may hold one across an engine call and across one of
     §13's `-X` hold points, which is what makes the rule below
     affordable: a queued object operation holds one from the head of
-    its handler to its last exit, a render holds one for the whole of
-    what it renders, and a pass or a timer tick takes one per pass or
-    per tick rather than per read. What a swap guarantees a reader is
+    its handler to the last exit of that handler's body, a render
+    holds one for the whole of what it renders, and a pass or a timer
+    tick takes one per pass or per tick rather than per read. What a
+    swap guarantees a reader is
     therefore that its own map does not move: the epoch, the
     placement and the `self` a placement member is compared against
     are one map's, and a pointer into that map's instance array stays
@@ -6289,6 +6290,20 @@ name a half that is not built; each says which.
     **`/map` renders one snapshot's text entire**, so the file is
     never a mix of two maps, and `/status`'s `status=` and `up=` are
     one record's pair.
+
+    **A hold never spans the reply.** Every hold above ends before
+    the `respond` that answers the message it was taken for: a queued
+    handler's body returns its answer and the wrapper gives the
+    snapshot back before it responds, a render gives it back before
+    it returns, and the readers on the service loop get and put
+    strictly before they answer. The reason is that the reply is
+    where lib9p counts the request complete — inside `respond`, and
+    before the reply is even written — and where it then releases the
+    service, which is what §13's drain converges on and what freeing
+    the context waits for. A hold outliving a respond would therefore
+    be a hold outliving the context: the shutdown's own put would
+    leak the snapshot it was meant to free, and the holder's put
+    would take the lock and decrement the count on freed memory.
 
     Where one 9P message is two readers, it may read two maps: a
     row's gate runs on the service loop before the queued handler
