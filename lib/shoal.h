@@ -1904,9 +1904,16 @@ int	maprefresh(Adopt*, Fence*, Cmap*, vlong now);
  * library owes it is to tell a dead connection from a §2.6 refusal.
  *
  * **Procs.**  Two per connection — a reader and a timer — made
- * through `spawn', exactly as the store engine makes its own (§7): a
- * T1 program passes an rfork(RFPROC|RFMEM) wrapper, the server passes
- * proccreate.  Nothing here includes <thread.h> either.
+ * through `spawn', exactly as the store engine makes its own (§7).
+ * `spawn' MUST create procs of the PROGRAM'S OWN flavour —
+ * proccreate under libthread, rfork(RFPROC|RFMEM) under plain libc —
+ * and a program MUST NOT mix the two on one connection.  The QLock
+ * and the Rendez below are libc's, but libthread routes both through
+ * a rendezvous of its own and resolves the current thread through a
+ * privalloc(2) slot, which rfork(RFMEM) SHARES between the procs that
+ * inherit it: a bare-rfork proc contending on this connection's QLock
+ * inside a libthread program corrupts that state rather than merely
+ * blocking oddly.  Nothing here includes <thread.h> either.
  *
  * **Hanging up.**  `hangup' breaks every blocked read and write on
  * this connection's fds.  For a network connection the owner writes

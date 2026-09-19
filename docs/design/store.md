@@ -3825,7 +3825,17 @@ answers a pair of fds and is the network's `Dev` vtable (§0): a real
 dial answers the same fd twice, a T1 program answers one end of each
 of two pipes, and nothing in the library knows the difference.
 `spawn` is §7's, so the procs the client makes are ordinary procs of
-the program under plain libc and `proccreate`'s under the server.
+the program under plain libc and `proccreate`'s under the server. It
+**MUST** make procs of the program's own flavour, and a program
+**MUST NOT** mix the two on one connection: libthread routes libc's
+`qlock` and `rsleep` through a rendezvous of its own
+(`/sys/src/libthread/main.c:28`, `_qlockinit(_threadrendezvous)`) and
+resolves the current thread through a `privalloc`(2) slot (`:27`),
+which `rfork(RFMEM)` shares between the procs that inherit it — so a
+bare-`rfork` proc contending on a client `QLock` inside a libthread
+program corrupts that state rather than merely blocking oddly. This
+is the client's rule and not just the engine's, because a connection
+is shared by more procs than a store is.
 `hangup` is the other half of `connect`: what `connect` opened, only
 its owner can break, and breaking it is the only way to recall a proc
 parked in `read(2)` or `write(2)` when notes are ruled out (§14(50)).
