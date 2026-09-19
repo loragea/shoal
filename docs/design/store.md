@@ -6328,7 +6328,7 @@ is not built; each says which.
 
     > A `Tread` of `/map`, on a fid whose **attach** carried
     > `role=instance,peer=i`, answered with a count **greater than
-    > zero**.
+    > zero**, from a snapshot that is **still the current map**.
 
     Every such read moves `lastseen(i)` to the moment it is answered.
     The open does not, a count of zero does not — that is end of
@@ -6342,18 +6342,42 @@ is not built; each says which.
     with no map there is no open to have (§14(54)). Why every such
     read and not only the first: §8.4 asks for the most recent, and
     an instance that re-reads one long-lived fid every `pollms` is
-    refreshing exactly the channel §8.4 is about. The residual is
-    stated rather than engineered around: because the file is
-    snapshot-at-open, such an instance renews its lease while reading
-    a map that may be old. That is consistent rather than a hole —
-    F1 has the instance fence *itself* when it cannot refresh, and an
-    instance re-reading a snapshot believes it has refreshed, so
-    neither side acts — and it is a broken instance in any case,
-    which is not what `deadms` is for.
+    refreshing exactly the channel §8.4 is about.
+
+    **Why the snapshot must still be current.** `/map` is
+    snapshot-at-open (§8.1), so a fid opened at epoch *E* answers
+    *E*'s bytes for as long as it is held. A rule that counted every
+    such read would let a wedged instance renew its lease forever
+    while serving a dead epoch: publish *E+1* moving primaryship from
+    X to Y, and Y adopts and serves while X never sees *E+1*, does
+    not self-fence under F1 — it received bytes, so as far as it can
+    tell it refreshed — and is not demoted at `deadms` either,
+    because the channel looks alive. Two primaries with no automatic
+    recovery, which is §6.4's hazard. F1 and F2 compose only if the
+    monitor's `lastseen(i)` is no fresher than the instance's last
+    successful refresh in §6.3's sense, and a read of a frozen
+    snapshot is not one — §6.3 already refuses to count an
+    epoch-regressed or `monid`-mismatched map as a refresh, and this
+    is the monitor's side of the same judgement.
+
+    The predicate is the slot store's `seq` (§10): the render stamps
+    the fid with the `seq` of the map it copied, and a read renews
+    only while that stamp is the current map's. `seq` and not the
+    epoch, for §14(60)'s reason — one epoch can be published twice.
+    The transfer is still the event, and between publishes an open
+    fid's bytes ARE the current map, so an instance polling one
+    long-lived fid every `pollms` renews exactly as before. After a
+    publish that fid stops renewing and `deadms` begins to run; the
+    instance renews again the moment it reopens, which is what an
+    instance actually tracking the map does anyway, because a
+    snapshot cannot tell it the epoch has moved.
 
     The `register` half of §8.4's rule is not built: the verb is not
     (§8.3's table, `mon/ctl.c`), and the unit that builds it records
-    evidence through the same call. The consumer — §8.4's demotion —
+    evidence through the same call, with **no** currency predicate —
+    a `register` is a write the instance made now, not a copy it is
+    re-reading, so there is no snapshot whose currency could be in
+    question. The consumer — §8.4's demotion —
     is not built either. `lastseen(i)` is recorded for any iid an
     attach names, including one no map carries, because §3.4 step 2
     has an unregistered disk attach `role=instance` before any map

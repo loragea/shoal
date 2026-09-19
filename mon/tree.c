@@ -338,14 +338,50 @@ mapsread(Req *r)
 }
 
 /*
+ * Is the snapshot this fid serves still the current map?  The render
+ * stamped the fid with the `seq' of the map it copied (status.c), and
+ * `seq' is the slot store's own: one space for the whole store,
+ * strictly increasing and never reused, so the comparison is exact
+ * across a ring wrap and across an epoch published twice.  A store
+ * that now holds no map answers no, and so does a fid that never
+ * rendered a map, whose stamp is 0 and which no published seq matches.
+ *
+ * monlk is taken per Tread for this.  Nothing in this service blocks
+ * under that lock — every accessor answers out of memory (mon.c) —
+ * so the cost is a QLock round trip on the one read that records.
+ */
+static int
+mapcurrent(Monctx *c, Mfid *f)
+{
+	Monmap mm;
+	int ok;
+
+	monsrvlock(c);
+	ok = moncurrent(c->mon, &mm) && mm.seq == f->mapseq;
+	monsrvunlock(c);
+	return ok;
+}
+
+/*
  * /map's read, which is the one read in this tree that records
  * anything.  layer-a §8.4 makes lastseen(i) "the time of instance i's
  * most recent successful read of the monitor's /map … on an attach
  * with role=instance,peer=i", and store.md §14(56) fixes what a
  * successful read is: a Tread of /map, on a fid whose ATTACH carried
- * role=instance, answered with a count greater than zero.  A count of
- * zero is end of data and moves nothing, and no other role's read of
- * anything moves anything.
+ * role=instance, answered with a count greater than zero, from a
+ * snapshot that is still the current map.  A count of zero is end of
+ * data and moves nothing, and no other role's read of anything moves
+ * anything.
+ *
+ * The currency clause is what keeps §6.4's F1 and F2 composable.
+ * /map is snapshot-at-open, so a fid opened at epoch E answers E's
+ * bytes for as long as it is held; without the clause an instance
+ * that never reopens renews its lease forever off a map the cluster
+ * has left behind — it received bytes, so it does not self-fence
+ * under F1, and the monitor will not demote it at `deadms' because
+ * the channel looks alive.  §6.3 already refuses to count an
+ * epoch-regressed map as a refresh, and this is the monitor's side of
+ * the same judgement (store.md §14(56)).
  *
  * It is recorded immediately before the reply, so the time is the time
  * the instance was answered.
@@ -363,7 +399,7 @@ mapread(Req *r)
 		return;
 	}
 	readbuf(r, f->text->p, f->text->n);
-	if(r->ofcall.count > 0 && f->role == Minstance)
+	if(r->ofcall.count > 0 && f->role == Minstance && mapcurrent(c, f))
 		monsrvseen(c, f->peer);
 	respond(r, nil);
 }
@@ -443,6 +479,7 @@ monsrvwalk(Req *r)
 	f = r->fid->aux;
 	g = *f;
 	g.text = nil;
+	g.mapseq = 0;
 	g.dir = nil;
 	g.ndir = 0;
 	e = nil;
@@ -467,6 +504,7 @@ monsrvwalk(Req *r)
 			 */
 			montextfree(f->text);
 			f->text = nil;
+			f->mapseq = 0;
 			free(f->dir);
 			f->dir = nil;
 			f->ndir = 0;

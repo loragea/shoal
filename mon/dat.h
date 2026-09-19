@@ -104,6 +104,12 @@ struct Mdirent
  * §8.4's evidence rule be stated per fid — the /map fid whose read
  * counts is one whose ATTACH carried role=instance,peer=i.
  *
+ * `mapseq' is the other half of §8.4's evidence rule: a /map fid
+ * carries the `seq' of the map its snapshot was copied from, and a
+ * read renews lastseen only while that is still the current map's
+ * (store.md §14(56)).  It is stamped by the render, under monlk, so
+ * it and the bytes are one state.
+ *
  * Nothing a fid holds outlives the slot store: `text' is a copy of the
  * bytes, made under the lock at open, and `dir' is a copy of the ring
  * positions.  So no fid needs a close hook and this service keeps no
@@ -122,6 +128,7 @@ struct Mfid
 	uvlong	qidpath;
 	uvlong	qidvers;
 	Mtext	*text;		/* the render-at-open snapshot, once open */
+	uvlong	mapseq;		/* Qmap: the seq of the map `text' copied */
 	Mdirent	*dir;		/* Qmroot, Qmaps: the listing snapshot */
 	int	ndir;
 };

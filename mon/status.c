@@ -38,17 +38,22 @@
  * empty answer would leave the refreshing instance's lease silently
  * unrenewed with nothing to tell it why.  A refusal says the one true
  * thing: this monitor has not published yet.
+ *
+ * The fid is stamped with the `seq' of the map these bytes came from.
+ * That is what lets tree.c's read tell a snapshot that is still the
+ * current map from one a publish has overtaken, which §8.4's evidence
+ * rule turns on (store.md §14(56)).
  */
 char*
 monmaptext(Monctx *c, Mfid *f, Mtext *t)
 {
 	Monmap mm;
 
-	USED(f);
 	if(!moncurrent(c->mon, &mm))
 		return Emonnomap;
 	if(montextwrite(t, mm.text, mm.len) < 0)
 		return "shoalmon: out of memory";
+	f->mapseq = mm.seq;
 	return nil;
 }
 

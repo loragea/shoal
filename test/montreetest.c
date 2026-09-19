@@ -1087,6 +1087,85 @@ tseen(void)
 }
 
 /*
+ * store.md §14(56)'s currency predicate.  /map is snapshot-at-open,
+ * so a fid opened at epoch E keeps answering E's bytes; those bytes
+ * stop being the current map at the next publish, and a read of them
+ * is then not the refresh §8.4 counts.  Three cases: an already-open
+ * fid whose snapshot IS the current map renews, the same fid after a
+ * publish does not, and a fresh open after the publish renews again.
+ *
+ * Each half uses an iid of its own that no earlier read has named, so
+ * "did this read renew?" is `lastseen' moving off zero rather than a
+ * comparison of two readings of a one-second clock.
+ */
+static void
+tcurrency(void)
+{
+	char buf[8192], err[ERRMAX], *old, *new;
+	Monctx *ctx;
+	Dev *d;
+	Fcall r;
+	Cl cl;
+	long n;
+
+	clstage = "evidence currency";
+	d = freshdisk();
+	seedmaps(d, 41, 41);
+	if((ctx = start(d)) == nil){
+		devclose(d);
+		return;
+	}
+	clstart(&cl, ctx, Clmsize);
+
+	/* a fid whose snapshot is still the current map renews on a read */
+	clattach(&cl, Froot2, "role=instance,peer=nb.0", &r);
+	clwalk1(&cl, Froot2, Ff2, "map", &r);
+	istrue("the current fid opens", clopen(&cl, Ff2, OREAD, &r) == Ropen);
+	eqv("its open alone is not evidence", monsrvlastseen(ctx, "nb.0"), 0);
+	clread(&cl, Ff2, 0, 64, &r);
+	istrue("the read on a current snapshot answered bytes", r.count > 0);
+	istrue("a read of the current map on an open fid is evidence",
+		monsrvlastseen(ctx, "nb.0") != 0);
+	clclunk(&cl, Ff2, &r);
+
+	/* one a publish has overtaken does not */
+	clattach(&cl, Froot, "role=instance,peer=na.0", &r);
+	clwalk1(&cl, Froot, Ff, "map", &r);
+	istrue("the fid that will be overtaken opens",
+		clopen(&cl, Ff, OREAD, &r) == Ropen);
+
+	new = mkmap(42);
+	monsrvlock(ctx);
+	if(moncommit(monsrvmon(ctx), new, strlen(new), 42) < 0)
+		fail("moncommit under the service: %r");
+	if(monsrvremap(ctx) < 0)
+		fail("monsrvremap: %r");
+	monsrvunlock(ctx);
+
+	n = clslurp(&cl, Ff, buf, sizeof buf);
+	old = mkmap(41);
+	eqv("the fid opened before the publish still reads its snapshot", n,
+		strlen(old));
+	eqs("... and the snapshot is the old map", buf, old);
+	free(old);
+	eqv("a read of an overtaken snapshot is not evidence",
+		monsrvlastseen(ctx, "na.0"), 0);
+	clclunk(&cl, Ff, &r);
+
+	/* and reopening is what renews */
+	n = slurpname(&cl, Froot, Ff, "map", buf, sizeof buf, err, sizeof err);
+	eqv("a fid opened after the publish reads the new map", n,
+		strlen(new));
+	istrue("... and its read IS evidence",
+		monsrvlastseen(ctx, "na.0") != 0);
+	free(new);
+
+	clstop(&cl);
+	monsrvfree(ctx);
+	devclose(d);
+}
+
+/*
  * §8.3's ctl framework.  Every verb of both tables is present and
  * answers this server's local `not built' to the role its row names;
  * the other role gets `permission denied', an unknown spelling gets
@@ -1272,6 +1351,7 @@ threadmain(int argc, char **argv)
 	tfiles();
 	tsnapshot();
 	tseen();
+	tcurrency();
 	tctl();
 	tshutdown();
 
