@@ -2056,8 +2056,13 @@ int	nineheld(Nine*);	/* tags this connection cannot hand out */
 uvlong	ninelate(Nine*);	/* replies discarded after a timeout */
 
 /*
- * §13's -X points, this library's set, reachable in-process only and
- * inert unless a T1 case sets one.  There is one:
+ * This client's own fault-injection points, inert unless a T1 case
+ * sets one.  They are reachable in-process only: store.md §13's `-X'
+ * flag names the points of the device under the store, which is a
+ * different set in a different program, and a client point is set by
+ * the program that holds the `Nine', which is a T1 program.  Nothing
+ * on the wire reaches one either — this side of a connection sends
+ * requests and nothing else.  There is one:
  *
  *	writewiden	a writer parks `n' milliseconds between its
  *			write(2) returning and the settling of the mark

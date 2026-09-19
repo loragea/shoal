@@ -629,7 +629,8 @@ ninetimer(void *a)
  * clear from further off does the same.  What the timer sees is the
  * deadline of the write outstanding now, or no write at all.
  *
- * `widenms' is §13's writewiden point (ninehook), inert unless a T1
+ * `widenms' is the writewiden point (ninehook, whose set is this
+ * library's own and is documented in lib/shoal.h), inert unless a T1
  * case set it: it parks a writer between its write(2) and the
  * settling of its mark, which is the one place two writers can be
  * ordered through this window from outside.
@@ -1050,7 +1051,7 @@ ninelate(Nine *c)
 	return n;
 }
 
-/* §13's -X points, this library's set; inert unless a case sets one */
+/* this library's own points, in lib/shoal.h; inert unless a case sets one */
 void
 ninehook(Nine *c, char *name, uvlong n)
 {

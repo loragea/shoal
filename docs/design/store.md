@@ -5052,7 +5052,11 @@ present in every build and inert without the flag; it is what drives
 the same named points on the real device. It is a command-line flag
 rather than a `/ctl` verb because layer-a §2.5 fixes the ctl grammar
 and requires an unknown verb to fail `unknown ctl`; a debug verb
-would be a wire change.
+would be a wire change. The points it names are the device's. The 9P
+client (§12) carries a set of its own that no flag reaches — one
+point, `writewiden`, named through `ninehook` and documented with it
+in `lib/shoal.h` — set in-process by the program that holds the
+connection, which is a T1 program.
 
 ## 14. Deviations from layer-a, and tensions with the platform
 
