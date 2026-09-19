@@ -122,6 +122,7 @@ enum
 
 static char Tuuid[] = "0000000000000000000000000000000a";
 static char Tmonid[] = "00112233445566778899aabbccddeeff";
+static char Tmonid2[] = "ffeeddccbbaa99887766554433221100";
 static char Nclient[] = "role=client,epoch=7";
 static char Nadmin[] = "role=admin";
 
@@ -150,7 +151,7 @@ enum
 };
 
 static char*
-mkmap(uvlong epoch, int kind, char *iid, char *uuid)
+mkmap(uvlong epoch, int kind, char *iid, char *uuid, char *monid)
 {
 	char *p;
 
@@ -168,7 +169,7 @@ mkmap(uvlong epoch, int kind, char *iid, char *uuid)
 		"instance=n2.0 onnode=n2 addr=tcp!10.0.0.2!17011\n"
 		"\tuuid=0000000000000000000000000000000c\n"
 		"\tclass=ssd weight=100 status=%s up=%s since=1 fenced=no\n",
-		epoch, Tmonid, (uvlong)Tobjmax, Tblksz,
+		epoch, monid, (uvlong)Tobjmax, Tblksz,
 		kind == Ppeer ? 2 : 1, iid, uuid,
 		kind == Ppeer ? "in" : "dead", kind == Ppeer ? "yes" : "no");
 	if(p == nil)
@@ -180,7 +181,7 @@ mkmap(uvlong epoch, int kind, char *iid, char *uuid)
 static char*
 mkself(uvlong epoch, int kind)
 {
-	return mkmap(epoch, kind, "n1.0", Tuuid);
+	return mkmap(epoch, kind, "n1.0", Tuuid, Tmonid);
 }
 
 static void
@@ -645,17 +646,21 @@ Out:
 
 /*
  * (iii) What a swap refuses.  A text that does not parse, one that
- * names no record with this instance's uuid, and one that gives that
- * uuid another iid are each refused, and each leaves the map in force
- * serving: /map still answers the old bytes, srvmap still answers the
- * old epoch, no snapshot is made, and a client write still goes
- * through on the old placement.
+ * names no record with this instance's uuid, one that gives that uuid
+ * another iid, and one carrying another monid are each refused, and
+ * each leaves the map in force serving: /map still answers the old
+ * bytes, srvmap still answers the old epoch, no snapshot is made, and
+ * a client write still goes through on the old placement.
+ *
+ * The last two are the values Srvctx keeps a COPY of, and /status
+ * renders them beside the snapshot's own record (srv/dat.h): a swap
+ * that moved either would have that one file answering two maps.
  */
 static void
 trefuse(void)
 {
 	static char junk[] = "this is not a map\n";
-	char buf[8192], *m0, *m1, *m2, *e;
+	char buf[8192], *m0, *m1, *m2, *m3, *e;
 	Srvctx *ctx;
 	Dev *d;
 	Cl cl;
@@ -667,9 +672,11 @@ trefuse(void)
 	m0 = mkself(Tepoch, Palone);
 	/* well-formed, but no record carries this instance's uuid */
 	m1 = mkmap(Tepoch2, Palone, "n1.0",
-		"0000000000000000000000000000000d");
+		"0000000000000000000000000000000d", Tmonid);
 	/* well-formed, this instance's uuid under another iid */
-	m2 = mkmap(Tepoch2, Palone, "n1.7", Tuuid);
+	m2 = mkmap(Tepoch2, Palone, "n1.7", Tuuid, Tmonid);
+	/* well-formed and ours, but under another monitor identity */
+	m3 = mkmap(Tepoch2, Palone, "n1.0", Tuuid, Tmonid2);
 	d = newdisk();
 	if((ctx = startsrv(d, m0)) == nil)
 		return;
@@ -694,6 +701,16 @@ trefuse(void)
 
 	e = srvmapswap(ctx, m2, strlen(m2));
 	istrue("a map giving this uuid another iid is refused", e != nil);
+
+	/*
+	 * `monid' is the other value Srvctx holds a copy of and /status
+	 * renders from that copy rather than from the snapshot (srv/dat.h),
+	 * and layer-a §6.3 adopts no map under another monitor identity.
+	 */
+	e = srvmapswap(ctx, m3, strlen(m3));
+	istrue("a map under another monitor identity is refused", e != nil);
+	istrue("... naming the monid it was pinned to",
+		e != nil && strstr(e, Tmonid) != nil);
 
 	srvmapcount(ctx, &ns, nil);
 	eqv("a refused swap makes no snapshot", ns, 1);
@@ -723,6 +740,7 @@ Out:
 	free(m0);
 	free(m1);
 	free(m2);
+	free(m3);
 }
 
 /*

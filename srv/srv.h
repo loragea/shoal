@@ -658,10 +658,16 @@ uvlong	srvreclaimperiod(Srvctx*);
  * It parses `text[0:len]' and resolves this instance's own record in
  * it by the uuid the disk carries, exactly as start-up does, and it
  * publishes the result as a new snapshot.  A text that does not parse,
- * that names no record with this instance's uuid, or that gives that
- * uuid an iid other than the one this instance answers to is REFUSED:
- * the call answers why, in a buffer of its own that the next call
- * overwrites, and the map in force is untouched.  nil is success.
+ * that names no record with this instance's uuid, that gives that uuid
+ * an iid other than the one this instance answers to, or that carries
+ * a `monid' other than the pinned one is REFUSED: the call answers
+ * why, in a buffer of its own that the next call overwrites, and the
+ * map in force is untouched.  nil is success.
+ *
+ * The last two refusals are the two values `Srvctx' holds a COPY of
+ * and /status renders from that copy (srv/dat.h): a swap that moved
+ * either would leave one render answering two maps.  layer-a §6.3
+ * never adopts a map under another monitor identity in any case.
  *
  * What it is NOT is an adoption: layer-a §6.3's decision, its two
  * durable values and the geometry checks start-up makes are start-up's

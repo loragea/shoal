@@ -783,14 +783,25 @@ struct Sstage
  * snapshot and the holder's own put would run on freed memory (srv.c).
  *
  * One 9P message may be more than one reader, and where it is, it may
- * read two maps.  Three places: a row's GATE runs on the service loop
- * before the queued handler behind it (tree.c's F3), /meta's open
- * admits on the queue and then calls a RENDER that takes its own
- * (obj.c), and a /repl or /rpc write is epoch-checked on the loop
- * before the operation is pushed (peer.c).  Each half is one map's,
- * which is what the rule above buys; the pair is not.  Nothing swaps
- * in this build, so nothing observes it — store.md §14(48) records it
- * as the refresh loop's to close.
+ * read two maps.  Four places, three of them two holds: a row's GATE
+ * runs on the service loop before the queued handler behind it
+ * (tree.c's F3), /meta's open admits on the queue and then calls a
+ * RENDER that takes its own (obj.c), and a /repl or /rpc write is
+ * epoch-checked on the loop before the operation is pushed (peer.c).
+ * Each half is one map's, which is what the rule above buys; the pair
+ * is not.
+ *
+ * The fourth is of another kind: /status renders `status=' and `up='
+ * out of the snapshot and `iid=', `uuid=', `monid=' and
+ * `monidmismatch=' out of the COPIES Srvctx took at start-up
+ * (status.c), so it is a snapshot read beside a context read rather
+ * than two holds.  What keeps that one record is srvmapswap refusing
+ * a text that renames this uuid or that carries another monid, and
+ * `uuid' being the disk's rather than any map's (srv.c); a refresh
+ * that meant to move either would have to re-pin the copies, which is
+ * the refresh loop's.  Nothing swaps in this build, so nothing
+ * observes any of the four — store.md §14(48) records them as the
+ * refresh loop's to close.
  *
  * The WRITE PATH's epoch is the rule this exists for.  A write is
  * keyed with the epoch of the map it was ADMITTED under: read once, at

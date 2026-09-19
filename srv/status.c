@@ -49,6 +49,14 @@ srvstatustext(Srvctx *c, Sfid *f, Text *t)
 	storestat(c->store, &st);
 	srvcount(c, &np, &nd);
 	kind = srvfencekind(c);
+	/*
+	 * `status=' and `up=' are one snapshot's record; `iid=', `uuid=',
+	 * `monid=' and `monidmismatch=' are the copies Srvctx took at
+	 * start-up.  That makes this render the one place a message reads
+	 * a snapshot beside a context copy, and what keeps the two one
+	 * map's is srvmapswap refusing a text that renames this uuid or
+	 * changes the pinned monid (dat.h, srv.c).
+	 */
 	m = srvmapget(c);
 	textprint(t, "iid=%s\n", c->iid);
 	textprint(t, "uuid=%s\n", c->uuid);

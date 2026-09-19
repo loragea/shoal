@@ -6305,25 +6305,35 @@ name a half that is not built; each says which.
     leak the snapshot it was meant to free, and the holder's put
     would take the lock and decrement the count on freed memory.
 
-    Where one 9P message is two readers, it may read two maps: a
-    row's gate runs on the service loop before the queued handler
-    behind it, `/meta`'s open admits on the queue and then calls a
-    render that takes its own snapshot, and a `/repl` or `/rpc` write
-    is epoch-checked on the loop before the operation is pushed. Each
-    half is one map's; the pair is not.
+    Where one 9P message is two readers, it may read two maps. Four
+    places, three of them two holds: a row's gate runs on the service
+    loop before the queued handler behind it, `/meta`'s open admits on
+    the queue and then calls a render that takes its own snapshot, and
+    a `/repl` or `/rpc` write is epoch-checked on the loop before the
+    operation is pushed. Each half is one map's; the pair is not. The
+    fourth is of another kind: `/status` renders `status=` and `up=`
+    out of the snapshot and `iid=`, `uuid=`, `monid=` and
+    `monidmismatch=` out of the copies the server took at start-up, so
+    it reads a snapshot beside a context copy. What keeps that one
+    record is the refusals below.
 
     **Nothing swaps in production.** The only caller is a T1 entry
     point, `srvmapswap`, which parses, resolves this instance's
     record by the uuid the disk carries exactly as start-up does, and
     refuses — leaving the map in force untouched — a text that does
-    not parse, that names no record with this uuid, or that gives
-    this uuid a different iid. It is deliberately **not** an
-    adoption: §6.3's decision (`mapadoptable`), the `monid` pin, the
-    durable `epochadopt`, §14(8)'s geometry checks against the
-    superblock and the copy of `leasems` into §6.4's fence state are
-    start-up's, and the refresh loop of item 18's open half is what
-    owes them. So the memory discipline is built and adoption policy
-    is not, and item 18's "adopted once at start-up and never
+    not parse, that names no record with this uuid, that gives this
+    uuid a different iid, or that carries a `monid` other than the
+    pinned one. The last two are the values the server holds a copy
+    of and `/status` renders from that copy; the `monid` refusal is
+    also §6.3's own rule, which never adopts a map under another
+    monitor identity. It is deliberately **not** an adoption: §6.3's
+    decision (`mapadoptable`), the `monid` pin, the durable
+    `epochadopt`, §14(8)'s geometry checks against the superblock and
+    the copy of `leasems` into §6.4's fence state are start-up's, and
+    the refresh loop of item 18's open half is what owes them —
+    re-pinning `monid` under a map that changed it included (item
+    32). So the memory discipline is built and adoption policy is
+    not, and item 18's "adopted once at start-up and never
     refreshed" still describes what a running server does.
 
 ## 15. Alternatives considered

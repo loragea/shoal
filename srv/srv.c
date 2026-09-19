@@ -191,6 +191,24 @@ srvmapswap(Srvctx *c, char *text, long len)
 		smapfree(s);
 		return swaperr;
 	}
+	/*
+	 * `monid' is the same kind of copy, and a swap that changed it
+	 * would be seen twice over.  layer-a §6.3 never adopts a map
+	 * under a monitor identity other than the pinned one — a swap is
+	 * that decision's dress rehearsal even though it makes nothing
+	 * durable — and /status renders `monid=' and `monidmismatch=' from
+	 * this copy beside `status=' and `up=' out of the snapshot, so a
+	 * changed one would have that file answering two maps at once
+	 * (dat.h, status.c).  Re-pinning is the refresh loop's, not a
+	 * swap's (store.md §14(32), §14(48)).
+	 */
+	if(strcmp(s->map->monid, c->monid) != 0){
+		snprint(swaperr, sizeof swaperr,
+			"shoalsrv: map monid %s is not the pinned %s",
+			s->map->monid, c->monid);
+		smapfree(s);
+		return swaperr;
+	}
 	lock(&c->maplk);
 	old = c->smap;
 	c->smap = s;
