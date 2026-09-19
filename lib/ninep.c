@@ -222,15 +222,16 @@ nineout(Ninerep *r, int out, char *fmt, ...)
 /*
  * Give the memory back.  Only the last reference reaches here, so the
  * reader is out of its read and the timer out of its sleep by now and
- * the fds are nobody's but ours.  The `freed' callback is called after
- * the last free, which is what makes the release observable to a test
- * that has no other way to see it.
+ * the fds are nobody's but ours.  The `freed' callback is the last
+ * act before the memory goes, which is what the header promises and
+ * what makes the release observable to a test that has no other way
+ * to see it.  It is nil until nineopen has a handle to hand back, so
+ * a nineopen that answers nil is silent: the caller never held the
+ * connection and has nothing to be told the end of (§14(50)).
  */
 static void
 ninefree(Nine *c)
 {
-	void (*f)(void*);
-	void *a;
 	int i;
 
 	if(c->infd >= 0)
@@ -243,11 +244,9 @@ ninefree(Nine *c)
 	free(c->req);
 	free(c->wbuf);
 	free(c->rbuf);
-	f = c->freed;
-	a = c->freedarg;
+	if(c->freed != nil)
+		(*c->freed)(c->freedarg);
 	free(c);
-	if(f != nil)
-		(*f)(a);
 }
 
 static void
@@ -726,8 +725,6 @@ nineopen(Ninecfg *cfg)
 	c->ref = 1;
 	c->hangup = cfg->hangup;
 	c->hanguparg = cfg->hanguparg;
-	c->freed = cfg->freed;
-	c->freedarg = cfg->freedarg;
 	c->bufsz = cfg->msize != 0 ? cfg->msize : Ninemsizedflt;
 	if(c->bufsz < Nminmsize)
 		c->bufsz = Nminmsize;
@@ -759,23 +756,33 @@ nineopen(Ninecfg *cfg)
 	/*
 	 * Both procs hold a reference of their own, so a spawn that
 	 * fails after the other succeeded is unwound by closing rather
-	 * than by unpicking it here.
+	 * than by unpicking it here.  The reader is already running by the
+	 * time the timer is spawned, so from here the count moves under
+	 * the lock, as it does everywhere else.
 	 */
+	qlock(&c->lk);
 	c->ref++;
 	c->nproc++;
+	qunlock(&c->lk);
 	if((*cfg->spawn)(ninereader, c) < 0){
+		qlock(&c->lk);
 		c->ref--;
 		c->nproc--;
+		qunlock(&c->lk);
 		rerrstr(e, sizeof e);
 		nineclose(c);
 		werrstr("ninep: cannot start the reader proc: %s", e);
 		return nil;
 	}
+	qlock(&c->lk);
 	c->ref++;
 	c->nproc++;
+	qunlock(&c->lk);
 	if((*cfg->spawn)(ninetimer, c) < 0){
+		qlock(&c->lk);
 		c->ref--;
 		c->nproc--;
+		qunlock(&c->lk);
 		rerrstr(e, sizeof e);
 		nineclose(c);
 		werrstr("ninep: cannot start the timer proc: %s", e);
@@ -810,6 +817,16 @@ nineopen(Ninecfg *cfg)
 	}
 	c->msize = f.msize;
 	free(m);
+	/*
+	 * The handle is the caller's from here, and only from here is
+	 * there anything for `freed' to observe the end of.  Every path
+	 * above answers nil, and a caller that never held a connection is
+	 * told nothing about its release (§14(50)).
+	 */
+	qlock(&c->lk);
+	c->freed = cfg->freed;
+	c->freedarg = cfg->freedarg;
+	qunlock(&c->lk);
 	return c;
 }
 

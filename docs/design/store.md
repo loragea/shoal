@@ -6345,7 +6345,13 @@ the 9P client's (§12), which nothing in this build dials with.
     exchange still unwinding lets go. `Ninecfg.freed` is called as the
     last act before the memory goes: §9's deferred free and §13's
     `Storecfg.freed` hook again, for the same reason and with the same
-    discipline. The rule about calls is `storeclose`'s: one in flight
+    discipline. It observes the end of a handle the caller HELD, so a
+    `nineopen` that answers nil never calls it, however far it got: an
+    allocation that failed, a `connect` that failed, a `spawn` that
+    failed, a peer whose `Rversion` broke 9P and a `Tversion` that
+    timed out are silent alike, because a caller cannot be told the
+    release of something it was never given. The rule about calls is
+    `storeclose`'s: one in flight
     when the close runs is safe, since the exchange holds a reference
     of its own, and one STARTED after it is undefined.
 

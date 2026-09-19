@@ -1953,7 +1953,10 @@ int	maprefresh(Adopt*, Fence*, Cmap*, vlong now);
  * the two procs and the exchanges unwinding lets go — `freed' is the
  * observation of that moment, as §13's hook is for the engine
  * (§14(50)), and `hangup' is what makes that moment the close's own
- * rather than the peer's.
+ * rather than the peer's.  `freed' belongs to a handle the caller
+ * HELD: a nineopen that answers nil never calls it, however far it
+ * got before failing, and the one call there ever is comes from the
+ * close of a connection nineopen handed back.
  */
 typedef struct Nine Nine;
 typedef struct Ninecfg Ninecfg;
@@ -1995,7 +1998,7 @@ struct Ninecfg
 	ulong	tickms;		/* 0 takes Ninetickmsdflt */
 	int	nreq;		/* 0 takes Ninereqdflt */
 	int	openms;		/* the Tversion's deadline; 0 takes the default */
-	void	(*freed)(void*);	/* §13's free observation */
+	void	(*freed)(void*);	/* §13's free observation; see above */
 	void	*freedarg;
 };
 

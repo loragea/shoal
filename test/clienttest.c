@@ -1114,7 +1114,9 @@ cbotch(void)
  * The reader is inside read(2) and nothing in plain libc recalls it,
  * so `hangup' is the whole of the answer: without it the two procs,
  * both fds and two buffers of the proposed msize are lost for every
- * dial attempt.  What says the fds went is the peer: its own read
+ * dial attempt.  There is no `freed' to watch here — a nineopen that
+ * answers nil never calls it (§14(50)), since the caller never held
+ * the handle — so what says the fds went is the peer: its own read
  * ends when the last of the client's references closes them.
  */
 static void
@@ -1135,6 +1137,7 @@ cmutepeer(void)
 		sleep(25);
 	istrue("... and the client's fds go with the reader it recalled",
 		s.ended);
+	eqv("no free callback for a handle the caller never held", freedseen, 0);
 	stubstop(&s);
 }
 
