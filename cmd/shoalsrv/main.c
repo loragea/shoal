@@ -26,6 +26,18 @@
 enum
 {
 	Stack	= Srvstack,
+
+	/*
+	 * The largest `-d scrubdays' this command will take: a hundred
+	 * years, which is orders above any period an operator has a use
+	 * for and far below where the period in milliseconds outgrows
+	 * the uvlong srvscrubperiod computes it in.  It is here rather
+	 * than in srv/ because it bounds the SPELLING and not the
+	 * mechanism: what makes a bound necessary is that Plan 9's
+	 * strtol clamps (see `-d' below), which is a parsing fact.
+	 * store.md §12 states it.
+	 */
+	Scrubdaysmax	= 36500,
 };
 
 void
@@ -67,6 +79,7 @@ threadmain(int argc, char **argv)
 	Srvcfg cfg;
 	Srvctx *c;
 	Dev *d;
+	vlong days;
 	int pointn;
 
 	memset(&cfg, 0, sizeof cfg);
@@ -88,18 +101,37 @@ threadmain(int argc, char **argv)
 	 * whole positive number of days or nothing — 0 and a negative are
 	 * not a period, and the default is what the flag is absent for.
 	 *
-	 * strtol and its end pointer rather than atoi, which stops at the
-	 * first character it cannot use and answers what it read: `3junk'
-	 * would be 3 and `1.9' would be 1, where store.md §12 says
-	 * anything but a whole number of days is refused with the usage.
-	 * A period is a thing an operator gets one chance a start-up to
-	 * spell, so a typo is worth a usage rather than a silent 1.
+	 * strtoll and its end pointer rather than atoi, which stops at
+	 * the first character it cannot use and answers what it read:
+	 * `3junk' would be 3 and `1.9' would be 1, where store.md §12
+	 * says anything but a whole number of days is refused with the
+	 * usage.  A period is a thing an operator gets one chance a
+	 * start-up to spell, so a typo is worth a usage rather than a
+	 * silent 1.
+	 *
+	 * The end pointer alone does not see an overflow, because Plan
+	 * 9's strtol CLAMPS to LONG_MAX and still leaves *e at the end
+	 * of the digits: measured on 9front, where a long is four bytes,
+	 * `99999999999' comes back 2147483647 with the whole string
+	 * consumed, so `-d 99999999999' would have started an instance
+	 * scrubbing on a period of some five million years with nothing
+	 * in the arguments to see it by.  Hence a vlong, which no
+	 * spelling of days can overflow, and an upper bound of
+	 * Scrubdaysmax above.
+	 *
+	 * The first character must be a DIGIT.  strtoll otherwise takes
+	 * a leading `+' and leading white space, so `+14' and ` 14' were
+	 * 14 while `14 ' was refused by the end pointer; one spelling of
+	 * a number, accepted or refused whole, is the rule that has no
+	 * such asymmetry in it.
 	 */
 	case 'd':
 		p = EARGF(usage());
-		cfg.scrubdays = strtol(p, &e, 10);
-		if(*p == 0 || *e != 0 || cfg.scrubdays <= 0)
+		days = strtoll(p, &e, 10);
+		if(*p < '0' || *p > '9' || *e != 0
+		|| days <= 0 || days > Scrubdaysmax)
 			usage();
+		cfg.scrubdays = days;
 		break;
 	case 's':
 		srvname = EARGF(usage());

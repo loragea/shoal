@@ -4172,10 +4172,23 @@ present in every build and inert without the flag; `-q` sets the
 queue-pool size, whose sizing rule is §7's; `-d` is layer-a §7.5's
 `scrubdays`, a whole positive number of days, which is how long a
 full scrub pass should take and so the period between passes (§8) —
-the default is 14 and anything else is refused with the usage; `-s`
-names the posted service. `-m` is the cluster map, as a file: this
+the default is 14, the largest accepted is 36500 (a hundred years),
+and anything else is refused with the usage; `-s` names the posted
+service. `-m` is the cluster map, as a file: this
 build has no monitor client, so the map is read once at start and
 never refreshed (§14(18)). The monitor is `cmd/shoalmon`.
+
+"Anything else" is meant strictly for `-d`, which an operator spells
+once a start-up and cannot correct afterwards. The argument is one
+run of decimal digits and nothing besides: the first character MUST
+be a digit, so a leading `+` and leading white space are refused as
+trailing characters already were, and the value must be at least 1
+and at most 36500. The upper bound exists because this platform's
+`strtol` clamps an overflowing number to `LONG_MAX` and reports the
+whole string consumed, which leaves the end pointer nothing to
+refuse — without a bound `-d 99999999999` would be taken as
+2147483647 days. All of this is **implementation policy**: layer-a
+§7.5 fixes what `scrubdays` means, not how a command spells it.
 
 ## 13. Test plan
 
