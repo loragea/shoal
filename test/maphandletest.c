@@ -812,8 +812,13 @@ Out:
  * (v) A hold never spans the reply (srv/dat.h).  A queued handler's
  * snapshot must be given back BEFORE the handler answers, because the
  * answer is where lib9p counts the request complete — srvdestroyreq,
- * from closereq, inside respond and before the reply is even written —
- * and where respond then releases the service.  A handler still
+ * from the SECOND of respond's two closereqs.  allocreq gives a Req
+ * two references: the first closereq, under `wlock' and before the
+ * reply is written, is the one that takes the request out of the pool
+ * and leaves the count at 1, and the second — after the write, after
+ * the lock is dropped and after `responded' is set — is the one that
+ * reaches the pool's destroy hook.  Both are inside respond, which
+ * then releases the service.  A handler still
  * holding one across its respond is therefore a handler the drain
  * converges past and srvfree's wait ends under: srvfree's own put
  * leaks the snapshot it was meant to free, and the handler's put,
