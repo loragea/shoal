@@ -293,6 +293,30 @@ dirents(char *p, long n, char **names, int maxn)
 	return k;
 }
 
+/* the same, with each entry's qid.path, for the cases that need both */
+static int
+direntqids(char *p, long n, char **names, uvlong *paths, int maxn)
+{
+	Dir dir;
+	char *ep;
+	int m, k;
+
+	k = 0;
+	ep = p + n;
+	while(p < ep){
+		m = convM2D((uchar*)p, ep-p, &dir, p+BIT16SZ);
+		if(m <= BIT16SZ)
+			break;
+		if(k < maxn){
+			names[k] = strdup(dir.name);
+			paths[k] = dir.qid.path;
+		}
+		p += m;
+		k++;
+	}
+	return k;
+}
+
 static int
 hasname(char **v, int n, char *want)
 {
@@ -837,6 +861,71 @@ tmaps(void)
 	devclose(d);
 }
 
+/*
+ * One epoch published twice, which `forceepoch' and §8.6's rebuild
+ * path may do (store.md §14(55), §10).  Two ring entries then carry
+ * one epoch, and a listing that showed both would name one file twice
+ * and disagree with the walk, which answers the greater seq.  All but
+ * the newest are dropped, and this is the case that holds it: exactly
+ * one entry for the repeated epoch, carrying the qid.path the walk
+ * answers.
+ */
+static void
+tdup(void)
+{
+	char buf[8192], err[ERRMAX], *nm[16];
+	uvlong path[16], dup, walk;
+	Monctx *ctx;
+	Dev *d;
+	Fcall r;
+	Cl cl;
+	long n;
+	int k, i, ndup;
+
+	clstage = "duplicate epoch";
+	d = freshdisk();
+	seedmaps(d, 5, 6);
+	seedmaps(d, 6, 6);		/* epoch 6 again, at a greater seq */
+	if((ctx = start(d)) == nil){
+		devclose(d);
+		return;
+	}
+	clstart(&cl, ctx, Clmsize);
+	clattach(&cl, Froot, Aadmina, &r);
+
+	clwalk1(&cl, Froot, Ff, "maps", &r);
+	if(clwalk1(&cl, Ff, Ff2, "6", &r) != Rwalk){
+		checks++;
+		fail("walk to /maps/6: %s", clerr(&r));
+		clclunk(&cl, Ff, &r);
+	}else{
+		walk = r.wqid[0].path;
+		clclunk(&cl, Ff2, &r);
+		clclunk(&cl, Ff, &r);
+
+		n = slurpname(&cl, Froot, Ff, "maps", buf, sizeof buf, err,
+			sizeof err);
+		k = direntqids(buf, n, nm, path, nelem(nm));
+		eqv("three publishes of two epochs list two entries", k, 2);
+		ndup = 0;
+		dup = 0;
+		for(i = 0; i < k; i++)
+			if(nm[i] != nil && strcmp(nm[i], "6") == 0){
+				ndup++;
+				dup = path[i];
+			}
+		eqv("an epoch published twice is listed once", ndup, 1);
+		eqv("... under the qid.path the walk answers", dup, walk);
+		istrue("... and the epoch published once is listed too",
+			hasname(nm, k, "5"));
+		freenames(nm, k);
+	}
+
+	clstop(&cl);
+	monsrvfree(ctx);
+	devclose(d);
+}
+
 /* /instances, /stale, /health and /status against the committed map */
 static void
 tfiles(void)
@@ -1348,6 +1437,7 @@ threadmain(int argc, char **argv)
 	tmatrix();
 	tmap();
 	tmaps();
+	tdup();
 	tfiles();
 	tsnapshot();
 	tseen();
