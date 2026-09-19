@@ -657,6 +657,27 @@ tmatrix(void)
 			eqs(what, opencell(&cl, root[j], Ff, v[i].file,
 				v[i].mode, buf, sizeof buf), v[i].want[j]);
 		}
+	/*
+	 * The walk column is a gate of its own and not a restatement of
+	 * the read one.  A Tstat runs no role gate — 9P settles the role
+	 * at the open, and a stat needs no open — so a row a role may not
+	 * reach has to be unreachable at the WALK, and a refusal that
+	 * arrives at the open instead leaves the row stat-able by
+	 * everyone (store.md §14(58)).
+	 */
+	clwalk1(&cl, Froot, Ff, "map.next", &r);
+	eqs("a reader's walk to /map.next", clerr(&r), "permission denied");
+	istrue("... and no fid was established", r.type != Rwalk);
+	if(r.type == Rwalk)
+		clclunk(&cl, Ff, &r);
+	istrue("an admin's walk to /map.next resolves",
+		clwalk1(&cl, Froot3, Ff, "map.next", &r) == Rwalk);
+	if(r.type == Rwalk){
+		istrue("... and an admin may stat it",
+			clstat(&cl, Ff, &r) == Rstat);
+		clclunk(&cl, Ff, &r);
+	}
+
 	/* a create, a remove and a wstat: nothing in this tree takes one */
 	clwalk1(&cl, Froot3, Ff, "status", &r);
 	clremove(&cl, Ff, &r);
