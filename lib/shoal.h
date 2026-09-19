@@ -1969,14 +1969,17 @@ int	maprefresh(Adopt*, Fence*, Cmap*, vlong now);
  * **Closing.**  nineclose answers every exchange in flight Ninedead
  * and stops both procs.  A call already in flight when it runs is
  * safe; a call STARTED after it is undefined, exactly as after
- * storeclose.  The memory and the fds go when the last of the caller,
- * the two procs and the exchanges unwinding lets go — `freed' is the
- * observation of that moment, as §13's hook is for the engine
- * (§14(50)), and `hangup' is what makes that moment the close's own
- * rather than the peer's.  `freed' belongs to a handle the caller
- * HELD: a nineopen that answers nil never calls it, however far it
- * got before failing, and the one call there ever is comes from the
- * close of a connection nineopen handed back.
+ * storeclose.  nineclose MAY be called once and once only, and a
+ * `hangup' callback MUST NOT re-enter this library: either drops the
+ * caller's reference a second time, which frees the connection under
+ * whoever still holds it.  The memory and the fds go when the last
+ * of the caller, the two procs and the exchanges unwinding lets go —
+ * `freed' is the observation of that moment, as §13's hook is for
+ * the engine (§14(50)), and `hangup' is what makes that moment the
+ * close's own rather than the peer's.  `freed' belongs to a handle
+ * the caller HELD: a nineopen that answers nil never calls it,
+ * however far it got before failing, and the one call there ever is
+ * comes from the close of a connection nineopen handed back.
  */
 typedef struct Nine Nine;
 typedef struct Ninecfg Ninecfg;
