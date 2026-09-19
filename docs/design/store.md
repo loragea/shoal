@@ -6357,6 +6357,25 @@ the 9P client's (§12), which nothing in this build dials with.
     waiters are still answered; what waits is the writer's own proc,
     until the peer reads or the fds go.
 
+    **Either deadline covers the wait for the write lock as well as
+    the write.** A write's deadline is taken before the lock is asked
+    for — the exchange's when the call starts, the `Tflush`'s where
+    the `Tflush` is built — so the time a writer spends queued behind
+    another writer's message is charged to it, and what the timer
+    judges is the sum. That is the bound layer-a §5.4 asks for: what
+    it bounds is the operation the caller asked for, and a caller
+    queued for the lock is waiting on the peer just the same, since
+    what holds the lock is another write into the same peer. The
+    consequence is that a peer which was accepting messages
+    throughout can still have its connection killed `Ninedead`, if
+    the writer in front held the lock longer than this writer's
+    remaining deadline; the 1000 ms above is the figure that has to
+    absorb it, being fixed rather than the caller's. *Implementation
+    policy:* a client may instead start the clock where the write
+    does, at the price of leaving the queueing itself unbounded — and
+    the queue is exactly where a stalled write puts every other
+    exchange on the connection.
+
     **That mark is owned, and the write lock is what owns it.** There
     is one mark per connection, because there is one writer at a time
     — but a connection has many writers over its life and they hand
