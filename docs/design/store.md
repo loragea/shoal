@@ -5275,7 +5275,10 @@ the 9P client's (§12), which nothing in this build dials with.
     inventory in §7.2's line grammar, live and tomb, for a peer to
     read. Nothing sends it, because §7.2's sender — and its rate
     limit — is the peer client this item is about; what is built is
-    the readable half.
+    the readable half. The 9P client both of the missing clients
+    speak through is built and is in `lib/` (§12, items 48 to 51):
+    what is absent is the poll loop, the map refresh and the
+    operations, not the transport under them.
 
 19. **§6.4 F1's lease fence is inert while the map is static.** F1
     fences an instance that has not refreshed its map within
