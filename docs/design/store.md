@@ -6357,18 +6357,25 @@ the 9P client's (§12), which nothing in this build dials with.
     waiters are still answered; what waits is the writer's own proc,
     until the peer reads or the fds go.
 
-    **That mark is owned.** There is one per connection, because
-    there is one writer at a time — but a connection has many writers
-    over its life and they hand the write lock from one to the next,
-    so a mark carries the generation of the write that set it, is
-    settled before its writer releases the write lock rather than
-    after, and is cleared only by the writer it still belongs to. A
-    writer that cleared the mark of the writer which overtook it
-    would leave that write with nothing bounding it at all, so the
-    bound above would hold for a connection with one writer and go
-    the moment two exchanges overlapped; a writer that cleared a mark
-    from further off would let the timer kill a connection over a
-    deadline no outstanding write has.
+    **That mark is owned, and the write lock is what owns it.** There
+    is one mark per connection, because there is one writer at a time
+    — but a connection has many writers over its life and they hand
+    the write lock from one to the next. A writer that cleared the
+    mark after letting the lock go would be clearing the mark of the
+    writer which overtook it, leaving that write with nothing
+    bounding it at all, so the bound above would hold for a
+    connection with one writer and go the moment two exchanges
+    overlapped. What prevents that is where the clear is: a mark is
+    settled inside the write lock's own hold, before the lock is
+    released, so the next writer has not reached the lock yet and has
+    no mark for this one to clear. The mark also carries the
+    generation of the write that set it, and the generation is tested
+    before the clear; with the clear where it is, no other writer can
+    have taken a generation in between, so that test cannot fail. It
+    is defence, against a clear that ever moves outside the lock,
+    which is what would let a writer clear a mark from further off
+    and the timer kill a connection over a deadline no outstanding
+    write has.
 
 50. **Four ways an exchange can end that are not an `Rerror`, and
     when a closed connection's memory goes (layer-a §2.6, §3.7).**

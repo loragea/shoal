@@ -618,16 +618,21 @@ ninetimer(void *a)
  *
  * The mark it is recorded in is one per connection — there is one
  * writer at a time — but the connection has many writers over its
- * life, and they hand the write lock from one to the next, so the
- * mark is OWNED: it carries this write's generation, it is settled
- * before the write lock goes rather than after, and a writer clears
- * it only while it is still the writer's own.  Both halves are
- * needed.  Without the first, a writer that released the lock can be
- * overtaken by the next one and clear ITS mark, and a stalled write
- * with no mark is the unbounded write this bound exists to prevent —
- * which is every time two exchanges overlap.  Without the second, a
- * clear from further off does the same.  What the timer sees is the
- * deadline of the write outstanding now, or no write at all.
+ * life, and they hand the write lock from one to the next, so a mark
+ * has to be cleared by the writer it belongs to and by nobody else.
+ * WHERE the clear is is what does that: inside the same wlk section
+ * that set the mark, before the lock goes rather than after, so the
+ * writer that will overtake this one has not reached the lock yet and
+ * there is nothing here but this write's own mark to clear.  A clear
+ * moved past the unlock would be a clear of the overtaking writer's,
+ * and a stalled write with no mark is the unbounded write this bound
+ * exists to prevent — which would be every time two exchanges
+ * overlap.  The generation the mark carries is tested before the
+ * clear as defence for that and not as the fix: with the clear where
+ * it is, no other writer can have bumped wseq in between, so the test
+ * cannot fail today; it is what would keep a clear honest if one ever
+ * moved outside wlk.  What the timer sees is the deadline of the
+ * write outstanding now, or no write at all.
  *
  * `widenms' is the writewiden point (ninehook, whose set is this
  * library's own and is documented in lib/shoal.h), inert unless a T1
@@ -662,7 +667,7 @@ nineput(Nine *c, Fcall *t, char *buf, int nbuf, vlong deadline)
 	if(widen > 0)
 		sleep(widen);
 	qlock(&c->lk);
-	if(c->wseq == seq)		/* the mark is still this write's */
+	if(c->wseq == seq)	/* defence: the clear is inside wlk, so it is */
 		c->writing = 0;
 	if(ok)
 		rwakeup(&c->rdrz);	/* now the peer owes a reply */
