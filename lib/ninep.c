@@ -1059,12 +1059,20 @@ ninehook(Nine *c, char *name, uvlong n)
 	}
 }
 
+/*
+ * §2's Tattach.  It names two fids where there is an auth fid, and
+ * §14(51) holds ANY fid a request names, so both are busy for the
+ * exchange: an afid an attach is using is not one for a second
+ * request to be naming meanwhile.
+ */
 int
 nineattach(Nine *c, ulong fid, ulong afid, char *uname, char *aname, int ms,
 	Ninerep *r)
 {
+	ulong w[Nfidmax];
 	uchar *m;
 	Fcall t, f;
+	int nw;
 
 	memset(&t, 0, sizeof t);
 	t.type = Tattach;
@@ -1072,7 +1080,10 @@ nineattach(Nine *c, ulong fid, ulong afid, char *uname, char *aname, int ms,
 	t.afid = afid;
 	t.uname = uname;
 	t.aname = aname;
-	if(ninerpc(c, &t, &fid, 1, ms, r, &f, &m) != Nineok)
+	w[0] = fid;
+	w[1] = afid;
+	nw = afid == NOFID || afid == fid ? 1 : 2;
+	if(ninerpc(c, &t, w, nw, ms, r, &f, &m) != Nineok)
 		return r->out;
 	r->qid = f.qid;
 	free(m);
