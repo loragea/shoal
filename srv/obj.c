@@ -696,13 +696,28 @@ stagepointarm(Srvctx *c, Sstage *s, Stage *g)
 	stagearm(c, s, g, 0);
 }
 
+/*
+ * Give a stage back, carrying %r across the give-back as createdrop
+ * carries it across its own.  The caller that has just had an engine
+ * call fail gives the stage back BEFORE it reads what the call left,
+ * and stagediscard is an engine call of its own: without this the
+ * string answered to the client could be the discard's, on an
+ * operation that had already failed for another reason.  Nothing may
+ * stand between a failing call and the rerrstr that reads what it left
+ * (srvmetatext), and this is how the cleanup that must stand there
+ * stands there harmlessly.
+ */
 static void
 stagedone(Sfid *f, Sstage *s)
 {
+	char err[ERRMAX];
 	Sstage *t;
 
-	if((t = stagetake(f, s)) != nil)
-		stagefree(t->ctx, t);
+	if((t = stagetake(f, s)) == nil)
+		return;
+	rerrstr(err, sizeof err);
+	stagefree(t->ctx, t);
+	errstr(err, sizeof err);
 }
 
 /*
