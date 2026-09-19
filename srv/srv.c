@@ -454,10 +454,10 @@ jobwait(Srvctx *c)
  * The same clearing is what frees a pass parked at `jobhold' before
  * jobwait reaches it, which matters more there: that wait is unbounded
  * by design, because §9 forbids closing the store while a pass is
- * still inside the engine (srv.h).  The cell point goes with them: its cells are the file table's, which
- * is the program's and not this context's, so a context that ends
- * without clearing them would leave them to the next server started in
- * the same program.
+ * still inside the engine (srv.h).  The cell point goes with them:
+ * its cells are the file table's, which is the program's and not this
+ * context's, so a context that ends without clearing them would leave
+ * them to the next server started in the same program.
  *
  * The fids outlive this, but what they are holding may not: a fid open
  * when the connection dropped can be holding a stage, and §9 allows
