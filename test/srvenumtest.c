@@ -92,7 +92,7 @@ enum
 	 * threadmain.  Every check this file makes is unconditional once
 	 * its case is entered, so the number is fixed.
 	 */
-	Nchecks	= 291,
+	Nchecks	= 292,
 
 	/* fids the cases use */
 	Froot	= 1,
@@ -2587,9 +2587,12 @@ treclaimwait(void)
 	Store *st;
 	Dev *d;
 	Cl cl;
+	vlong t0;
+	uvlong slice;
 	int i;
 
 	clstage = "reclaimwait";
+	slice = 3000;
 	m = mkmapd(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid, 0);
 	d = newdisk();
 	freedseen = 0;
@@ -2616,7 +2619,7 @@ treclaimwait(void)
 	istrue("the timer is still up with the pass over",
 		srvreclaimlive(ctx) != 0);
 	srvreclaimms(ctx, 0);		/* no tick inside the long slice */
-	srvreclaimslicems(ctx, 3000);
+	srvreclaimslicems(ctx, slice);
 	/*
 	 * Out of the old half-second slice and into a new long one.
 	 * Three of the server's own slices and not one, for tscrubwait's
@@ -2626,7 +2629,21 @@ treclaimwait(void)
 	 */
 	sleep(1500);
 Out:
+	/*
+	 * The other half of what the wait is worth, which is tscrubwait's
+	 * assertion for this timer: the shutdown waits for the proc, so
+	 * it takes as long as the proc has left of its slice — and that
+	 * is bounded by the slice, not by the PERIOD the slice is being
+	 * slept in.  A timer that only ever read `stopping' at the end of
+	 * a wait would hold the shutdown for the whole of one, which is
+	 * half a day at this period's floor; this check is what would
+	 * catch it.  A second of slack over the slice covers everything
+	 * srvshutdown does besides the wait.
+	 */
+	t0 = nsec()/1000000;
 	clstop(&cl);			/* the loop ends; the shutdown runs */
+	istrue("the shutdown waited no longer than a slice of the timer's",
+		nsec()/1000000 - t0 < (vlong)slice + 1000);
 	eqv("the store was closed once", freedseen, 1);
 	eqv("the timer had ended when the store closed", freedlive, 0);
 	istrue("and it is not reading the context now either",
