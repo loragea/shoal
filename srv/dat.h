@@ -129,16 +129,20 @@ enum
  * the loop, which is what the fixed status files want), the read cell
  * for a read.  Opting in is expected of a row whose render takes an
  * engine snapshot or a lock the engine holds; /status has not, and is
- * still rendered on the service loop although it calls storestat and
- * dirtycount, which take the engine's state lock.  It stays there
- * while it is the only caller and the lock is uncontended; the row
- * moves to the offload path when that stops being true, and nothing
- * outside this table has to change when it does.  Such a cell pushes
- * and returns; what runs on the queue obeys the pool's rules entire —
- * it tests srvqcheck if it has work worth skipping, and it MUST leave
- * through srvqdone, which is where the flush is answered and step 7
- * performed.  srvopentext is the standard render-at-open body for a
- * row that wants it on a queue.
+ * still rendered on the service loop although it takes three locks in
+ * the course of one render: the engine's state lock, for storestat
+ * and dirtycount; `cntlk', for srvdiverged; and `joblk', for
+ * srvscrubnextms.  They are taken one after another and never one
+ * inside another, so the render cannot be part of a cycle, and each
+ * is held for a read of a word or two.  It stays on the loop while
+ * every one of the three is uncontended and this is the only caller;
+ * the row moves to the offload path when that stops being true, and
+ * nothing outside this table has to change when it does.  Such a cell
+ * pushes and returns; what runs on the queue obeys the pool's rules
+ * entire — it tests srvqcheck if it has work worth skipping, and it
+ * MUST leave through srvqdone, which is where the flush is answered
+ * and step 7 performed.  srvopentext is the standard render-at-open
+ * body for a row that wants it on a queue.
  *
  * Which cells belong with which body of work.  The /obj directory
  * row's open and read cells — and the aux a fid of that row carries

@@ -411,21 +411,39 @@ int	srvscrublive(Srvctx*);
  *		entire.
  *	tickhold
  *		n != 0 holds a TIMER's own start of a pass — the reclaim
- *		timer's and the scrub timer's alike, since one point serves
- *		both and no case has both timers ticking — after it has
+ *		timer's and the scrub timer's alike — after it has
  *		decided to start one and before the pass's proc
  *		exists.  That window is where a `reclaim start' written on
  *		the service loop meets a tick in flight, and it is too
  *		narrow to write into without a hold.  Only the timer's call
  *		parks here, never a verb's: a verb's call IS the loop, and
- *		a loop parked answers nothing else either.  The proc it
- *		parks does hold a job — the admission has counted and
- *		linked the pass before the timer reaches this point, so
- *		/jobs lists it while it is parked — but it carries none of
- *		jobhold's hazard, because a tick that reaches the point
- *		was admitted before `stopping' was set: jobadmit reads
- *		that flag under the same joblk hold the shutdown sets it
- *		in, so no shutdown can have begun behind the parked tick.
+ *		a loop parked answers nothing else either.
+ *
+ *		One point serves both timers, so a case that parks a tick
+ *		MUST have only one of the two ticking.  Nothing enforces
+ *		it and nothing could tell a case otherwise: the hold
+ *		counts no parks (qhold is called with a nil counter,
+ *		queue.c), so a second tick parked here is invisible, and
+ *		the one srvhook(...,0) that releases the tick the case
+ *		meant releases the other with it.  Two timers park only if
+ *		a case shortens both periods; the defaults are days and
+ *		half a day apart, and a case shortens the one it is about.
+ *
+ *		The proc it parks does hold a job — the admission has
+ *		counted and linked the pass before the timer reaches this
+ *		point, so /jobs lists it while it is parked — but it
+ *		carries none of jobhold's hazard, and not because a
+ *		shutdown cannot have begun behind it: one can, the hold
+ *		being taken off the service loop with nothing to stop the
+ *		loop ending behind it.  What makes it safe is the two ends
+ *		the shutdown holds.  srvholdclear (srv.c) releases this
+ *		point with the rest before any of the waits, so the parked
+ *		tick is let go rather than waited for; and the job the
+ *		admission counted is one jobwait sees, so the pass it then
+ *		launches is waited for like any other.  A tick that has
+ *		NOT reached the admission gets nothing at all: jobadmit
+ *		reads `stopping' under the same joblk hold the shutdown
+ *		sets it in and refuses.
  *	fullhold
  *		n != 0 holds an op=full chunk on a /repl fid between the
  *		stage it continued or opened and the engine write through
