@@ -6362,7 +6362,19 @@ the 9P client's (§12), which nothing in this build dials with.
     Every local string carries the prefix `ninep: `, which shares no
     prefix with §2.6's set or with the server's `shoalsrv: `
     (§14(29)), so the marking is visible to a caller that relays one
-    rather than merely intended. A protocol violation kills the
+    rather than merely intended.
+
+    **A short `Rwalk` is one of those outcomes.** 9P answers a walk
+    that failed partway with an `Rwalk` carrying fewer qids than there
+    were names, and leaves `newfid` uncreated. That is not `Nineok`:
+    there is no `newfid` to clunk and no full walk to take
+    `Ninerep.qid` from, and a caller that read `qid` would get the
+    last qid WALKED rather than the one it asked for. Nor is it
+    `Nineerr`, which is §2.6's string verbatim and nothing was refused
+    in those words — nothing was sent back as an error at all. It is
+    `Ninelocal`, with a string naming how many of the names the walk
+    got; `Ninerep.nwqid` and `Ninerep.wqid` carry the partial result
+    for a caller that wants it. A protocol violation kills the
     connection as transport death does, and stays distinguishable
     from it: a peer that hangs up is one to dial again, and a peer
     that answers on a tag nobody sent is not.
@@ -6429,9 +6441,13 @@ the 9P client's (§12), which nothing in this build dials with.
     enforced is here. And the rest of 9P has no use for the freedom:
     a second `Tread` on a fid whose position the first is moving, or
     a `Tclunk` beside a request naming the fid, is a caller bug in
-    every case this build has. A fid a timed-out exchange abandoned
-    counts as busy until its `Rflush` (§14(49)), because the peer may
-    still be working on it. The refusal is local and is NOT §2.6's
+    every case this build has. A `Twalk` holds BOTH of the fids it
+    names for the exchange, the one it walks from and the `newfid` it
+    walks to, so that two concurrent walks cannot target one `newfid`
+    — the second is refused here rather than racing for a fid the
+    server would give to one of them. A fid a timed-out exchange
+    abandoned counts as busy until its `Rflush` (§14(49)), because the
+    peer may still be working on it. The refusal is local and is NOT §2.6's
     `bad ctl`: nothing was sent, so no receiver refused anything.
 
 ## 15. Alternatives considered

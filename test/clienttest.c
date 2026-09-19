@@ -598,7 +598,7 @@ cmsize(void)
 static void
 cexchanges(void)
 {
-	char buf[8192], sbuf[512];
+	char buf[8192], sbuf[512], *sw[2];
 	uchar st[512];
 	Ninerep r;
 	Inst in;
@@ -663,6 +663,30 @@ cexchanges(void)
 	nineflush(c, 31337, Tms, &r);
 	eqv("a Tflush naming a tag nobody sent is answered", r.out, Nineok);
 
+	/*
+	 * A walk that fails partway: 9P answers an Rwalk with fewer qids
+	 * than names and leaves newfid uncreated, so there is nothing to
+	 * clunk and no full walk to take a qid from.  It is neither
+	 * Nineok nor §2.6's Nineerr — nothing was refused in those words
+	 * — and the qids that did come back are the caller's to read.
+	 */
+	sw[0] = "obj";
+	sw[1] = "nosuchthing";
+	memset(&r, 0, sizeof r);
+	ninewalk(c, Froot, Fc, sw, 2, Tms, &r);
+	eqv("a walk that got only some of its names is not ok", r.out,
+		Ninelocal);
+	eqs("... and says how far it got", r.err,
+		"ninep: a walk of 2 names got 1");
+	eqv("... with the partial result left for the caller", r.nwqid, 1);
+	eqv("... and no qid, which is a full walk's alone", r.qid.type, 0);
+	eqv("no tag is held by it", nineheld(c), 0);
+	/* nothing was created under the newfid, so the fid is still free */
+	if(walk1(c, Froot, Fc, "status", &r) == Nineok)
+		eqv("clunk", nineclunk(c, Fc, Tms, &r), Nineok);
+	else
+		fail("%s: the newfid after a short walk: %s", stage, r.err);
+
 	eqv("no tag is left held", nineheld(c), 0);
 	eqv("and nothing arrived late", ninelate(c), 0);
 	closecl(c);
@@ -692,6 +716,7 @@ busyproc(void*)
 static void
 cfidbusy(void)
 {
+	char *w[1];
 	Ninerep r;
 	Inst in;
 	Nine *c;
@@ -724,11 +749,28 @@ cfidbusy(void)
 		"ninep: fid 2 already has a request outstanding");
 	eqv("and nothing of it reached the peer", pooldepth(in.ctx), 1);
 
+	/*
+	 * A walk holds BOTH of its fids, so a walk ONTO the busy fid is
+	 * refused too: the newfid a walk targets is as much in the
+	 * exchange as the fid it walks from (§14(51)).
+	 */
+	w[0] = "status";
+	ninewalk(c, Froot, Fa, w, 1, Tms, &r);
+	eqv("a walk onto a busy newfid is refused", r.out, Ninebusy);
+	eqs("... naming that fid and not the one walked from", r.err,
+		"ninep: fid 2 already has a request outstanding");
+	eqv("and nothing of it reached the peer either", pooldepth(in.ctx), 1);
+
 	/* the rule is per fid: another fid is served while that one waits */
 	if(openpath(c, Froot, Fb, "status", OREAD, &r) == Nineok)
 		eqv("clunk", nineclunk(c, Fb, Tms, &r), Nineok);
 	else
 		fail("%s: another fid while one is busy: %s", stage, r.err);
+	if(walk1(c, Froot, Fc, "status", &r) == Nineok)
+		eqv("... and so is a walk onto one", nineclunk(c, Fc, Tms, &r),
+			Nineok);
+	else
+		fail("%s: a walk onto a free newfid: %s", stage, r.err);
 
 	srvhook(in.ctx, "mapopen", 0);
 	for(i = 0; i*25 < Twaitms && !busydone; i++)

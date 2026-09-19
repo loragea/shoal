@@ -1942,7 +1942,9 @@ int	maprefresh(Adopt*, Fence*, Cmap*, vlong now);
  *
  * **One outstanding request per fid** (layer-a §5.6, §14(51)): a
  * second request on a fid that has one outstanding is refused
- * Ninebusy before anything is written.
+ * Ninebusy before anything is written.  A Twalk holds BOTH of the
+ * fids it names, the one it walks from and the newfid it walks to,
+ * so two walks cannot target one newfid at once.
  *
  * **msize.**  nineopen proposes Ninecfg.msize, and ninemsize reports
  * what was negotiated.  layer-a §5.5's floor is NOT enforced here:
@@ -2019,6 +2021,11 @@ struct Ninecfg
  * and the last qid of a full Rwalk; `count' is an Rread's or Rwrite's
  * byte count and an Rstat's message length; `tag' is the tag the
  * exchange used, which is what nineflush names.
+ *
+ * A walk that got only some of its names is Ninelocal and NOT Nineok
+ * — 9P leaves newfid uncreated, so there is nothing to clunk and no
+ * full walk to take a qid from — but `nwqid' and `wqid' carry the
+ * partial result for a caller that wants it, and `qid' is untouched.
  */
 struct Ninerep
 {

@@ -113,6 +113,7 @@ enum
 	Nflushing,	/* a Tflush naming `old', which nobody waits for */
 
 	Nminmsize	= 512 + IOHDRSZ,	/* the smallest this will work at */
+	Nfidmax		= 2,			/* fids one request names: Twalk's two */
 
 	/*
 	 * The bound on the Tflush write a timed-out exchange leaves
@@ -143,8 +144,8 @@ struct Nreq
 	int	state;
 	int	out;		/* Nineok … Ninelocal, once Ndone */
 	int	owed;		/* the peer still owes a reply for this tag */
-	int	hasfid;
-	ulong	fid;
+	int	nfid;		/* fids this request holds busy */
+	ulong	fid[Nfidmax];
 	ushort	tag;
 	ushort	old;		/* Nflushing: the slot its Tflush names */
 	vlong	deadline;	/* ms on the monotonic clock */
@@ -309,17 +310,29 @@ ninedied(Nine *c, int out, char *err)
 	rwakeupall(&c->rdrz);
 }
 
-/* is a request outstanding on this fid?  Called under the lock. */
+/*
+ * Is a request outstanding on any of these fids?  A Twalk names two —
+ * the fid it walks from and the newfid it walks to — and both are
+ * held for the exchange, so that two concurrent walks cannot target
+ * one newfid (§14(51)).  Answers 1 with the offending fid in *busy.
+ * Called under the lock.
+ */
 static int
-ninefidbusy(Nine *c, ulong fid)
+ninefidbusy(Nine *c, ulong *fid, int nfid, ulong *busy)
 {
 	Nreq *q;
-	int i;
+	int i, j, k;
 
 	for(i = 0; i < c->nslot; i++){
 		q = &c->req[i];
-		if(q->state != Nfree && q->hasfid && q->fid == fid)
-			return 1;
+		if(q->state == Nfree)
+			continue;
+		for(j = 0; j < q->nfid; j++)
+			for(k = 0; k < nfid; k++)
+				if(q->fid[j] == fid[k]){
+					*busy = fid[k];
+					return 1;
+				}
 	}
 	return 0;
 }
@@ -409,7 +422,7 @@ ninegot(Nine *c, int n)
 		free(f->m);
 		f->m = nil;
 		f->state = Nfree;
-		f->hasfid = 0;
+		f->nfid = 0;
 		q->owed = 0;
 		c->nexpect--;
 		q->state = Nfree;
@@ -650,13 +663,14 @@ nineflushtag(Nine *c, int i)
  * its caller asked for and frees it.
  */
 static int
-ninerpc(Nine *c, Fcall *t, ulong fid, int hasfid, int ms, Ninerep *r,
+ninerpc(Nine *c, Fcall *t, ulong *fid, int nfid, int ms, Ninerep *r,
 	Fcall *f, uchar **mp)
 {
 	char buf[ERRMAX];
+	ulong busy;
 	Nreq *q;
 	uchar *m;
-	int i, out, nm;
+	int i, j, out, nm;
 
 	memset(r, 0, sizeof *r);
 	*mp = nil;
@@ -668,9 +682,9 @@ ninerpc(Nine *c, Fcall *t, ulong fid, int hasfid, int ms, Ninerep *r,
 		return out;
 	}
 	c->ref++;			/* this exchange holds the handle up */
-	if(hasfid && ninefidbusy(c, fid)){
+	if(nfid > 0 && ninefidbusy(c, fid, nfid, &busy)){
 		out = nineout(r, Ninebusy, "ninep: fid %lud already has a"
-			" request outstanding", fid);
+			" request outstanding", busy);
 		goto Drop;
 	}
 	if((i = ninetake(c, t->type == Tversion)) < 0){
@@ -678,8 +692,9 @@ ninerpc(Nine *c, Fcall *t, ulong fid, int hasfid, int ms, Ninerep *r,
 		goto Drop;
 	}
 	q = &c->req[i];
-	q->hasfid = hasfid;
-	q->fid = fid;
+	q->nfid = nfid;
+	for(j = 0; j < nfid; j++)
+		q->fid[j] = fid[j];
 	q->deadline = nowms() + ms;
 	q->out = Nineok;
 	q->err[0] = 0;
@@ -706,7 +721,7 @@ ninerpc(Nine *c, Fcall *t, ulong fid, int hasfid, int ms, Ninerep *r,
 				c->nexpect--;
 			}
 			q->state = Nfree;
-			q->hasfid = 0;
+			q->nfid = 0;
 			out = nineout(r, Ninelocal, "%s", buf);
 			goto Drop;
 		}
@@ -731,7 +746,7 @@ ninerpc(Nine *c, Fcall *t, ulong fid, int hasfid, int ms, Ninerep *r,
 			c->req[i + c->nreq].state = Nflushing;
 			c->req[i + c->nreq].old = i;
 			c->req[i + c->nreq].owed = 1;
-			c->req[i + c->nreq].hasfid = 0;
+			c->req[i + c->nreq].nfid = 0;
 			c->nexpect++;
 		}else
 			ninedied(c, Ninedead,
@@ -745,7 +760,7 @@ ninerpc(Nine *c, Fcall *t, ulong fid, int hasfid, int ms, Ninerep *r,
 		return out;
 	}
 	q->state = Nfree;
-	q->hasfid = 0;
+	q->nfid = 0;
 	qunlock(&c->lk);
 
 	if(out != Nineok){
@@ -886,7 +901,7 @@ nineopen(Ninecfg *cfg)
 	t.type = Tversion;
 	t.msize = c->bufsz;
 	t.version = "9P2000";
-	if(ninerpc(c, &t, 0, 0, ms, &r, &f, &m) != Nineok){
+	if(ninerpc(c, &t, nil, 0, ms, &r, &f, &m) != Nineok){
 		nineclose(c);
 		werrstr("%s", r.err);
 		return nil;
@@ -1008,20 +1023,35 @@ nineattach(Nine *c, ulong fid, ulong afid, char *uname, char *aname, int ms,
 	t.afid = afid;
 	t.uname = uname;
 	t.aname = aname;
-	if(ninerpc(c, &t, fid, 1, ms, r, &f, &m) != Nineok)
+	if(ninerpc(c, &t, &fid, 1, ms, r, &f, &m) != Nineok)
 		return r->out;
 	r->qid = f.qid;
 	free(m);
 	return Nineok;
 }
 
+/*
+ * §2's Twalk.  Both fids are held busy for the exchange — the one
+ * walked from and the newfid walked to — so that two walks cannot
+ * target one newfid at once (§14(51)).
+ *
+ * A SHORT walk, which 9P answers with an Rwalk carrying fewer qids
+ * than there were names, is not Nineok: nothing was created under
+ * newfid, so there is nothing for the caller to clunk, and r->qid is
+ * promised to be the last qid of a FULL walk.  Nor is it Nineerr,
+ * which is §2.6's own string and nothing was refused in those words.
+ * It is Ninelocal, naming how far the walk got, with the qids that
+ * did come back in r->wqid and their number in r->nwqid for a caller
+ * that wants the partial result.
+ */
 int
 ninewalk(Nine *c, ulong fid, ulong newfid, char **name, int nname, int ms,
 	Ninerep *r)
 {
+	ulong w[Nfidmax];
 	uchar *m;
 	Fcall t, f;
-	int i;
+	int i, nw;
 
 	if(nname < 0 || nname > MAXWELEM){
 		memset(r, 0, sizeof *r);
@@ -1035,14 +1065,20 @@ ninewalk(Nine *c, ulong fid, ulong newfid, char **name, int nname, int ms,
 	t.nwname = nname;
 	for(i = 0; i < nname; i++)
 		t.wname[i] = name[i];
-	if(ninerpc(c, &t, fid, 1, ms, r, &f, &m) != Nineok)
+	w[0] = fid;
+	w[1] = newfid;
+	nw = newfid == fid ? 1 : 2;	/* a walk in place names one fid */
+	if(ninerpc(c, &t, w, nw, ms, r, &f, &m) != Nineok)
 		return r->out;
 	r->nwqid = f.nwqid;
 	for(i = 0; i < f.nwqid && i < MAXWELEM; i++)
 		r->wqid[i] = f.wqid[i];
+	free(m);
+	if((int)f.nwqid < nname)
+		return nineout(r, Ninelocal, "ninep: a walk of %d names got %d",
+			nname, f.nwqid);
 	if(f.nwqid > 0)
 		r->qid = f.wqid[f.nwqid-1];
-	free(m);
 	return Nineok;
 }
 
@@ -1060,7 +1096,7 @@ nineopenfid(Nine *c, ulong fid, int mode, int ms, Ninerep *r)
 	t.type = Topen;
 	t.fid = fid;
 	t.mode = mode;
-	if(ninerpc(c, &t, fid, 1, ms, r, &f, &m) != Nineok)
+	if(ninerpc(c, &t, &fid, 1, ms, r, &f, &m) != Nineok)
 		return r->out;
 	r->qid = f.qid;
 	r->iounit = f.iounit;
@@ -1081,7 +1117,7 @@ ninecreate(Nine *c, ulong fid, char *name, ulong perm, int mode, int ms,
 	t.name = name;
 	t.perm = perm;
 	t.mode = mode;
-	if(ninerpc(c, &t, fid, 1, ms, r, &f, &m) != Nineok)
+	if(ninerpc(c, &t, &fid, 1, ms, r, &f, &m) != Nineok)
 		return r->out;
 	r->qid = f.qid;
 	r->iounit = f.iounit;
@@ -1133,7 +1169,7 @@ nineread(Nine *c, ulong fid, vlong off, void *a, long n, int ms, Ninerep *r)
 	t.fid = fid;
 	t.offset = off;
 	t.count = n;
-	if(ninerpc(c, &t, fid, 1, ms, r, &f, &m) != Nineok)
+	if(ninerpc(c, &t, &fid, 1, ms, r, &f, &m) != Nineok)
 		return r->out;
 	if(f.count > (ulong)n){
 		free(m);
@@ -1163,7 +1199,7 @@ ninewrite(Nine *c, ulong fid, vlong off, void *a, long n, int ms, Ninerep *r)
 	t.offset = off;
 	t.count = n;
 	t.data = a;
-	if(ninerpc(c, &t, fid, 1, ms, r, &f, &m) != Nineok)
+	if(ninerpc(c, &t, &fid, 1, ms, r, &f, &m) != Nineok)
 		return r->out;
 	if(f.count > (ulong)n){
 		free(m);
@@ -1183,7 +1219,7 @@ nineclunk(Nine *c, ulong fid, int ms, Ninerep *r)
 	memset(&t, 0, sizeof t);
 	t.type = Tclunk;
 	t.fid = fid;
-	if(ninerpc(c, &t, fid, 1, ms, r, &f, &m) != Nineok)
+	if(ninerpc(c, &t, &fid, 1, ms, r, &f, &m) != Nineok)
 		return r->out;
 	free(m);
 	return Nineok;
@@ -1198,7 +1234,7 @@ nineremove(Nine *c, ulong fid, int ms, Ninerep *r)
 	memset(&t, 0, sizeof t);
 	t.type = Tremove;
 	t.fid = fid;
-	if(ninerpc(c, &t, fid, 1, ms, r, &f, &m) != Nineok)
+	if(ninerpc(c, &t, &fid, 1, ms, r, &f, &m) != Nineok)
 		return r->out;
 	free(m);
 	return Nineok;
@@ -1214,7 +1250,7 @@ ninestat(Nine *c, ulong fid, uchar *a, int n, int ms, Ninerep *r)
 	memset(&t, 0, sizeof t);
 	t.type = Tstat;
 	t.fid = fid;
-	if(ninerpc(c, &t, fid, 1, ms, r, &f, &m) != Nineok)
+	if(ninerpc(c, &t, &fid, 1, ms, r, &f, &m) != Nineok)
 		return r->out;
 	if(n < 0 || f.nstat > (uint)n){
 		free(m);
@@ -1242,7 +1278,7 @@ nineflush(Nine *c, ushort oldtag, int ms, Ninerep *r)
 	memset(&t, 0, sizeof t);
 	t.type = Tflush;
 	t.oldtag = oldtag;
-	if(ninerpc(c, &t, 0, 0, ms, r, &f, &m) != Nineok)
+	if(ninerpc(c, &t, nil, 0, ms, r, &f, &m) != Nineok)
 		return r->out;
 	free(m);
 	return Nineok;
