@@ -155,8 +155,13 @@ srvqended(Qreq *qr)
 	 * The §13 point that widens the gap this count opens: the count is
 	 * taken from lib9p's closereq, inside respond and before respond's
 	 * own trailing release of the Srv, so the drain can converge and
-	 * the service loop end while this proc is still inside lib9p.
-	 * Nothing of the context is touched while it waits.
+	 * the service loop end while this proc is still inside lib9p.  The
+	 * store may therefore be closed under this wait, and the wait goes
+	 * nowhere near it: the only thing of the context it touches is the
+	 * point below — `endhold' under `holdlk' — which the shutdown does
+	 * not free.  Nor can the context itself go while it waits, because
+	 * the release the wait sits in front of is the one srvfree's own
+	 * wait is for (srv.c).
 	 *
 	 * The point is re-read as it waits, so clearing it ends the wait
 	 * as well: a test that has to say exactly when lib9p is let go of
