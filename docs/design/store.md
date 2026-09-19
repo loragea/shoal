@@ -3825,17 +3825,11 @@ answers a pair of fds and is the network's `Dev` vtable (§0): a real
 dial answers the same fd twice, a T1 program answers one end of each
 of two pipes, and nothing in the library knows the difference.
 `spawn` is §7's, so the procs the client makes are ordinary procs of
-the program under plain libc and `proccreate`'s under the server. It
-**MUST** make procs of the program's own flavour, and a program
-**MUST NOT** mix the two on one connection: libthread routes libc's
-`qlock` and `rsleep` through a rendezvous of its own
-(`/sys/src/libthread/main.c:28`, `_qlockinit(_threadrendezvous)`) and
-resolves the current thread through a `privalloc`(2) slot (`:27`),
-which `rfork(RFMEM)` shares between the procs that inherit it — so a
-bare-`rfork` proc contending on a client `QLock` inside a libthread
-program corrupts that state rather than merely blocking oddly. This
-is the client's rule and not just the engine's, because a connection
-is shared by more procs than a store is.
+the program under plain libc and `proccreate`'s under the server. The
+rule it MUST follow — procs of the program's own flavour, and never
+the two flavours mixed on one connection — is normative and is
+§14(50)'s, with what libthread does to a bare-`rfork` proc's `QLock`
+as the reason.
 `hangup` is the other half of `connect`: what `connect` opened, only
 its owner can break, and breaking it is the only way to recall a proc
 parked in `read(2)` or `write(2)` when notes are ruled out (§14(50)).
@@ -6450,6 +6444,26 @@ the 9P client's (§12), which nothing in this build dials with.
     leaves the reader parked where it was and a close of an idle
     connection reclaims everything at once; that much holds with no
     callback at all.
+
+    **`spawn`'s own contract, and this part is normative.** The two
+    procs are made through §7's callback, and what the callback
+    answers is not free: `spawn` **MUST** make procs of the calling
+    program's own flavour — `proccreate` under libthread,
+    `rfork(RFPROC|RFMEM)` under plain libc — and a program **MUST
+    NOT** mix the two on one connection. libthread routes libc's
+    `qlock` and `rsleep` through a rendezvous of its own
+    (`/sys/src/libthread/main.c:28`, `_qlockinit(_threadrendezvous)`)
+    and resolves the current thread through a `privalloc`(2) slot
+    (`:27`), which `rfork(RFMEM)` shares between the procs that
+    inherit it, so a bare-`rfork` proc contending on a client
+    `QLock` inside a libthread program corrupts that state rather
+    than merely blocking oddly. That is the rule for any
+    implementation of this client that coordinates its procs with
+    libc's `QLock` and `Rendez`, and a caller keeps it whether or not
+    the procs are two — this client's being two, and being a reader
+    and a timer, is the implementation policy part. The rule is the
+    client's and not just the engine's (§7) because a connection is
+    shared by more procs than a store is.
 
 51. **One outstanding request per fid, widened from `/rpc` to every
     fid (layer-a §5.6).** §5.6 makes it a rule of one channel: a

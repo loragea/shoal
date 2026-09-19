@@ -1905,9 +1905,10 @@ int	maprefresh(Adopt*, Fence*, Cmap*, vlong now);
  *
  * **Procs.**  Two per connection — a reader and a timer — made
  * through `spawn', exactly as the store engine makes its own (§7).
- * `spawn' MUST create procs of the PROGRAM'S OWN flavour —
- * proccreate under libthread, rfork(RFPROC|RFMEM) under plain libc —
- * and a program MUST NOT mix the two on one connection.  The QLock
+ * The contract below is normative (§14(50)): `spawn' MUST create
+ * procs of the PROGRAM'S OWN flavour — proccreate under libthread,
+ * rfork(RFPROC|RFMEM) under plain libc — and a program MUST NOT mix
+ * the two on one connection.  The QLock
  * and the Rendez below are libc's, but libthread routes both through
  * a rendezvous of its own and resolves the current thread through a
  * privalloc(2) slot, which rfork(RFMEM) SHARES between the procs that
