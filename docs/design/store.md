@@ -6520,7 +6520,10 @@ is not built; each says which.
       built. In this build that is every verb of §8.3 and the
       `/map.next` write, and nothing else.
     - `shoalmon: no such file` — a name in `/` or in `/maps` that
-      this tree does not have (§14(55)).
+      this tree does not have (§14(55)), and any element named on a
+      fid that is not a directory, `..` included: lib9p's
+      `Ewalknodir` covers only the fid a `Twalk` starts from, so the
+      second element of `/ctl/..` is this server's to refuse.
     - `shoalmon: no such epoch` — a `/maps` element that is a u64 and
       names a map the ring no longer retains (§14(55)).
     - `shoalmon: no map` — a `/map` open on a store holding no map

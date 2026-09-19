@@ -222,6 +222,26 @@ opencell(Cl *c, ulong root, ulong fid, char *name, int mode, char *buf,
 	return "ok";
 }
 
+/*
+ * A multi-element walk from one fid: the number of qids it answered,
+ * or -1 for an Rerror.  A walk that resolved every element
+ * established the new fid, so it is clunked here and the caller's fid
+ * number is free whichever way the walk went.
+ */
+static int
+walkn(Cl *c, ulong fid, ulong newfid, int n, char **names)
+{
+	Fcall r;
+	int k;
+
+	if(clwalk(c, fid, newfid, n, names, &r) != Rwalk)
+		return -1;
+	k = r.nwqid;
+	if(k == n)
+		clclunk(c, newfid, &r);
+	return k;
+}
+
 /* the whole of one file, opened by name from the root; -1 on a refusal */
 static long
 slurpname(Cl *c, ulong root, ulong fid, char *name, char *buf, long max,
@@ -520,7 +540,7 @@ ttree(void)
 		{"health",	QTFILE},
 		{"status",	QTFILE},
 	};
-	char buf[8192], err[ERRMAX], what[128], sbuf[512], *nm[16];
+	char buf[8192], err[ERRMAX], what[128], sbuf[512], *nm[16], *w[3];
 	Monctx *ctx;
 	Dev *d;
 	Fcall r;
@@ -569,6 +589,43 @@ ttree(void)
 	clwalk1(&cl, Froot, Ff, "nosuch", &r);
 	eqs("a name the tree does not have", clerr(&r),
 		"shoalmon: no such file");
+
+	/*
+	 * `..' is a walk out of a directory and so needs one.  lib9p's
+	 * Ewalknodir guards only the fid a walk STARTS from, so an
+	 * element that lands on a file and then names `..' is this
+	 * server's to refuse, and it answers the `no such file' every
+	 * other element of a non-directory gets (srv/tree.c's rule).  A
+	 * walk refused at element k answers k qids and establishes no
+	 * fid, which is what these three assert.
+	 */
+	w[0] = "ctl";
+	w[1] = "..";
+	eqv("/ctl/.. does not walk out of /ctl", walkn(&cl, Froot, Ff, 2, w),
+		1);
+	w[0] = "maps";
+	w[1] = "12";
+	w[2] = "..";
+	eqv("/maps/12/.. does not walk out of /maps/12",
+		walkn(&cl, Froot, Ff, 3, w), 2);
+	w[0] = "status";
+	w[1] = "..";
+	w[2] = "map";
+	eqv("/status/../map does not walk out of /status",
+		walkn(&cl, Froot, Ff, 3, w), 1);
+
+	/* out of a directory it still walks */
+	w[0] = "maps";
+	w[1] = "..";
+	clwalk(&cl, Froot, Ff, 2, w, &r);
+	eqv("/maps/.. resolves", r.type == Rwalk ? r.nwqid : -1, 2);
+	if(r.type == Rwalk && r.nwqid == 2){
+		eqv("... onto a directory", r.wqid[1].type, QTDIR);
+		clclunk(&cl, Ff, &r);
+	}
+	w[0] = "..";
+	w[1] = "ctl";
+	eqv("/../ctl resolves", walkn(&cl, Froot, Ff, 2, w), 2);
 
 	/* the root itself: clone the attached fid and read it */
 	clwalk(&cl, Froot, Ff, 0, nil, &r);

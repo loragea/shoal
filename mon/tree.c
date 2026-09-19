@@ -407,6 +407,15 @@ mapread(Req *r)
 /*
  * One walk element.  f is a working copy of the fid's state; on
  * success it is advanced onto the named file.
+ *
+ * Every element, `..' included, needs a directory to walk out of.
+ * lib9p's own Ewalknodir covers only the fid a Twalk STARTS from, so
+ * an element that lands on a file and is followed by another is this
+ * server's to refuse — and `..' is such an element, not an exemption
+ * from the rule: without this /ctl/.. would answer the root and
+ * /maps/<epoch>/.. would answer /maps.  The refusal is the same
+ * `no such file' every other element of a non-directory gets, which
+ * is what srv/tree.c answers for the same case.
  */
 static char*
 walk1(Monctx *c, Mfid *f, char *name, Qid *q)
@@ -416,6 +425,8 @@ walk1(Monctx *c, Mfid *f, char *name, Qid *q)
 	uvlong epoch;
 	int i, ok;
 
+	if(!monfiles[f->file].isdir)
+		return Emonnofile;
 	if(strcmp(name, "..") == 0){
 		f->file = f->file == Qmapfile ? Qmaps : Qmroot;
 		f->epoch = 0;
