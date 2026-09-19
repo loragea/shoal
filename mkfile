@@ -1,7 +1,7 @@
 </$objtype/mkfile
 
 # lib must be built before anything that links against it.
-DIRS=lib srv cmd test
+DIRS=lib srv mon cmd test
 
 default:V:	all
 

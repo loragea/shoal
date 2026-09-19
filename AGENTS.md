@@ -36,7 +36,7 @@ the decisions it rests on.
 | `docs/target.md` | The ratified deliverable target: layers, semantics contract, milestones, design envelope. |
 | `docs/decisions.md` | Design decisions with rationale; each row marked normative vs implementation policy. |
 | `docs/design/layer-a.md` | The ratified Layer A contract: object model, storage-server 9P export, cluster map, placement, write/read path, epoch/fencing, heal, monitor. Wire truth lives here. |
-| `docs/design/store.md` | The per-instance local object store and the monitor's map store: on-disk format, write/read paths, recovery, space, concurrency and group commit, tooling, and the store's test plan. On-disk truth lives here. |
+| `docs/design/store.md` | The per-instance local object store, the monitor's map store and the monitor's deviations: on-disk format, write/read paths, recovery, space, concurrency and group commit, tooling, and the store's test plan. On-disk truth lives here. |
 | `docs/platform/9front-storage.md` | Verified 9front storage facts: file-server durability, the sd(3) raw path and flush behaviour, measured costs. |
 
 `docs/platform/` holds facts about the target platform rather than
@@ -49,46 +49,50 @@ shoal is written in the Plan 9 C dialect and built on 9front with
 `6c`/`6l` under `mk` (decisions.md D12). From the repo root:
 
 - `mk` — build `lib/libshoal.a$O`, then `srv/libshoalsrv.a$O`, then
-  every command in `cmd/`, then the T1 test programs in `test/`.
+  `mon/libshoalmon.a$O`, then every command in `cmd/`, then the T1
+  test programs in `test/`.
 - `mk test` — build everything, then run T1 (below).
 - `mk clean`, `mk nuke` — remove build products in every
   subdirectory.
 
 | Path | Holds |
 |---|---|
-| `mkfile` | Root. Iterates `lib srv cmd test` for `all`, `clean` and `nuke`, and runs T1 for `test`. |
+| `mkfile` | Root. Iterates `lib srv mon cmd test` for `all`, `clean` and `nuke`, and runs T1 for `test`. |
 | `lib/` | `libshoal.a$O`: code shared by servers, commands and tests. `lib/shoal.h` is its header; includers name it by relative path after `<u.h>`, `<libc.h>`, `<libsec.h>` and `<fcall.h>` — the last for the GBIT/PBIT macros every on-disk integer is packed with. `lib/store.h` is private to `lib/`: it holds the store engine's own structures, which are opaque to everything else. Built by `/sys/src/cmd/mklib`. libshoal depends on neither lib9p nor libthread and must not come to: the same engine runs under a plain-libc T1 program and under the libthread 9P server (`docs/design/store.md` §7). |
 | `srv/` | `libshoalsrv.a$O`: the storage instance's 9P service (`docs/design/layer-a.md` §2) — attach, the file tree, the `Reqqueue` pool, `Tflush`, the ctl framework, start-up and shutdown. `srv/srv.h` is its header, included after `<thread.h>`, `<9p.h>` and `lib/shoal.h`; `srv/dat.h` and `srv/fns.h` are private to `srv/`. It is a library for the same reason `lib/` is: a T1 test links libraries and execs nothing, and §2 is what T1 has to drive. Built by `/sys/src/cmd/mklib`. |
+| `mon/` | `libshoalmon.a$O`: the monitor's 9P service (`docs/design/layer-a.md` §8) — attach, the file tree, the status renders, §8.4's liveness evidence and the ctl framework. `mon/mon.h` is its header, included after `<thread.h>`, `<9p.h>` and `lib/shoal.h`; `mon/dat.h` and `mon/fns.h` are private to `mon/`. It is a library for the same reason `srv/` is, and it is independent of `srv/`: the two serve different trees with different role matrices and share no code, so the render-at-open helper exists in both under different names. Its durable state is `lib/mon.c`'s map slot store (`docs/design/store.md` §10). Built by `/sys/src/cmd/mklib`. |
 | `cmd/` | One directory per command, each built by `/sys/src/cmd/mkone` — so it produces `$O.out` and installs as `$TARG` in `/$objtype/bin`. `cmd/mkfile` lists them in `DIRS`. |
 | `test/` | T1 test programs. |
 
 Every mkfile starts with `</$objtype/mkfile`. A new command is a
 directory under `cmd/` with an `mkone` mkfile plus its name in
 `cmd/mkfile`'s `DIRS`; a new library source file is a name in
-`lib/mkfile`'s or `srv/mkfile`'s `OFILES`.
+`lib/mkfile`'s, `srv/mkfile`'s or `mon/mkfile`'s `OFILES`.
 
 ## Test tiers
 
 **T1 — unit.** `mk test` at the repo root. Runs on any single
 9front machine: no disks, no network, no second node, seconds to
 run. Each test is a C program in `test/` linking `libshoal`, and — if
-it drives the 9P surface — `libshoalsrv`, lib9p and libthread as
-well; it exits non-zero if any check failed and prints one
+it drives a 9P surface — `libshoalsrv` or `libshoalmon`, lib9p and
+libthread as well; it exits non-zero if any check failed and prints one
 `FAIL: <reason>` line per failed check to standard error. `mk test`
 fails on the first failing program. To add one: write `test/foo.c`
 and add `foo` to `TESTS` in `test/mkfile`. Known-answer vectors are
 computed outside this codebase, and the test source says how they
 were computed.
 
-A test that drives the 9P surface runs a whole storage instance
-inside itself: `test/srv9p.h` is an in-process 9P client that puts
-the server on one end of a pair of pipes and speaks raw 9P
+A test that drives a 9P surface runs a whole server inside itself:
+`test/srv9p.h` is an in-process 9P client that puts the storage
+instance on one end of a pair of pipes and speaks raw 9P
 (`convS2M`/`convM2S`) on the other, over the simulated disk. It is
 what lets a case pipeline tags, flush any tag, propose an `msize`
-below the attach floor and assert exact `Rerror` strings. Such a
-program is a libthread program — `threadmain`, its own
-`mainstacksize` — because the queue pool is `9pqueue`(2)'s, and it
-arms `srv9p.h`'s watchdog proc so that a wedged server fails the
+below the attach floor and assert exact `Rerror` strings.
+`test/mon9p.h` is the same client for the monitor, differing only in
+the context type it starts; the two are a deliberate copy, because
+each is tied to its library's own types. Such a program is a
+libthread program — `threadmain`, its own `mainstacksize` — and it
+arms the client's watchdog proc so that a wedged server fails the
 test instead of hanging `mk test`.
 
 T1 needs no partition because every device access in the store goes
