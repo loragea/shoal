@@ -697,9 +697,21 @@ monsrvstat(Req *r)
  * Nothing in §8.1 or §8.3 creates, removes or renames anything in this
  * tree — a map is published by a ctl verb — so the three exist to
  * answer, not to act.
+ *
+ * A nil cell here answers `permission denied' and not this server's
+ * `not built'.  `not built' is a promise that a later unit fills the
+ * cell in — which is true of every verb of §8.3 and of /map.next's
+ * write, and is what makes /map.next's write the one file cell in the
+ * tree that answers it (store.md §14(59)) — and no unit is going to
+ * build a create, a remove or a wstat for a tree of synthetic files.
+ * What the operator is being told is that the operation is not
+ * theirs, which is §2.5's convention and what the role gate above
+ * answers for every row outside the write column already.  A Twstat
+ * that changes the name is §2.6's `no rename' instead, because §2.6
+ * has a string for exactly that and a client is entitled to it.
  */
 static void
-wrop(Req *r, void (*cell)(Req*))
+wrop(Req *r, void (*cell)(Req*), char *none)
 {
 	Mfid *f;
 	Mfile *file;
@@ -714,25 +726,36 @@ wrop(Req *r, void (*cell)(Req*))
 		cell(r);
 		return;
 	}
-	respond(r, Emonnotbuilt);
+	respond(r, none);
 }
 
 void
 monsrvcreate(Req *r)
 {
-	wrop(r, nil);
+	wrop(r, nil, Emperm);
 }
 
 void
 monsrvremove(Req *r)
 {
-	wrop(r, nil);
+	wrop(r, nil, Emperm);
 }
 
+/*
+ * 9P's Twstat leaves a field the client does not want changed empty,
+ * so a name that is there at all is a rename.  The role gate still
+ * runs first: a row this role may not write is `permission denied'
+ * whatever the wstat asked for.
+ */
 void
 monsrvwstat(Req *r)
 {
-	wrop(r, nil);
+	char *e;
+
+	e = Emperm;
+	if(r->d.name != nil && *r->d.name != 0)
+		e = Emnorename;
+	wrop(r, nil, e);
 }
 
 /*

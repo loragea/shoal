@@ -727,6 +727,7 @@ tmatrix(void)
 	Dev *d;
 	Fcall r;
 	Cl cl;
+	Dir wd;
 	int i, j;
 
 	clstage = "role matrix";
@@ -769,13 +770,44 @@ tmatrix(void)
 		clclunk(&cl, Ff, &r);
 	}
 
-	/* a create, a remove and a wstat: nothing in this tree takes one */
+	/*
+	 * A remove and a wstat: nothing in §8.1 or §8.3 removes or
+	 * renames anything in this tree, so the two exist to answer and
+	 * not to act.  A row outside the role's write column is refused
+	 * there; a row inside it has no cell to reach and answers
+	 * `permission denied' as well, because `not built' would promise
+	 * a body that no unit is going to write.  A Twstat that changes
+	 * the name is §2.6's own `no rename' (store.md §14(59)).
+	 */
 	clwalk1(&cl, Froot3, Ff, "status", &r);
 	clremove(&cl, Ff, &r);
 	eqs("an admin removes /status", clerr(&r), "permission denied");
 	clwalk1(&cl, Froot3, Ff, "ctl", &r);
 	clremove(&cl, Ff, &r);
-	eqs("an admin removes /ctl", clerr(&r), "shoalmon: not built");
+	eqs("an admin removes /ctl", clerr(&r), "permission denied");
+
+	clwalk1(&cl, Froot3, Ff, "ctl", &r);
+	nulldir(&wd);
+	wd.name = "ctl2";
+	clwstat(&cl, Ff, &wd, &r);
+	eqs("an admin renames /ctl", clerr(&r), "no rename");
+	nulldir(&wd);
+	clwstat(&cl, Ff, &wd, &r);
+	eqs("an admin wstats /ctl without renaming it", clerr(&r),
+		"permission denied");
+	clclunk(&cl, Ff, &r);
+
+	clwalk1(&cl, Froot3, Ff, "status", &r);
+	nulldir(&wd);
+	wd.name = "status2";
+	clwstat(&cl, Ff, &wd, &r);
+	eqs("an admin renames /status", clerr(&r), "permission denied");
+	clclunk(&cl, Ff, &r);
+
+	/* and the one file cell that IS `not built': /map.next's write */
+	clwalk1(&cl, Froot3, Ff, "map.next", &r);
+	clremove(&cl, Ff, &r);
+	eqs("an admin removes /map.next", clerr(&r), "permission denied");
 
 	clstop(&cl);
 	monsrvfree(ctx);

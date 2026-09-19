@@ -6526,8 +6526,16 @@ is not built; each says which.
     after the role gate, never instead of it:
 
     - `shoalmon: not built` — a file or a ctl verb whose body is not
-      built. In this build that is every verb of §8.3 and the
-      `/map.next` write, and nothing else.
+      built, which is a promise that a later unit fills that cell in.
+      In this build that is every verb of §8.3 and the `/map.next`
+      write, and nothing else: `/map.next`'s write is the **only**
+      file cell in the tree that answers it. `Tcreate`, `Tremove` and
+      a `Twstat` that changes nothing answer `permission denied`
+      after the role gate — §2.5's convention, and honest, because
+      no unit is going to build a create, a remove or a rename for a
+      tree of synthetic files — and a `Twstat` that changes the name
+      answers §2.6's `no rename`, which is the string §2.6 has for
+      exactly that.
     - `shoalmon: no such file` — a name in `/` or in `/maps` that
       this tree does not have (§14(55)), and any element named on a
       fid that is not a directory, `..` included: lib9p's
