@@ -3820,12 +3820,15 @@ and **nothing in this build dials it**: §14(18)'s item stands, so the
 only program that opens a connection today is `test/clienttest.c`.
 What is built is the engine each of those callers needs first.
 
-The two callbacks are why it can be built before them. `connect`
+The callbacks are why it can be built before them. `connect`
 answers a pair of fds and is the network's `Dev` vtable (§0): a real
 dial answers the same fd twice, a T1 program answers one end of each
 of two pipes, and nothing in the library knows the difference.
 `spawn` is §7's, so the procs the client makes are ordinary procs of
 the program under plain libc and `proccreate`'s under the server.
+`hangup` is the other half of `connect`: what `connect` opened, only
+its owner can break, and breaking it is the only way to recall a proc
+parked in `read(2)` or `write(2)` when notes are ruled out (§14(50)).
 
 **The bounded wait.** layer-a §5.4 bounds a peer operation by
 `replms`, and a client parked for ever on a dead peer is that bound
@@ -3839,8 +3842,8 @@ sleeps. There is no `alarm` and there are no notes, for §7's reason,
 and no `rendezvous`(2) either: libthread supplies its own, which
 rendezvous between threads, so the call would mean two different
 things in this library's two homes while `QLock` and `Rendez` mean
-one. The reader reads only while the peer owes a reply, which is what
-lets an idle connection be closed without waiting for the peer to
+one. The reader reads only while a request is on the wire, which is
+what lets an idle connection be closed without waiting for the peer to
 speak. §14(48) is what the client does with the negotiated `msize`,
 §14(49) what a timeout leaves behind, §14(50) how a dead connection
 is classified and when a closed one's memory goes.
@@ -6335,22 +6338,40 @@ the 9P client's (§12), which nothing in this build dials with.
     from it: a peer that hangs up is one to dial again, and a peer
     that answers on a tag nobody sent is not.
 
-    **The memory goes late, and the going is observable.** A reader
-    parked inside `read(2)` cannot be recalled in plain libc — the
-    only mechanism is a note, and §7 rules notes out for exactly the
-    procs this library makes — so `nineclose` answers every exchange
-    in flight `Ninedead` and marks the connection closed, and the
-    memory, the fds and the two procs go when the LAST of the caller,
-    the reader, the timer and any exchange still unwinding lets go.
-    `Ninecfg.freed` is called as the last act before the memory
-    goes: §9's deferred free and §13's `Storecfg.freed` hook again,
-    for the same reason and with the same discipline. The reader
-    reads only while the peer owes a reply, so the deferral is
-    confined to a close with work still in flight; a close of an idle
-    connection reclaims everything at once. The rule about calls is
-    `storeclose`'s: one in flight when the close runs is safe, since
-    the exchange holds a reference of its own, and one STARTED after
-    it is undefined.
+    **The memory goes late, and the going is observable.**
+    `nineclose` answers every exchange in flight `Ninedead` and marks
+    the connection closed, and the memory, the fds and the two procs
+    go when the LAST of the caller, the reader, the timer and any
+    exchange still unwinding lets go. `Ninecfg.freed` is called as the
+    last act before the memory goes: §9's deferred free and §13's
+    `Storecfg.freed` hook again, for the same reason and with the same
+    discipline. The rule about calls is `storeclose`'s: one in flight
+    when the close runs is safe, since the exchange holds a reference
+    of its own, and one STARTED after it is undefined.
+
+    **Whose moment that is depends on `Ninecfg.hangup`.** A proc
+    parked in `read(2)` or `write(2)` cannot be recalled from inside
+    the library: the only mechanism is a note, and §7 rules notes out
+    for exactly the procs this library makes. The owner of the fds
+    can, because they are its fds — a network connection takes
+    `hangup` written to its ctl file, a pipe pair takes the peer's
+    ends closed — so the transport's owner supplies a third callback
+    beside `connect` and `spawn`, documented in `lib/shoal.h`: break
+    every blocked read and write on this connection's fds, MAY be
+    called more than once, and after it reads and writes fail.
+    `nineclose` calls it, a `nineopen` that fails calls it, and the
+    timer calls it when a write has stalled past its deadline
+    (§14(49)). With one, a close reclaims everything within the time
+    the callback takes, whatever the peer is doing. Without one — it
+    is optional — a close of a connection whose reader is inside
+    `read(2)` reclaims nothing until the peer speaks or hangs up, and
+    a peer that does neither holds the memory, both fds and two procs
+    for the life of the program. The reader is sent into `read(2)`
+    only once a request is ON THE WIRE, never merely once a slot is
+    armed, so a request refused locally after its slot was taken
+    leaves the reader parked where it was and a close of an idle
+    connection reclaims everything at once; that much holds with no
+    callback at all.
 
 51. **One outstanding request per fid, widened from `/rpc` to every
     fid (layer-a §5.6).** §5.6 makes it a rule of one channel: a

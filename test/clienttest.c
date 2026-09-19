@@ -18,10 +18,11 @@
  * instance inside this program — a simulated disk, the store engine
  * over it and srv/libshoalsrv.a over that, on the far end of a pair of
  * pipes — because what a client must get right is what a real server
- * answers, hold points included.  The two cases about a BROKEN peer
- * run against a stub of a few lines instead: a hang-up and a reply on
- * a tag nobody sent are things a conforming server never does, and a
- * stub is the only way to make it do them.
+ * answers, hold points included.  The cases about a BROKEN peer run
+ * against a stub of a few lines instead: a hang-up, a reply on a tag
+ * nobody sent, a reply longer than the negotiated msize, a peer that
+ * never speaks and a peer that stops reading are things a conforming
+ * server never does, and a stub is the only way to make it do them.
  *
  * This program does not include test/srv9p.h.  That file is the raw
  * in-process 9P client the §2 cases drive, and this one exists to
@@ -219,6 +220,9 @@ onfreed(void*)
 	freedseen++;
 }
 
+/* and how many times the client asked for the transport to be broken */
+static int hangups;
+
 /*
  * The transport.  Two pipes rather than one, for srv9p.h's reason: the
  * server keeps infd and outfd apart, and the request pipe closing is
@@ -260,24 +264,42 @@ pipeconnect(void *v, int *infd, int *outfd)
 	return 0;
 }
 
+/*
+ * Open a connection over those pipes.  `hangup' is §12's third
+ * callback and is what lets a close recall a proc this program parked
+ * in read(2) or write(2); most cases pass none, because the deferred
+ * behaviour a nil one leaves is itself part of the contract.  This
+ * one does not fail on nil: a case whose subject is a nineopen that
+ * must not succeed calls it directly.
+ */
 static Nine*
-opencl(Pipes *p, ulong msize)
+openfull(Pipes *p, ulong msize, int openms, void (*hangup)(void*), void *harg)
 {
 	Ninecfg cfg;
-	Nine *c;
 
 	memset(&cfg, 0, sizeof cfg);
 	cfg.connect = pipeconnect;
 	cfg.connectarg = p;
 	cfg.spawn = tspawn;
+	cfg.hangup = hangup;
+	cfg.hanguparg = harg;
 	cfg.msize = msize;
 	cfg.tickms = 5;
 	cfg.nreq = 8;
-	cfg.openms = Twaitms;
+	cfg.openms = openms;
 	cfg.freed = onfreed;
 	cfg.freedarg = nil;
 	freedseen = 0;
-	if((c = nineopen(&cfg)) == nil)
+	hangups = 0;
+	return nineopen(&cfg);
+}
+
+static Nine*
+opencl(Pipes *p, ulong msize)
+{
+	Nine *c;
+
+	if((c = openfull(p, msize, Twaitms, nil, nil)) == nil)
 		fail("%s: nineopen: %r", stage);
 	return c;
 }
@@ -840,6 +862,13 @@ enum
 {
 	Sthold	= 0,		/* read the request and never answer it */
 	Stbadtag,		/* answer on a tag nobody sent */
+	Stmute,			/* never answer anything, the Tversion included */
+	Stdeaf,			/* answer the Tversion, then stop reading */
+	Stover,			/* answer an Rread/Rwrite over the count asked for */
+	Stlong,			/* answer an Rread over the negotiated msize */
+
+	Stubbuf	= 16384,	/* the stub's own message buffer */
+	Sover	= 64,		/* Stover: what the case asks a read for */
 };
 
 typedef struct Stub Stub;
@@ -848,45 +877,116 @@ struct Stub
 	Pipes	p;
 	int	mode;
 	ulong	offer;		/* the msize it answers, if it is lower */
+	ulong	over;		/* Stlong: the count it answers a Tread with */
+	int	deaf;		/* Stdeaf: the Tversion is answered, no more reads */
 	int	got;		/* requests read past the Tversion */
 	int	ended;
 };
 
+/*
+ * The transport owner's half of §12's `hangup' contract, for a T1
+ * pipe pair: close the peer's ends, which is what breaks a read or a
+ * write the client has parked in.  It may be called more than once,
+ * so each end goes at most once and stubstop finds nothing left.
+ */
+static void
+stubhangup(void *v)
+{
+	Stub *s;
+	int fd;
+
+	s = v;
+	hangups++;
+	if((fd = s->p.sout) >= 0){
+		s->p.sout = -1;
+		close(fd);
+	}
+	if((fd = s->p.sin) >= 0){
+		s->p.sin = -1;
+		close(fd);
+	}
+}
+
 static void
 stubproc(void *v)
 {
-	uchar buf[8192];
+	uchar *buf, *data;
 	Fcall t, f;
 	Stub *s;
 	int n;
 
 	s = v;
+	if((buf = mallocz(Stubbuf, 1)) == nil || (data = mallocz(Stubbuf, 1)) == nil)
+		sysfatal("malloc: %r");
 	for(;;){
-		if((n = read9pmsg(s->p.sin, buf, sizeof buf)) <= 0)
+		/*
+		 * layer-a §5.4's own scenario: a peer that took the
+		 * connection and then stopped reading, so the client's next
+		 * write fills the pipe and parks in write(2).
+		 */
+		if(s->deaf){
+			if(s->p.sin < 0)
+				break;
+			sleep(25);
+			continue;
+		}
+		if((n = read9pmsg(s->p.sin, buf, Stubbuf)) <= 0)
 			break;
 		if(convM2S(buf, n, &t) != n)
 			break;
 		memset(&f, 0, sizeof f);
 		if(t.type == Tversion){
+			if(s->mode == Stmute){
+				s->got++;
+				continue;
+			}
 			f.type = Rversion;
 			f.tag = t.tag;
 			f.msize = t.msize;
 			if(s->offer != 0 && s->offer < f.msize)
 				f.msize = s->offer;
 			f.version = "9P2000";
-			if((n = convS2M(&f, buf, sizeof buf)) > 0)
+			if((n = convS2M(&f, buf, Stubbuf)) > 0)
 				write(s->p.sout, buf, n);
+			if(s->mode == Stdeaf)
+				s->deaf = 1;
 			continue;
 		}
-		if(s->mode == Stbadtag){
+		switch(s->mode){
+		case Stbadtag:
 			f.type = Rattach;
 			f.tag = t.tag + 100;
 			f.qid.type = QTDIR;
-			if((n = convS2M(&f, buf, sizeof buf)) > 0)
+			if((n = convS2M(&f, buf, Stubbuf)) > 0)
 				write(s->p.sout, buf, n);
+			break;
+		case Stover:
+			/* one byte more than the request asked for */
+			if(t.type != Tread && t.type != Twrite)
+				break;
+			f.type = t.type+1;
+			f.tag = t.tag;
+			f.count = t.count + 1;
+			f.data = (char*)data;
+			if((n = convS2M(&f, buf, Stubbuf)) > 0)
+				write(s->p.sout, buf, n);
+			break;
+		case Stlong:
+			/* ... and a whole message over the negotiated msize */
+			if(t.type != Tread)
+				break;
+			f.type = Rread;
+			f.tag = t.tag;
+			f.count = s->over;
+			f.data = (char*)data;
+			if((n = convS2M(&f, buf, Stubbuf)) > 0)
+				write(s->p.sout, buf, n);
+			break;
 		}
 		s->got++;
 	}
+	free(buf);
+	free(data);
 	s->ended = 1;
 	threadexits(nil);
 }
@@ -903,7 +1003,9 @@ stubstart(Stub *s, int mode, ulong offer)
 
 /*
  * The stub is parked in a read of the request pipe; the client's own
- * close is what shuts the write end of it and lets the stub out.
+ * close is what shuts the write end of it and lets the stub out — or,
+ * where the case gave the client a hangup callback, that callback
+ * already took the stub's ends.
  */
 static void
 stubstop(Stub *s)
@@ -1005,6 +1107,90 @@ cbotch(void)
 	stubstop(&s);
 }
 
+/*
+ * A peer that accepts the connection and then says nothing at all —
+ * the monitor poll loop's hung-peer case.  The Tversion times out, so
+ * nineopen answers nil; what this is about is what is left behind.
+ * The reader is inside read(2) and nothing in plain libc recalls it,
+ * so `hangup' is the whole of the answer: without it the two procs,
+ * both fds and two buffers of the proposed msize are lost for every
+ * dial attempt.  What says the fds went is the peer: its own read
+ * ends when the last of the client's references closes them.
+ */
+static void
+cmutepeer(void)
+{
+	Stub s;
+	Nine *c;
+	int i;
+
+	stage = "a peer that never speaks";
+	stubstart(&s, Stmute, 0);
+	c = openfull(&s.p, Ninemsizefloor, 300, stubhangup, &s);
+	istrue("nineopen against a mute peer answers nil", c == nil);
+	if(c != nil)
+		nineclose(c);
+	istrue("... having asked for the transport to be broken", hangups > 0);
+	for(i = 0; i*25 < Twaitms && !s.ended; i++)
+		sleep(25);
+	istrue("... and the client's fds go with the reader it recalled",
+		s.ended);
+	stubstop(&s);
+}
+
+/*
+ * The other half of the same fault, and this one needs no callback at
+ * all: a request whose slot is armed and which is then refused HERE,
+ * before anything reaches the wire.  The reader must not have left its
+ * park for it, because nothing will ever arrive for that tag.  The
+ * refusal is a Twalk the negotiated msize will not hold, which is why
+ * the connection is opened at a msize a walk can overrun.
+ */
+enum
+{
+	Csmall	= 600,		/* a msize MAXWELEM long names overrun */
+	Cwname	= 200,		/* ... each of them this long */
+};
+
+static char cwbuf[MAXWELEM][Cwname+1];
+
+static void
+clocalrefuse(void)
+{
+	char *w[MAXWELEM];
+	Ninerep r;
+	Stub s;
+	Nine *c;
+	int i;
+
+	stage = "a request refused after its slot was armed";
+	stubstart(&s, Sthold, 0);
+	if((c = openfull(&s.p, Csmall, Twaitms, nil, nil)) == nil){
+		fail("%s: nineopen: %r", stage);
+		close(s.p.cin);
+		close(s.p.cout);
+		stubstop(&s);
+		return;
+	}
+	for(i = 0; i < MAXWELEM; i++){
+		memset(cwbuf[i], 'x', Cwname);
+		cwbuf[i][Cwname] = 0;
+		w[i] = cwbuf[i];
+	}
+	ninewalk(c, Froot, Fa, w, MAXWELEM, Tms, &r);
+	eqv("a walk the negotiated msize will not hold is refused here",
+		r.out, Ninelocal);
+	eqv("and nothing of it reached the peer", s.got, 0);
+	eqv("no tag is left held", nineheld(c), 0);
+	/*
+	 * Nothing is on the wire and nothing ever was, so this is an idle
+	 * connection and its close reclaims everything at once — with no
+	 * hangup callback, which is the point.
+	 */
+	closecl(c);
+	stubstop(&s);
+}
+
 void
 threadmain(int argc, char **argv)
 {
@@ -1020,6 +1206,8 @@ threadmain(int argc, char **argv)
 	cclosebusy();
 	cdeath();
 	cbotch();
+	cmutepeer();
+	clocalrefuse();
 
 	watchoff();
 	if(fails > 0){

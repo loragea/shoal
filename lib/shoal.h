@@ -1908,6 +1908,18 @@ int	maprefresh(Adopt*, Fence*, Cmap*, vlong now);
  * T1 program passes an rfork(RFPROC|RFMEM) wrapper, the server passes
  * proccreate.  Nothing here includes <thread.h> either.
  *
+ * **Hanging up.**  `hangup' breaks every blocked read and write on
+ * this connection's fds: for a network connection the owner writes
+ * `hangup' to the conversation's ctl file, and for a T1 pipe pair it
+ * closes the peer's ends.  It MAY be called more than once, and after
+ * it reads and writes on those fds fail.  It is what lets this
+ * library recall a proc parked in read(2) or write(2), which plain
+ * libc cannot do by itself — nineclose calls it, a nineopen that
+ * fails calls it, and the timer calls it when a write has stalled
+ * past its deadline.  It is optional: with no `hangup', a close
+ * leaves a parked reader where it is until the peer speaks or hangs
+ * up, and the memory, the fds and the procs go only then (§14(50)).
+ *
  * **Every exchange is bounded.**  Each call takes a deadline in
  * milliseconds — layer-a §5.4's `replms' is what a peer client will
  * pass — and answers Ninetimeout once it passes, within one timer
@@ -1937,11 +1949,11 @@ int	maprefresh(Adopt*, Fence*, Cmap*, vlong now);
  * **Closing.**  nineclose answers every exchange in flight Ninedead
  * and stops both procs.  A call already in flight when it runs is
  * safe; a call STARTED after it is undefined, exactly as after
- * storeclose.  A reader parked inside read(2) cannot be recalled in
- * plain libc, so the memory and the fds go when the last of the
- * caller, the two procs and the exchanges unwinding lets go — `freed'
- * is the observation of that moment, as §13's hook is for the engine
- * (§14(50)).
+ * storeclose.  The memory and the fds go when the last of the caller,
+ * the two procs and the exchanges unwinding lets go — `freed' is the
+ * observation of that moment, as §13's hook is for the engine
+ * (§14(50)), and `hangup' is what makes that moment the close's own
+ * rather than the peer's.
  */
 typedef struct Nine Nine;
 typedef struct Ninecfg Ninecfg;
@@ -1977,6 +1989,8 @@ struct Ninecfg
 	int	(*connect)(void *arg, int *infd, int *outfd);
 	void	*connectarg;
 	int	(*spawn)(void (*)(void*), void*);
+	void	(*hangup)(void *arg);	/* break the fds; nil leaves them */
+	void	*hanguparg;
 	ulong	msize;		/* proposed; 0 takes Ninemsizedflt */
 	ulong	tickms;		/* 0 takes Ninetickmsdflt */
 	int	nreq;		/* 0 takes Ninereqdflt */

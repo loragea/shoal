@@ -37,10 +37,13 @@
  *
  *	the reader	parks in read(2), demultiplexes each reply by tag
  *			into that tag's slot and wakes the waiter.  It
- *			reads only while the peer owes a reply — with
+ *			reads only while a request is ON THE WIRE — with
  *			nothing outstanding it parks on `rdrz' instead, so
  *			an idle connection can be closed without waiting
- *			for the peer to say anything.
+ *			for the peer to say anything.  The wake is in
+ *			nineput and not where the slot is armed, because a
+ *			request that never reaches the wire is one the
+ *			reader must not have left the park for.
  *	the timer	wakes every `tickms', and settles every slot whose
  *			deadline has passed.
  *
@@ -78,13 +81,25 @@
  * a fid that already has one outstanding is refused Ninebusy before
  * anything is written.  §14(51) argues the widening.
  *
- * **Closing.**  nineclose answers every exchange in flight Ninedead
- * and stops both procs; the last of the caller, the two procs and any
- * exchange still unwinding releases the memory and the fds, and the
- * `freed' callback is the observation of that moment (§13's hook, as
- * the engine has one).  A caller must not START a call after
- * nineclose, exactly as storeclose requires; a call already in flight
- * when it runs is safe, and that is what the reference count is for.
+ * **Closing, and the one thing plain libc cannot do.**  nineclose
+ * answers every exchange in flight Ninedead and stops both procs; the
+ * last of the caller, the two procs and any exchange still unwinding
+ * releases the memory and the fds, and the `freed' callback is the
+ * observation of that moment (§13's hook, as the engine has one).  A
+ * caller must not START a call after nineclose, exactly as storeclose
+ * requires; a call already in flight when it runs is safe, and that is
+ * what the reference count is for.
+ *
+ * A proc parked in read(2) or write(2) cannot be recalled from inside
+ * this library: the only mechanism is a note, and notes are ruled out
+ * above for exactly these procs.  The transport's owner CAN recall
+ * one, because it is the owner of the fds — a network connection
+ * takes `hangup' written to its ctl file and a pipe pair takes the
+ * peer's ends closed — so that is a third callback, `Ninecfg.hangup',
+ * whose contract is in lib/shoal.h.  nineclose calls it, a nineopen
+ * that fails calls it through nineclose, and the timer calls it when
+ * a write has stalled past its deadline.  Without one, a close waits
+ * on the peer for as long as the peer takes (§14(50)).
  */
 
 enum
@@ -152,9 +167,26 @@ struct Nine
 	uvlong	nlate;		/* replies discarded after a timeout */
 	int	ref;
 	int	nproc;		/* procs of this connection still running */
+	void	(*hangup)(void*);	/* break the fds; set once, then read-only */
+	void	*hanguparg;
 	void	(*freed)(void*);
 	void	*freedarg;
 };
+
+/*
+ * Break every blocked read and write on the fds, so that a proc this
+ * library parked in one comes back.  The callback may be called more
+ * than once and is called with no lock of ours held, since what it
+ * does is the transport owner's business and may block.  With no
+ * callback there is nothing to do and the parked proc waits for the
+ * peer.
+ */
+static void
+ninehangup(Nine *c)
+{
+	if(c->hangup != nil)
+		(*c->hangup)(c->hanguparg);
+}
 
 static vlong
 nowms(void)
@@ -468,11 +500,16 @@ ninetimer(void *a)
  * buf: a message that will not fit the negotiated msize is a local
  * refusal and a failed write is the connection's death, and the caller
  * tells them apart by whether the connection is dead afterwards.
+ *
+ * The reader is woken HERE and not where the slot was armed: until
+ * the bytes are on the wire the peer owes nothing, and a reader sent
+ * into read(2) for a request that then never leaves is a reader
+ * nothing can recall.
  */
 static int
 nineput(Nine *c, Fcall *t, char *buf, int nbuf)
 {
-	int n;
+	int n, ok;
 
 	qlock(&c->wlk);
 	if((n = convS2M(t, c->wbuf, c->msize)) <= 0){
@@ -481,16 +518,17 @@ nineput(Nine *c, Fcall *t, char *buf, int nbuf)
 			" msize %lud", t->type, c->msize);
 		return -1;
 	}
-	if(write(c->outfd, c->wbuf, n) != n){
-		qunlock(&c->wlk);
+	ok = write(c->outfd, c->wbuf, n) == n;
+	if(!ok)
 		snprint(buf, nbuf, "ninep: writing a T%d: %r", t->type);
-		qlock(&c->lk);
-		ninedied(c, Ninedead, buf);
-		qunlock(&c->lk);
-		return -1;
-	}
 	qunlock(&c->wlk);
-	return 0;
+	qlock(&c->lk);
+	if(ok)
+		rwakeup(&c->rdrz);	/* now the peer owes a reply */
+	else
+		ninedied(c, Ninedead, buf);
+	qunlock(&c->lk);
+	return ok ? 0 : -1;
 }
 
 /*
@@ -559,7 +597,6 @@ ninerpc(Nine *c, Fcall *t, ulong fid, int hasfid, int ms, Ninerep *r,
 	c->nexpect++;
 	t->tag = q->tag;
 	r->tag = q->tag;
-	rwakeup(&c->rdrz);
 	qunlock(&c->lk);
 
 	if(nineput(c, t, buf, sizeof buf) < 0){
@@ -687,6 +724,8 @@ nineopen(Ninecfg *cfg)
 	c->infd = c->outfd = -1;
 	c->rdrz.l = &c->lk;
 	c->ref = 1;
+	c->hangup = cfg->hangup;
+	c->hanguparg = cfg->hanguparg;
 	c->freed = cfg->freed;
 	c->freedarg = cfg->freedarg;
 	c->bufsz = cfg->msize != 0 ? cfg->msize : Ninemsizedflt;
@@ -797,6 +836,14 @@ nineclose(Nine *c)
 	c->nexpect = 0;
 	rwakeupall(&c->rdrz);
 	qunlock(&c->lk);
+	/*
+	 * The reader may be inside read(2) and a writer inside write(2);
+	 * neither is recalled by anything this library can do, so the
+	 * transport's owner is asked to break the fds under them.  With no
+	 * callback they come back when the peer lets them, which is what
+	 * defers the free (§14(50)).
+	 */
+	ninehangup(c);
 	ninedrop(c);
 }
 
