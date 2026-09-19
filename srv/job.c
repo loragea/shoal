@@ -768,6 +768,29 @@ srvreclaimperiod(Srvctx *c)
 }
 
 /*
+ * The stretch the timer sleeps at a time: Reclaimslicems, unless a T1
+ * has set the knob over it (srv.h).  It is read fresh each slice, like
+ * the period.
+ *
+ * What the length costs is the shutdown's wait for this proc, which is
+ * bounded by one slice — so a case that wants that wait to be worth
+ * something makes the slice longer than everything srvshutdown does
+ * after it, and a wait that is not made shows as the store closing
+ * under a timer that is still up.  Nothing but a test sets it: the
+ * server's own slice is the constant.
+ */
+static uvlong
+reclaimslicems(Srvctx *c)
+{
+	uvlong ms;
+
+	lock(&c->joblk);
+	ms = c->reclaimslice;
+	unlock(&c->joblk);
+	return ms != 0 ? ms : Reclaimslicems;
+}
+
+/*
  * The timer.  It is not a job — it makes no engine call, and a job
  * the shutdown waits for would have to end before jobwait rather than
  * with it — so the shutdown waits for this proc separately, and the
@@ -785,18 +808,20 @@ static void
 reclaimtimer(void *a)
 {
 	Srvctx *c;
-	uvlong t;
+	uvlong t, slice;
 
 	c = a;
+	slice = Reclaimslicems;
 	for(;;){
-		for(t = 0; t < srvreclaimperiod(c); t += Reclaimslicems){
+		for(t = 0; t < srvreclaimperiod(c); t += slice){
+			slice = reclaimslicems(c);
 			if(srvstopping(c)){
 				lock(&c->joblk);
 				c->reclaimup = 0;
 				unlock(&c->joblk);
 				threadexits(nil);
 			}
-			sleep(Reclaimslicems);
+			sleep(slice);
 		}
 		reclaimgo(c, 1);
 	}
@@ -843,6 +868,17 @@ srvreclaimms(Srvctx *c, uvlong ms)
 {
 	lock(&c->joblk);
 	c->reclaimms = ms;
+	unlock(&c->joblk);
+}
+
+/*
+ * The T1 knob over the slice (srv.h).  0 puts Reclaimslicems back.
+ */
+void
+srvreclaimslicems(Srvctx *c, uvlong ms)
+{
+	lock(&c->joblk);
+	c->reclaimslice = ms;
 	unlock(&c->joblk);
 }
 
@@ -1055,6 +1091,23 @@ srvscrubnextms(Srvctx *c)
 }
 
 /*
+ * The stretch this timer sleeps at a time, which is reclaimslicems's
+ * twin and carries that function's comment entire: Scrubtickms unless
+ * a T1 has set the knob over it (srv.h), read fresh each slice, and
+ * the bound on the shutdown's wait for this proc.
+ */
+static uvlong
+scrubslicems(Srvctx *c)
+{
+	uvlong ms;
+
+	lock(&c->joblk);
+	ms = c->scrubslice;
+	unlock(&c->joblk);
+	return ms != 0 ? ms : Scrubtickms;
+}
+
+/*
  * The scrub's timer, which is reclaimtimer's twin: not a job, waited
  * for separately by the shutdown and before the jobs because it is one
  * of the two things that could still start one, and reading
@@ -1064,12 +1117,14 @@ static void
 scrubtimer(void *a)
 {
 	Srvctx *c;
-	uvlong left, period, t;
+	uvlong left, period, slice, t;
 
 	c = a;
+	slice = Scrubtickms;
 	for(;;){
-		for(t = 0;; t += Scrubtickms){
+		for(t = 0;; t += slice){
 			period = srvscrubperiod(c);
+			slice = scrubslicems(c);
 			left = period > t ? period - t : 0;
 			scrubarm(c, left);
 			if(left == 0)
@@ -1080,7 +1135,7 @@ scrubtimer(void *a)
 				unlock(&c->joblk);
 				threadexits(nil);
 			}
-			sleep(Scrubtickms);
+			sleep(slice);
 		}
 		scrubgo(c, 1);
 	}
@@ -1128,6 +1183,17 @@ srvscrubms(Srvctx *c, uvlong ms)
 {
 	lock(&c->joblk);
 	c->scrubms = ms;
+	unlock(&c->joblk);
+}
+
+/*
+ * The T1 knob over the slice (srv.h).  0 puts Scrubtickms back.
+ */
+void
+srvscrubslicems(Srvctx *c, uvlong ms)
+{
+	lock(&c->joblk);
+	c->scrubslice = ms;
 	unlock(&c->joblk);
 }
 

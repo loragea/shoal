@@ -667,6 +667,31 @@ void	srvscrubms(Srvctx*, uvlong ms);
 uvlong	srvscrubperiod(Srvctx*);
 
 /*
+ * The knobs over the SLICE each of those two timers sleeps its period
+ * in — half a second in this server (job.c) — where the knobs above
+ * are over the period itself.  0 puts the server's own slice back.
+ *
+ * The slice is what bounds the shutdown's wait for a timer proc, and
+ * that is the whole of what these are for: at half a second the wait
+ * is shorter than the work srvshutdown does after it — jobwait, the
+ * fid close, the stage drain and the queue free — so a shutdown that
+ * did not wait at all would still, most times, reach storeclose with
+ * the proc already gone, and a case asserting that it has gone would
+ * pass either way.  A case sets the slice to seconds, gives the timer
+ * one old slice to enter a new one, and then takes the server down:
+ * the remaining sleep is now longer than everything downstream of the
+ * wait, so the proc is demonstrably still up when the wait begins and
+ * the assertion at storeclose fails if the wait is not made.
+ *
+ * The period is set back to the server's own before the slice is
+ * lengthened: a long slice under a period of tens of milliseconds is a
+ * tick per slice, and a tick during a shutdown is not what the case is
+ * about.  Like the two above, the shutdown does not clear these.
+ */
+void	srvscrubslicems(Srvctx*, uvlong ms);
+void	srvreclaimslicems(Srvctx*, uvlong ms);
+
+/*
  * The stage point, over the per-fid staged operation layer-a §5.4 step
  * 3 creates and §5.4.1 step 7 discards.  With it on, an open of
  * /obj/<oid> for writing leaves a stage on the fid — one that stages

@@ -809,14 +809,15 @@ struct Srvctx
 	 * the scrub's: the two walks run at once and neither stops the
 	 * other (job.c).
 	 *
-	 * Each of the two has a timer, and the last three words of each
-	 * pair are that timer's: `...ms' is the T1 knob over its period,
-	 * `...up' says the proc is still reading this context — which is
-	 * what the shutdown waits for, since a timer holds no job, making
-	 * no engine call — and the scrub's `scrubnext' is when its next
-	 * tick is due, as an absolute millisecond, which is what /status
-	 * renders as `scrubnext=' (job.c, status.c).  The reclaim timer
-	 * has no such word because no file reports its schedule.
+	 * Each of the two has a timer, and the last words of each pair are
+	 * that timer's: `...ms' is the T1 knob over its period,
+	 * `...slice' the T1 knob over the stretch it sleeps that period
+	 * in, `...up' says the proc is still reading this context — which
+	 * is what the shutdown waits for, since a timer holds no job,
+	 * making no engine call — and the scrub's `scrubnext' is when its
+	 * next tick is due, as an absolute millisecond, which is what
+	 * /status renders as `scrubnext=' (job.c, status.c).  The reclaim
+	 * timer has no such word because no file reports its schedule.
 	 */
 	Sjob	*jobs;
 	int	scrubbing;
@@ -824,11 +825,13 @@ struct Srvctx
 	ulong	scrubrate;
 	int	scrubup;
 	uvlong	scrubms;
+	uvlong	scrubslice;
 	uvlong	scrubnext;
 	int	reclaiming;
 	int	reclaimstop;
 	int	reclaimup;
 	uvlong	reclaimms;
+	uvlong	reclaimslice;
 	int	stopping;	/* the shutdown has begun: no new jobs */
 	int	served;		/* a service loop was started over this context */
 	int	released;	/* lib9p has let go of the Srv (Srv.free) */

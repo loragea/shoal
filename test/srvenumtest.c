@@ -2571,9 +2571,13 @@ Out:
  * The timer is made demonstrably alive across the shutdown rather than
  * assumed to be: the knob puts its period in tens of milliseconds, the
  * case waits until a pass no verb asked for has come and gone, and it
- * asserts the proc is still up with the client about to go.  The proc
- * sleeps its wait in slices, so the shutdown begins with it inside
- * one — which is exactly the proc the store must not close under.
+ * asserts the proc is still up with the client about to go.  The
+ * period knob then goes back and the SLICE knob goes to seconds, so
+ * the shutdown begins with the proc inside a sleep longer than
+ * everything srvshutdown does after the wait.  That is what makes `the
+ * timer had ended when the store closed' a check about the wait: at
+ * the server's own half-second slice the proc would be gone by then
+ * whether the shutdown waited for it or not (srv.h).
  */
 static void
 treclaimwait(void)
@@ -2611,6 +2615,9 @@ treclaimwait(void)
 		sleep(20);
 	istrue("the timer is still up with the pass over",
 		srvreclaimlive(ctx) != 0);
+	srvreclaimms(ctx, 0);		/* no tick inside the long slice */
+	srvreclaimslicems(ctx, 3000);
+	sleep(700);			/* one old slice: it is inside a new one */
 Out:
 	clstop(&cl);			/* the loop ends; the shutdown runs */
 	eqv("the store was closed once", freedseen, 1);
@@ -3435,10 +3442,14 @@ Out:
  * The timer is made demonstrably alive across the shutdown rather than
  * assumed to be: the knob puts its period in tens of milliseconds, the
  * case waits until a pass no verb asked for has come and gone, and it
- * asserts the proc is still up with the client about to go.  The knob
- * then goes back, so the shutdown begins with the proc inside one of
- * its half-second slices — which is exactly the proc the store must
- * not close under, and the slice is what bounds the wait.
+ * asserts the proc is still up with the client about to go.  The
+ * period knob then goes back and the SLICE knob goes to seconds, so
+ * the shutdown begins with the proc inside a sleep longer than
+ * everything srvshutdown does after the wait — which is what makes
+ * `the scrub timer had ended when the store closed' a check about the
+ * wait rather than about how long the rest of the shutdown takes
+ * (srv.h).  The slice is also what bounds that wait, which is the
+ * other thing read here.
  */
 static void
 tscrubwait(void)
@@ -3449,9 +3460,11 @@ tscrubwait(void)
 	Dev *d;
 	Cl cl;
 	vlong t0;
+	uvlong slice;
 	int i;
 
 	clstage = "scrubwait";
+	slice = 3000;
 	m = mkmap();
 	d = newdisk();
 	freedseen = 0;
@@ -3478,11 +3491,24 @@ tscrubwait(void)
 		sleep(20);
 	istrue("the timer is still up with the pass over",
 		srvscrublive(ctx) != 0);
+	/*
+	 * And it is made to stay up ACROSS the wait, which is what gives
+	 * the check at the store's close anything to catch: the server's
+	 * own slice is half a second and everything srvshutdown does
+	 * after the wait takes longer than that, so a shutdown that never
+	 * waited would still reach storeclose with the proc gone most
+	 * times over, and the check would pass either way (srv.h).  The
+	 * slice goes to seconds with the period already back at
+	 * `scrubdays', and the sleep is one old slice, so the proc is
+	 * inside a new long one when the loop ends below.
+	 */
+	srvscrubslicems(ctx, slice);
+	sleep(700);
 Out:
 	t0 = nsec()/1000000;
 	clstop(&cl);			/* the loop ends; the shutdown runs */
 	istrue("the shutdown waited no longer than a slice of the timer's",
-		nsec()/1000000 - t0 < 3000);
+		nsec()/1000000 - t0 < (vlong)slice + 1000);
 	eqv("the store was closed once", freedseen, 1);
 	eqv("the scrub timer had ended when the store closed", freedscrub, 0);
 	istrue("and it is not reading the context now either",
