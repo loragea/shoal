@@ -723,10 +723,18 @@ struct Sstage
  * way.
  *
  *	srvmapget	answers the snapshot in force with a reference of
- *		the caller's.  It never answers nil: a context that has
- *		been built has a snapshot in force for as long as it
- *		exists, and the start-up refusals free the context
- *		outright (srv.c).
+ *		the caller's.  It never answers nil WHILE THE CONTEXT IS
+ *		LIVE: a context srvnew returned has a snapshot in force,
+ *		and the start-up refusals free the context outright rather
+ *		than answering one without (srv.c).  That is the bound on
+ *		the call as well — a get is legal between srvnew and
+ *		srvfree and nowhere else, which in practice means from a
+ *		request that has not yet replied or from a proc the
+ *		shutdown waits for (the reclaim timer, a job).  srvfree
+ *		empties the field before it gives the installed reference
+ *		back, so a get after that point would read nil and fault;
+ *		what keeps it from happening is the reply rule below and
+ *		the two waits srvshutdown makes.
  *	srvmapput	gives that reference back.  The LAST holder of a
  *		snapshot no longer in force is what frees it — which may
  *		be the swap that replaced it, or a request that has been
