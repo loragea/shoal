@@ -5390,7 +5390,19 @@ name a half that is not built; each says which.
     says when the schedule will next *look* — a tick that finds a
     pass already running starts nothing — and it is re-armed at every
     tick, so it counts down and begins again rather than reaching 0
-    and staying there. `queues=` is the size of the hash the
+    and staying there. It is a **lower bound** on the wall-clock
+    wait and not a deadline: the timer counts its period in nominal
+    ticks rather than off the clock, and every tick that oversleeps
+    — `sleep` is a lower bound on the wait, with nothing bounding it
+    from above — is time the count never charges, so the tick lands
+    at or after the moment the field named and never before. At one
+    per cent of overshoot per tick that is some three and a half
+    hours over a 14-day period. The tombstone reclaim walk's timer
+    counts the same way and drifts the same; it has no field of its
+    own, so its drift shows only as a pass landing late. All of that
+    is *implementation policy*: layer-a §7.5 asks for a pace and
+    names no accuracy, and D26 makes each walk's period policy in as
+    many words. `queues=` is the size of the hash the
     object ids land in — the ceiling §7 is about — and does not count
     the one reserved queue an operation that names no object is
     offloaded to; the other three count every request the pool took

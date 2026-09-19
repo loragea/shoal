@@ -1105,6 +1105,25 @@ scrubarm(Srvctx *c, uvlong left)
  * field answers when the schedule will next LOOK, which is the only
  * thing the timer decides; whether that look starts a pass depends on
  * what is running when it lands.
+ *
+ * What it is NOT is a wall-clock deadline.  scrubtimer counts its
+ * period in NOMINAL ticks — it adds the tick it asked for to `t' and
+ * never reads the clock — while sleep(2) is a lower bound, so every
+ * tick that oversleeps is time the period does not count and the real
+ * wait runs long by the sum of the overshoots.  At 1% per tick that
+ * is some three and a half hours over a 14-day period.  So the field
+ * is a LOWER BOUND on how long the next tick is still away: it counts
+ * down as stated and the tick lands at or after zero, never before.
+ * That is **implementation policy** — layer-a §7.5 asks for a pace
+ * and names no accuracy, and a drift below a percent of a period of
+ * days is nothing an operator reads `scrubnext=' to learn.  Pulling
+ * the deadline out of nsec() instead is the change that would make it
+ * exact, and it is not made here.
+ *
+ * reclaimtimer counts the same way and has the same drift.  It shows
+ * only as a pass landing late, because there is no `reclaimnext=' —
+ * §2.2 names no field for that schedule either, and this server chose
+ * to report the scrub's alone (store.md §14(23)).
  */
 uvlong
 srvscrubnextms(Srvctx *c)
