@@ -937,7 +937,13 @@ tmatrix(void)
 	 * there; a row inside it has no cell to reach and answers
 	 * `permission denied' as well, because `not built' would promise
 	 * a body that no unit is going to write.  A Twstat that changes
-	 * the name is §2.6's own `no rename' (store.md §14(59)).
+	 * the name is §2.6's own `no rename'.
+	 *
+	 * The exception is a Twstat that changes NOTHING: it is 9P's own
+	 * sync of a fid, srv/ answers it with success, and so does this
+	 * tree — on every row and for every role that holds a fid on the
+	 * row, which is why the reader's /map below succeeds at it while
+	 * the reader may not write /map at all (store.md §14(59)).
 	 */
 	clwalk1(&cl, Froot3, Ff, "status", &r);
 	clremove(&cl, Ff, &r);
@@ -953,8 +959,12 @@ tmatrix(void)
 	eqs("an admin renames /ctl", clerr(&r), "no rename");
 	nulldir(&wd);
 	clwstat(&cl, Ff, &wd, &r);
-	eqs("an admin wstats /ctl without renaming it", clerr(&r),
-		"permission denied");
+	eqs("an admin's null wstat of /ctl", clerr(&r), "ok");
+	istrue("... and the reply is an Rwstat", r.type == Rwstat);
+	nulldir(&wd);
+	wd.length = 0;
+	clwstat(&cl, Ff, &wd, &r);
+	eqs("an admin wstats /ctl's length", clerr(&r), "permission denied");
 	clclunk(&cl, Ff, &r);
 
 	clwalk1(&cl, Froot3, Ff, "status", &r);
@@ -962,6 +972,17 @@ tmatrix(void)
 	wd.name = "status2";
 	clwstat(&cl, Ff, &wd, &r);
 	eqs("an admin renames /status", clerr(&r), "permission denied");
+	clclunk(&cl, Ff, &r);
+
+	/*
+	 * The null wstat runs before the role gate, so a reader's /map
+	 * fid answers it with success as well, although /map is a row no
+	 * reader may write.
+	 */
+	clwalk1(&cl, Froot, Ff, "map", &r);
+	nulldir(&wd);
+	clwstat(&cl, Ff, &wd, &r);
+	eqs("a reader's null wstat of /map", clerr(&r), "ok");
 	clclunk(&cl, Ff, &r);
 
 	/* and the one file cell that IS `not built': /map.next's write */

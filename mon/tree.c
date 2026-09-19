@@ -728,7 +728,8 @@ monsrvstat(Req *r)
  * theirs, which is §2.5's convention and what the role gate above
  * answers for every row outside the write column already.  A Twstat
  * that changes the name is §2.6's `no rename' instead, because §2.6
- * has a string for exactly that and a client is entitled to it.
+ * has a string for exactly that and a client is entitled to it, and a
+ * Twstat that changes nothing at all never arrives here (below).
  */
 static void
 wrop(Req *r, void (*cell)(Req*), char *none)
@@ -763,15 +764,43 @@ monsrvremove(Req *r)
 
 /*
  * 9P's Twstat leaves a field the client does not want changed empty,
- * so a name that is there at all is a rename.  The role gate still
- * runs first: a row this role may not write is `permission denied'
+ * so a name that is there at all is a rename.
+ *
+ * A Twstat that leaves EVERY field empty asks for no change at all,
+ * and 9P clients use it as a sync of a fid.  It succeeds, on every row
+ * of this tree and for every role that got far enough to hold a fid on
+ * the row: it names no field this tree refuses and it changes nothing,
+ * so a refusal would be a claim about an operation that does not
+ * exist.  srv/obj.c answers the same message the same way on the
+ * instance's tree, and a client library that talks to both servers is
+ * entitled to one answer (store.md §14(59)).  That is why this test
+ * comes before the role gate and not after it.
+ *
+ * A wstat that sets anything keeps the refusals.  The role gate runs
+ * first there: a row this role may not write is `permission denied'
  * whatever the wstat asked for.
  */
+static int
+nullwstat(Dir *d)
+{
+	return (d->name == nil || d->name[0] == 0)
+		&& (d->uid == nil || d->uid[0] == 0)
+		&& (d->gid == nil || d->gid[0] == 0)
+		&& (d->muid == nil || d->muid[0] == 0)
+		&& d->mode == (ulong)~0 && d->mtime == (ulong)~0
+		&& d->atime == (ulong)~0 && d->length == (vlong)~0
+		&& d->type == (ushort)~0 && d->dev == (ulong)~0;
+}
+
 void
 monsrvwstat(Req *r)
 {
 	char *e;
 
+	if(nullwstat(&r->d)){
+		respond(r, nil);
+		return;
+	}
 	e = Emperm;
 	if(r->d.name != nil && *r->d.name != 0)
 		e = Emnorename;

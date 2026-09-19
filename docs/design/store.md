@@ -6561,13 +6561,25 @@ is not built; each says which.
       built, which is a promise that a later unit fills that cell in.
       In this build that is every verb of §8.3 and the `/map.next`
       write, and nothing else: `/map.next`'s write is the **only**
-      file cell in the tree that answers it. `Tcreate`, `Tremove` and
-      a `Twstat` that changes nothing answer `permission denied`
-      after the role gate — §2.5's convention, and honest, because
-      no unit is going to build a create, a remove or a rename for a
-      tree of synthetic files — and a `Twstat` that changes the name
-      answers §2.6's `no rename`, which is the string §2.6 has for
-      exactly that.
+      file cell in the tree that answers it. `Tcreate` and `Tremove`
+      answer `permission denied` after the role gate — §2.5's
+      convention, and honest, because no unit is going to build a
+      create or a remove for a tree of synthetic files — and so does
+      a `Twstat` that sets any field but the name; a `Twstat` that
+      changes the name answers §2.6's `no rename`, which is the
+      string §2.6 has for exactly that.
+
+      A `Twstat` whose every field is "don't change" is not one of
+      those. It asks for no change, 9P clients use it as a sync of a
+      fid, and it **succeeds** — on every file of this tree, for
+      every role that holds a fid on the row, and before the role
+      gate rather than after it, since a role gate on an operation
+      that changes nothing would be a claim about an operation that
+      does not exist. `srv/obj.c` answers the same message the same
+      way on the instance's tree, and a client library that talks to
+      both servers is entitled to one answer. *Implementation
+      policy*: §2.6 and §8.1 leave the case open, and a server that
+      refused it would be within both.
     - `shoalmon: no such file` — a name in `/` or in `/maps` that
       this tree does not have (§14(55)), and any element named on a
       fid that is not a directory, `..` included: lib9p's
