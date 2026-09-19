@@ -193,7 +193,9 @@ monhealthtext(Monctx *c, Mfid *f, Mtext *t)
 /*
  * /status, §8.1: `epoch=', `monid=', `uptime=', the timer attributes
  * in force, `retain=', `ledger=ok|lost' (§8.6) and `pending=<n>'
- * staged edits.  Format otherwise implementation policy.
+ * staged edits.  Format otherwise implementation policy; one
+ * attribute per line, as §2.2 asks of the instance's /status, so that
+ * one grep answers one question.
  *
  * The map-derived fields are present only when this store holds a map,
  * and `hasmap=' says which case a reader is in — a monitor formatted
@@ -235,12 +237,14 @@ monstatustext(Monctx *c, Mfid *f, Mtext *t)
 	}
 	montextprint(t, "uptime=%llud\n", (uvlong)time(0) - c->t0);
 	if(m != nil){
-		montextprint(t, "pollms=%lud leasems=%lud replms=%lud "
-			"deadms=%lud\n", m->pollms, m->leasems, m->replms,
-			m->deadms);
-		montextprint(t, "outmins=%lud tombdays=%lud mincopies=%lud "
-			"replicas=%lud\n", m->outmins, m->tombdays,
-			m->mincopies, m->replicas);
+		montextprint(t, "pollms=%lud\n", m->pollms);
+		montextprint(t, "leasems=%lud\n", m->leasems);
+		montextprint(t, "replms=%lud\n", m->replms);
+		montextprint(t, "deadms=%lud\n", m->deadms);
+		montextprint(t, "outmins=%lud\n", m->outmins);
+		montextprint(t, "tombdays=%lud\n", m->tombdays);
+		montextprint(t, "mincopies=%lud\n", m->mincopies);
+		montextprint(t, "replicas=%lud\n", m->replicas);
 		montextprint(t, "retain=%lud\n", m->retain);
 	}
 	montextprint(t, "slots=%lud\n", st.retain);

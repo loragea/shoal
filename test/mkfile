@@ -23,9 +23,11 @@ TESTS=\
 	srvenumtest\
 	srviotest\
 	srvwiretest\
+	montreetest\
 
 LIB=../lib/libshoal.a$O
 SRVLIB=../srv/libshoalsrv.a$O
+MONLIB=../mon/libshoalmon.a$O
 HFILES=../lib/shoal.h ../lib/store.h t1.h
 LDFLAGS=
 
@@ -38,8 +40,8 @@ all:V:	$PROGS
 $O.%:	%.$O $LIB
 	$LD $LDFLAGS -o $target $prereq
 
-# The four programs that drive the 9P surface link the server library
-# too and are libthread programs; every other test's link line is
+# The five programs that drive a 9P surface link a server library too
+# and are libthread programs; every other test's link line is
 # unchanged.
 $O.srvtest:	srvtest.$O $SRVLIB $LIB
 	$LD $LDFLAGS -o $target $prereq
@@ -64,6 +66,14 @@ $O.srvwiretest:	srvwiretest.$O $SRVLIB $LIB
 
 srvwiretest.$O:	srvwiretest.c srv9p.h ../srv/srv.h $HFILES
 	$CC $CFLAGS srvwiretest.c
+
+# The monitor's 9P surface links the monitor library instead, and its
+# in-process client is test/mon9p.h.
+$O.montreetest:	montreetest.$O $MONLIB $LIB
+	$LD $LDFLAGS -o $target $prereq
+
+montreetest.$O:	montreetest.c mon9p.h ../mon/mon.h $HFILES
+	$CC $CFLAGS montreetest.c
 
 %.$O:	%.c $HFILES
 	$CC $CFLAGS $stem.c

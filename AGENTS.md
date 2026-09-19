@@ -74,23 +74,25 @@ directory under `cmd/` with an `mkone` mkfile plus its name in
 **T1 — unit.** `mk test` at the repo root. Runs on any single
 9front machine: no disks, no network, no second node, seconds to
 run. Each test is a C program in `test/` linking `libshoal`, and — if
-it drives the 9P surface — `libshoalsrv`, lib9p and libthread as
-well; it exits non-zero if any check failed and prints one
+it drives a 9P surface — `libshoalsrv` or `libshoalmon`, lib9p and
+libthread as well; it exits non-zero if any check failed and prints one
 `FAIL: <reason>` line per failed check to standard error. `mk test`
 fails on the first failing program. To add one: write `test/foo.c`
 and add `foo` to `TESTS` in `test/mkfile`. Known-answer vectors are
 computed outside this codebase, and the test source says how they
 were computed.
 
-A test that drives the 9P surface runs a whole storage instance
-inside itself: `test/srv9p.h` is an in-process 9P client that puts
-the server on one end of a pair of pipes and speaks raw 9P
+A test that drives a 9P surface runs a whole server inside itself:
+`test/srv9p.h` is an in-process 9P client that puts the storage
+instance on one end of a pair of pipes and speaks raw 9P
 (`convS2M`/`convM2S`) on the other, over the simulated disk. It is
 what lets a case pipeline tags, flush any tag, propose an `msize`
-below the attach floor and assert exact `Rerror` strings. Such a
-program is a libthread program — `threadmain`, its own
-`mainstacksize` — because the queue pool is `9pqueue`(2)'s, and it
-arms `srv9p.h`'s watchdog proc so that a wedged server fails the
+below the attach floor and assert exact `Rerror` strings.
+`test/mon9p.h` is the same client for the monitor, differing only in
+the context type it starts; the two are a deliberate copy, because
+each is tied to its library's own types. Such a program is a
+libthread program — `threadmain`, its own `mainstacksize` — and it
+arms the client's watchdog proc so that a wedged server fails the
 test instead of hanging `mk test`.
 
 T1 needs no partition because every device access in the store goes

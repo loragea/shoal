@@ -6440,7 +6440,12 @@ is not built; each says which.
     - The refused cell is always `permission denied`, §2.5's
       convention, at the open — or at the walk for `/map.next`, where
       the row is outside the role's walk column and the answer is the
-      same string.
+      same string. The one exception is not this server's: the write
+      column of the two **directory** rows is unreachable, because
+      lib9p's `sopen` answers a non-read open of a `QTDIR` fid with
+      `is a directory` before the server is called at all. The rows
+      carry no write bit for any role all the same, so the matrix
+      stays one table and does not depend on lib9p for a refusal.
 
     The attach grammar's fills, all answering §2.6's `bad aname`, are
     the reading §14(25) takes of §2.1 applied to §8.1's own grammar:
@@ -6598,8 +6603,9 @@ is not built; each says which.
     - An instance never seen has no `lastrefresh` to subtract from,
       and its `silent=` is the milliseconds since this service
       started. That is a true lower bound on how long the channel has
-      been quiet, and a `0` there would read as "heard from just
-      now", which is the one thing it must not say.
+      been quiet; a flat `0` would read as "heard from just now"
+      however long the monitor had been up, which is the one thing it
+      must not say.
     - `reports=` is empty on every line. It is the instances that
       currently claim they cannot reach this one, which the
       `unreachable`/`reachable` verbs of §8.3 record; those are the
