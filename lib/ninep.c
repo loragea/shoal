@@ -425,8 +425,10 @@ ninegot(Nine *c, int n)
 		f->m = nil;
 		f->state = Nfree;
 		f->nfid = 0;
-		q->owed = 0;
-		c->nexpect--;
+		if(q->owed){
+			q->owed = 0;
+			c->nexpect--;
+		}
 		q->state = Nfree;
 		break;
 	}
