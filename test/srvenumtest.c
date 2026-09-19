@@ -2617,7 +2617,14 @@ treclaimwait(void)
 		srvreclaimlive(ctx) != 0);
 	srvreclaimms(ctx, 0);		/* no tick inside the long slice */
 	srvreclaimslicems(ctx, 3000);
-	sleep(700);			/* one old slice: it is inside a new one */
+	/*
+	 * Out of the old half-second slice and into a new long one.
+	 * Three of the server's own slices and not one, for tscrubwait's
+	 * reason: the proc is at most one old slice from waking, but
+	 * sleep(2) guarantees only a lower bound, so a 700 ms sleep was
+	 * a 200 ms margin against a scheduler that promises none.
+	 */
+	sleep(1500);
 Out:
 	clstop(&cl);			/* the loop ends; the shutdown runs */
 	eqv("the store was closed once", freedseen, 1);
@@ -3499,11 +3506,19 @@ tscrubwait(void)
 	 * waited would still reach storeclose with the proc gone most
 	 * times over, and the check would pass either way (srv.h).  The
 	 * tick goes to seconds with the period already back at
-	 * `scrubdays', and the sleep is one old tick, so the proc is
-	 * inside a new long one when the loop ends below.
+	 * `scrubdays', and the sleep is what carries the proc out of the
+	 * old half-second tick and into a new long one before the loop
+	 * ends below.
+	 *
+	 * 1500 is three of the server's own ticks, not one: the proc is
+	 * at most one old tick from waking, but Plan 9's sleep(2) is a
+	 * lower bound on the wait and nothing bounds it from above, so a
+	 * sleep of 700 was a 200 ms margin against a scheduler that owes
+	 * none.  Three ticks is a margin worth having and costs a second
+	 * of one case's run.
 	 */
 	srvscrubtickms(ctx, tick);
-	sleep(700);
+	sleep(1500);
 Out:
 	t0 = nsec()/1000000;
 	clstop(&cl);			/* the loop ends; the shutdown runs */
