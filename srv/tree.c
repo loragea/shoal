@@ -253,6 +253,25 @@ reservedid(uchar *oid, int oidlen)
  *
  * store.md §14(24) carries the same order for a reader outside srv/.
  */
+
+/*
+ * F3's pair, read off ONE snapshot of the map: `up=no' and
+ * `status=out' are two fields of this instance's own record, and a
+ * gate that read them from two maps could answer a state neither map
+ * describes (dat.h).
+ */
+static int
+selfdown(Srvctx *c)
+{
+	Smap *m;
+	int down;
+
+	m = srvmapget(c);
+	down = m->self->up == Uno || m->self->status == Sout;
+	srvmapput(c, m);
+	return down;
+}
+
 static char*
 objgate(Srvctx *c, Sfid *f, Req *r, int op)
 {
@@ -296,8 +315,7 @@ objgate(Srvctx *c, Sfid *f, Req *r, int op)
 	rsvd = reservedid(oid, oidlen);
 	if(wr && f->role == Radmin && !rsvd)
 		return Eperm;
-	if(f->role == Rclient
-	&& (c->self->up == Uno || c->self->status == Sout))
+	if(f->role == Rclient && selfdown(c))
 		return Edown;
 	if(srvfencekind(c) != Fencenone){
 		if(!wr && (f->file == Qobj || f->file == Qmeta))
@@ -1160,11 +1178,17 @@ srvopen(Req *r)
  * offloaded runs the same one: it is reached from the service loop and
  * from a queue proc, and it answers through the pool's one exit either
  * way (srvqdone answers directly for a request that was never pushed).
+ *
+ * The buffer a render composes its answer in is this frame's, and is
+ * what makes that answer outlive the call: srvqdone responds from it,
+ * and a render that composed one in a frame of its own would hand this
+ * function a pointer into a frame that textfree and srvqdone overlay
+ * (dat.h).
  */
 void
 srvopentext(Req *r)
 {
-	char *e;
+	char buf[ERRMAX], *e;
 	Srvctx *c;
 	Sfid *f;
 	Sfile *file;
@@ -1177,7 +1201,7 @@ srvopentext(Req *r)
 		srvqdone(r, "shoalsrv: out of memory");
 		return;
 	}
-	if((e = file->render(c, f, t)) != nil){
+	if((e = file->render(c, f, t, buf, sizeof buf)) != nil){
 		textfree(t);
 		srvqdone(r, e);
 		return;

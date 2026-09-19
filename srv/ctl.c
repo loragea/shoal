@@ -314,8 +314,9 @@ ctldrop(Req *r)
 	char buf[ERRMAX], name[Oidmax+1];
 	Cinst *pl[Maxplace];
 	Srvctx *c;
+	Smap *m;
 	Qreq *qr;
-	int i, n;
+	int i, n, placed;
 
 	if(srvqcheck(r)){
 		srvqdone(r, nil);
@@ -325,18 +326,31 @@ ctldrop(Req *r)
 	qr = r->aux;
 	memmove(name, qr->oid, qr->oidlen);
 	name[qr->oidlen] = 0;
-	if((n = mapplace(c->map, name, pl, nelem(pl))) < 0){
+	/*
+	 * One snapshot answers the placement and the `self' it is
+	 * compared against (srv/dat.h), so the guard is made against one
+	 * map and never against a pair.
+	 */
+	m = srvmapget(c);
+	placed = 0;
+	if((n = mapplace(m->map, name, pl, nelem(pl))) < 0)
 		rerrstr(buf, sizeof buf);
+	else{
+		if(n > nelem(pl))	/* mapparse bounds replicas by Maxplace */
+			n = nelem(pl);
+		for(i = 0; i < n; i++)
+			if(pl[i] == m->self)
+				placed = 1;
+	}
+	srvmapput(c, m);
+	if(n < 0){
 		srvqdone(r, buf);
 		return;
 	}
-	if(n > nelem(pl))		/* mapparse bounds replicas by Maxplace */
-		n = nelem(pl);
-	for(i = 0; i < n; i++)
-		if(pl[i] == c->self){
-			srvqdone(r, Estillplaced);
-			return;
-		}
+	if(placed){
+		srvqdone(r, Estillplaced);
+		return;
+	}
 	if(objdrop(c->store, qr->oid, qr->oidlen) < 0){
 		srvqexit(r);
 		srvrerror(r);

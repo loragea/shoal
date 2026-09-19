@@ -1043,6 +1043,28 @@ tmeta(void)
 	clerris("a walk to a deleted object through /meta", &r,
 		"object deleted");
 	clclunk(&cl, Fdir, &r);
+
+	/*
+	 * §2.6's `no such object' through /meta, on a fid walked while the
+	 * object still had a record: a drop or the reclaim pass takes the
+	 * record away and the render's own objstat is what finds it gone.
+	 * The string is checked exactly because that exit is the one whose
+	 * answer the render composes rather than names, and it composes it
+	 * in the caller's buffer — a render answering from a frame of its
+	 * own hands srvopentext a pointer that textfree and srvqdone then
+	 * overlay (srv/dat.h).
+	 */
+	mkobj(srvstore(ctx), "beta", "0123456789", 10);
+	if(clwalkobj(&cl, Froot, Fmeta, "meta", "beta", &r) != Rwalk)
+		fail("walk /meta/beta: %s", clerr(&r));
+	else{
+		if(objdrop(srvstore(ctx), (uchar*)"beta", 4) < 0)
+			fail("objdrop beta: %r");
+		clopen(&cl, Fmeta, OREAD, &r);
+		clerris("an open of /meta for an object dropped under the fid",
+			&r, "no such object");
+		clclunk(&cl, Fmeta, &r);
+	}
 	clclunk(&cl, Froot, &r);
 Out:
 	clstop(&cl);

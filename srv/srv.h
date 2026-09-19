@@ -249,6 +249,14 @@ int	srvstopping(Srvctx*);
 
 /* what a caller and the tests read back */
 Store*	srvstore(Srvctx*);
+/*
+ * The `Cmap' of the snapshot in force, with NO reference taken: it is
+ * what a test computes a placement with, and it is valid until the
+ * next srvmapswap and no longer.  A program that swaps must therefore
+ * ask again after the swap rather than keep this pointer across one.
+ * Inside the server nothing uses it — every reader there takes a
+ * snapshot instead (srv/dat.h).
+ */
 Cmap*	srvmap(Srvctx*);
 char*	srviid(Srvctx*);
 void	srvcount(Srvctx*, uvlong *pushed, uvlong *done);
@@ -517,8 +525,9 @@ void	srvhook(Srvctx*, char *name, uvlong n);
  * WHILE a request is parked, and a sleep long enough today is a wedge
  * or a silent pass tomorrow.  A point counts only where a case needs
  * the wait — today the three of the /repl transfer, fullhold, openhold
- * and finalhold, and the stage slot's newhold — and an unnamed point
- * answers 0.
+ * and finalhold, the stage slot's newhold, and the client write path's
+ * objprelook, which is where a case parks a write across a map swap
+ * (srvmapswap above) — and an unnamed point answers 0.
  */
 uvlong	srvheld(Srvctx*, char *name);
 
@@ -638,6 +647,47 @@ void	srvendpoint(Srvctx*, uvlong ms);
  */
 void	srvreclaimms(Srvctx*, uvlong ms);
 uvlong	srvreclaimperiod(Srvctx*);
+
+/*
+ * The adopted map, swapped under the running server.  Nothing in this
+ * build swaps on its own — there is no monitor client, so the map is
+ * adopted once at start-up and never refreshed (store.md §14(18)) —
+ * and this is how a test drives what a swap does to the requests,
+ * renders and passes that are reading the map while it happens.
+ *
+ * It parses `text[0:len]' and resolves this instance's own record in
+ * it by the uuid the disk carries, exactly as start-up does, and it
+ * publishes the result as a new snapshot.  A text that does not parse,
+ * that names no record with this instance's uuid, that gives that uuid
+ * an iid other than the one this instance answers to, or that carries
+ * a `monid' other than the pinned one is REFUSED: the call answers
+ * why, in a buffer of its own that the next call overwrites, and the
+ * map in force is untouched.  nil is success.
+ *
+ * The last two refusals are the two values `Srvctx' holds a COPY of
+ * and /status renders from that copy (srv/dat.h): a swap that moved
+ * either would leave one render answering two maps.  layer-a §6.3
+ * never adopts a map under another monitor identity in any case.
+ *
+ * What it is NOT is an adoption: layer-a §6.3's decision, its two
+ * durable values and the geometry checks start-up makes are start-up's
+ * alone, and a refresh loop is what owes them (store.md §14(48)).  So
+ * a swap MAY install a map this instance would have refused to start
+ * under, which is what lets a case drive the window rather than the
+ * policy.
+ *
+ * A request, render or pass already reading the map goes on reading
+ * the snapshot it took; the old one is freed when its last reader
+ * lets go (srv/dat.h).  srvmapcount is the observable over that:
+ * `nsnap' is how many snapshots exist — one when nothing is parked
+ * across a swap — and `nref' how many holders the snapshot in force
+ * has, the context's own installed reference included.  `nsnap' is
+ * what a case asserts exactly; `nref' is a floor, because the reclaim
+ * timer takes a snapshot of its own on every slice of its wait and a
+ * case cannot say it is not mid-read.  Either pointer may be nil.
+ */
+char*	srvmapswap(Srvctx*, char *text, long len);
+void	srvmapcount(Srvctx*, int *nsnap, int *nref);
 
 /*
  * The stage point, over the per-fid staged operation layer-a §5.4 step

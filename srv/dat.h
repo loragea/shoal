@@ -9,6 +9,7 @@ typedef struct Sfid Sfid;
 typedef struct Sfile Sfile;
 typedef struct Sctl Sctl;
 typedef struct Qreq Qreq;
+typedef struct Smap Smap;
 typedef struct Sstage Sstage;
 typedef struct Qjob Qjob;
 typedef struct Sjob Sjob;
@@ -97,7 +98,14 @@ enum
  *	render	the file is a render-at-open text file (§2.2's MUST):
  *		open composes its bytes once into the fid's Text and
  *		every read is served from them.  It answers nil, or an
- *		error string.
+ *		error string.  A string it composes rather than names
+ *		goes in the `buf, nbuf' the caller passes and NEVER in a
+ *		buffer of the render's own: srvopentext calls textfree
+ *		and srvqdone on what it is handed, and those frames
+ *		overlay the render's.  No answer this server composes
+ *		lives in the frame that composed it: /rpc's does in the
+ *		caller's buffer too (peer.c), and a ctl verb's in a
+ *		static the service loop has to itself (ctl.c).
  *	read	a read that is not served from a snapshot — a channel
  *		(/repl, /rpc) or a directory read.  It responds.  A row
  *		with a read cell gets every read, whether or not the fid
@@ -246,7 +254,7 @@ struct Sfile
 	int	rd;
 	int	wr;
 	char*	(*gate)(Srvctx*, Sfid*, Req*, int op);
-	char*	(*render)(Srvctx*, Sfid*, Text*);
+	char*	(*render)(Srvctx*, Sfid*, Text*, char *buf, int nbuf);
 	void	(*read)(Req*);
 	void	(*write)(Req*);
 	void	(*open)(Req*);
@@ -701,6 +709,145 @@ struct Sstage
 	Sstage	*next;
 };
 
+/*
+ * The adopted cluster map, layer-a §6.3 — and the handle every reader
+ * of it takes.
+ *
+ * A snapshot is IMMUTABLE once published: the bytes the map was
+ * adopted from, the `Cmap' they parsed to, and this instance's own
+ * record resolved inside that `Cmap'.  Nothing ever writes a field of
+ * a published snapshot, so a reader needs no lock over the contents —
+ * only over the pointer that says which snapshot is in force, and over
+ * the count that says how many readers still hold it.
+ *
+ * That pointer and that count are what `Srvctx.maplk' covers, and
+ * nothing else.  It is a LEAF and a spin `Lock': it is held across a
+ * pointer copy and an int, never across an engine call, a device
+ * access, a park or another lock, and no lock of this server or of the
+ * engine is ever taken under it (store.md §7 rules 1 and 2).  It may
+ * itself be taken under anything, which is what lets a render on the
+ * service loop and a handler on a queue proc reach the map the same
+ * way.
+ *
+ *	srvmapget	answers the snapshot in force with a reference of
+ *		the caller's.  It never answers nil WHILE THE CONTEXT IS
+ *		LIVE: a context srvnew returned has a snapshot in force,
+ *		and the start-up refusals free the context outright rather
+ *		than answering one without (srv.c).  That is the bound on
+ *		the call as well — a get is legal between srvnew and
+ *		srvfree and nowhere else, which in practice means from a
+ *		request that has not yet replied or from a proc the
+ *		shutdown waits for (the reclaim timer, a job).  srvfree
+ *		empties the field before it gives the installed reference
+ *		back, so a get after that point would read nil and fault;
+ *		what keeps it from happening is the reply rule below and
+ *		the two waits srvshutdown makes.
+ *	srvmapput	gives that reference back.  The LAST holder of a
+ *		snapshot no longer in force is what frees it — which may
+ *		be the swap that replaced it, or a request that has been
+ *		parked across the swap; the free runs outside the lock,
+ *		and it is safe there because a snapshot at zero is one
+ *		nothing can reach to count up again.
+ *	srvmapswap	publishes a new snapshot and gives the old one's
+ *		installed reference back (srv.h).  It is T1's alone: this
+ *		build has no monitor client, so nothing swaps in
+ *		production (store.md §14(18), §14(48)).
+ *
+ * What a swap guarantees to a request already in flight is that its
+ * own snapshot does not change under it.  A holder therefore reads
+ * `map', `text' and `self' as ONE map for as long as it holds — the
+ * epoch and the placement it admitted under, and the `self' it
+ * compares a placement member against, are the same map's — and a
+ * pointer into `map->inst[]', which is what mapplace and mapprimary
+ * answer and what `self' is, stays live for exactly that long.
+ *
+ * Who may hold one, and for how long:
+ *
+ *	A QUEUED OBJECT OPERATION takes one at the head of its handler
+ *		and holds it to the end of that handler's BODY, across its
+ *		engine calls and across every -X hold point it parks at
+ *		(srv.h).  That is the hold the rule above is for: §5.4
+ *		step 1's admission, the epoch the stage is keyed with and
+ *		step 5's placement are three reads of one map, and a swap
+ *		landing between any two of them moves none of them.
+ *	A RENDER takes one for the whole of what it renders and gives it
+ *		back before it answers: /map writes `text' entire, so the
+ *		file is one snapshot's bytes and never a mix of two
+ *		(status.c), and /status's `status=' and `up=' are one
+ *		record's pair.
+ *	A PASS or a TIMER TICK takes one per pass or per tick and not
+ *		per read, and it is the READS that are together under the
+ *		hold rather than the pass: reclaimpass takes one, copies
+ *		`tombdays' and the epoch out of it and lets go before the
+ *		walk begins, so the two values a walk judges by are one
+ *		map's while the hold itself is as short as the copying
+ *		(job.c).  A pass that runs while the map moves therefore
+ *		reports the map it started under.
+ *	NOBODY holds one beyond the request, render, pass or tick that
+ *		took it.  A hold is not a lock — it blocks no swap and
+ *		bars no other reader — but it does keep the memory alive,
+ *		so a hold left behind is a leak, and one kept in a fid or
+ *		a stage would be a snapshot outliving its reader.
+ *
+ * A HOLD NEVER SPANS THE REPLY.  Every hold above ends before the
+ * respond that answers the message it was taken for — the queued
+ * handlers give theirs back in the wrapper and answer from what the
+ * body returned (obj.c), a render gives it back before it returns to
+ * srvopentext, and the loop's own readers (tree.c's F3, attach.c,
+ * peer.c's epoch check) get and put strictly before they answer.  The
+ * reason is that the reply is where lib9p counts the request complete
+ * — srvdestroyreq, from closereq, INSIDE respond — and where it then
+ * releases the service, which is what srvqdrain converges on and what
+ * srvfree waits for.  A hold that outlived the respond would therefore
+ * be a hold outliving the context: srvfree's put would leak the
+ * snapshot and the holder's own put would run on freed memory (srv.c).
+ *
+ * One 9P message may be more than one reader, and where it is, it may
+ * read two maps.  Four places, three of them two holds: a row's GATE
+ * runs on the service loop before the queued handler behind it
+ * (tree.c's F3), /meta's open admits on the queue and then calls a
+ * RENDER that takes its own (obj.c), and a /repl or /rpc write is
+ * epoch-checked on the loop before the operation is pushed (peer.c).
+ * Each half is one map's, which is what the rule above buys; the pair
+ * is not.
+ *
+ * The fourth is of another kind: /status renders `status=' and `up='
+ * out of the snapshot and `iid=', `uuid=', `monid=' and
+ * `monidmismatch=' out of the COPIES Srvctx took at start-up
+ * (status.c), so it is a snapshot read beside a context read rather
+ * than two holds.  What keeps that one record is srvmapswap refusing
+ * a text that renames this uuid or that carries another monid, and
+ * `uuid' being the disk's rather than any map's (srv.c); a refresh
+ * that meant to move either would have to re-pin the copies, which is
+ * the refresh loop's.  Nothing swaps in this build, so nothing
+ * observes any of the four — store.md §14(48) records them as the
+ * refresh loop's to close.
+ *
+ * The WRITE PATH's epoch is the rule this exists for.  A write is
+ * keyed with the epoch of the map it was ADMITTED under: read once, at
+ * the stage of §5.4 step 3, and carried in `Sstage.wepoch' to the
+ * engine call that commits it.  Nothing between the stage and the
+ * commit re-reads the map's epoch, so a swap landing in that window —
+ * including one landing while the request is parked at `objprelook' or
+ * `objstage' — produces a commit stamped with the epoch the write was
+ * admitted under and not with the epoch now in force.  The next write
+ * on that object takes the new epoch, because its own admission does.
+ *
+ * `self' points INTO `map->inst[]' of this snapshot and nowhere else.
+ * It is resolved once, when the snapshot is made, from this
+ * instance's own uuid, which layer-a §3.4 makes the disk's (srv.c) —
+ * so it is the record every placement member is compared against, and
+ * it is valid for exactly as long as the hold that answered it.
+ */
+struct Smap
+{
+	Cmap	*map;		/* the parsed map; never written after this */
+	char	*text;		/* the bytes it was parsed from, for /map */
+	long	len;		/* ... and how many of them */
+	Cinst	*self;		/* our own record, inside map->inst[] */
+	int	ref;		/* holders, under Srvctx.maplk */
+};
+
 struct Srvctx
 {
 	Srv	srv;
@@ -708,10 +855,14 @@ struct Srvctx
 	Dev	*dev;
 	Store	*store;
 	Super	sb;		/* the copy superselect chose */
-	char	*maptext;
-	long	maplen;
-	Cmap	*map;
-	Cinst	*self;		/* our own instance record in map */
+	/*
+	 * §6.3's adopted map, behind the handle above.  The lock covers
+	 * these three fields and nothing else: which snapshot is in
+	 * force, and how many exist for srvmapcount to report.
+	 */
+	Lock	maplk;
+	Smap	*smap;
+	int	nsmap;		/* snapshots made and not yet freed */
 	char	iid[Iidlen+1];
 	char	uuid[Uuidlen+1];
 	char	monid[Monidlen+1];
@@ -774,6 +925,13 @@ struct Srvctx
 	uvlong	openheld;
 	uvlong	finalheld;
 	uvlong	newheld;
+	/*
+	 * ... and at the client write path's own, which is the window a
+	 * map swap has to be driven against: a write parked there has
+	 * been admitted and keyed and has not yet read the placement
+	 * (srv.h's objprelook, and the map handle below).
+	 */
+	uvlong	prelookheld;
 	uvlong	mapopen;	/* srvhook("mapopen") */
 	uvlong	walkhold;	/* srvhook("walkhold") */
 	uvlong	anyexit;	/* srvhook("anyexit") */

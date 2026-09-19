@@ -127,9 +127,10 @@ srvaname(Sfid *f, char *aname)
 void
 srvattach(Req *r)
 {
-	char buf[ERRMAX];
+	char buf[ERRMAX], *e;
 	Srvctx *c;
 	Sfid *f;
+	Smap *m;
 
 	c = r->srv->aux;
 	if((f = mallocz(sizeof *f, 1)) == nil){
@@ -167,25 +168,26 @@ srvattach(Req *r)
 	 * so the refusal is the whole of what happens and the instance
 	 * stays at the epoch of the map it was started with (store.md
 	 * §14(21)).
+	 *
+	 * §6.4 F3's receiver half is asked of the same map in the same
+	 * hold: an instance MUST refuse, with `permission denied', any
+	 * role=repl attach whose peer= is not a non-dead instance in its
+	 * own current map.  One snapshot answers both, so an attach is
+	 * admitted against one map and never against a pair (dat.h).
 	 */
+	m = srvmapget(c);
+	e = nil;
 	if(f->hasepoch){
-		if(f->epoch < c->map->epoch){
-			respond(r, Estaleepoch);
-			return;
-		}
-		if(f->epoch > c->map->epoch){
-			respond(r, Efutureepoch);
-			return;
-		}
+		if(f->epoch < m->map->epoch)
+			e = Estaleepoch;
+		else if(f->epoch > m->map->epoch)
+			e = Efutureepoch;
 	}
-	/*
-	 * §6.4 F3's receiver half: an instance MUST refuse, with
-	 * `permission denied', any role=repl attach whose peer= is not a
-	 * non-dead instance in its own current map.  That map is the
-	 * static one here, and the check is live against it.
-	 */
-	if(f->role == Rrepl && !mapmember(c->map, f->peer)){
-		respond(r, Eperm);
+	if(e == nil && f->role == Rrepl && !mapmember(m->map, f->peer))
+		e = Eperm;
+	srvmapput(c, m);
+	if(e != nil){
+		respond(r, e);
 		return;
 	}
 	f->file = Qroot;

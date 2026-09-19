@@ -42,6 +42,10 @@ extern char Einterrupted[];
 extern char Edevintr[];
 extern char Ebotch[];
 
+/* srv.c: the adopted map's handle, dat.h's contract */
+Smap*	srvmapget(Srvctx*);
+void	srvmapput(Srvctx*, Smap*);
+
 /* text.c */
 void	textread(Req*, Text*);
 
@@ -101,12 +105,12 @@ void	srvattach(Req*);
 int	srvaname(Sfid*, char *aname);
 
 /* status.c */
-char*	srvstatustext(Srvctx*, Sfid*, Text*);
-char*	srvmaptext(Srvctx*, Sfid*, Text*);
-char*	srvemptytext(Srvctx*, Sfid*, Text*);
-char*	srvdirtytext(Srvctx*, Sfid*, Text*);
-char*	srvstaletext(Srvctx*, Sfid*, Text*);
-char*	srvlosttext(Srvctx*, Sfid*, Text*);
+char*	srvstatustext(Srvctx*, Sfid*, Text*, char *buf, int nbuf);
+char*	srvmaptext(Srvctx*, Sfid*, Text*, char *buf, int nbuf);
+char*	srvemptytext(Srvctx*, Sfid*, Text*, char *buf, int nbuf);
+char*	srvdirtytext(Srvctx*, Sfid*, Text*, char *buf, int nbuf);
+char*	srvstaletext(Srvctx*, Sfid*, Text*, char *buf, int nbuf);
+char*	srvlosttext(Srvctx*, Sfid*, Text*, char *buf, int nbuf);
 
 /* enum.c */
 Objsnap* srvsnapopen(Store*, int kinds, char *buf, int nbuf);
@@ -114,11 +118,11 @@ void	srvopenq(Req*);
 void	srvobjdiropen(Req*);
 void	srvobjdirread(Req*);
 int	srvobjdirheld(Sfid*);
-char*	srvtombstext(Srvctx*, Sfid*, Text*);
-char*	srvadverttext(Srvctx*, Sfid*, Text*);
+char*	srvtombstext(Srvctx*, Sfid*, Text*, char *buf, int nbuf);
+char*	srvadverttext(Srvctx*, Sfid*, Text*, char *buf, int nbuf);
 
 /* job.c */
-char*	srvjobstext(Srvctx*, Sfid*, Text*);
+char*	srvjobstext(Srvctx*, Sfid*, Text*, char *buf, int nbuf);
 char*	srvctlscrub(Srvctx*, Sfid*, int, char**);
 char*	srvctlreclaim(Srvctx*, Sfid*, int, char**);
 char*	srvctlforget(Srvctx*, Sfid*, int, char**);
@@ -145,7 +149,7 @@ void	srvobjremove(Req*);
 void	srvobjwstat(Req*);
 void	srvobjcreate(Req*);
 void	srvmetaopen(Req*);
-char*	srvmetatext(Srvctx*, Sfid*, Text*);
+char*	srvmetatext(Srvctx*, Sfid*, Text*, char *buf, int nbuf);
 void	srvstagesweep(Srvctx*);
 void	srvstagedrain(Srvctx*);
 
