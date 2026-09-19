@@ -137,16 +137,20 @@ enum
  * the loop, which is what the fixed status files want), the read cell
  * for a read.  Opting in is expected of a row whose render takes an
  * engine snapshot or a lock the engine holds; /status has not, and is
- * still rendered on the service loop although it calls storestat and
- * dirtycount, which take the engine's state lock.  It stays there
- * while it is the only caller and the lock is uncontended; the row
- * moves to the offload path when that stops being true, and nothing
- * outside this table has to change when it does.  Such a cell pushes
- * and returns; what runs on the queue obeys the pool's rules entire —
- * it tests srvqcheck if it has work worth skipping, and it MUST leave
- * through srvqdone, which is where the flush is answered and step 7
- * performed.  srvopentext is the standard render-at-open body for a
- * row that wants it on a queue.
+ * still rendered on the service loop although it takes three locks in
+ * the course of one render: the engine's state lock, for storestat
+ * and dirtycount; `cntlk', for srvdiverged; and `joblk', for
+ * srvscrubnextms.  They are taken one after another and never one
+ * inside another, so the render cannot be part of a cycle, and each
+ * is held for a read of a word or two.  It stays on the loop while
+ * every one of the three is uncontended and this is the only caller;
+ * the row moves to the offload path when that stops being true, and
+ * nothing outside this table has to change when it does.  Such a cell
+ * pushes and returns; what runs on the queue obeys the pool's rules
+ * entire — it tests srvqcheck if it has work worth skipping, and it
+ * MUST leave through srvqdone, which is where the flush is answered
+ * and step 7 performed.  srvopentext is the standard render-at-open
+ * body for a row that wants it on a queue.
  *
  * Which cells belong with which body of work.  The /obj directory
  * row's open and read cells — and the aux a fid of that row carries
@@ -741,7 +745,7 @@ struct Sstage
  *		empties the field before it gives the installed reference
  *		back, so a get after that point would read nil and fault;
  *		what keeps it from happening is the reply rule below and
- *		the two waits srvshutdown makes.
+ *		the waits srvshutdown makes.
  *	srvmapput	gives that reference back.  The LAST holder of a
  *		snapshot no longer in force is what frees it — which may
  *		be the swap that replaced it, or a request that has been
@@ -958,25 +962,38 @@ struct Srvctx
 	 * rate `scrub rate=' sets, in KiB/s, and the flag `scrub stop'
 	 * raises, which a running pass tests between objects exactly as
 	 * it tests srvstopping.  `scrubbing' is what keeps a second
-	 * `scrub start' from putting two passes over one index.
+	 * `scrub start' — or a tick of the scrub's own timer — from
+	 * putting two passes over one index.
 	 *
 	 * The tombstone reclaim walk carries the same pair of flags, for
 	 * the same two jobs — one pass over one index, and a stop a
 	 * running pass reads between entries — and they are its own, not
 	 * the scrub's: the two walks run at once and neither stops the
-	 * other (job.c).  `reclaimms' is the T1 knob over the timer's
-	 * period and `reclaimup' says the timer proc is still reading
-	 * this context, which is what the shutdown waits for; the timer
-	 * holds no job, since it makes no engine call.
+	 * other (job.c).
+	 *
+	 * Each of the two has a timer, and the last words of each pair are
+	 * that timer's: `...ms' is the T1 knob over its period,
+	 * `...slice' the T1 knob over the stretch it sleeps that period
+	 * in, `...up' says the proc is still reading this context — which
+	 * is what the shutdown waits for, since a timer holds no job,
+	 * making no engine call — and the scrub's `scrubnext' is when its
+	 * next tick is due, as an absolute millisecond, which is what
+	 * /status renders as `scrubnext=' (job.c, status.c).  The reclaim
+	 * timer has no such word because no file reports its schedule.
 	 */
 	Sjob	*jobs;
 	int	scrubbing;
 	int	scrubstop;
 	ulong	scrubrate;
+	int	scrubup;
+	uvlong	scrubms;
+	uvlong	scrubtick;
+	uvlong	scrubnext;
 	int	reclaiming;
 	int	reclaimstop;
 	int	reclaimup;
 	uvlong	reclaimms;
+	uvlong	reclaimslice;
 	int	stopping;	/* the shutdown has begun: no new jobs */
 	int	served;		/* a service loop was started over this context */
 	int	released;	/* lib9p has let go of the Srv (Srv.free) */

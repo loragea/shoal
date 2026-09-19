@@ -2693,10 +2693,11 @@ already there:
 **What the engine builds, and what the server still owes.** The
 engine holds the per-object primitives and the durable state; the
 pass that drives them — the proc, its rate limit, the queue it pushes
-through and the peer fetch — is the server's. All of it but the peer
-fetch is built: `srv/job.c` runs the pass from layer-a §2.5's `scrub`
-verb, in a proc holding one of the server's background jobs, and
-paces itself over the bytes it hashes (§14(31)). The primitives are:
+through, the schedule and the peer fetch — is the server's. All of it
+but the peer fetch is built: `srv/job.c` runs the pass from layer-a
+§2.5's `scrub` verb and from a timer of its own (below), in a proc
+holding one of the server's background jobs, and paces itself over the
+bytes it hashes (§14(31)). The primitives are:
 
 - **verify** one object, as above, mutating nothing.
 - **scrub** one object: verify, then the one durable transition that
@@ -2800,6 +2801,59 @@ two-vCPU node that also runs the write path. The engine's own calls
 make that discipline available rather than enforce it: each is one
 object's worth of work, serialised by the caller exactly as every
 other call in §7 is.
+
+**And it runs on a schedule, which is what layer-a §7.5's
+"continuously" is.** A timer proc started at start-up beside the
+tombstone reclaim walk's (§14(39)) starts a pass every `scrubdays`,
+so an instance nobody writes a verb to still re-reads everything it
+holds. The period and the flag over it are **implementation policy**,
+which is what §7.5 says of `scrubdays` itself: the default is 14 days
+— §7.5's own example, which is also what sizes the 4 MiB/s default
+rate above — and `shoalsrv -d <scrubdays>` overrides it (§12). The
+period is the interval between one pass *starting* and the next tick,
+and the rate is what makes a pass take about that long, so the two
+knobs describe the same fortnight from either end.
+
+The first pass comes one period after start-up rather than at it: a
+pass is a walk of the whole index at `scrubdays` of pacing, so an
+instance restarted often would otherwise spend its life in the first
+part of one and never reach the far end of the index.
+
+**A tick that lands on a running pass starts nothing.** That is not a
+missed tick to be caught up on — the pass still walking *is* the
+continuity §7.5 asks for, and a second pass over one index is what
+the `scrubbing` flag exists to prevent. The tick is otherwise the
+verb's own path exactly (`scrubgo` in `srv/job.c`, which the verb and
+the timer share), down to the refusals: a tick meeting the job cap is
+turned back like a `scrub start` meeting it.
+
+The timer arms tick to tick and not from the end of a pass, which is
+what settles the gap on the far side of an overlong one: a pass that
+outlasts its period ends at no fixed point in the tick it is in, so
+the wait between it ending and the next pass starting is anywhere in
+[0, `scrubdays`] — the tick it was still running for was a no-op, and
+the one after that starts the next pass. That is **implementation
+policy** and it is the cheap reading: an index that takes longer than
+`scrubdays` to walk is one whose rate is set too low for its size, and
+§7.5's continuity is met by a pass always being due rather than by any
+particular spacing between them.
+
+**Neither word of the verb touches the schedule.** `scrub start`
+starts a pass now and leaves the timer where it was; `scrub stop`
+stops the pass that is running, and the next tick starts another. The
+reading is the one layer-a §2.5's `reclaim` row already states for
+the reclaim walk, so the two verbs agree by design rather than by
+accident; §14(39) has the argument and what it costs an operator who
+wants a walk off for good. `/status`'s `scrubnext=` (§14(23)) is how
+long is left until the next tick, which is where that schedule is
+read from the wire.
+
+The timer proc holds none of §9's background jobs, because it makes
+no engine call — the pass it starts holds one for its own run — so
+the shutdown waits for the proc separately and before the jobs, since
+it is one of the two things that could still start one. Its wait is
+slept in half-second slices so that a shutdown is seen inside one
+rather than at the end of a period measured in days.
 
 **The pass is also where a condemned slot's grains come back.** *The
 engine's half is built — `bmpassbegin`, `bmpassfold`, `bmpassend` and
@@ -4105,19 +4159,36 @@ flush caveat depends on: `virtio` and `ahci` issue a real flush,
 `ata` (the legacy IDE driver) fakes it silently.
 
 The servers themselves — the object server and the monitor — are
-layer-a's subject, not this document's, but two of `shoalsrv`'s flags
-carry behaviour this document defines, so it gets a synopsis here:
+layer-a's subject, not this document's, but several of `shoalsrv`'s
+flags carry behaviour this document defines, so it gets a synopsis
+here:
 
-    shoalsrv [-w] [-X point[,n]] [-q queues] [-s srvname]
-             -m mapfile /dev/sdXX/name
+    shoalsrv [-w] [-X point[,n]] [-q queues] [-d scrubdays]
+             [-s srvname] -m mapfile /dev/sdXX/name
 
 `-w` is §3.2's operator assertion that the unit is write-through and
 is reported in `/status`; `-X` is §13's fault-injection point,
 present in every build and inert without the flag; `-q` sets the
-queue-pool size, whose sizing rule is §7's; `-s` names the posted
+queue-pool size, whose sizing rule is §7's; `-d` is layer-a §7.5's
+`scrubdays`, a whole positive number of days, which is how long a
+full scrub pass should take and so the period between passes (§8) —
+the default is 14, the largest accepted is 36500 (a hundred years),
+and anything else is refused with the usage; `-s` names the posted
 service. `-m` is the cluster map, as a file: this build has no
 monitor client, so the map is read once at start and never refreshed
 (§14(18)).
+
+"Anything else" is meant strictly for `-d`, which an operator spells
+once a start-up and cannot correct afterwards. The argument is one
+run of decimal digits and nothing besides: the first character MUST
+be a digit, so a leading `+` and leading white space are refused as
+trailing characters already were, and the value must be at least 1
+and at most 36500. The upper bound exists because this platform's
+`strtol` clamps an overflowing number to `LONG_MAX` and reports the
+whole string consumed, which leaves the end pointer nothing to
+refuse — without a bound `-d 99999999999` would be taken as
+2147483647 days. All of this is **implementation policy**: layer-a
+§7.5 fixes what `scrubdays` means, not how a command spells it.
 
 The monitor is `cmd/shoalmon`, and it gets a synopsis here for the
 same reason: its one argument is the raw partition §10 formats and
@@ -5317,7 +5388,7 @@ is not built; each says which.
     None of the four can be computed without the peers and the
     reconcile pass §14(18) says are not built, and a zero would be a
     measurement this instance has not made. *Not made:* they are
-    absent from the file rather than present and wrong. Four fields
+    absent from the file rather than present and wrong. Five fields
     beyond §2.2's list are present because nothing else reports them:
     `objsnapopen=`, which §9 makes the server's half of `objsnap=`;
     the queue pool's `queues=`, `qdepth=`, `qpushed=` and
@@ -5330,7 +5401,27 @@ is not built; each says which.
     "reported in `/status`" without naming a field, so the name is
     this server's. §14(15) has the rest of that record: the count is
     in memory and per process, and the durable `/lost kind=diverged`
-    line is the open half. `queues=` is the size of the hash the
+    line is the open half. The fifth is `scrubnext=<ms>`, the
+    milliseconds left until the scrub timer's next tick (§8): layer-a
+    §7.5 has the pass run on a schedule and §2.2 names no field for
+    when the next one is due, so an operator would otherwise have to
+    infer it from a `job=scrub` line that has not appeared yet. It
+    says when the schedule will next *look* — a tick that finds a
+    pass already running starts nothing — and it is re-armed at every
+    tick, so it counts down and begins again rather than reaching 0
+    and staying there. It is a **lower bound** on the wall-clock
+    wait and not a deadline: the timer counts its period in nominal
+    ticks rather than off the clock, and every tick that oversleeps
+    — `sleep` is a lower bound on the wait, with nothing bounding it
+    from above — is time the count never charges, so the tick lands
+    at or after the moment the field named and never before. At one
+    per cent of overshoot per tick that is some three and a half
+    hours over a 14-day period. The tombstone reclaim walk's timer
+    counts the same way and drifts the same; it has no field of its
+    own, so its drift shows only as a pass landing late. All of that
+    is *implementation policy*: layer-a §7.5 asks for a pace and
+    names no accuracy, and D26 makes each walk's period policy in as
+    many words. `queues=` is the size of the hash the
     object ids land in — the ceiling §7 is about — and does not count
     the one reserved queue an operation that names no object is
     offloaded to; the other three count every request the pool took
@@ -5962,33 +6053,44 @@ is not built; each says which.
     one period after start-up rather than at it, so that an instance
     restarted often does not walk its index at every start.
 
-    **What the verb does not do, and the half that is open.**
-    `reclaim stop` stops the pass that is running; it does not turn
-    the timer off, and the next tick starts a pass as a `reclaim
+    **What the verb does not do, and how `scrub` reads the same
+    way.** `reclaim stop` stops the pass that is running; it does not
+    turn the timer off, and the next tick starts a pass as a `reclaim
     start` would. §2.5's form has two words and neither names a
     schedule, and an operator who wants the walk off for good has no
     verb for it — which costs a walk of the tombstone snapshot per
     period and no durable change, since the walk discards nothing.
-    That is the **open half**: `scrub` has no schedule of its own yet
-    (layer-a §7.5's "continuously" is not built), so `scrub stop`
-    means "stop this pass" and nothing else, and the two verbs agree
-    today by accident. When the scrub gets a scheduler, a `stop` that
-    holds the schedule until the next `start` is the reading that
-    verb will want, and this one's meaning has to be settled against
-    it — either the same reading here, or a form of §2.5's own for a
-    schedule. Nothing on the wire commits either way today: the two
-    `stop`s do the same thing. The timer is not gated by the fence
-    either: it starts no discard while condition 1 is unanswerable,
-    and what the fence governs is `start`, which is the surface §2.5
-    has.
+
+    `scrub` reads exactly that way, and now for the same reason
+    rather than by accident: the scrub has a schedule of its own (§8)
+    and `scrub stop` stops the pass that is running, leaving the next
+    tick to start another, while `scrub start` asks for a pass now
+    and leaves the timer where it was. *Considered and rejected:* a
+    `stop` that holds the schedule until the next `start`, which is
+    the other reading of two words that name no schedule. It makes
+    `stop` a durable mode change spelled like a cancellation, leaves
+    an instance silently unscrubbed with nothing in `/status` or
+    `/jobs` to say so — layer-a §7.5 has the pass run continuously,
+    so an instance that has quietly stopped is one that has stopped
+    meeting §7.5 — and gives the two verbs different meanings for one
+    word. An operator who wants the scrub cheap has `scrub rate=`;
+    one who wants it off has `-d` and a number of days. The timer is
+    not gated by the fence either: it starts no discard while
+    condition 1 is unanswerable, and what the fence governs is
+    `start`, which is the surface §2.5 has.
 
     **What it is not.** The timer proc holds none of §9's background
     jobs, because it makes no engine call — the pass it starts holds
     one for its own run — so the shutdown waits for the proc
-    separately and before the jobs, since it is the one thing that
-    could still start one. layer-a §7.5's "continuously" for the
-    scrub is a **separate** matter and is not built: `scrub` still
-    runs only when an operator asks for it.
+    separately and before the jobs, since it is one of the two things
+    that could still start one. The other is the scrub's own timer,
+    which is this one's twin: layer-a §7.5's "continuously" is built
+    the same way, and §8 has its period, its first pass and what a
+    tick landing on a running pass does. That schedule is §7.5
+    implemented rather than a deviation, so it has no item of its
+    own; what is policy about it — the period, the flag over it, and
+    that the first pass comes one period in — is recorded there and
+    in §14(23) for the field that reports it.
 
 40. **A `Tread` of `/repl` is end of data.** §5.5 defines no read of
     the channel: it is one-way, and the reply to an operation is the

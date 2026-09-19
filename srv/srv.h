@@ -144,6 +144,7 @@ struct Srvcfg
 	long	maplen;
 	int	nqueue;		/* -q; 0 takes Nqueuedflt */
 	int	noflush;	/* -w, store.md §3.2, reported in /status */
+	int	scrubdays;	/* -d; 0 takes layer-a §7.5's default of 14 */
 	/*
 	 * The engine's; spawn is filled in here.  Two of its stage fields
 	 * are read by this library as well: `stagems' is how long a stage
@@ -237,10 +238,12 @@ void	srvshutdown(Srvctx*);
  * running SHOULD test srvstopping between units of work and give up
  * rather than leave the shutdown waiting.
  *
- * The tombstone reclaim walk's timer is the one proc here that is NOT
- * a job: it starts passes and makes no engine call of its own, so it
- * holds nothing the store's close must wait behind.  What it does hold
- * is the context it reads, and the shutdown waits for it separately.
+ * The two timers — the scrub's (layer-a §7.5) and the tombstone
+ * reclaim walk's (§1.5) — are the procs here that are NOT jobs: each
+ * starts passes and makes no engine call of its own, so neither holds
+ * anything the store's close must wait behind.  What they do hold is
+ * the context they read, and the shutdown waits for each of them
+ * separately, and before the jobs.
  */
 int	srvjobstart(Srvctx*);
 void	srvjobend(Srvctx*);
@@ -261,7 +264,8 @@ Cmap*	srvmap(Srvctx*);
 char*	srviid(Srvctx*);
 void	srvcount(Srvctx*, uvlong *pushed, uvlong *done);
 int	srvjobcount(Srvctx*);	/* jobs held: what the shutdown waits for */
-int	srvreclaimlive(Srvctx*);	/* ... and the timer, which holds none */
+int	srvreclaimlive(Srvctx*);	/* ... and the timers, which hold none */
+int	srvscrublive(Srvctx*);
 
 /*
  * store.md §13's -X shape, for this library's own points: inert until
@@ -414,20 +418,40 @@ int	srvreclaimlive(Srvctx*);	/* ... and the timer, which holds none */
  *		parks a pass proc, so it carries jobhold's hazard above
  *		entire.
  *	tickhold
- *		n != 0 holds the reclaim TIMER's own start of a pass, after
- *		it has decided to start one and before the pass's proc
+ *		n != 0 holds a TIMER's own start of a pass — the reclaim
+ *		timer's and the scrub timer's alike — after it has
+ *		decided to start one and before the pass's proc
  *		exists.  That window is where a `reclaim start' written on
  *		the service loop meets a tick in flight, and it is too
  *		narrow to write into without a hold.  Only the timer's call
  *		parks here, never a verb's: a verb's call IS the loop, and
- *		a loop parked answers nothing else either.  The proc it
- *		parks does hold a job — the admission has counted and
- *		linked the pass before the timer reaches this point, so
- *		/jobs lists it while it is parked — but it carries none of
- *		jobhold's hazard, because a tick that reaches the point
- *		was admitted before `stopping' was set: jobadmit reads
- *		that flag under the same joblk hold the shutdown sets it
- *		in, so no shutdown can have begun behind the parked tick.
+ *		a loop parked answers nothing else either.
+ *
+ *		One point serves both timers, so a case that parks a tick
+ *		MUST have only one of the two ticking.  Nothing enforces
+ *		it and nothing could tell a case otherwise: the hold
+ *		counts no parks (qhold is called with a nil counter,
+ *		queue.c), so a second tick parked here is invisible, and
+ *		the one srvhook(...,0) that releases the tick the case
+ *		meant releases the other with it.  Two timers park only if
+ *		a case shortens both periods; the defaults are days and
+ *		half a day apart, and a case shortens the one it is about.
+ *
+ *		The proc it parks does hold a job — the admission has
+ *		counted and linked the pass before the timer reaches this
+ *		point, so /jobs lists it while it is parked — but it
+ *		carries none of jobhold's hazard, and not because a
+ *		shutdown cannot have begun behind it: one can, the hold
+ *		being taken off the service loop with nothing to stop the
+ *		loop ending behind it.  What makes it safe is the two ends
+ *		the shutdown holds.  srvholdclear (srv.c) releases this
+ *		point with the rest before any of the waits, so the parked
+ *		tick is let go rather than waited for; and the job the
+ *		admission counted is one jobwait sees, so the pass it then
+ *		launches is waited for like any other.  A tick that has
+ *		NOT reached the admission gets nothing at all: jobadmit
+ *		reads `stopping' under the same joblk hold the shutdown
+ *		sets it in and refuses.
  *	fullhold
  *		n != 0 holds an op=full chunk on a /repl fid between the
  *		stage it continued or opened and the engine write through
@@ -647,6 +671,59 @@ void	srvendpoint(Srvctx*, uvlong ms);
  */
 void	srvreclaimms(Srvctx*, uvlong ms);
 uvlong	srvreclaimperiod(Srvctx*);
+
+/*
+ * The same knob over the scrub's timer, which runs layer-a §7.5's
+ * "continuously": the period there is `scrubdays' — 14 unless
+ * `shoalsrv -d' said otherwise (store.md §12) — so a T1 that wants to
+ * see a tick sets this to a few tens of milliseconds, and 0 puts
+ * `scrubdays' back.  It is re-read as the timer waits, like the one
+ * above, and the wait is slept in half-second slices, so a period
+ * below that is one tick per slice and the first tick comes within a
+ * slice of the call.  The shutdown does not clear it, for the reasons
+ * it does not clear that one.
+ *
+ * srvscrubperiod is the period in force, which is what a test asserts
+ * the default by: 14 days is longer than a test can wait.  What a tick
+ * DOES is not this knob's: a tick that lands on a running pass starts
+ * nothing, so a case that wants a second pass gives the first one time
+ * to end (job.c).  /status's `scrubnext=' is how long is left of the
+ * wait, which is the same schedule read from the wire.
+ */
+void	srvscrubms(Srvctx*, uvlong ms);
+uvlong	srvscrubperiod(Srvctx*);
+
+/*
+ * The knobs over the stretch each of those two timers sleeps its
+ * period in — half a second in this server (job.c) — where the knobs
+ * above are over the period itself.  0 puts the server's own back.
+ *
+ * The two are named after the constants they override, which are not
+ * the same word: the scrub timer's is Scrubtickms, because job.c has
+ * a Scrubslicems as well and that one is something else entirely —
+ * the twenty milliseconds a scrub PASS sleeps between rate charges.
+ * The reclaim timer has no such twin, so its constant and its knob
+ * are both `slice'.
+ *
+ * That stretch is what bounds the shutdown's wait for a timer proc,
+ * and that is the whole of what these are for: at half a second the
+ * wait is shorter than the work srvshutdown does after it — jobwait,
+ * the fid close, the stage drain and the queue free — so a shutdown
+ * that did not wait at all would still, most times, reach storeclose
+ * with the proc already gone, and a case asserting that it has gone
+ * would pass either way.  A case sets it to seconds, gives the timer
+ * one old stretch to enter a new one, and then takes the server down:
+ * the remaining sleep is now longer than everything downstream of the
+ * wait, so the proc is demonstrably still up when the wait begins and
+ * the assertion at storeclose fails if the wait is not made.
+ *
+ * The period is set back to the server's own before the stretch is
+ * lengthened: a long one under a period of tens of milliseconds is a
+ * tick apiece, and a tick during a shutdown is not what the case is
+ * about.  Like the two above, the shutdown does not clear these.
+ */
+void	srvscrubtickms(Srvctx*, uvlong ms);
+void	srvreclaimslicems(Srvctx*, uvlong ms);
 
 /*
  * The adopted map, swapped under the running server.  Nothing in this

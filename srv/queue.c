@@ -648,16 +648,18 @@ srvreclaimhold(Srvctx *c, uvlong i)
 }
 
 /*
- * The point inside the reclaim timer's own start of a pass (job.c):
+ * The point inside a timer's own start of a pass (job.c) — the
+ * reclaim timer's and the scrub timer's alike, one point for both:
  * n != 0 parks the tick after it has decided to start one and before
  * the pass's proc exists.  That window is where a `reclaim start'
  * written on the service loop meets a tick in flight, and it is too
  * narrow to write into without a hold.  Only the timer's call parks
  * here — a verb's is the loop itself, and a loop parked answers
  * nothing else either.  The proc it parks holds a job — the admission
- * has counted and linked the pass before the timer gets here — but a
- * tick that reaches the point was admitted before `stopping' was set,
- * so no shutdown can have begun behind it (srv.h).
+ * has counted and linked the pass before the timer gets here — so a
+ * shutdown that begins behind the park finds the pass in what jobwait
+ * waits for, and srvholdclear lets the park itself go before any of
+ * the waits (srv.h).
  */
 void
 srvtickhold(Srvctx *c)

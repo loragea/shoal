@@ -12,9 +12,12 @@
 /*
  * The background passes, /jobs, and the three ctl verbs that start
  * one: `scrub' (layer-a §2.5, §7.5, store.md §8), `reclaim' (§2.5,
- * store.md §9) and `forget' (§2.5, §7.1).  The reclaim pass also has
- * a timer of its own, started at srvnew, which is the only pass here
- * that runs without a verb having asked for it.
+ * store.md §9) and `forget' (§2.5, §7.1).  Two of the three have a
+ * timer of their own, started at srvnew: the scrub's is layer-a
+ * §7.5's "continuously", and the reclaim's is the cadence §1.5's
+ * condition 3 moves at.  Both run their pass with no verb having
+ * asked for one, and `forget' is the pass that has no timer, since
+ * it names a peer and nothing but an operator knows which.
  *
  * §2.5: "Commands that start background work return success once the
  * job is accepted; progress is read from /jobs."  Every verb here does
@@ -24,8 +27,8 @@
  * anything is still inside the engine, and the request drain cannot
  * see a proc that is not a request.  A pass tests srvstopping between
  * units of work and gives up rather than leave the shutdown waiting.
- * The timer is the one proc here that holds no job, because it walks
- * nothing itself: it only starts passes (srv.h).
+ * The two timers are the procs here that hold no job, because they
+ * walk nothing themselves: they only start passes (srv.h).
  *
  * WHY `forget' IS A PASS.  §2.5 does not call it background work, and
  * this server makes it so.  Each record it discards is one dirtydel,
@@ -62,6 +65,44 @@ enum
 	Scrubratedflt	= 4096,
 	Scrubfloor	= 1024,
 	Scrubslicems	= 20,
+
+	/*
+	 * The scrub's own timer (store.md §8, §14(39)).  layer-a §7.5 has
+	 * each instance re-read its objects CONTINUOUSLY, "rate-limited so
+	 * that a full pass completes in about `scrubdays'" — so the period
+	 * between one pass starting and the next is that same `scrubdays',
+	 * and a pass still running when its period is up is the continuity
+	 * §7.5 asks for rather than a tick to be caught up on: the tick is
+	 * a no-op and the walk goes on.  The default is 14 days, which is
+	 * the default §7.5 sizes its own example at, and `shoalsrv -d'
+	 * overrides it (store.md §12).  Both are implementation policy,
+	 * which §7.5 says in as many words.
+	 *
+	 * The wait is slept in half-second ticks for the reasons the
+	 * reclaim timer's slices are (Reclaimslicems below): what it paces
+	 * is a period of days, the proc is not a job, and what the length
+	 * costs is the shutdown's wait for the proc, which is bounded by
+	 * one tick.  It is NOT Scrubslicems above: that one paces a walk
+	 * of a disk and is twenty milliseconds, and the difference is why
+	 * this constant, its accessor and its T1 knob are all `tick' —
+	 * `scrubslice' would name the wrong number.
+	 *
+	 * The first pass comes one period after start-up rather than at
+	 * it, which is reclaim's argument (reclaimtimer below) reaching
+	 * the same place from the other end: a pass costs a walk of the
+	 * whole index at `scrubdays' of pacing, so an instance restarted
+	 * often would spend its life in the first tenth of one.
+	 *
+	 * The period itself is not here but below, as a macro: an enum
+	 * constant is an int, and a period in milliseconds outgrows one
+	 * at 24 days — 14 already spends 56% of the range.  A default
+	 * raised past that would wrap to a negative, which `return
+	 * Scrubperiodms' then sign-extends into a period of some hundred
+	 * million years.  The `-d' path is not exposed to it, casting to
+	 * uvlong before it multiplies; this one has to say so too.
+	 */
+	Scrubdaysdflt	= 14,
+	Scrubtickms	= 500,
 
 	/*
 	 * How many passes may run at once.  layer-a §2.5 bounds neither
@@ -113,6 +154,15 @@ enum
 	/* what qjob runs on the object's queue */
 	Jscrub		= 0,
 };
+
+/*
+ * The default period in milliseconds, which is Scrubdaysdflt of days
+ * (see the enum above for why it is not in it): a macro rather than an
+ * enum constant, and multiplied by an unsigned long long rather than
+ * by two ints, so that the width of the result follows the number of
+ * days and not the other way about.
+ */
+#define Scrubperiodms	(Scrubdaysdflt*86400000ULL)
 
 /*
  * One unit of a pass's work, run on the object's own queue.
@@ -290,8 +340,8 @@ jobproc(void *a)
 	 * finished walking, which is a job that is not running and is not
 	 * going to be.  The record stays linked either way, so /jobs
 	 * still lists what the pass finished with.  `reclaim' carries the
-	 * same flag for the same reason, and its timer reads it too: a
-	 * tick that finds it raised starts nothing.
+	 * same flag for the same reason, and each verb's timer reads its
+	 * own: a tick that finds it raised starts nothing.
 	 */
 	lock(&c->joblk);
 	if(strcmp(j->verb, "scrub") == 0)
@@ -689,9 +739,13 @@ reclaimgo(Srvctx *c, int bytimer)
 		 * asks for: it will read the flag between two entries and
 		 * give up.  This is `scrub's rule (§14(31)) for the same
 		 * reason — clearing the stop flag instead races the pass's
-		 * own read of it — and the timer is answered it too, which
-		 * costs a tick: the pass winding down is about to end, and
-		 * the next tick starts a whole walk.
+		 * own read of it — and the timer is answered it too.  What
+		 * that costs is a whole period: `tombdays'/2, which is half
+		 * a day at the shortest and days for any map an operator
+		 * would write, with no walk over the entries the stopped
+		 * one never reached.  The tick cannot be spent on the pass
+		 * winding down instead — that pass is about to end — and a
+		 * walk started behind it is what `reclaiming' forbids.
 		 */
 		if(c->reclaimstop){
 			unlock(&c->joblk);
@@ -756,6 +810,29 @@ srvreclaimperiod(Srvctx *c)
 }
 
 /*
+ * The stretch the timer sleeps at a time: Reclaimslicems, unless a T1
+ * has set the knob over it (srv.h).  It is read fresh each slice, like
+ * the period.
+ *
+ * What the length costs is the shutdown's wait for this proc, which is
+ * bounded by one slice — so a case that wants that wait to be worth
+ * something makes the slice longer than everything srvshutdown does
+ * after it, and a wait that is not made shows as the store closing
+ * under a timer that is still up.  Nothing but a test sets it: the
+ * server's own slice is the constant.
+ */
+static uvlong
+reclaimslicems(Srvctx *c)
+{
+	uvlong ms;
+
+	lock(&c->joblk);
+	ms = c->reclaimslice;
+	unlock(&c->joblk);
+	return ms != 0 ? ms : Reclaimslicems;
+}
+
+/*
  * The timer.  It is not a job — it makes no engine call, and a job
  * the shutdown waits for would have to end before jobwait rather than
  * with it — so the shutdown waits for this proc separately, and the
@@ -773,18 +850,19 @@ static void
 reclaimtimer(void *a)
 {
 	Srvctx *c;
-	uvlong t;
+	uvlong t, slice;
 
 	c = a;
 	for(;;){
-		for(t = 0; t < srvreclaimperiod(c); t += Reclaimslicems){
+		for(t = 0; t < srvreclaimperiod(c); t += slice){
+			slice = reclaimslicems(c);
 			if(srvstopping(c)){
 				lock(&c->joblk);
 				c->reclaimup = 0;
 				unlock(&c->joblk);
 				threadexits(nil);
 			}
-			sleep(Reclaimslicems);
+			sleep(slice);
 		}
 		reclaimgo(c, 1);
 	}
@@ -831,6 +909,17 @@ srvreclaimms(Srvctx *c, uvlong ms)
 {
 	lock(&c->joblk);
 	c->reclaimms = ms;
+	unlock(&c->joblk);
+}
+
+/*
+ * The T1 knob over the slice (srv.h).  0 puts Reclaimslicems back.
+ */
+void
+srvreclaimslicems(Srvctx *c, uvlong ms)
+{
+	lock(&c->joblk);
+	c->reclaimslice = ms;
 	unlock(&c->joblk);
 }
 
@@ -909,6 +998,285 @@ scrubpass(Sjob *j)
 		}
 		scrubpace(c, &bytes, &t0, &lastrate, oi.len);
 	}
+}
+
+/*
+ * Start a scrub pass, for the verb and for the timer alike.  It is
+ * reclaimgo's twin and every word of that function's comment applies
+ * here: one "a pass is running" flag between the two callers, raised
+ * in the SAME hold of joblk that admits the job so that a caller which
+ * finds it up is never answered success for a pass the admission then
+ * refuses, put back with the stop flag by the one refusal below the
+ * admission, and `bytimer' parking §13's `tickhold' for the timer's
+ * call alone.
+ *
+ * What differs is only which pass it is.  A tick that lands on a pass
+ * an operator started starts nothing, and a `scrub start' written over
+ * a pass the timer started is the same no-op as one written over a
+ * pass the verb started — which is what layer-a §7.5's "continuously"
+ * wants of a tick: the walk already running IS the pass the tick would
+ * have asked for.
+ */
+static char*
+scrubgo(Srvctx *c, int bytimer)
+{
+	char *e;
+	Sjob *j;
+	int wasstop;
+
+	if((j = jobnew(c, "scrub", scrubpass, nil)) == nil)
+		return Enomem;
+	lock(&c->joblk);
+	if(c->scrubbing){
+		/*
+		 * A pass that has been told to stop is not the job a start
+		 * asks for: it reads the flag between two objects and gives
+		 * up (store.md §14(31)).  The timer is answered that too,
+		 * and what that costs is a whole period — `scrubdays', 14
+		 * days unless `shoalsrv -d' said otherwise — with no pass
+		 * running over the tail the stopped one never reached.  The
+		 * tick cannot be spent on the pass winding down instead:
+		 * that pass is about to end, and a tick answered with it is
+		 * a tick answered with nothing.  Starting one behind it is
+		 * what `scrubbing' forbids, since the two would be over one
+		 * index at once.
+		 */
+		if(c->scrubstop){
+			unlock(&c->joblk);
+			free(j);
+			return Escrubstopping;
+		}
+		unlock(&c->joblk);
+		free(j);
+		return nil;
+	}
+	if((e = jobadmit(c, j)) != nil){
+		unlock(&c->joblk);
+		free(j);
+		return e;
+	}
+	wasstop = c->scrubstop;
+	c->scrubbing = 1;
+	c->scrubstop = 0;
+	unlock(&c->joblk);
+	if(bytimer)
+		srvtickhold(c);
+	if((e = joblaunch(j)) == nil)
+		return nil;
+	lock(&c->joblk);
+	c->scrubbing = 0;
+	c->scrubstop = wasstop;
+	unlock(&c->joblk);
+	return e;
+}
+
+/*
+ * The period between scrub passes, in ms: `scrubdays', which is
+ * layer-a §7.5's own knob and is 14 days unless `shoalsrv -d' said
+ * otherwise (store.md §12).  It is read fresh each slice, so a test
+ * that sets the knob after srvnew shortens the wait it is already in.
+ *
+ * It is public for the same reason srvreclaimperiod is (srv.h): the
+ * period is measured in days, so what a test can assert about it is
+ * the number itself and not a tick it waited for.
+ */
+uvlong
+srvscrubperiod(Srvctx *c)
+{
+	uvlong ms;
+
+	lock(&c->joblk);
+	ms = c->scrubms;
+	unlock(&c->joblk);
+	if(ms != 0)
+		return ms;
+	if(c->cfg.scrubdays > 0)
+		return (uvlong)c->cfg.scrubdays * 86400000;
+	return Scrubperiodms;
+}
+
+/*
+ * When the next tick is due, as an absolute millisecond on the same
+ * clock srvscrubnextms reads: the timer writes it under joblk at every
+ * slice and at every re-arm, so /status can report the schedule
+ * without asking the proc anything.  It is armed before the proc
+ * exists (srvscrubproc), so the field is never the zero of a timer
+ * that has not run yet.
+ */
+static void
+scrubarm(Srvctx *c, uvlong left)
+{
+	uvlong now;
+
+	now = nsec()/1000000;
+	lock(&c->joblk);
+	c->scrubnext = now + left;
+	unlock(&c->joblk);
+}
+
+/*
+ * What /status renders as `scrubnext=' (status.c): milliseconds from
+ * now until the timer's next tick, 0 once that moment has passed and
+ * the tick has not yet re-armed.  nsec() is read outside joblk, which
+ * is a spin lock.
+ *
+ * A tick that finds a pass running starts nothing and re-arms, so the
+ * field answers when the schedule will next LOOK, which is the only
+ * thing the timer decides; whether that look starts a pass depends on
+ * what is running when it lands.
+ *
+ * What it is NOT is a wall-clock deadline.  scrubtimer counts its
+ * period in NOMINAL ticks — it adds the tick it asked for to `t' and
+ * never reads the clock — while sleep(2) is a lower bound, so every
+ * tick that oversleeps is time the period does not count and the real
+ * wait runs long by the sum of the overshoots.  At 1% per tick that
+ * is some three and a half hours over a 14-day period.  So the field
+ * is a LOWER BOUND on how long the next tick is still away: it counts
+ * down as stated and the tick lands at or after zero, never before.
+ * That is **implementation policy** — layer-a §7.5 asks for a pace
+ * and names no accuracy, and a drift below a percent of a period of
+ * days is nothing an operator reads `scrubnext=' to learn.  Pulling
+ * the deadline out of nsec() instead is the change that would make it
+ * exact, and it is not made here.
+ *
+ * reclaimtimer counts the same way and has the same drift.  It shows
+ * only as a pass landing late, because there is no `reclaimnext=' —
+ * §2.2 names no field for that schedule either, and this server chose
+ * to report the scrub's alone (store.md §14(23)).
+ */
+uvlong
+srvscrubnextms(Srvctx *c)
+{
+	uvlong now, next;
+
+	now = nsec()/1000000;
+	lock(&c->joblk);
+	next = c->scrubnext;
+	unlock(&c->joblk);
+	return next > now ? next - now : 0;
+}
+
+/*
+ * The stretch this timer sleeps at a time, which is reclaimslicems's
+ * twin and carries that function's comment entire: Scrubtickms unless
+ * a T1 has set the knob over it (srv.h), read fresh each stretch, and
+ * the bound on the shutdown's wait for this proc.
+ *
+ * It is `tick' and not `slice' because the constant it overrides is
+ * Scrubtickms.  Scrubslicems is a different number for a different
+ * job — the twenty milliseconds a scrub PASS sleeps between rate
+ * charges (scrubpace above) — and naming this after it would say the
+ * knob reached the pass's pacing, which it does not.
+ */
+static uvlong
+scrubtickms(Srvctx *c)
+{
+	uvlong ms;
+
+	lock(&c->joblk);
+	ms = c->scrubtick;
+	unlock(&c->joblk);
+	return ms != 0 ? ms : Scrubtickms;
+}
+
+/*
+ * The scrub's timer, which is reclaimtimer's twin: not a job, waited
+ * for separately by the shutdown and before the jobs because it is one
+ * of the two things that could still start one, and reading
+ * srvstopping between ticks so as to be there to be waited for.
+ *
+ * A tick landing exactly as the shutdown begins still calls scrubgo:
+ * `left' reaching 0 leaves the wait before the flag is read, so the
+ * pass is asked for.  It is refused — jobadmit answers `shutting
+ * down' to anything offered once c->stopping is set, and it decides
+ * that under joblk, which is the lock the shutdown sets the flag
+ * under — so no pass starts, and the proc reads the flag at the top
+ * of the next wait and exits.  The cost is one refused start.
+ * reclaimtimer reaches the same place by the same route: its period
+ * expiring ends the for without consulting the flag either, so the
+ * two agree and there is nothing here to reorder.
+ */
+static void
+scrubtimer(void *a)
+{
+	Srvctx *c;
+	uvlong left, period, tick, t;
+
+	c = a;
+	for(;;){
+		for(t = 0;; t += tick){
+			period = srvscrubperiod(c);
+			tick = scrubtickms(c);
+			left = period > t ? period - t : 0;
+			scrubarm(c, left);
+			if(left == 0)
+				break;
+			if(srvstopping(c)){
+				lock(&c->joblk);
+				c->scrubup = 0;
+				unlock(&c->joblk);
+				threadexits(nil);
+			}
+			sleep(tick);
+		}
+		scrubgo(c, 1);
+	}
+}
+
+/*
+ * Start it, from srvnew once the map is adopted and the store is open
+ * (srv.h), beside the reclaim timer and under the same rule: the two
+ * are the last thing start-up does, so no refusal below them can free
+ * the context under a proc that is reading it.
+ */
+int
+srvscrubproc(Srvctx *c)
+{
+	scrubarm(c, srvscrubperiod(c));
+	lock(&c->joblk);
+	c->scrubup = 1;
+	unlock(&c->joblk);
+	if(proccreate(scrubtimer, c, Srvstack) < 0){
+		lock(&c->joblk);
+		c->scrubup = 0;
+		unlock(&c->joblk);
+		return -1;
+	}
+	return 0;
+}
+
+/* whether that proc is still reading the context: the shutdown's wait */
+int
+srvscrublive(Srvctx *c)
+{
+	int n;
+
+	lock(&c->joblk);
+	n = c->scrubup;
+	unlock(&c->joblk);
+	return n;
+}
+
+/*
+ * The T1 knob over the period (srv.h).  0 puts `scrubdays' back.
+ */
+void
+srvscrubms(Srvctx *c, uvlong ms)
+{
+	lock(&c->joblk);
+	c->scrubms = ms;
+	unlock(&c->joblk);
+}
+
+/*
+ * The T1 knob over the tick (srv.h).  0 puts Scrubtickms back.
+ */
+void
+srvscrubtickms(Srvctx *c, uvlong ms)
+{
+	lock(&c->joblk);
+	c->scrubtick = ms;
+	unlock(&c->joblk);
 }
 
 /*
@@ -1004,21 +1372,30 @@ ratearg(char *s, ulong *rate)
  * for is not running and is not going to be.  A `stop' with no pass
  * running is accepted too and clears itself at the next `start'.
  *
+ * NEITHER WORD TOUCHES THE SCHEDULE.  `stop' stops the pass that is
+ * running and nothing more: the next tick starts a pass exactly as a
+ * `start' would, because the flag it raises is the pass's and §2.5's
+ * form has no word for a schedule.  `start' asks for a pass now and
+ * leaves the timer where it was — it does not re-arm it, and the tick
+ * it lands before is the no-op scrubgo describes.  That is the reading
+ * §2.5's own `reclaim' row states for the reclaim walk, and the two
+ * verbs agree by design rather than by accident (store.md §14(39)).
+ * An operator who wants the scrub off has no verb for it; `scrub
+ * rate=' is the knob for making it cheap.
+ *
  * `reclaim' below reads the same rules off the same table row shape;
- * what differs is the fence and the timer.
+ * what differs is the fence, not the timer.
  */
 char*
 srvctlscrub(Srvctx *c, Sfid *f, int argc, char **argv)
 {
-	char *e;
 	ulong rate;
-	int i, start, stop, wasstop;
+	int i, start, stop;
 
 	USED(f);
 	i = 0;
 	start = stop = 0;
 	rate = 0;
-	wasstop = 0;
 	if(i < argc && strcmp(argv[i], "start") == 0){
 		start = 1;
 		i++;
@@ -1038,54 +1415,17 @@ srvctlscrub(Srvctx *c, Sfid *f, int argc, char **argv)
 		c->scrubrate = rate;
 	if(stop)
 		c->scrubstop = 1;
-	if(start && c->scrubbing){
-		/*
-		 * A pass that has been told to stop is not the job this
-		 * line asks for: it will read the flag between two
-		 * objects and give up, and this `start' would have been
-		 * answered success over a pass winding down — the client
-		 * told the index is being scrubbed while nothing is going
-		 * to scrub it.  Clearing the flag instead, so that the
-		 * pass carries on, races the pass's own read of it: told
-		 * before, it walks on; told after, it has already broken
-		 * off, and which of those happened is not something a
-		 * client can be told.  So the line is refused, and the
-		 * `rate=' on it stands for the next pass, as it does for
-		 * the other refusals below.
-		 */
-		if(c->scrubstop){
-			unlock(&c->joblk);
-			return Escrubstopping;
-		}
-		start = 0;
-	}
-	if(start){
-		wasstop = c->scrubstop;
-		c->scrubbing = 1;
-		c->scrubstop = 0;
-	}
 	unlock(&c->joblk);
 	if(!start)
 		return nil;
-	if((e = jobstart(c, "scrub", scrubpass, nil)) == nil)
-		return nil;
 	/*
-	 * The flag is raised above, before it is known that a pass will
-	 * run, because raising it after the proc exists would race the
-	 * proc's own clearing of it.  So a jobstart that refuses — the
-	 * shutdown, the job cap, no memory — has to put it back: a flag
-	 * left raised makes every later `scrub start' answer success and
-	 * start nothing, which is the silent half of the failure.  The
-	 * stop flag goes back with it, so the refused line has changed
-	 * nothing about the pass; a `rate=' on the same line stands,
-	 * since it is what the NEXT pass starts at and this line's
-	 * refusal does not unsay it.
+	 * The start itself is scrubgo's, which the timer calls too: one
+	 * admission, one flag, one refusal for each of the three things
+	 * that can go wrong.  A `rate=' on a line scrubgo refuses stands
+	 * for the next pass, since it is what that pass starts at and
+	 * this line's refusal does not unsay it.
 	 */
-	lock(&c->joblk);
-	c->scrubbing = 0;
-	c->scrubstop = wasstop;
-	unlock(&c->joblk);
-	return e;
+	return scrubgo(c, 0);
 }
 
 /*

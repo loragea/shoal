@@ -127,6 +127,8 @@ char*	srvctlscrub(Srvctx*, Sfid*, int, char**);
 char*	srvctlreclaim(Srvctx*, Sfid*, int, char**);
 char*	srvctlforget(Srvctx*, Sfid*, int, char**);
 int	srvreclaimproc(Srvctx*);	/* the reclaim timer, from srvnew */
+int	srvscrubproc(Srvctx*);		/* the scrub timer, likewise */
+uvlong	srvscrubnextms(Srvctx*);	/* /status's `scrubnext=' */
 
 /* ctl.c */
 void	srvctlwrite(Req*);

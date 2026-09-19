@@ -13,7 +13,8 @@
  * the /obj and /meta enumerations, §2.5's ctl verbs that are not
  * object I/O, §7.5's scrub pass and store.md §9's tombstone reclaim —
  * the last both as `reclaim [start|stop]' and as the timer that runs
- * it with no verb written.  store.md §13's T1.27 is here too: that a
+ * it with no verb written — as the scrub's own timer runs the pass
+ * §7.5 calls continuous.  store.md §13's T1.27 is here too: that a
  * scrub read of one object is held inside that object's queue.
  *
  * It is a second program beside srvtest rather than more cases in it.
@@ -91,7 +92,7 @@ enum
 	 * threadmain.  Every check this file makes is unconditional once
 	 * its case is entered, so the number is fixed.
 	 */
-	Nchecks	= 272,
+	Nchecks	= 292,
 
 	/* fids the cases use */
 	Froot	= 1,
@@ -206,6 +207,7 @@ static Srvctx *freedctx;
 static int freedjobs;
 static int freedheld;
 static int freedlive;
+static int freedscrub;
 
 static void
 onfreed(void*)
@@ -214,6 +216,7 @@ onfreed(void*)
 	freedjobs = freedctx != nil && srvstopping(freedctx);
 	freedheld = freedctx != nil ? srvjobcount(freedctx) : -1;
 	freedlive = freedctx != nil ? srvreclaimlive(freedctx) : -1;
+	freedscrub = freedctx != nil ? srvscrublive(freedctx) : -1;
 }
 
 static Srvctx*
@@ -323,6 +326,24 @@ slurpfile(Cl *cl, ulong fid, char *name, char *buf, long max)
 		fail("read /%s: short", name);
 	clclunk(cl, fid, &r);
 	return n;
+}
+
+/*
+ * One numeric field of /status, read on a fresh fid.  ~0 says the file
+ * would not render or carries no such field, which no caller here can
+ * mistake for a value: every field this is asked for counts something
+ * far short of it.
+ */
+static uvlong
+statusnum(Cl *cl, char *attr)
+{
+	char buf[8192], val[64];
+
+	if(slurpfile(cl, Ffile, "status", buf, sizeof buf) <= 0)
+		return ~0ULL;
+	if(clfield(buf, attr, val, sizeof val) == nil)
+		return ~0ULL;
+	return strtoull(val, nil, 10);
 }
 
 /* how many lines of buf begin with pfx */
@@ -2550,9 +2571,13 @@ Out:
  * The timer is made demonstrably alive across the shutdown rather than
  * assumed to be: the knob puts its period in tens of milliseconds, the
  * case waits until a pass no verb asked for has come and gone, and it
- * asserts the proc is still up with the client about to go.  The proc
- * sleeps its wait in slices, so the shutdown begins with it inside
- * one — which is exactly the proc the store must not close under.
+ * asserts the proc is still up with the client about to go.  The
+ * period knob then goes back and the SLICE knob goes to seconds, so
+ * the shutdown begins with the proc inside a sleep longer than
+ * everything srvshutdown does after the wait.  That is what makes `the
+ * timer had ended when the store closed' a check about the wait: at
+ * the server's own half-second slice the proc would be gone by then
+ * whether the shutdown waited for it or not (srv.h).
  */
 static void
 treclaimwait(void)
@@ -2562,9 +2587,12 @@ treclaimwait(void)
 	Store *st;
 	Dev *d;
 	Cl cl;
+	vlong t0;
+	uvlong slice;
 	int i;
 
 	clstage = "reclaimwait";
+	slice = 3000;
 	m = mkmapd(Tepoch, Tblksz, Tobjmax, "blake2s256", Tuuid, 0);
 	d = newdisk();
 	freedseen = 0;
@@ -2590,8 +2618,32 @@ treclaimwait(void)
 		sleep(20);
 	istrue("the timer is still up with the pass over",
 		srvreclaimlive(ctx) != 0);
+	srvreclaimms(ctx, 0);		/* no tick inside the long slice */
+	srvreclaimslicems(ctx, slice);
+	/*
+	 * Out of the old half-second slice and into a new long one.
+	 * Three of the server's own slices and not one, for tscrubwait's
+	 * reason: the proc is at most one old slice from waking, but
+	 * sleep(2) guarantees only a lower bound, so a 700 ms sleep was
+	 * a 200 ms margin against a scheduler that promises none.
+	 */
+	sleep(1500);
 Out:
+	/*
+	 * The other half of what the wait is worth, which is tscrubwait's
+	 * assertion for this timer: the shutdown waits for the proc, so
+	 * it takes as long as the proc has left of its slice — and that
+	 * is bounded by the slice, not by the PERIOD the slice is being
+	 * slept in.  A timer that only ever read `stopping' at the end of
+	 * a wait would hold the shutdown for the whole of one, which is
+	 * half a day at this period's floor; this check is what would
+	 * catch it.  A second of slack over the slice covers everything
+	 * srvshutdown does besides the wait.
+	 */
+	t0 = nsec()/1000000;
 	clstop(&cl);			/* the loop ends; the shutdown runs */
+	istrue("the shutdown waited no longer than a slice of the timer's",
+		nsec()/1000000 - t0 < (vlong)slice + 1000);
 	eqv("the store was closed once", freedseen, 1);
 	eqv("the timer had ended when the store closed", freedlive, 0);
 	istrue("and it is not reading the context now either",
@@ -3216,6 +3268,289 @@ Out:
 }
 
 /*
+ * layer-a §7.5's "continuously": the scrub's own timer (store.md §8),
+ * which is what runs a pass on an instance nobody writes a verb to.
+ *
+ * The period is `scrubdays' and the default is 14 days, so srv.h's
+ * `srvscrubms' is what a T1 can drive and the default itself is read
+ * rather than waited out.  /status's `scrubnext=' is that same
+ * schedule seen from the wire: it counts down while the timer waits,
+ * and a TICK re-arms it at whatever period is then in force — which
+ * is what the knob's second value shows, since a wait armed once at
+ * start-up would still be counting the first one down.
+ *
+ * §13's `jobhold' keeps the pass the timer started listed once its
+ * walk is over, as it does for a verb's, and the knob goes to a period
+ * no test outlasts before the /jobs line is counted, so the ticks
+ * behind the first cannot park a second pass beside it.
+ */
+static void
+tscrubtimer(void)
+{
+	char buf[8192], val[64], name[32], *m;
+	Srvctx *ctx;
+	Store *st;
+	Dev *d;
+	Cl cl;
+	uvlong dflt, slow, n0, n1, n2;
+	int i;
+
+	clstage = "scrubtimer";
+	dflt = (uvlong)14*86400000;
+	slow = (uvlong)4*3600000;
+	m = mkmap();
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4, 0)) == nil)
+		return;
+	st = srvstore(ctx);
+	for(i = 0; i < 4; i++){
+		snprint(name, sizeof name, "obj%.2d", i);
+		mkobj(st, name, nil, 0, 1);
+	}
+	clstart(&cl, ctx, Clmsize);
+	if(!adminctl(&cl, "role=admin"))
+		goto Out;
+	istrue("no pass runs before the timer fires", !jobrunning(&cl));
+	eqv("the default period is layer-a §7.5's own 14 days",
+		srvscrubperiod(ctx), dflt);
+
+	/*
+	 * The schedule at /status, before any tick: a whole period less
+	 * the moment this instance has been up, and falling.
+	 */
+	n0 = statusnum(&cl, "scrubnext");
+	istrue("/status's scrubnext= is inside that period",
+		n0 > dflt - 60000 && n0 <= dflt);
+	sleep(1200);
+	n1 = statusnum(&cl, "scrubnext");
+	istrue("and it counts down as the timer waits", n1 + 1000 <= n0);
+
+	/* a pass with no verb written at all */
+	srvhook(ctx, "jobhold", 1);
+	srvscrubms(ctx, 30);
+	eqv("the knob is what overrides the period",
+		srvscrubperiod(ctx), 30);
+	if(jobparked(&cl, "job", val, sizeof val) == nil)
+		fail("no pass reached the hold: the timer never fired");
+	else
+		eqs("the pass the timer started is a scrub", val, "scrub");
+	srvscrubms(ctx, slow);		/* no further tick in this case */
+	if(slurpfile(&cl, Ffile2, "jobs", buf, sizeof buf) > 0)
+		eqv("and the ticks behind it started no second pass",
+			nlines(buf, "job="), 1);
+	else
+		fail("the parked pass left no /jobs line");
+
+	/* the tick re-armed the wait, at the period then in force */
+	n2 = 0;
+	for(i = 0; i < 100; i++){
+		n2 = statusnum(&cl, "scrubnext");
+		if(n2 > slow - 5000 && n2 <= slow)
+			break;
+		sleep(50);
+	}
+	istrue("scrubnext= is re-armed after a tick",
+		n2 > slow - 5000 && n2 <= slow);
+	srvscrubms(ctx, 0);
+Out:
+	srvhook(ctx, "jobhold", 0);
+	for(i = 0; i < 400 && jobrunning(&cl); i++)
+		sleep(20);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
+ * What a tick does to a pass that is already running, and what the
+ * verbs do to the schedule (store.md §8, §14(39)).
+ *
+ * A tick that lands on a running pass starts nothing: the walk still
+ * going IS layer-a §7.5's continuity, and a second pass over one index
+ * is what `scrubbing' keeps off.  `scrub stop' ends that pass and
+ * leaves the schedule where it was, so the NEXT tick starts another —
+ * the reading §2.5's `reclaim' row already states for the reclaim
+ * walk, which is how the two verbs come to agree by design.
+ *
+ * The pass is made slow enough to still be walking several ticks later
+ * by `rate=1': one KiB/s over objects charged the 1 KiB floor each is
+ * a second an object, and the index holds forty of them.  The rate
+ * outlives the pass it was set on, so the pass the next tick starts is
+ * as slow, which is what makes that one visible at /jobs too.
+ */
+static void
+tscrubticks(void)
+{
+	char buf[8192], name[32], *m;
+	Srvctx *ctx;
+	Store *st;
+	Dev *d;
+	Cl cl;
+	Fcall r;
+	int i;
+
+	clstage = "scrubticks";
+	m = mkmap();
+	d = newdisk();
+	if((ctx = startsrv(d, m, 4, 0)) == nil)
+		return;
+	st = srvstore(ctx);
+	for(i = 0; i < 40; i++){
+		snprint(name, sizeof name, "obj%.2d", i);
+		mkobj(st, name, nil, 0, 1);
+	}
+	clstart(&cl, ctx, Clmsize);
+	if(!adminctl(&cl, "role=admin"))
+		goto Out;
+	if(clwrite(&cl, Fctl, 0, "scrub start rate=1", &r) != Rwrite){
+		fail("scrub start: %s", clerr(&r));
+		goto Out;
+	}
+	istrue("the pass a verb started is listed at /jobs", jobrunning(&cl));
+
+	/* several ticks land on it, and each starts nothing */
+	srvscrubms(ctx, 30);
+	sleep(2000);
+	if(slurpfile(&cl, Ffile, "jobs", buf, sizeof buf) > 0){
+		eqv("a tick on a running pass starts no second one",
+			nlines(buf, "job="), 1);
+		istrue("and the pass it landed on is still running",
+			haspfx(buf, "job=scrub state=running "));
+	}else
+		fail("/jobs is empty with a slow pass running");
+
+	/*
+	 * `stop' ends that pass and turns no schedule off.  The period
+	 * goes back to `scrubdays' across the stop, because what says the
+	 * pass ended is jobrunning(), and that reads "/jobs is empty" and
+	 * not "this pass is over": a tick landing in the window where the
+	 * stopped pass has unlinked would fill /jobs with a pass of its
+	 * own, and the stop would read as never having taken.  The window
+	 * is a fraction of a tick and the poll below samples it, so the
+	 * tick is kept out of it rather than raced with.  The half after
+	 * shortens the period again, which is what that half is about.
+	 */
+	srvscrubms(ctx, 0);
+	if(clwrite(&cl, Fctl, 0, "scrub stop", &r) != Rwrite)
+		fail("scrub stop: %s", clerr(&r));
+	for(i = 0; i < 400 && jobrunning(&cl); i++)
+		sleep(20);
+	istrue("a pass stops when it is told to", !jobrunning(&cl));
+	srvscrubms(ctx, 30);
+	for(i = 0; i < 200 && !jobrunning(&cl); i++)
+		sleep(20);
+	if(slurpfile(&cl, Ffile, "jobs", buf, sizeof buf) > 0)
+		eqv("and a later tick starts another: the stop held no "
+			"schedule", nlines(buf, "job=scrub"), 1);
+	else
+		fail("no tick started a pass after a scrub stop");
+	srvscrubms(ctx, 0);
+	if(clwrite(&cl, Fctl, 0, "scrub stop", &r) != Rwrite)
+		fail("the final scrub stop: %s", clerr(&r));
+Out:
+	for(i = 0; i < 400 && jobrunning(&cl); i++)
+		sleep(20);
+	clstop(&cl);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
+ * D16's shutdown against the SCRUB timer, which like the reclaim
+ * walk's holds no job: srvshutdown waits for it apart from the jobs
+ * and before them (srv.h), and what that wait is worth is read at the
+ * moment the store closes.
+ *
+ * The timer is made demonstrably alive across the shutdown rather than
+ * assumed to be: the knob puts its period in tens of milliseconds, the
+ * case waits until a pass no verb asked for has come and gone, and it
+ * asserts the proc is still up with the client about to go.  The
+ * period knob then goes back and the SLICE knob goes to seconds, so
+ * the shutdown begins with the proc inside a sleep longer than
+ * everything srvshutdown does after the wait — which is what makes
+ * `the scrub timer had ended when the store closed' a check about the
+ * wait rather than about how long the rest of the shutdown takes
+ * (srv.h).  The slice is also what bounds that wait, which is the
+ * other thing read here.
+ */
+static void
+tscrubwait(void)
+{
+	char val[64], name[32], *m;
+	Srvctx *ctx;
+	Store *st;
+	Dev *d;
+	Cl cl;
+	vlong t0;
+	uvlong tick;
+	int i;
+
+	clstage = "scrubwait";
+	tick = 3000;
+	m = mkmap();
+	d = newdisk();
+	freedseen = 0;
+	freedscrub = -1;
+	if((ctx = startsrv(d, m, 4, 0)) == nil)
+		return;
+	st = srvstore(ctx);
+	for(i = 0; i < 4; i++){
+		snprint(name, sizeof name, "obj%.2d", i);
+		mkobj(st, name, nil, 0, 1);
+	}
+	clstart(&cl, ctx, Clmsize);
+	if(!adminctl(&cl, "role=admin"))
+		goto Out;
+	srvhook(ctx, "jobhold", 1);
+	srvscrubms(ctx, 30);
+	if(jobparked(&cl, "job", val, sizeof val) == nil)
+		fail("no pass reached the hold: the timer never fired");
+	else
+		eqs("a pass the timer started is a scrub", val, "scrub");
+	srvscrubms(ctx, 0);
+	srvhook(ctx, "jobhold", 0);
+	for(i = 0; i < 400 && jobrunning(&cl); i++)
+		sleep(20);
+	istrue("the timer is still up with the pass over",
+		srvscrublive(ctx) != 0);
+	/*
+	 * And it is made to stay up ACROSS the wait, which is what gives
+	 * the check at the store's close anything to catch: the server's
+	 * own tick is half a second and everything srvshutdown does
+	 * after the wait takes longer than that, so a shutdown that never
+	 * waited would still reach storeclose with the proc gone most
+	 * times over, and the check would pass either way (srv.h).  The
+	 * tick goes to seconds with the period already back at
+	 * `scrubdays', and the sleep is what carries the proc out of the
+	 * old half-second tick and into a new long one before the loop
+	 * ends below.
+	 *
+	 * 1500 is three of the server's own ticks, not one: the proc is
+	 * at most one old tick from waking, but Plan 9's sleep(2) is a
+	 * lower bound on the wait and nothing bounds it from above, so a
+	 * sleep of 700 was a 200 ms margin against a scheduler that owes
+	 * none.  Three ticks is a margin worth having and costs a second
+	 * of one case's run.
+	 */
+	srvscrubtickms(ctx, tick);
+	sleep(1500);
+Out:
+	t0 = nsec()/1000000;
+	clstop(&cl);			/* the loop ends; the shutdown runs */
+	istrue("the shutdown waited no longer than a tick of the timer's",
+		nsec()/1000000 - t0 < (vlong)tick + 1000);
+	eqv("the store was closed once", freedseen, 1);
+	eqv("the scrub timer had ended when the store closed", freedscrub, 0);
+	istrue("and it is not reading the context now either",
+		srvscrublive(ctx) == 0);
+	srvfree(ctx);
+	devclose(d);
+	free(m);
+}
+
+/*
  * /jobs lists every pass, and the passes are bounded.
  *
  * layer-a §2.2 wants "one line per running or queued background job",
@@ -3479,6 +3814,9 @@ threadmain(int argc, char **argv)
 	tforget();
 	tscrubctl();
 	tscrubrate();
+	tscrubtimer();
+	tscrubticks();
+	tscrubwait();
 	tpassfail();
 	tobjgone();
 	tjobs();
