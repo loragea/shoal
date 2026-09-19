@@ -63,7 +63,7 @@ readmap(char *path, long *np)
 void
 threadmain(int argc, char **argv)
 {
-	char *mapfile, *srvname, *point, *path, *p;
+	char *mapfile, *srvname, *point, *path, *p, *e;
 	Srvcfg cfg;
 	Srvctx *c;
 	Dev *d;
@@ -87,10 +87,18 @@ threadmain(int argc, char **argv)
 	 * take, which is also the period between passes (srv/job.c).  A
 	 * whole positive number of days or nothing — 0 and a negative are
 	 * not a period, and the default is what the flag is absent for.
+	 *
+	 * strtol and its end pointer rather than atoi, which stops at the
+	 * first character it cannot use and answers what it read: `3junk'
+	 * would be 3 and `1.9' would be 1, where store.md §12 says
+	 * anything but a whole number of days is refused with the usage.
+	 * A period is a thing an operator gets one chance a start-up to
+	 * spell, so a typo is worth a usage rather than a silent 1.
 	 */
 	case 'd':
-		cfg.scrubdays = atoi(EARGF(usage()));
-		if(cfg.scrubdays <= 0)
+		p = EARGF(usage());
+		cfg.scrubdays = strtol(p, &e, 10);
+		if(*p == 0 || *e != 0 || cfg.scrubdays <= 0)
 			usage();
 		break;
 	case 's':
