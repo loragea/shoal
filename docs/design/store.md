@@ -6267,8 +6267,10 @@ name a half that is not built; each says which.
     affordable: a queued object operation holds one from the head of
     its handler to the last exit of that handler's body, a render
     holds one for the whole of what it renders, and a pass or a timer
-    tick takes one per pass or per tick rather than per read. What a
-    swap guarantees a reader is
+    tick takes one per pass or per tick rather than per read — the
+    reclaim pass copies the two values it judges by out of one
+    snapshot and lets go before the walk begins, which is the same
+    guarantee for a shorter hold. What a swap guarantees a reader is
     therefore that its own map does not move: the epoch, the
     placement and the `self` a placement member is compared against
     are one map's, and a pointer into that map's instance array stays

@@ -761,8 +761,13 @@ struct Sstage
  *		(status.c), and /status's `status=' and `up=' are one
  *		record's pair.
  *	A PASS or a TIMER TICK takes one per pass or per tick and not
- *		per read, so a walk's `tombdays' and its epoch are one
- *		map's (job.c).
+ *		per read, and it is the READS that are together under the
+ *		hold rather than the pass: reclaimpass takes one, copies
+ *		`tombdays' and the epoch out of it and lets go before the
+ *		walk begins, so the two values a walk judges by are one
+ *		map's while the hold itself is as short as the copying
+ *		(job.c).  A pass that runs while the map moves therefore
+ *		reports the map it started under.
  *	NOBODY holds one beyond the request, render, pass or tick that
  *		took it.  A hold is not a lock — it blocks no swap and
  *		bars no other reader — but it does keep the memory alive,
