@@ -960,12 +960,35 @@ background work returns on acceptance is unchanged and governs it.
 §1.5's three discard conditions are normative and are layer-a's, not
 this row's — what this row settles is that a walk which can test only
 two of the three discards nothing.
-**Implementation policy:** the rest — which verbs are passes, the
+
+*Amended 2026-09-19*, the scrub having gained a schedule of its own
+(`design/store.md` §8): **what `stop` means is normative, and it means
+the same for both verbs.** `scrub stop` and `reclaim stop` stop the
+pass that is running and hold no schedule back — the next tick of that
+verb's timer starts a pass exactly as a `start` would, and `start`
+asks for a pass now without moving the timer. A client writes those
+two words and acts on the answer, so a reimplementation must match the
+reading; and §2.5's form, which has no word for a schedule, leaves an
+operator no way to spell the other intent, which is what settles it
+this way rather than the other (§14(39) has the argument and what it
+costs). Until the scrub had a timer the two `stop`s agreed by
+accident, this row's first form having built one schedule and not the
+other.
+**Implementation policy:** the rest — which verbs are passes, each
 walk's timer and its period (§14(39)), the scrub's rate default and
 the bytes it charges itself (§14(31)), `/jobs`'s line format, the
 `reclaimable=` count it reports, and that a second `scrub start` or
-`reclaim start` while a pass runs starts nothing. An implementation
-that answers `forget` synchronously, or that runs the walk on a
-period of its own choosing, conforms; one that discards nothing —
+`reclaim start` while a pass runs starts nothing. The same amendment
+adds the scrub schedule's own policy: that there is a timer at all,
+its period of `scrubdays` — 14 days by default, `shoalsrv -d`
+otherwise — that the first pass comes one period after start-up
+rather than at it, and that a tick landing on a running pass starts
+nothing rather than being caught up on, since the pass still walking
+is the continuity `design/layer-a.md` §7.5 asks for. §7.5 calls the
+pace implementation policy in as many words, and `/status`'s
+`scrubnext=` (§14(23)) is this server's way of reporting a schedule
+§2.2 names no field for. An implementation that answers `forget`
+synchronously, or that runs either walk on a period of its own
+choosing, conforms; one that discards nothing —
 §1.5 makes the discard an optimisation and not a requirement — still
 owes the verb its answer, and answers it with a walk that counts.
