@@ -106,17 +106,6 @@ static char Eseek[] = "shoalsrv: seek in a directory read";
  */
 static char Emoved[] = "object snapshot: the index moved";
 
-/*
- * The error string an offloaded render answers with.  A render cell
- * answers a char*, and the engine's own text has to outlive the call,
- * so it is composed here rather than in the caller's frame.  One
- * buffer is enough because every render that can fill it runs on the
- * reserved queue and lib9p gives a Reqqueue exactly one proc, so
- * these renders have one writer between them; /status and /map, which
- * render on the service loop, answer literals and never come here.
- */
-static char rendererr[ERRMAX];
-
 static void	objdirfree(void*);
 static void	objdirflush(Sfid*, Req*);
 
@@ -163,7 +152,7 @@ srvsnapopen(Store *s, int kinds, char *buf, int nbuf)
  * is the one the record kept, which is what an advert is compared on.
  */
 static char*
-snaptext(Srvctx *c, Text *t, int kinds)
+snaptext(Srvctx *c, Text *t, int kinds, char *buf, int nbuf)
 {
 	char name[Oidmax+1], csum[2*Csumlen+1];
 	Objsnap *sn;
@@ -172,15 +161,15 @@ snaptext(Srvctx *c, Text *t, int kinds)
 	ulong i, n;
 	int oidlen, rc;
 
-	if((sn = srvsnapopen(c->store, kinds, rendererr, sizeof rendererr)) == nil)
-		return rendererr;
+	if((sn = srvsnapopen(c->store, kinds, buf, nbuf)) == nil)
+		return buf;
 	n = objsnapcount(sn);
 	for(i = 0; i < n; i++){
 		rc = objsnapent(sn, i, oid, &oidlen, &oi);
 		if(rc < 0){
-			rerrstr(rendererr, sizeof rendererr);
+			rerrstr(buf, nbuf);
 			objsnapclose(sn);
-			return rendererr;
+			return buf;
 		}
 		if(rc == 0)		/* §9's two gone conditions */
 			continue;
@@ -197,10 +186,10 @@ snaptext(Srvctx *c, Text *t, int kinds)
 
 /* /tombs: the tombstones this instance holds (§2.2, §7.2) */
 char*
-srvtombstext(Srvctx *c, Sfid *f, Text *t)
+srvtombstext(Srvctx *c, Sfid *f, Text *t, char *buf, int nbuf)
 {
 	USED(f);
-	return snaptext(c, t, Snaptomb);
+	return snaptext(c, t, Snaptomb, buf, nbuf);
 }
 
 /*
@@ -211,10 +200,10 @@ srvtombstext(Srvctx *c, Sfid *f, Text *t)
  * and there is no sender yet (store.md §14(18)).
  */
 char*
-srvadverttext(Srvctx *c, Sfid *f, Text *t)
+srvadverttext(Srvctx *c, Sfid *f, Text *t, char *buf, int nbuf)
 {
 	USED(f);
-	return snaptext(c, t, Snapboth);
+	return snaptext(c, t, Snapboth, buf, nbuf);
 }
 
 /*

@@ -1178,11 +1178,17 @@ srvopen(Req *r)
  * offloaded runs the same one: it is reached from the service loop and
  * from a queue proc, and it answers through the pool's one exit either
  * way (srvqdone answers directly for a request that was never pushed).
+ *
+ * The buffer a render composes its answer in is this frame's, and is
+ * what makes that answer outlive the call: srvqdone responds from it,
+ * and a render that composed one in a frame of its own would hand this
+ * function a pointer into a frame that textfree and srvqdone overlay
+ * (dat.h).
  */
 void
 srvopentext(Req *r)
 {
-	char *e;
+	char buf[ERRMAX], *e;
 	Srvctx *c;
 	Sfid *f;
 	Sfile *file;
@@ -1195,7 +1201,7 @@ srvopentext(Req *r)
 		srvqdone(r, "shoalsrv: out of memory");
 		return;
 	}
-	if((e = file->render(c, f, t)) != nil){
+	if((e = file->render(c, f, t, buf, sizeof buf)) != nil){
 		textfree(t);
 		srvqdone(r, e);
 		return;

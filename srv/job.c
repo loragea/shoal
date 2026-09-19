@@ -413,13 +413,15 @@ jobstart(Srvctx *c, char *verb, void (*fn)(Sjob*), char *arg)
  * `k' is what was there to copy.  Njobmax bounds both.
  */
 char*
-srvjobstext(Srvctx *c, Sfid *f, Text *t)
+srvjobstext(Srvctx *c, Sfid *f, Text *t, char *buf, int nbuf)
 {
 	Sjob *cp, *j;
 	ulong rate;
 	int i, k, n;
 
 	USED(f);
+	USED(buf);
+	USED(nbuf);
 	rate = scrubrate(c);
 	lock(&c->joblk);
 	n = joblen(c);

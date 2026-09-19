@@ -1865,16 +1865,16 @@ srvobjcreate(Req *r)
  * so the whole of P(o) is rendered and nothing is dropped.
  */
 char*
-srvmetatext(Srvctx *c, Sfid *f, Text *t)
+srvmetatext(Srvctx *c, Sfid *f, Text *t, char *buf, int nbuf)
 {
-	char buf[ERRMAX], id[Oidmax+1], csum[Csumhexlen];
+	char id[Oidmax+1], csum[Csumhexlen];
 	Objinfo oi;
 	Cinst *p[Maxplace], *pr;
 	Smap *m;
 	int i, n;
 
 	if(objstat(c->store, f->oid, f->oidlen, &oi) < 0)
-		return srverr(buf, sizeof buf);
+		return srverr(buf, nbuf);
 	if(oi.state != Slive)
 		return Edeleted;
 	oidstr(id, f->oid, f->oidlen);
@@ -1893,7 +1893,7 @@ srvmetatext(Srvctx *c, Sfid *f, Text *t)
 		 * stand between a failing call and the rerrstr that reads
 		 * what it left.
 		 */
-		srverr(buf, sizeof buf);
+		srverr(buf, nbuf);
 		srvmapput(c, m);
 		return buf;
 	}

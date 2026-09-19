@@ -38,7 +38,7 @@
  * which and why; the render below is what it describes.
  */
 char*
-srvstatustext(Srvctx *c, Sfid *f, Text *t)
+srvstatustext(Srvctx *c, Sfid *f, Text *t, char *buf, int nbuf)
 {
 	Storestat st;
 	uvlong np, nd;
@@ -46,6 +46,8 @@ srvstatustext(Srvctx *c, Sfid *f, Text *t)
 	int kind;
 
 	USED(f);
+	USED(buf);
+	USED(nbuf);
 	storestat(c->store, &st);
 	srvcount(c, &np, &nd);
 	kind = srvfencekind(c);
@@ -98,34 +100,20 @@ srvstatustext(Srvctx *c, Sfid *f, Text *t)
  * map this render will not see, and the next open is what sees it.
  */
 char*
-srvmaptext(Srvctx *c, Sfid *f, Text *t)
+srvmaptext(Srvctx *c, Sfid *f, Text *t, char *buf, int nbuf)
 {
 	Smap *m;
 	int ok;
 
 	USED(f);
+	USED(buf);
+	USED(nbuf);
 	m = srvmapget(c);
 	ok = textwrite(t, m->text, m->len) >= 0;
 	srvmapput(c, m);
 	if(!ok)
 		return "shoalsrv: out of memory";
 	return nil;
-}
-
-/*
- * The error string /dirty's and /lost's renders answer with.  Both
- * run on the reserved queue, which lib9p gives one proc, so the two
- * have one writer between them; the renders above answer literals and
- * never come here.  A render cell answers a char*, which is why the
- * engine's own text cannot be composed in the caller's frame.
- */
-static char rendererr[ERRMAX];
-
-static char*
-renderr(void)
-{
-	rerrstr(rendererr, sizeof rendererr);
-	return rendererr;
 }
 
 /*
@@ -143,7 +131,7 @@ renderr(void)
  * peer this store has heard of.
  */
 char*
-srvdirtytext(Srvctx *c, Sfid *f, Text *t)
+srvdirtytext(Srvctx *c, Sfid *f, Text *t, char *buf, int nbuf)
 {
 	char oid[Oidmax+1], peer[Peermax+1];
 	Dirtyrec *dr;
@@ -152,7 +140,7 @@ srvdirtytext(Srvctx *c, Sfid *f, Text *t)
 
 	USED(f);
 	if(dirtysnap(c->store, &dr, &n) < 0)
-		return renderr();
+		return srverr(buf, nbuf);
 	for(i = 0; i < n; i++){
 		memmove(oid, dr[i].oid, dr[i].oidlen);
 		oid[dr[i].oidlen] = 0;
@@ -163,7 +151,7 @@ srvdirtytext(Srvctx *c, Sfid *f, Text *t)
 	}
 	free(dr);
 	if(fullsyncsnap(c->store, &pp, &n) < 0)
-		return renderr();
+		return srverr(buf, nbuf);
 	for(i = 0; i < n; i++)
 		textprint(t, "fullsync peer=%s\n", pp[i]);
 	free(pp);
@@ -186,13 +174,15 @@ srvdirtytext(Srvctx *c, Sfid *f, Text *t)
  * (dat.h), so a ledger it renders is one map's whole ledger.
  */
 char*
-srvstaletext(Srvctx *c, Sfid *f, Text *t)
+srvstaletext(Srvctx *c, Sfid *f, Text *t, char *buf, int nbuf)
 {
 	Cstale *ml;
 	Smap *m;
 	int i;
 
 	USED(f);
+	USED(buf);
+	USED(nbuf);
 	m = srvmapget(c);
 	for(i = 0; i < m->map->nstale; i++){
 		ml = &m->map->stale[i];
@@ -235,7 +225,7 @@ srvstaletext(Srvctx *c, Sfid *f, Text *t)
  * `diverged' and none reads `lost'.  store.md §14(15) records it.
  */
 char*
-srvlosttext(Srvctx *c, Sfid *f, Text *t)
+srvlosttext(Srvctx *c, Sfid *f, Text *t, char *buf, int nbuf)
 {
 	char oid[Oidmax+1];
 	Lostent *lp;
@@ -243,7 +233,7 @@ srvlosttext(Srvctx *c, Sfid *f, Text *t)
 
 	USED(f);
 	if(lostsnap(c->store, &lp, &n) < 0)
-		return renderr();
+		return srverr(buf, nbuf);
 	for(i = 0; i < n; i++){
 		if(lp[i].oidlen == 0){
 			textprint(t, "slot=%lud kind=lost\n", lp[i].oi.slot);
@@ -260,10 +250,12 @@ srvlosttext(Srvctx *c, Sfid *f, Text *t)
 
 /* /ctl reads answer no bytes; the verbs are a write surface (§2.5) */
 char*
-srvemptytext(Srvctx *c, Sfid *f, Text *t)
+srvemptytext(Srvctx *c, Sfid *f, Text *t, char *buf, int nbuf)
 {
 	USED(c);
 	USED(f);
 	USED(t);
+	USED(buf);
+	USED(nbuf);
 	return nil;
 }

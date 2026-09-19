@@ -98,7 +98,14 @@ enum
  *	render	the file is a render-at-open text file (§2.2's MUST):
  *		open composes its bytes once into the fid's Text and
  *		every read is served from them.  It answers nil, or an
- *		error string.
+ *		error string.  A string it composes rather than names
+ *		goes in the `buf, nbuf' the caller passes and NEVER in a
+ *		buffer of the render's own: srvopentext calls textfree
+ *		and srvqdone on what it is handed, and those frames
+ *		overlay the render's.  No answer this server composes
+ *		lives in the frame that composed it: /rpc's does in the
+ *		caller's buffer too (peer.c), and a ctl verb's in a
+ *		static the service loop has to itself (ctl.c).
  *	read	a read that is not served from a snapshot — a channel
  *		(/repl, /rpc) or a directory read.  It responds.  A row
  *		with a read cell gets every read, whether or not the fid
@@ -247,7 +254,7 @@ struct Sfile
 	int	rd;
 	int	wr;
 	char*	(*gate)(Srvctx*, Sfid*, Req*, int op);
-	char*	(*render)(Srvctx*, Sfid*, Text*);
+	char*	(*render)(Srvctx*, Sfid*, Text*, char *buf, int nbuf);
 	void	(*read)(Req*);
 	void	(*write)(Req*);
 	void	(*open)(Req*);
