@@ -287,9 +287,8 @@ mapsopen(Req *r)
 	f = r->fid->aux;
 	monsrvlock(c);
 	monstat(c->mon, &st);
-	dir = nil;
 	n = 0;
-	if(st.retain > 0 && (dir = mallocz((st.retain+1)*sizeof *dir, 1)) == nil){
+	if((dir = mallocz((st.retain+1)*sizeof *dir, 1)) == nil){
 		monsrvunlock(c);
 		respond(r, "shoalmon: out of memory");
 		return;
