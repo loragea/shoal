@@ -920,6 +920,7 @@ struct Stub
 	int	mode;
 	ulong	offer;		/* the msize it answers, if it is lower */
 	ulong	over;		/* Stlong: the count it answers a Tread with */
+	int	deafafter;	/* Stdeaf: requests it reads before going deaf */
 	int	deaf;		/* Stdeaf: the Tversion is answered, no more reads */
 	int	drain;		/* ... until a hangup, which resumes them */
 	int	got;		/* requests read past the Tversion */
@@ -1000,7 +1001,7 @@ stubproc(void *v)
 			f.version = "9P2000";
 			if((n = convS2M(&f, buf, Stubbuf)) > 0)
 				write(s->p.sout, buf, n);
-			if(s->mode == Stdeaf)
+			if(s->mode == Stdeaf && s->deafafter == 0)
 				s->deaf = 1;
 			continue;
 		}
@@ -1036,6 +1037,13 @@ stubproc(void *v)
 			break;
 		}
 		s->got++;
+		/*
+		 * A peer that goes deaf after reading a request, not at the
+		 * Tversion: ctwowriters needs one write of its own through
+		 * before the pipe stops being emptied.
+		 */
+		if(s->mode == Stdeaf && s->got >= s->deafafter)
+			s->deaf = 1;
 	}
 	free(buf);
 	free(data);
@@ -1301,6 +1309,120 @@ cwritestall(void)
 }
 
 /*
+ * The same stall, with a second writer in front of it.  The mark that
+ * bounds a write is one per connection and the writers hand it over
+ * with the write lock, so a case has to put two of them through that
+ * hand-over: a small Tclunk the pipe buffer takes at once, which
+ * leaves the lock with its own mark still to settle, and then the
+ * megabyte of cwritestall behind it.  A mark cleared by the writer
+ * that had finished would leave the stalled write with nothing to
+ * bound it — the timer would see no write outstanding — and the
+ * deadline, the Tflush behind it and every other exchange on the
+ * connection would be unbounded with it (§14(49)).
+ *
+ * The window between a write returning and its mark being settled is
+ * microseconds wide, so this does not race for it: `writewiden'
+ * parks the first writer in exactly that window (ninehook), and the
+ * peer is told to read one request past the Tversion so that what
+ * this waits on is the peer HAVING the first request rather than a
+ * sleep.  Timing is not asserted here — the widening is in the path —
+ * only that the stalled write comes back at all, and with the
+ * connection's death rather than its own timeout.
+ */
+enum
+{
+	Cwidenms	= 500,		/* how wide the hand-over window is */
+	/*
+	 * The second writer's deadline, which must outlast the window:
+	 * it is set when the CALL starts and the call spends the window
+	 * waiting for the write lock, so a deadline inside it would be
+	 * the slot's ordinary timeout rather than the write's mark.
+	 */
+	Cwidewrms	= 1000,
+	Cwidewaitms	= 5000,		/* ... and how long the stall may take */
+};
+
+static Nine *widec;
+static char *widebig;
+static int wideclunked, widewrote, wideout;
+static char wideerr[ERRMAX];
+
+/* the writer that finishes and must not settle the other's mark */
+static void
+wideclunkproc(void*)
+{
+	Ninerep r;
+
+	nineclunk(widec, Fb, Twaitms, &r);
+	wideclunked = 1;
+	threadexits(nil);
+}
+
+/* ... and the one that stalls owning it */
+static void
+widewriteproc(void*)
+{
+	Ninerep r;
+
+	wideout = ninewrite(widec, Fa, 0, widebig, Cbig, Cwidewrms, &r);
+	utfecpy(wideerr, wideerr + sizeof wideerr, r.err);
+	widewrote = 1;
+	threadexits(nil);
+}
+
+static void
+ctwowriters(void)
+{
+	Stub s;
+	Nine *c;
+	int i;
+
+	stage = "two writers, the clear window widened";
+	if((widebig = mallocz(Cbig, 1)) == nil)
+		sysfatal("malloc: %r");
+	stubstart(&s, Stdeaf, 0);
+	s.deafafter = 1;		/* the Tclunk is read; nothing after it */
+	if((c = openfull(&s.p, Cbig+IOHDRSZ, Twaitms, stubhangup, &s)) == nil){
+		fail("%s: nineopen: %r", stage);
+		free(widebig);
+		stubstop(&s);
+		return;
+	}
+	widec = c;
+	wideclunked = widewrote = 0;
+	wideout = -1;
+	wideerr[0] = 0;
+	ninehook(c, "writewiden", Cwidenms);
+	proccreate(wideclunkproc, nil, Srvstack);
+	for(i = 0; i*5 < Twaitms && s.got == 0; i++)
+		sleep(5);
+	istrue("the peer has the first writer's request", s.got > 0);
+
+	/* from here the first writer is inside the window for Cwidenms */
+	proccreate(widewriteproc, nil, Srvstack);
+	for(i = 0; i*25 < Cwidewaitms && !widewrote; i++)
+		sleep(25);
+	checks++;
+	if(!widewrote)
+		fail("%s: the stalled write never came back: it is unbounded",
+			stage);
+	else{
+		eqv("a write stalled behind another writer is still bounded",
+			wideout, Ninedead);
+		eqs("... by its own mark, naming its own message", wideerr,
+			"ninep: a T118 the peer would not accept before the"
+			" deadline");
+	}
+	ninehook(c, "writewiden", 0);
+	closecl(c);
+	for(i = 0; i*25 < Twaitms && !wideclunked; i++)
+		sleep(25);
+	istrue("and the writer in front of it is answered too", wideclunked);
+	free(widebig);
+	stubstop(&s);
+}
+
+/*
  * A peer whose Rread or Rwrite claims more bytes than the request
  * asked for.  That is a 9P violation like any other and it kills the
  * connection: a client that answered the NEXT call Nineok would be
@@ -1433,6 +1555,7 @@ threadmain(int argc, char **argv)
 	cmutepeer();
 	clocalrefuse();
 	cwritestall();
+	ctwowriters();
 	covercount();
 	clongreply();
 

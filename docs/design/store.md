@@ -6345,19 +6345,32 @@ the 9P client's (§12), which nothing in this build dials with.
     could never be written at all. A peer that will not ACCEPT a
     message within the exchange's deadline therefore counts as dead:
     there is nothing to flush, because nothing was sent, and nothing
-    to wait for. The writer records the write's deadline before
-    entering `write(2)`; the timer, finding a write outstanding past
-    it, kills the connection `Ninedead` with a string naming the
-    stalled `T`-message and calls `Ninecfg.hangup` (§14(50)) so that
-    the blocked `write` returns, and the waiter collects `Ninedead`
-    rather than `Ninetimeout`. The `Tflush`'s own write is bounded the
-    same way, by a fixed 1000 ms rather than by an exchange's
-    deadline: it has no exchange of its own and nobody waits for it,
-    and the number has only to be far above a busy peer's read of six
-    bytes and far below the life of a connection. With no `hangup`
-    callback the connection still dies and the waiters are still
-    answered; what waits is the writer's own proc, until the peer
-    reads or the fds go.
+    to wait for. The writer marks the connection with the write's
+    deadline before entering `write(2)`; the timer, finding a write
+    outstanding past it, kills the connection `Ninedead` with a
+    string naming the stalled `T`-message and calls `Ninecfg.hangup`
+    (§14(50)) so that the blocked `write` returns, and the waiter
+    collects `Ninedead` rather than `Ninetimeout`. The `Tflush`'s own
+    write is bounded the same way, by a fixed 1000 ms rather than by
+    an exchange's deadline: it has no exchange of its own and nobody
+    waits for it, and the number has only to be far above a busy
+    peer's read of six bytes and far below the life of a connection.
+    With no `hangup` callback the connection still dies and the
+    waiters are still answered; what waits is the writer's own proc,
+    until the peer reads or the fds go.
+
+    **That mark is owned.** There is one per connection, because
+    there is one writer at a time — but a connection has many writers
+    over its life and they hand the write lock from one to the next,
+    so a mark carries the generation of the write that set it, is
+    settled before its writer releases the write lock rather than
+    after, and is cleared only by the writer it still belongs to. A
+    writer that cleared the mark of the writer which overtook it
+    would leave that write with nothing bounding it at all, so the
+    bound above would hold for a connection with one writer and go
+    the moment two exchanges overlapped; a writer that cleared a mark
+    from further off would let the timer kill a connection over a
+    deadline no outstanding write has.
 
 50. **Four ways an exchange can end that are not an `Rerror`, and
     when a closed connection's memory goes (layer-a §2.6, §3.7).**

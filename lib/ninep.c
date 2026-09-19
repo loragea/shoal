@@ -180,6 +180,8 @@ struct Nine
 	int	writing;	/* a write is inside write(2) right now */
 	int	wtype;		/* ... of this T-message */
 	vlong	wdeadline;	/* ... and it is stalled past this */
+	uvlong	wseq;		/* ... and the mark is that write's, not another's */
+	ulong	widenms;	/* the writewiden point: 0 unless a test set it */
 	int	ref;
 	int	nproc;		/* procs of this connection still running */
 	void	(*hangup)(void*);	/* break the fds; set once, then read-only */
@@ -539,7 +541,9 @@ ninereader(void *a)
  * ever sent, and every other exchange is piled up behind the write
  * lock — so it is dead for this client's purposes: the connection
  * dies Ninedead, and `hangup' is what brings the writer back out of
- * write(2) to find that out (§14(49)).
+ * write(2) to find that out (§14(49)).  The mark this reads is the
+ * outstanding write's own (nineput), so what it judges is never a
+ * deadline left behind by a write that already came back.
  */
 static void
 ninetimer(void *a)
@@ -600,10 +604,30 @@ ninetimer(void *a)
  * the peer declines to read and nothing else here would bound it:
  * the timer is what notices, kills the connection and breaks the fds
  * under it, and this proc then finds a write that failed.
+ *
+ * The mark it is recorded in is one per connection — there is one
+ * writer at a time — but the connection has many writers over its
+ * life, and they hand the write lock from one to the next, so the
+ * mark is OWNED: it carries this write's generation, it is settled
+ * before the write lock goes rather than after, and a writer clears
+ * it only while it is still the writer's own.  Both halves are
+ * needed.  Without the first, a writer that released the lock can be
+ * overtaken by the next one and clear ITS mark, and a stalled write
+ * with no mark is the unbounded write this bound exists to prevent —
+ * which is every time two exchanges overlap.  Without the second, a
+ * clear from further off does the same.  What the timer sees is the
+ * deadline of the write outstanding now, or no write at all.
+ *
+ * `widenms' is §13's writewiden point (ninehook), inert unless a T1
+ * case set it: it parks a writer between its write(2) and the
+ * settling of its mark, which is the one place two writers can be
+ * ordered through this window from outside.
  */
 static int
 nineput(Nine *c, Fcall *t, char *buf, int nbuf, vlong deadline)
 {
+	uvlong seq;
+	ulong widen;
 	int n, ok;
 
 	qlock(&c->wlk);
@@ -614,21 +638,26 @@ nineput(Nine *c, Fcall *t, char *buf, int nbuf, vlong deadline)
 		return -1;
 	}
 	qlock(&c->lk);
+	seq = ++c->wseq;
 	c->writing = 1;
 	c->wtype = t->type;
 	c->wdeadline = deadline;
+	widen = c->widenms;
 	qunlock(&c->lk);
 	ok = write(c->outfd, c->wbuf, n) == n;
 	if(!ok)
 		snprint(buf, nbuf, "ninep: writing a T%d: %r", t->type);
-	qunlock(&c->wlk);
+	if(widen > 0)
+		sleep(widen);
 	qlock(&c->lk);
-	c->writing = 0;
+	if(c->wseq == seq)		/* the mark is still this write's */
+		c->writing = 0;
 	if(ok)
 		rwakeup(&c->rdrz);	/* now the peer owes a reply */
 	else
 		ninedied(c, Ninedead, buf);	/* keeps an earlier reason */
 	qunlock(&c->lk);
+	qunlock(&c->wlk);
 	return ok ? 0 : -1;
 }
 
@@ -1008,6 +1037,17 @@ ninelate(Nine *c)
 	n = c->nlate;
 	qunlock(&c->lk);
 	return n;
+}
+
+/* §13's -X points, this library's set; inert unless a case sets one */
+void
+ninehook(Nine *c, char *name, uvlong n)
+{
+	if(strcmp(name, "writewiden") == 0){
+		qlock(&c->lk);
+		c->widenms = n;
+		qunlock(&c->lk);
+	}
 }
 
 int

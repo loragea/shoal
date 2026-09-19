@@ -2052,6 +2052,21 @@ int	nineheld(Nine*);	/* tags this connection cannot hand out */
 uvlong	ninelate(Nine*);	/* replies discarded after a timeout */
 
 /*
+ * §13's -X points, this library's set, reachable in-process only and
+ * inert unless a T1 case sets one.  There is one:
+ *
+ *	writewiden	a writer parks `n' milliseconds between its
+ *			write(2) returning and the settling of the mark
+ *			that bounds it, holding the write lock while it
+ *			does.  The mark is handed from one writer to the
+ *			next through that window, and it is the only
+ *			place two writers can be ordered through it from
+ *			outside, so a case about a write stalled behind
+ *			another writer's is a case that arms this.
+ */
+void	ninehook(Nine*, char *name, uvlong n);
+
+/*
  * Every one of these answers the outcome, which is also in r->out, and
  * `ms' is the deadline in milliseconds.  Topen is spelled with the fid
  * in its name because this library's own open is the connection's.
