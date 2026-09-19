@@ -6434,7 +6434,7 @@ is not built; each says which.
     | file | walk | open for read | open for write |
     |---|---|---|---|
     | `/` | all | all | — |
-    | `/ctl` | all | all | instance, admin |
+    | `/ctl` | all | admin | instance, admin |
     | `/map` | all | all | — |
     | `/map.next` | admin | admin | admin |
     | `/maps` | all | all | — |
@@ -6459,8 +6459,17 @@ is not built; each says which.
     - **`admin` may read everything `reader` may.** §8.1 grants the
       operator role nothing explicitly; an operator role that could
       not read the map it is editing would be unusable.
-    - **`/ctl` is readable by every role and reads as no bytes.** The
-      verbs are a write surface.
+    - **`/ctl` is readable by `admin` alone, and reads as no bytes.**
+      §8.1 grants `reader` and `instance` `/map`, any
+      `/maps/<epoch>` and the status files "and nothing else", and
+      `/ctl` is not one of the status files it lists — it is §8.3's
+      verb surface. The write cell above is not an exception to that
+      sentence, because an `OWRITE` open is not a read and §8.3
+      REQUIRES `role=instance` to reach it; an `OREAD` open by those
+      two roles is exactly what "nothing else" excludes, and there is
+      nothing behind it for them to learn — the file reads as no
+      bytes for the operator too. `ORDWR` needs both columns and so
+      is `admin`'s as well.
     - The refused cell is always `permission denied`, §2.5's
       convention, at the open — or at the walk for `/map.next`, where
       the row is outside the role's walk column and the answer is the

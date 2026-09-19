@@ -28,12 +28,16 @@
  * columns are walk, open-for-read and open-for-write, because 9P
  * separates them.
  *
- * Two of those cells are worth naming here.  /ctl is open for WRITING
- * to `instance' and `admin' and not to `reader': §8.3's two verb
- * tables are exactly those two roles, `reader' has no verb in either,
- * and the gate that matters for the two that do is §8.3's per-verb
- * Role column — which has meaning only if an `instance' fid can hold
- * /ctl open and be refused an operator verb.  /map.next is `admin'
+ * Three of those cells are worth naming here.  /ctl is open for
+ * WRITING to `instance' and `admin' and not to `reader': §8.3's two
+ * verb tables are exactly those two roles, `reader' has no verb in
+ * either, and the gate that matters for the two that do is §8.3's
+ * per-verb Role column — which has meaning only if an `instance' fid
+ * can hold /ctl open and be refused an operator verb.  /ctl is open
+ * for READING to `admin' alone: §8.1 grants `reader' and `instance'
+ * the map, the retained maps and the status files "and nothing else",
+ * and /ctl is not a status file — an OWRITE open is not a read, so
+ * the write cell above is untouched by that.  /map.next is `admin'
  * alone in all three columns: it is the operator's staging surface
  * (§8.3), not a status file, and a reader has no business seeing an
  * uncommitted map.
@@ -65,7 +69,7 @@ Mfile monfiles[Nmfile] =
 	.name	= "ctl",
 	.perm	= 0666,
 	.walk	= Amall,
-	.rd	= Amall,
+	.rd	= Amadmin,
 	.wr	= Ainstance|Amadmin,
 	.render	= monemptytext,
 	.write	= monctlwrite,

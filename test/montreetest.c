@@ -671,9 +671,19 @@ tmatrix(void)
 		int	mode;
 		char	*want[3];	/* reader, instance, admin */
 	} v[] = {
-		{"ctl",		OREAD,	{"ok", "ok", "ok"}},
+		/*
+		 * §8.1 grants `reader' and `instance' the status files
+		 * "and nothing else", and /ctl is not a status file: the
+		 * read cell is admin's alone, and ORDWR — which needs both
+		 * columns — follows it (store.md §14(58)).  The instance's
+		 * OWRITE open is not a read and stays, because §8.3's verb
+		 * tables and §3.4 need it.
+		 */
+		{"ctl",		OREAD,	{"permission denied",
+					 "permission denied", "ok"}},
 		{"ctl",		OWRITE,	{"permission denied", "ok", "ok"}},
-		{"ctl",		ORDWR,	{"permission denied", "ok", "ok"}},
+		{"ctl",		ORDWR,	{"permission denied",
+					 "permission denied", "ok"}},
 		{"map",		OREAD,	{"ok", "ok", "ok"}},
 		{"map",		OWRITE,	{"permission denied",
 					 "permission denied",
