@@ -734,6 +734,8 @@ waitreleased(Srvctx *c)
 void
 srvfree(Srvctx *c)
 {
+	Smap *s;
+
 	if(c == nil)
 		return;
 	srvshutdown(c);
@@ -748,9 +750,17 @@ srvfree(Srvctx *c)
 	 * and the context is freed under it.  Every handler therefore lets
 	 * go before it answers, and the procs the shutdown waits for
 	 * (reclaimwait, jobwait) have ended; this put is the last one.
+	 *
+	 * The field is emptied under the lock BEFORE the put, and the put
+	 * is made against the saved pointer: putting first would leave
+	 * `smap' pointing at freed memory for as long as the assignment
+	 * behind it took, and srvmapget reads that field under the lock.
 	 */
-	srvmapput(c, c->smap);
+	lock(&c->maplk);
+	s = c->smap;
 	c->smap = nil;
+	unlock(&c->maplk);
+	srvmapput(c, s);
 	free(c);
 }
 
