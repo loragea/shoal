@@ -94,9 +94,10 @@
  * this library: the only mechanism is a note, and notes are ruled out
  * above for exactly these procs.  The transport's owner CAN recall
  * one, because it is the owner of the fds — a network connection
- * takes `hangup' written to its ctl file and a pipe pair takes the
- * peer's ends closed — so that is a third callback, `Ninecfg.hangup',
- * whose contract is in lib/shoal.h.  nineclose calls it, a nineopen
+ * takes `hangup' written to its ctl file — so that is a third
+ * callback, `Ninecfg.hangup', whose contract is in lib/shoal.h,
+ * including what a pipe pair has to do instead of a close to avoid
+ * killing the parked proc outright.  nineclose calls it, a nineopen
  * that fails calls it through nineclose, and the timer calls it when
  * a write has stalled past its deadline.  Without one, a close waits
  * on the peer for as long as the peer takes (§14(50)).
@@ -112,6 +113,16 @@ enum
 	Nflushing,	/* a Tflush naming `old', which nobody waits for */
 
 	Nminmsize	= 512 + IOHDRSZ,	/* the smallest this will work at */
+
+	/*
+	 * The bound on the Tflush write a timed-out exchange leaves
+	 * behind.  It has no exchange of its own to take a deadline from
+	 * and nobody waits for it, so it takes a fixed one: long enough
+	 * that an ordinary busy peer is never killed for a slow read of
+	 * six bytes, short enough that a peer which has stopped reading
+	 * altogether does not hold the write lock for longer than a call.
+	 */
+	Nflushwms	= 1000,
 };
 
 static char Eclosed[] = "ninep: the connection was closed";
@@ -165,6 +176,9 @@ struct Nine
 	int	closed;
 	char	deaderr[ERRMAX];
 	uvlong	nlate;		/* replies discarded after a timeout */
+	int	writing;	/* a write is inside write(2) right now */
+	int	wtype;		/* ... of this T-message */
+	vlong	wdeadline;	/* ... and it is stalled past this */
 	int	ref;
 	int	nproc;		/* procs of this connection still running */
 	void	(*hangup)(void*);	/* break the fds; set once, then read-only */
@@ -461,14 +475,23 @@ ninereader(void *a)
  * The timer proc.  It owns no deadline of its own: it looks every
  * tickms and settles whatever has expired, so a call comes back within
  * its deadline plus one tick plus the cost of writing the Tflush.
+ *
+ * A write stalled past its deadline is settled first and differently.
+ * A peer that will not ACCEPT a message within the exchange's deadline
+ * cannot be waited on — there is no tag to flush, since nothing was
+ * ever sent, and every other exchange is piled up behind the write
+ * lock — so it is dead for this client's purposes: the connection
+ * dies Ninedead, and `hangup' is what brings the writer back out of
+ * write(2) to find that out (§14(49)).
  */
 static void
 ninetimer(void *a)
 {
+	char buf[ERRMAX];
 	Nine *c;
 	Nreq *q;
 	vlong now;
-	int i;
+	int i, hang;
 
 	c = a;
 	for(;;){
@@ -477,6 +500,13 @@ ninetimer(void *a)
 		if(c->closed || c->dead)
 			break;
 		now = nowms();
+		hang = 0;
+		if(c->writing && c->wdeadline <= now){
+			snprint(buf, sizeof buf, "ninep: a T%d the peer would not"
+				" accept before the deadline", c->wtype);
+			ninedied(c, Ninedead, buf);
+			hang = 1;
+		}
 		for(i = 0; i < c->nslot; i++){
 			q = &c->req[i];
 			if(q->state == Nsent && q->deadline <= now){
@@ -487,6 +517,8 @@ ninetimer(void *a)
 			}
 		}
 		qunlock(&c->lk);
+		if(hang)
+			ninehangup(c);
 	}
 	c->nproc--;
 	qunlock(&c->lk);
@@ -504,9 +536,16 @@ ninetimer(void *a)
  * the bytes are on the wire the peer owes nothing, and a reader sent
  * into read(2) for a request that then never leaves is a reader
  * nothing can recall.
+ *
+ * `deadline' is the point past which this write is stalled and the
+ * peer is dead for this client's purposes (§14(49)).  It is recorded
+ * under lk before the write, because write(2) blocks for as long as
+ * the peer declines to read and nothing else here would bound it:
+ * the timer is what notices, kills the connection and breaks the fds
+ * under it, and this proc then finds a write that failed.
  */
 static int
-nineput(Nine *c, Fcall *t, char *buf, int nbuf)
+nineput(Nine *c, Fcall *t, char *buf, int nbuf, vlong deadline)
 {
 	int n, ok;
 
@@ -517,15 +556,21 @@ nineput(Nine *c, Fcall *t, char *buf, int nbuf)
 			" msize %lud", t->type, c->msize);
 		return -1;
 	}
+	qlock(&c->lk);
+	c->writing = 1;
+	c->wtype = t->type;
+	c->wdeadline = deadline;
+	qunlock(&c->lk);
 	ok = write(c->outfd, c->wbuf, n) == n;
 	if(!ok)
 		snprint(buf, nbuf, "ninep: writing a T%d: %r", t->type);
 	qunlock(&c->wlk);
 	qlock(&c->lk);
+	c->writing = 0;
 	if(ok)
 		rwakeup(&c->rdrz);	/* now the peer owes a reply */
 	else
-		ninedied(c, Ninedead, buf);
+		ninedied(c, Ninedead, buf);	/* keeps an earlier reason */
 	qunlock(&c->lk);
 	return ok ? 0 : -1;
 }
@@ -535,7 +580,10 @@ nineput(Nine *c, Fcall *t, char *buf, int nbuf)
  * under the lock by the waiter, so the reader can already see it when
  * the Rflush arrives; the write itself is outside the lock like every
  * other.  A failed write is the connection's death, which releases the
- * tags with everything else.
+ * tags with everything else, and a write the peer will not accept
+ * within Nflushwms is the same death by the timer's hand — without
+ * that bound this call, which is on the timeout path, could itself
+ * block for ever and hold the write lock while it did.
  */
 static void
 nineflushtag(Nine *c, int i)
@@ -547,7 +595,7 @@ nineflushtag(Nine *c, int i)
 	t.type = Tflush;
 	t.tag = c->req[i + c->nreq].tag;
 	t.oldtag = c->req[i].tag;
-	nineput(c, &t, buf, sizeof buf);
+	nineput(c, &t, buf, sizeof buf, nowms() + Nflushwms);
 }
 
 /*
@@ -598,7 +646,7 @@ ninerpc(Nine *c, Fcall *t, ulong fid, int hasfid, int ms, Ninerep *r,
 	r->tag = q->tag;
 	qunlock(&c->lk);
 
-	if(nineput(c, t, buf, sizeof buf) < 0){
+	if(nineput(c, t, buf, sizeof buf, q->deadline) < 0){
 		qlock(&c->lk);
 		/*
 		 * A message the negotiated msize will not hold never

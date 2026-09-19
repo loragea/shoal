@@ -6305,7 +6305,28 @@ the 9P client's (§12), which nothing in this build dials with.
     passes answers `Ninetimeout` within one timer tick of it, and the
     client sends a `Tflush` for that tag itself **without waiting for
     the `Rflush`** — so the call costs the deadline, one tick and one
-    write, and no more. Until that `Rflush` arrives the tag is not
+    write, and no more. That bound holds only because **a stalled
+    write kills the connection**. `write(2)` on a peer that has
+    stopped reading blocks until the peer reads, which is layer-a
+    §5.4's own dead-peer scenario arriving on the sending side, and it
+    blocks holding the one write lock, so every other exchange on the
+    connection piles up behind it and the `Tflush` above — which is on
+    the timeout path — could never be written at all. A peer that will
+    not ACCEPT a message within the exchange's deadline therefore
+    counts as dead: there is nothing to flush, because nothing was
+    sent, and nothing to wait for. The writer records the write's
+    deadline before entering `write(2)`; the timer, finding a write
+    outstanding past it, kills the connection `Ninedead` with a string
+    naming the stalled `T`-message and calls `Ninecfg.hangup`
+    (§14(50)) so that the blocked `write` returns, and the waiter
+    collects `Ninedead` rather than `Ninetimeout`. The `Tflush`'s own
+    write is bounded the same way, by a fixed 1000 ms rather than by
+    an exchange's deadline: it has no exchange of its own and nobody
+    waits for it, and the number has only to be far above a busy
+    peer's read of six bytes and far below the life of a connection.
+    With no `hangup` callback the connection still dies and the
+    waiters are still answered; what waits is the writer's own proc,
+    until the peer reads or the fds go. Until that `Rflush` arrives the tag is not
     handed out again and the fid it named stays busy (§14(51)); a
     reply that arrives for it meanwhile is read off the wire and
     **discarded where it arrives**, which is what 9P has a client do
@@ -6359,12 +6380,18 @@ the 9P client's (§12), which nothing in this build dials with.
     parked in `read(2)` or `write(2)` cannot be recalled from inside
     the library: the only mechanism is a note, and §7 rules notes out
     for exactly the procs this library makes. The owner of the fds
-    can, because they are its fds — a network connection takes
-    `hangup` written to its ctl file, a pipe pair takes the peer's
-    ends closed — so the transport's owner supplies a third callback
-    beside `connect` and `spawn`, documented in `lib/shoal.h`: break
-    every blocked read and write on this connection's fds, MAY be
-    called more than once, and after it reads and writes fail.
+    can, because they are its fds, so the transport's owner supplies
+    a third callback beside `connect` and `spawn`, documented in
+    `lib/shoal.h`: break every blocked read and write on this
+    connection's fds, MAY be called more than once, and after it a
+    read or a write on them comes back rather than blocking. A network
+    connection takes `hangup` written to its ctl file. A pipe pair
+    takes the end the client reads closed and the end it writes
+    **drained, not closed**: `pipewrite` posts `sys: write on closed
+    pipe` to a proc blocked writing a pipe whose reader has gone
+    (`/sys/src/9/port/devpipe.c:310`, 9front), and that note kills the
+    proc — which on the write path is the caller's own — rather than
+    failing its write.
     `nineclose` calls it, a `nineopen` that fails calls it, and the
     timer calls it when a write has stalled past its deadline
     (§14(49)). With one, a close reclaims everything within the time

@@ -879,15 +879,22 @@ struct Stub
 	ulong	offer;		/* the msize it answers, if it is lower */
 	ulong	over;		/* Stlong: the count it answers a Tread with */
 	int	deaf;		/* Stdeaf: the Tversion is answered, no more reads */
+	int	drain;		/* ... until a hangup, which resumes them */
 	int	got;		/* requests read past the Tversion */
 	int	ended;
 };
 
 /*
- * The transport owner's half of §12's `hangup' contract, for a T1
- * pipe pair: close the peer's ends, which is what breaks a read or a
- * write the client has parked in.  It may be called more than once,
- * so each end goes at most once and stubstop finds nothing left.
+ * The transport owner's half of §12's `hangup' contract, for a pipe
+ * pair.  The end the client READS is closed, which is what ends a
+ * read it has parked in.  The end it WRITES is drained and not
+ * closed: `pipewrite' posts `sys: write on closed pipe' to a proc
+ * blocked writing a pipe whose reader has gone
+ * (/sys/src/9/port/devpipe.c:310), and libthread answers a `sys:'
+ * note with noted(NDFLT), so closing it would kill the client's
+ * caller outright rather than break its write.  It may be called more
+ * than once, so the end goes at most once and stubstop finds nothing
+ * left.
  */
 static void
 stubhangup(void *v)
@@ -901,10 +908,7 @@ stubhangup(void *v)
 		s->p.sout = -1;
 		close(fd);
 	}
-	if((fd = s->p.sin) >= 0){
-		s->p.sin = -1;
-		close(fd);
-	}
+	s->drain = 1;
 }
 
 static void
@@ -927,6 +931,12 @@ stubproc(void *v)
 		if(s->deaf){
 			if(s->p.sin < 0)
 				break;
+			if(s->drain){
+				/* the hangup: read and discard, to the end */
+				if(read(s->p.sin, buf, Stubbuf) <= 0)
+					break;
+				continue;
+			}
 			sleep(25);
 			continue;
 		}
@@ -1194,6 +1204,60 @@ clocalrefuse(void)
 	stubstop(&s);
 }
 
+/*
+ * A peer that took the connection and then stopped reading — layer-a
+ * §5.4's dead peer, arriving on the sending side.  The pipe fills and
+ * write(2) parks with the write lock held, so the deadline bounds
+ * nothing at all unless the timer settles the write itself: the
+ * connection dies Ninedead within the deadline and a tick, every call
+ * after it says so, and the close reclaims everything (§14(49)).
+ *
+ * The message is a megabyte because that is well past any pipe's
+ * buffer, so one write is enough to park; a 64 KiB one would have to
+ * be repeated an unknown number of times first.
+ */
+enum
+{
+	Cbig	= 1024*1024,	/* a Twrite no pipe buffer will take */
+	Cwrms	= 200,		/* ... under this deadline */
+};
+
+static void
+cwritestall(void)
+{
+	char *big;
+	Ninerep r;
+	Stub s;
+	Nine *c;
+	vlong t0, ms;
+
+	stage = "a peer that stops reading";
+	if((big = mallocz(Cbig, 1)) == nil)
+		sysfatal("malloc: %r");
+	stubstart(&s, Stdeaf, 0);
+	if((c = openfull(&s.p, Cbig+IOHDRSZ, Twaitms, stubhangup, &s)) == nil){
+		fail("%s: nineopen: %r", stage);
+		free(big);
+		stubstop(&s);
+		return;
+	}
+	t0 = nsec();
+	ninewrite(c, Fa, 0, big, Cbig, Cwrms, &r);
+	ms = (nsec() - t0)/1000000;
+	eqv("a write the peer will not accept kills the connection", r.out,
+		Ninedead);
+	eqs("... naming the message it stalled on", r.err, "ninep: a T118 the"
+		" peer would not accept before the deadline");
+	istrue("... not before the deadline", ms >= Cwrms - 5);
+	istrue("... and not long after it", ms < 2000);
+
+	nineclunk(c, Fb, Tms, &r);
+	eqv("and a call afterwards says so too", r.out, Ninedead);
+	closecl(c);
+	free(big);
+	stubstop(&s);
+}
+
 void
 threadmain(int argc, char **argv)
 {
@@ -1211,6 +1275,7 @@ threadmain(int argc, char **argv)
 	cbotch();
 	cmutepeer();
 	clocalrefuse();
+	cwritestall();
 
 	watchoff();
 	if(fails > 0){

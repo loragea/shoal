@@ -1909,16 +1909,22 @@ int	maprefresh(Adopt*, Fence*, Cmap*, vlong now);
  * proccreate.  Nothing here includes <thread.h> either.
  *
  * **Hanging up.**  `hangup' breaks every blocked read and write on
- * this connection's fds: for a network connection the owner writes
- * `hangup' to the conversation's ctl file, and for a T1 pipe pair it
- * closes the peer's ends.  It MAY be called more than once, and after
- * it reads and writes on those fds fail.  It is what lets this
+ * this connection's fds.  For a network connection the owner writes
+ * `hangup' to the conversation's ctl file.  For a pipe pair it closes
+ * the end this client READS and drains the end it WRITES rather than
+ * closing that one, because a pipe whose reader has gone posts `sys:
+ * write on closed pipe' to the proc blocked writing it, and a note
+ * kills that proc — the caller's own — instead of failing its write.
+ * `hangup' MAY be called more than once, and after it a read or a
+ * write on those fds comes back rather than blocking.  It is what lets
+ * this
  * library recall a proc parked in read(2) or write(2), which plain
  * libc cannot do by itself — nineclose calls it, a nineopen that
  * fails calls it, and the timer calls it when a write has stalled
  * past its deadline.  It is optional: with no `hangup', a close
  * leaves a parked reader where it is until the peer speaks or hangs
- * up, and the memory, the fds and the procs go only then (§14(50)).
+ * up, a stalled write stays parked until the peer reads, and the
+ * memory, the fds and the procs go only then (§14(50)).
  *
  * **Every exchange is bounded.**  Each call takes a deadline in
  * milliseconds — layer-a §5.4's `replms' is what a peer client will
@@ -1927,6 +1933,12 @@ int	maprefresh(Adopt*, Fence*, Cmap*, vlong now);
  * tag and holds the tag, and the fid, until the Rflush; a reply that
  * arrives late is discarded (§14(49)).  nineheld and ninelate are
  * what a caller sees of that.
+ *
+ * A peer that will not ACCEPT the request inside that deadline is a
+ * different answer: nothing was sent, so there is no tag to flush and
+ * nothing to wait for, and the connection dies Ninedead with a string
+ * naming the stalled T-message.  Every call on it answers Ninedead
+ * from then on (§14(49)).
  *
  * **One outstanding request per fid** (layer-a §5.6, §14(51)): a
  * second request on a fid that has one outstanding is refused
