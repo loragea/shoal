@@ -1691,7 +1691,6 @@ objcreaterun(Req *r, Srvctx *c, Smap *m, char *buf, int nbuf)
 {
 	char err[ERRMAX], *e;
 	Sfid *f;
-	Sstage *s;
 	Objinfo oi;
 	Qreq *qr;
 	uvlong ver;
