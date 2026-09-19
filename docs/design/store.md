@@ -6372,6 +6372,38 @@ is not built; each says which.
     instance actually tracking the map does anyway, because a
     snapshot cannot tell it the epoch has moved.
 
+    **Two residuals of where the predicate sits**, recorded for the
+    unit that builds the demotion rule.
+
+    *The `Ropen`→`Tread` window.* The render stamps the fid at the
+    open, so a publish that lands between that render and the fid's
+    first `Tread` makes the stamp stale before the instance has read
+    a byte: that poll does not renew, although the instance did
+    everything §6.3 asks of it. One lost poll is harmless — the
+    instance reopens on the next `pollms` and renews off the new
+    map. `deadms`/`pollms` consecutive losses are not: the monitor
+    would publish `up=no fenced=yes` for an instance that kept
+    refreshing successfully in §6.3's sense, which is F2's **bad**
+    direction, not the "no fresher than" one the paragraph above
+    argues. At the defaults that is 10000/1000 = **10** consecutive
+    losses of a race one 9P round trip wide, against publishes that
+    are an operator's actions — theoretical, and recorded because it
+    is the direction the rest of this item does not cover and the
+    unit that builds the demotion rule is the one that would have to
+    weigh it.
+
+    *Seq identity, not content identity.* The predicate compares
+    `seq`, so a republish of byte-identical text — §14(60)'s case of
+    one epoch published twice, which `forceepoch` (§8.3) and §8.6's
+    rebuild path reach — leaves a fid's stamp stale although the
+    bytes it serves ARE the current map. That is the one case where
+    "not current" is factually false, and it withdraws evidence from
+    a fid that deserves it. *Implementation policy:* `seq` identity
+    is one comparison against a value the accessor already returns,
+    whereas content identity is a `memcmp` of the whole map text
+    under `monlk` on every recording read; the cost of being wrong is
+    one poll of withheld evidence, which the `pollms` reopen heals.
+
     The `register` half of §8.4's rule is not built: the verb is not
     (§8.3's table, `mon/ctl.c`), and the unit that builds it records
     evidence through the same call, with **no** currency predicate —
@@ -6664,8 +6696,14 @@ is not built; each says which.
     - Neither subtraction can run backwards. `time(2)` is not
       monotonic, and an unsigned wrap on a clock that went back
       between the reading recorded and the reading taken would render
-      a silence of some hundred million years; both answer `0`
-      instead.
+      a silence of some hundred million years; both subtractions are
+      guarded and yield `0` instead. The guard is not the last word
+      on the never-seen branch: the one-second floor above is applied
+      after it, so a backward clock renders `silent=1000` there and
+      `silent=0` on the seen branch. That is the floor doing exactly
+      what it is for — the never-seen branch must never read "heard
+      from just now" — and a second against a `deadms` of ten
+      thousand costs the demotion rule nothing.
     - `reports=` is empty on every line. It is the instances that
       currently claim they cannot reach this one, which the
       `unreachable`/`reachable` verbs of §8.3 record; those are the

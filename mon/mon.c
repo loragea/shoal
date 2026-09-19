@@ -300,7 +300,12 @@ monsrvunlock(Monctx *c)
  * of the monitor's /map, or its most recent `register', on an attach
  * with role=instance,peer=i."  The read half is built and is
  * tree.c's; the `register' half is the next unit's, and it records
- * evidence by calling monsrvseen from that verb's body.
+ * evidence by calling monsrvseen from that verb's body with no
+ * currency predicate of any kind: tree.c guards its own call with
+ * mapcurrent because /map is snapshot-at-open and a frozen snapshot is
+ * not a refresh, while a `register' is a write the instance made now,
+ * so there is no snapshot whose currency could be in question
+ * (store.md §14(56)).
  *
  * store.md §14(56) fixes what a successful read is and why, and is
  * what the demotion rule of the unit after next will stand on: it
