@@ -3460,11 +3460,11 @@ tscrubwait(void)
 	Dev *d;
 	Cl cl;
 	vlong t0;
-	uvlong slice;
+	uvlong tick;
 	int i;
 
 	clstage = "scrubwait";
-	slice = 3000;
+	tick = 3000;
 	m = mkmap();
 	d = newdisk();
 	freedseen = 0;
@@ -3494,21 +3494,21 @@ tscrubwait(void)
 	/*
 	 * And it is made to stay up ACROSS the wait, which is what gives
 	 * the check at the store's close anything to catch: the server's
-	 * own slice is half a second and everything srvshutdown does
+	 * own tick is half a second and everything srvshutdown does
 	 * after the wait takes longer than that, so a shutdown that never
 	 * waited would still reach storeclose with the proc gone most
 	 * times over, and the check would pass either way (srv.h).  The
-	 * slice goes to seconds with the period already back at
-	 * `scrubdays', and the sleep is one old slice, so the proc is
+	 * tick goes to seconds with the period already back at
+	 * `scrubdays', and the sleep is one old tick, so the proc is
 	 * inside a new long one when the loop ends below.
 	 */
-	srvscrubslicems(ctx, slice);
+	srvscrubtickms(ctx, tick);
 	sleep(700);
 Out:
 	t0 = nsec()/1000000;
 	clstop(&cl);			/* the loop ends; the shutdown runs */
-	istrue("the shutdown waited no longer than a slice of the timer's",
-		nsec()/1000000 - t0 < (vlong)slice + 1000);
+	istrue("the shutdown waited no longer than a tick of the timer's",
+		nsec()/1000000 - t0 < (vlong)tick + 1000);
 	eqv("the store was closed once", freedseen, 1);
 	eqv("the scrub timer had ended when the store closed", freedscrub, 0);
 	istrue("and it is not reading the context now either",

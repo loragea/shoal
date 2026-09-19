@@ -829,7 +829,7 @@ struct Srvctx
 	ulong	scrubrate;
 	int	scrubup;
 	uvlong	scrubms;
-	uvlong	scrubslice;
+	uvlong	scrubtick;
 	uvlong	scrubnext;
 	int	reclaiming;
 	int	reclaimstop;

@@ -78,12 +78,14 @@ enum
 	 * overrides it (store.md §12).  Both are implementation policy,
 	 * which §7.5 says in as many words.
 	 *
-	 * The wait is slept in half-second slices for the reasons the
-	 * reclaim timer's are (Reclaimslicems below): what it paces is a
-	 * period of days, the proc is not a job, and what the length costs
-	 * is the shutdown's wait for the proc, which is bounded by one
-	 * slice.  It is NOT Scrubslicems above: that one paces a walk of a
-	 * disk and is twenty milliseconds.
+	 * The wait is slept in half-second ticks for the reasons the
+	 * reclaim timer's slices are (Reclaimslicems below): what it paces
+	 * is a period of days, the proc is not a job, and what the length
+	 * costs is the shutdown's wait for the proc, which is bounded by
+	 * one tick.  It is NOT Scrubslicems above: that one paces a walk
+	 * of a disk and is twenty milliseconds, and the difference is why
+	 * this constant, its accessor and its T1 knob are all `tick' —
+	 * `scrubslice' would name the wrong number.
 	 *
 	 * The first pass comes one period after start-up rather than at
 	 * it, which is reclaim's argument (reclaimtimer below) reaching
@@ -1119,16 +1121,22 @@ srvscrubnextms(Srvctx *c)
 /*
  * The stretch this timer sleeps at a time, which is reclaimslicems's
  * twin and carries that function's comment entire: Scrubtickms unless
- * a T1 has set the knob over it (srv.h), read fresh each slice, and
+ * a T1 has set the knob over it (srv.h), read fresh each stretch, and
  * the bound on the shutdown's wait for this proc.
+ *
+ * It is `tick' and not `slice' because the constant it overrides is
+ * Scrubtickms.  Scrubslicems is a different number for a different
+ * job — the twenty milliseconds a scrub PASS sleeps between rate
+ * charges (scrubpace above) — and naming this after it would say the
+ * knob reached the pass's pacing, which it does not.
  */
 static uvlong
-scrubslicems(Srvctx *c)
+scrubtickms(Srvctx *c)
 {
 	uvlong ms;
 
 	lock(&c->joblk);
-	ms = c->scrubslice;
+	ms = c->scrubtick;
 	unlock(&c->joblk);
 	return ms != 0 ? ms : Scrubtickms;
 }
@@ -1137,20 +1145,20 @@ scrubslicems(Srvctx *c)
  * The scrub's timer, which is reclaimtimer's twin: not a job, waited
  * for separately by the shutdown and before the jobs because it is one
  * of the two things that could still start one, and reading
- * srvstopping between slices so as to be there to be waited for.
+ * srvstopping between ticks so as to be there to be waited for.
  */
 static void
 scrubtimer(void *a)
 {
 	Srvctx *c;
-	uvlong left, period, slice, t;
+	uvlong left, period, tick, t;
 
 	c = a;
-	slice = Scrubtickms;
+	tick = Scrubtickms;
 	for(;;){
-		for(t = 0;; t += slice){
+		for(t = 0;; t += tick){
 			period = srvscrubperiod(c);
-			slice = scrubslicems(c);
+			tick = scrubtickms(c);
 			left = period > t ? period - t : 0;
 			scrubarm(c, left);
 			if(left == 0)
@@ -1161,7 +1169,7 @@ scrubtimer(void *a)
 				unlock(&c->joblk);
 				threadexits(nil);
 			}
-			sleep(slice);
+			sleep(tick);
 		}
 		scrubgo(c, 1);
 	}
@@ -1213,13 +1221,13 @@ srvscrubms(Srvctx *c, uvlong ms)
 }
 
 /*
- * The T1 knob over the slice (srv.h).  0 puts Scrubtickms back.
+ * The T1 knob over the tick (srv.h).  0 puts Scrubtickms back.
  */
 void
-srvscrubslicems(Srvctx *c, uvlong ms)
+srvscrubtickms(Srvctx *c, uvlong ms)
 {
 	lock(&c->joblk);
-	c->scrubslice = ms;
+	c->scrubtick = ms;
 	unlock(&c->joblk);
 }
 
