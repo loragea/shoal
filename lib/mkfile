@@ -18,6 +18,7 @@ OFILES=\
 	log.$O\
 	map.$O\
 	mon.$O\
+	ninep.$O\
 	obj.$O\
 	ondisk.$O\
 	snap.$O\

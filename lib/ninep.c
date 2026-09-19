@@ -1,0 +1,1070 @@
+#include <u.h>
+#include <libc.h>
+#include <libsec.h>
+#include <fcall.h>
+#include "shoal.h"
+
+/*
+ * A 9P client, docs/design/store.md §12.
+ *
+ * It speaks stock 9P2000 over a pair of file descriptors with
+ * convS2M/convM2S, and it holds no shoal semantics at all: there is no
+ * map here, no `op=' grammar, no retry policy and no idea what a peer
+ * is.  Those belong to the monitor poll loop and the peer clients that
+ * layer-a §5.5, §5.6 and §6.3 define; this is the engine each of them
+ * needs first.
+ *
+ * **Nothing here dials.**  A connection is made by a caller-supplied
+ * callback that answers a pair of fds — the network's equivalent of
+ * the device vtable (§0), and for the same reason: it is what lets a
+ * T1 program run two instances and a monitor inside itself over pipes
+ * with no network at all, and a real dial answers the same fd twice.
+ * Reconnection is the caller's too.  What this client owes the caller
+ * is to tell a dead connection from a §2.6 refusal, which it does with
+ * distinct outcomes rather than with a string the caller must parse.
+ *
+ * **Every exchange is bounded.**  layer-a §5.4 bounds each peer
+ * operation by `replms' and §5.4's write path must not block a client
+ * on a dead peer, so every call takes a deadline in milliseconds and
+ * answers Ninetimeout when it passes.  Getting that bound out of plain
+ * libc is this file's one real design problem, and the shape it takes
+ * is below.
+ *
+ * **The bounded wait.**  Two procs per connection, made through a
+ * spawn callback exactly as the store engine makes its own (§7): a
+ * T1 program passes an rfork(RFPROC|RFMEM) wrapper and the server
+ * passes proccreate.
+ *
+ *	the reader	parks in read(2), demultiplexes each reply by tag
+ *			into that tag's slot and wakes the waiter.  It
+ *			reads only while the peer owes a reply — with
+ *			nothing outstanding it parks on `rdrz' instead, so
+ *			an idle connection can be closed without waiting
+ *			for the peer to say anything.
+ *	the timer	wakes every `tickms', and settles every slot whose
+ *			deadline has passed.
+ *
+ * A waiter, the reader and the timer coordinate under one QLock, and
+ * the slot's state is what makes exactly one of them the waker: a slot
+ * is Nsent from the moment its request is written until whichever of
+ * the reader and the timer reaches it first moves it to Ndone under
+ * the lock and calls rwakeup.  The other then finds a slot that is no
+ * longer Nsent and does nothing.  The waiter parks in rsleep on the
+ * slot's own Rendez, which releases the lock while it sleeps, and
+ * re-tests the state on waking, so a reply that lands before the
+ * waiter gets there is not lost.
+ *
+ * **Why QLock and Rendez rather than rendezvous(2).**  The engine
+ * states the rule this library lives under (§7): QLock, Rendez and
+ * Lock mean the same thing under plain libc and under libthread, so
+ * one library serves the T1 programs and the 9P server.
+ * `rendezvous' does not: libthread supplies its own, which rendezvous
+ * BETWEEN THREADS of one program and answers ~0 to a broken sleep,
+ * while libc's is the kernel call between procs of a rendezvous group.
+ * The two would have this file mean different things in its two
+ * homes.  Neither is `alarm' or a note used here, for the reason the
+ * engine gives for its own procs: a note delivered to a proc of a
+ * libthread program lands in libthread's handler, and an alarm is one
+ * timer shared with whatever else the program is doing.
+ *
+ * **What a timeout leaves behind** is store.md §14(49).  In one line:
+ * the call answers Ninetimeout, the client sends a Tflush naming the
+ * tag, and the tag is not reused until the Rflush for it comes back —
+ * a late reply for it is read off the wire and discarded (nineheld and
+ * ninelate are what a caller sees of both).
+ *
+ * **One outstanding request per fid** (layer-a §5.6) is enforced here,
+ * over every fid and not only over an `/rpc' one: a second request on
+ * a fid that already has one outstanding is refused Ninebusy before
+ * anything is written.  §14(51) argues the widening.
+ *
+ * **Closing.**  nineclose answers every exchange in flight Ninedead
+ * and stops both procs; the last of the caller, the two procs and any
+ * exchange still unwinding releases the memory and the fds, and the
+ * `freed' callback is the observation of that moment (§13's hook, as
+ * the engine has one).  A caller must not START a call after
+ * nineclose, exactly as storeclose requires; a call already in flight
+ * when it runs is safe, and that is what the reference count is for.
+ */
+
+enum
+{
+	/* slot states */
+	Nfree	= 0,	/* the slot is nobody's */
+	Nsent,		/* a request is out and a waiter is in the exchange */
+	Ndone,		/* the outcome is in; the waiter has not taken it */
+	Ngone,		/* the waiter gave up: a late reply lands here */
+	Nflushing,	/* a Tflush naming `old', which nobody waits for */
+
+	Nminmsize	= 512 + IOHDRSZ,	/* the smallest this will work at */
+};
+
+static char Eclosed[] = "ninep: the connection was closed";
+static char Ehangup[] = "ninep: the peer hung up";
+static char Etimeout[] = "ninep: no reply before the deadline";
+static char Enomem[] = "ninep: out of memory";
+
+typedef struct Nreq Nreq;
+
+/*
+ * One tag.  Slot 0 carries NOTAG, which is Tversion's alone; slots
+ * 1..nreq are the request tags, and slot i+nreq is the tag the Tflush
+ * for slot i is sent under, so a timed-out exchange always has a tag
+ * to flush with and the two are found from each other by arithmetic.
+ */
+struct Nreq
+{
+	int	state;
+	int	out;		/* Nineok … Ninelocal, once Ndone */
+	int	owed;		/* the peer still owes a reply for this tag */
+	int	hasfid;
+	ulong	fid;
+	ushort	tag;
+	ushort	old;		/* Nflushing: the slot its Tflush names */
+	vlong	deadline;	/* ms on the monotonic clock */
+	uchar	*m;		/* the reply, as it came off the wire */
+	int	nm;
+	char	err[ERRMAX];
+	Rendez	rz;		/* on Nine.lk: the waiter parks here */
+};
+
+struct Nine
+{
+	QLock	lk;		/* everything below, and every slot */
+	Rendez	rdrz;		/* on lk: the reader waits for work here */
+	QLock	wlk;		/* one writer on the fd at a time */
+
+	int	infd, outfd;
+	ulong	msize;		/* negotiated (§5.5), settled before we escape */
+	ulong	bufsz;		/* proposed: what the buffers are sized for */
+	ulong	tickms;
+	int	nreq;		/* request tags: 1..nreq */
+	int	nslot;		/* 2*nreq + 1 */
+	Nreq	*req;
+	uchar	*wbuf;		/* under wlk */
+	uchar	*rbuf;		/* the reader's own */
+
+	int	nexpect;	/* replies the peer still owes */
+	int	dead;
+	int	deadout;	/* Ninedead, or Ninebotch if 9P was broken */
+	int	closed;
+	char	deaderr[ERRMAX];
+	uvlong	nlate;		/* replies discarded after a timeout */
+	int	ref;
+	int	nproc;		/* procs of this connection still running */
+	void	(*freed)(void*);
+	void	*freedarg;
+};
+
+static vlong
+nowms(void)
+{
+	return nsec()/1000000;
+}
+
+static void
+setstr(char *buf, char *s)
+{
+	utfecpy(buf, buf+ERRMAX, s);
+}
+
+/*
+ * The outcome of a call that never reached the wire, or that came back
+ * as something other than the reply it asked for.  The string is also
+ * left in the error string, so a caller that prints %r sees the same
+ * thing a caller that reads Ninerep.err does.
+ */
+static int
+nineout(Ninerep *r, int out, char *fmt, ...)
+{
+	va_list arg;
+
+	va_start(arg, fmt);
+	vseprint(r->err, r->err + sizeof r->err, fmt, arg);
+	va_end(arg);
+	r->out = out;
+	werrstr("%s", r->err);
+	return out;
+}
+
+/*
+ * Give the memory back.  Only the last reference reaches here, so the
+ * reader is out of its read and the timer out of its sleep by now and
+ * the fds are nobody's but ours.  The `freed' callback is called after
+ * the last free, which is what makes the release observable to a test
+ * that has no other way to see it.
+ */
+static void
+ninefree(Nine *c)
+{
+	void (*f)(void*);
+	void *a;
+	int i;
+
+	if(c->infd >= 0)
+		close(c->infd);
+	if(c->outfd >= 0 && c->outfd != c->infd)
+		close(c->outfd);
+	if(c->req != nil)
+		for(i = 0; i < c->nslot; i++)
+			free(c->req[i].m);
+	free(c->req);
+	free(c->wbuf);
+	free(c->rbuf);
+	f = c->freed;
+	a = c->freedarg;
+	free(c);
+	if(f != nil)
+		(*f)(a);
+}
+
+static void
+ninedrop(Nine *c)
+{
+	int last;
+
+	qlock(&c->lk);
+	last = --c->ref == 0;
+	qunlock(&c->lk);
+	if(last)
+		ninefree(c);
+}
+
+/*
+ * The connection is gone: a read or a write failed, or the peer broke
+ * the protocol.  Every waiter in an exchange is answered with the same
+ * outcome and the same string, and nothing more is expected off the
+ * wire.  `out' is what tells transport death from a protocol
+ * violation, which is a distinction a caller acts on: a peer that
+ * hangs up is one to dial again, and a peer that answers on a tag
+ * nobody sent is not.  Called under the lock.
+ */
+static void
+ninedied(Nine *c, int out, char *err)
+{
+	Nreq *q;
+	int i;
+
+	if(!c->dead){
+		c->dead = 1;
+		c->deadout = out;
+		setstr(c->deaderr, err);
+	}
+	for(i = 0; i < c->nslot; i++){
+		q = &c->req[i];
+		q->owed = 0;
+		if(q->state == Nsent){
+			q->state = Ndone;
+			q->out = c->deadout;
+			setstr(q->err, c->deaderr);
+			rwakeup(&q->rz);
+		}
+	}
+	c->nexpect = 0;
+	rwakeupall(&c->rdrz);
+}
+
+/* is a request outstanding on this fid?  Called under the lock. */
+static int
+ninefidbusy(Nine *c, ulong fid)
+{
+	Nreq *q;
+	int i;
+
+	for(i = 0; i < c->nslot; i++){
+		q = &c->req[i];
+		if(q->state != Nfree && q->hasfid && q->fid == fid)
+			return 1;
+	}
+	return 0;
+}
+
+/* a free request slot, or -1.  Called under the lock. */
+static int
+ninetake(Nine *c, int notag)
+{
+	int i;
+
+	if(notag)
+		return c->req[0].state == Nfree ? 0 : -1;
+	for(i = 1; i <= c->nreq; i++)
+		if(c->req[i].state == Nfree && c->req[i+c->nreq].state == Nfree)
+			return i;
+	return -1;
+}
+
+/*
+ * One message off the wire, already read into rbuf.  Called under the
+ * lock; answers 0 to go on reading and -1 once the connection is gone.
+ */
+static int
+ninegot(Nine *c, int n)
+{
+	char buf[ERRMAX];
+	Nreq *q, *f;
+	uchar *m;
+	ushort tag;
+	int i;
+
+	if((ulong)n > c->msize){
+		snprint(buf, sizeof buf, "ninep: a reply of %d bytes over the"
+			" negotiated msize %lud", n, c->msize);
+		ninedied(c, Ninebotch, buf);
+		return -1;
+	}
+	if(n < BIT32SZ+BIT8SZ+BIT16SZ){
+		ninedied(c, Ninebotch, "ninep: a short reply");
+		return -1;
+	}
+	tag = GBIT16(c->rbuf+BIT32SZ+BIT8SZ);
+	i = tag == NOTAG ? 0 : tag;
+	if(i < 0 || i >= c->nslot || c->req[i].tag != tag
+		|| c->req[i].state == Nfree){
+		ninedied(c, Ninebotch, "ninep: a reply nothing is waiting for");
+		return -1;
+	}
+	q = &c->req[i];
+	switch(q->state){
+	case Nsent:
+		if((m = malloc(n)) == nil){
+			ninedied(c, Ninedead, Enomem);
+			return -1;
+		}
+		memmove(m, c->rbuf, n);
+		q->m = m;
+		q->nm = n;
+		q->out = Nineok;	/* the waiter decodes it and judges */
+		q->state = Ndone;
+		q->owed = 0;
+		c->nexpect--;
+		rwakeup(&q->rz);
+		break;
+	case Ndone:
+	case Ngone:
+		/*
+		 * A reply for a tag the timer settled.  It is discarded
+		 * where it arrives (§14(49)); the tag stays held until the
+		 * Rflush for it, so nothing else can have claimed this
+		 * reply.
+		 */
+		if(q->owed){
+			q->owed = 0;
+			c->nexpect--;
+		}
+		c->nlate++;
+		break;
+	case Nflushing:
+		if(c->rbuf[BIT32SZ] != Rflush){
+			snprint(buf, sizeof buf, "ninep: a Tflush answered"
+				" with type %d", c->rbuf[BIT32SZ]);
+			ninedied(c, Ninebotch, buf);
+			return -1;
+		}
+		/*
+		 * 9P has the server answer a flushed request before the
+		 * Rflush or not at all, so the Rflush is where both tags
+		 * come back: this one, and the one it named.
+		 */
+		f = &c->req[q->old];
+		if(f->owed){
+			f->owed = 0;
+			c->nexpect--;
+		}
+		free(f->m);
+		f->m = nil;
+		f->state = Nfree;
+		f->hasfid = 0;
+		q->owed = 0;
+		c->nexpect--;
+		q->state = Nfree;
+		break;
+	}
+	return 0;
+}
+
+/*
+ * The reader proc.  It reads only while the peer owes a reply, so a
+ * connection with nothing outstanding is one whose reader is parked on
+ * a Rendez and can be stopped at once; a reader inside read(2) cannot
+ * be recalled in plain libc (§14(50)), and this is what keeps that
+ * case to a connection the caller closed with work still in flight.
+ */
+static void
+ninereader(void *a)
+{
+	char e[ERRMAX];
+	Nine *c;
+	int n;
+
+	c = a;
+	qlock(&c->lk);
+	for(;;){
+		while(c->nexpect == 0 && !c->closed && !c->dead)
+			rsleep(&c->rdrz);
+		if(c->closed || c->dead)
+			break;
+		qunlock(&c->lk);
+		n = read9pmsg(c->infd, c->rbuf, c->bufsz);
+		if(n < 0)
+			snprint(e, sizeof e, "ninep: %r");
+		qlock(&c->lk);
+		if(c->closed)
+			break;
+		if(n == 0){
+			ninedied(c, Ninedead, Ehangup);
+			break;
+		}
+		if(n < 0){
+			ninedied(c, Ninedead, e);
+			break;
+		}
+		if(ninegot(c, n) < 0)
+			break;
+	}
+	c->nproc--;
+	qunlock(&c->lk);
+	ninedrop(c);
+}
+
+/*
+ * The timer proc.  It owns no deadline of its own: it looks every
+ * tickms and settles whatever has expired, so a call comes back within
+ * its deadline plus one tick plus the cost of writing the Tflush.
+ */
+static void
+ninetimer(void *a)
+{
+	Nine *c;
+	Nreq *q;
+	vlong now;
+	int i;
+
+	c = a;
+	for(;;){
+		sleep(c->tickms);
+		qlock(&c->lk);
+		if(c->closed || c->dead)
+			break;
+		now = nowms();
+		for(i = 0; i < c->nslot; i++){
+			q = &c->req[i];
+			if(q->state == Nsent && q->deadline <= now){
+				q->state = Ndone;
+				q->out = Ninetimeout;
+				setstr(q->err, Etimeout);
+				rwakeup(&q->rz);
+			}
+		}
+		qunlock(&c->lk);
+	}
+	c->nproc--;
+	qunlock(&c->lk);
+	ninedrop(c);
+}
+
+/*
+ * Put one message on the wire, under the write lock so that two procs
+ * cannot interleave their bytes.  Answers 0, or -1 with the reason in
+ * buf: a message that will not fit the negotiated msize is a local
+ * refusal and a failed write is the connection's death, and the caller
+ * tells them apart by whether the connection is dead afterwards.
+ */
+static int
+nineput(Nine *c, Fcall *t, char *buf, int nbuf)
+{
+	int n;
+
+	qlock(&c->wlk);
+	if((n = convS2M(t, c->wbuf, c->msize)) <= 0){
+		qunlock(&c->wlk);
+		snprint(buf, nbuf, "ninep: a T%d does not fit the negotiated"
+			" msize %lud", t->type, c->msize);
+		return -1;
+	}
+	if(write(c->outfd, c->wbuf, n) != n){
+		qunlock(&c->wlk);
+		snprint(buf, nbuf, "ninep: writing a T%d: %r", t->type);
+		qlock(&c->lk);
+		ninedied(c, Ninedead, buf);
+		qunlock(&c->lk);
+		return -1;
+	}
+	qunlock(&c->wlk);
+	return 0;
+}
+
+/*
+ * The Tflush a timed-out exchange leaves behind.  Its slot is armed
+ * under the lock by the waiter, so the reader can already see it when
+ * the Rflush arrives; the write itself is outside the lock like every
+ * other.  A failed write is the connection's death, which releases the
+ * tags with everything else.
+ */
+static void
+nineflushtag(Nine *c, int i)
+{
+	char buf[ERRMAX];
+	Fcall t;
+
+	memset(&t, 0, sizeof t);
+	t.type = Tflush;
+	t.tag = c->req[i + c->nreq].tag;
+	t.oldtag = c->req[i].tag;
+	nineput(c, &t, buf, sizeof buf);
+}
+
+/*
+ * One exchange: write the request, wait for its reply until the
+ * deadline, and answer which of the outcomes it came to.  On Nineok
+ * *mp is the reply as it came off the wire and f points into it — the
+ * decoded strings live in those bytes — so the wrapper copies out what
+ * its caller asked for and frees it.
+ */
+static int
+ninerpc(Nine *c, Fcall *t, ulong fid, int hasfid, int ms, Ninerep *r,
+	Fcall *f, uchar **mp)
+{
+	char buf[ERRMAX];
+	Nreq *q;
+	uchar *m;
+	int i, out, nm;
+
+	memset(r, 0, sizeof *r);
+	*mp = nil;
+	qlock(&c->lk);
+	if(c->closed || c->dead){
+		out = nineout(r, c->dead ? c->deadout : Ninedead, "%s",
+			c->dead ? c->deaderr : Eclosed);
+		qunlock(&c->lk);
+		return out;
+	}
+	c->ref++;			/* this exchange holds the handle up */
+	if(hasfid && ninefidbusy(c, fid)){
+		out = nineout(r, Ninebusy, "ninep: fid %lud already has a"
+			" request outstanding", fid);
+		goto Drop;
+	}
+	if((i = ninetake(c, t->type == Tversion)) < 0){
+		out = nineout(r, Ninelocal, "ninep: no free tag");
+		goto Drop;
+	}
+	q = &c->req[i];
+	q->hasfid = hasfid;
+	q->fid = fid;
+	q->deadline = nowms() + ms;
+	q->out = Nineok;
+	q->err[0] = 0;
+	q->state = Nsent;
+	q->owed = 1;
+	c->nexpect++;
+	t->tag = q->tag;
+	r->tag = q->tag;
+	rwakeup(&c->rdrz);
+	qunlock(&c->lk);
+
+	if(nineput(c, t, buf, sizeof buf) < 0){
+		qlock(&c->lk);
+		/*
+		 * A message the negotiated msize will not hold never
+		 * reached the wire, so nothing is owed for this tag and the
+		 * refusal is local.  A write that FAILED killed the
+		 * connection, and ninedied has already settled this slot
+		 * with every other waiter's, so that case waits below and
+		 * collects the Ninedead it left.
+		 */
+		if(!c->dead){
+			if(q->owed){
+				q->owed = 0;
+				c->nexpect--;
+			}
+			q->state = Nfree;
+			q->hasfid = 0;
+			out = nineout(r, Ninelocal, "%s", buf);
+			goto Drop;
+		}
+	}else
+		qlock(&c->lk);
+	while(q->state != Ndone)
+		rsleep(&q->rz);
+	out = q->out;
+	setstr(r->err, q->err);
+	m = q->m;
+	nm = q->nm;
+	q->m = nil;
+	if(out == Ninetimeout){
+		/*
+		 * The tag is not free: the peer may still answer it, and a
+		 * reply read against a tag handed out again would be
+		 * collected as the next exchange's.  It comes back with the
+		 * Rflush (§14(49)), and so does the fid.
+		 */
+		q->state = Ngone;
+		if(i > 0){
+			c->req[i + c->nreq].state = Nflushing;
+			c->req[i + c->nreq].old = i;
+			c->req[i + c->nreq].owed = 1;
+			c->req[i + c->nreq].hasfid = 0;
+			c->nexpect++;
+		}else
+			ninedied(c, Ninedead,
+				"ninep: no Rversion before the deadline");
+		qunlock(&c->lk);
+		if(i > 0)
+			nineflushtag(c, i);
+		werrstr("%s", r->err);
+		r->out = out;
+		ninedrop(c);
+		return out;
+	}
+	q->state = Nfree;
+	q->hasfid = 0;
+	qunlock(&c->lk);
+
+	if(out != Nineok){
+		free(m);
+		r->out = out;
+		werrstr("%s", r->err);
+		ninedrop(c);
+		return out;
+	}
+	if(convM2S(m, nm, f) != nm){
+		free(m);
+		snprint(buf, sizeof buf, "ninep: a reply that will not decode");
+		qlock(&c->lk);
+		ninedied(c, Ninebotch, buf);
+		qunlock(&c->lk);
+		out = nineout(r, Ninebotch, "%s", buf);
+		ninedrop(c);
+		return out;
+	}
+	if(f->type == Rerror){
+		/* §2.6's string, verbatim: nothing here adds to it */
+		setstr(r->err, f->ename);
+		free(m);
+		r->out = Nineerr;
+		werrstr("%s", r->err);
+		ninedrop(c);
+		return Nineerr;
+	}
+	if(f->type != t->type+1){
+		snprint(buf, sizeof buf, "ninep: a reply of type %d to a T%d",
+			f->type, t->type);
+		free(m);
+		qlock(&c->lk);
+		ninedied(c, Ninebotch, buf);
+		qunlock(&c->lk);
+		out = nineout(r, Ninebotch, "%s", buf);
+		ninedrop(c);
+		return out;
+	}
+	*mp = m;
+	r->out = Nineok;
+	ninedrop(c);
+	return Nineok;
+
+Drop:
+	qunlock(&c->lk);
+	ninedrop(c);
+	return out;
+}
+
+Nine*
+nineopen(Ninecfg *cfg)
+{
+	char e[ERRMAX];
+	Nine *c;
+	Ninerep r;
+	Fcall t, f;
+	uchar *m;
+	int i, ms;
+
+	if(cfg == nil || cfg->connect == nil || cfg->spawn == nil){
+		werrstr("ninep: no connect or spawn callback");
+		return nil;
+	}
+	if((c = mallocz(sizeof *c, 1)) == nil)
+		return nil;
+	c->infd = c->outfd = -1;
+	c->rdrz.l = &c->lk;
+	c->ref = 1;
+	c->freed = cfg->freed;
+	c->freedarg = cfg->freedarg;
+	c->bufsz = cfg->msize != 0 ? cfg->msize : Ninemsizedflt;
+	if(c->bufsz < Nminmsize)
+		c->bufsz = Nminmsize;
+	c->msize = c->bufsz;
+	c->tickms = cfg->tickms != 0 ? cfg->tickms : Ninetickmsdflt;
+	c->nreq = cfg->nreq != 0 ? cfg->nreq : Ninereqdflt;
+	if(c->nreq > Ninereqmax)
+		c->nreq = Ninereqmax;
+	c->nslot = 2*c->nreq + 1;
+	c->req = mallocz(c->nslot*sizeof(Nreq), 1);
+	c->wbuf = malloc(c->bufsz);
+	c->rbuf = malloc(c->bufsz);
+	if(c->req == nil || c->wbuf == nil || c->rbuf == nil){
+		ninefree(c);
+		werrstr("%s", Enomem);
+		return nil;
+	}
+	for(i = 0; i < c->nslot; i++){
+		c->req[i].rz.l = &c->lk;
+		c->req[i].tag = i == 0 ? NOTAG : i;
+	}
+	if((*cfg->connect)(cfg->connectarg, &c->infd, &c->outfd) < 0){
+		rerrstr(e, sizeof e);
+		ninefree(c);
+		werrstr("%s", e);
+		return nil;
+	}
+
+	/*
+	 * Both procs hold a reference of their own, so a spawn that
+	 * fails after the other succeeded is unwound by closing rather
+	 * than by unpicking it here.
+	 */
+	c->ref++;
+	c->nproc++;
+	if((*cfg->spawn)(ninereader, c) < 0){
+		c->ref--;
+		c->nproc--;
+		rerrstr(e, sizeof e);
+		nineclose(c);
+		werrstr("ninep: cannot start the reader proc: %s", e);
+		return nil;
+	}
+	c->ref++;
+	c->nproc++;
+	if((*cfg->spawn)(ninetimer, c) < 0){
+		c->ref--;
+		c->nproc--;
+		rerrstr(e, sizeof e);
+		nineclose(c);
+		werrstr("ninep: cannot start the timer proc: %s", e);
+		return nil;
+	}
+
+	ms = cfg->openms != 0 ? cfg->openms : Nineopenmsdflt;
+	memset(&t, 0, sizeof t);
+	t.type = Tversion;
+	t.msize = c->bufsz;
+	t.version = "9P2000";
+	if(ninerpc(c, &t, 0, 0, ms, &r, &f, &m) != Nineok){
+		nineclose(c);
+		werrstr("%s", r.err);
+		return nil;
+	}
+	/*
+	 * layer-a §5.5 makes the floor an instance's own policy to
+	 * refuse at; what is owed here is the negotiated number, so a
+	 * size below the floor is reported and not refused (§14(48)).
+	 * A size ABOVE what was proposed, or a version this client did
+	 * not offer, is the peer breaking 9P and is refused.
+	 */
+	if(strcmp(f.version, "9P2000") != 0 || f.msize > c->bufsz
+		|| f.msize < Nminmsize){
+		snprint(e, sizeof e, "ninep: the peer offers version %s at"
+			" msize %ud", f.version, f.msize);
+		free(m);
+		nineclose(c);
+		werrstr("%s", e);
+		return nil;
+	}
+	c->msize = f.msize;
+	free(m);
+	return c;
+}
+
+void
+nineclose(Nine *c)
+{
+	Nreq *q;
+	int i;
+
+	if(c == nil)
+		return;
+	qlock(&c->lk);
+	c->closed = 1;
+	for(i = 0; i < c->nslot; i++){
+		q = &c->req[i];
+		q->owed = 0;
+		if(q->state == Nsent){
+			q->state = Ndone;
+			q->out = Ninedead;
+			setstr(q->err, Eclosed);
+			rwakeup(&q->rz);
+		}
+	}
+	c->nexpect = 0;
+	rwakeupall(&c->rdrz);
+	qunlock(&c->lk);
+	ninedrop(c);
+}
+
+ulong
+ninemsize(Nine *c)
+{
+	return c->msize;
+}
+
+/*
+ * Tags this connection cannot hand out: the exchanges in flight, plus
+ * every tag a timed-out exchange is still holding against its Rflush
+ * and the tag that Rflush will arrive on.  It is 0 on a connection
+ * with nothing in flight, which is what a test asserts to see that a
+ * timeout gave its tags back.
+ */
+int
+nineheld(Nine *c)
+{
+	int i, n;
+
+	n = 0;
+	qlock(&c->lk);
+	for(i = 0; i < c->nslot; i++)
+		if(c->req[i].state != Nfree)
+			n++;
+	qunlock(&c->lk);
+	return n;
+}
+
+/* replies that arrived for a tag whose exchange had already given up */
+uvlong
+ninelate(Nine *c)
+{
+	uvlong n;
+
+	qlock(&c->lk);
+	n = c->nlate;
+	qunlock(&c->lk);
+	return n;
+}
+
+int
+nineattach(Nine *c, ulong fid, ulong afid, char *uname, char *aname, int ms,
+	Ninerep *r)
+{
+	uchar *m;
+	Fcall t, f;
+
+	memset(&t, 0, sizeof t);
+	t.type = Tattach;
+	t.fid = fid;
+	t.afid = afid;
+	t.uname = uname;
+	t.aname = aname;
+	if(ninerpc(c, &t, fid, 1, ms, r, &f, &m) != Nineok)
+		return r->out;
+	r->qid = f.qid;
+	free(m);
+	return Nineok;
+}
+
+int
+ninewalk(Nine *c, ulong fid, ulong newfid, char **name, int nname, int ms,
+	Ninerep *r)
+{
+	uchar *m;
+	Fcall t, f;
+	int i;
+
+	if(nname < 0 || nname > MAXWELEM){
+		memset(r, 0, sizeof *r);
+		return nineout(r, Ninelocal, "ninep: a walk of %d elements",
+			nname);
+	}
+	memset(&t, 0, sizeof t);
+	t.type = Twalk;
+	t.fid = fid;
+	t.newfid = newfid;
+	t.nwname = nname;
+	for(i = 0; i < nname; i++)
+		t.wname[i] = name[i];
+	if(ninerpc(c, &t, fid, 1, ms, r, &f, &m) != Nineok)
+		return r->out;
+	r->nwqid = f.nwqid;
+	for(i = 0; i < f.nwqid && i < MAXWELEM; i++)
+		r->wqid[i] = f.wqid[i];
+	if(f.nwqid > 0)
+		r->qid = f.wqid[f.nwqid-1];
+	free(m);
+	return Nineok;
+}
+
+/*
+ * §2's Topen.  It is spelled with the fid in the name because this
+ * library's own open is the connection's.
+ */
+int
+nineopenfid(Nine *c, ulong fid, int mode, int ms, Ninerep *r)
+{
+	uchar *m;
+	Fcall t, f;
+
+	memset(&t, 0, sizeof t);
+	t.type = Topen;
+	t.fid = fid;
+	t.mode = mode;
+	if(ninerpc(c, &t, fid, 1, ms, r, &f, &m) != Nineok)
+		return r->out;
+	r->qid = f.qid;
+	r->iounit = f.iounit;
+	free(m);
+	return Nineok;
+}
+
+int
+ninecreate(Nine *c, ulong fid, char *name, ulong perm, int mode, int ms,
+	Ninerep *r)
+{
+	uchar *m;
+	Fcall t, f;
+
+	memset(&t, 0, sizeof t);
+	t.type = Tcreate;
+	t.fid = fid;
+	t.name = name;
+	t.perm = perm;
+	t.mode = mode;
+	if(ninerpc(c, &t, fid, 1, ms, r, &f, &m) != Nineok)
+		return r->out;
+	r->qid = f.qid;
+	r->iounit = f.iounit;
+	free(m);
+	return Nineok;
+}
+
+/*
+ * A read of at most n bytes into a, and a write of n bytes out of it.
+ * Neither chunks: a count that will not fit the negotiated msize is
+ * refused Ninelocal rather than shortened, because which of §2.4's
+ * short forms the caller wants is the caller's to decide — the write
+ * path shortens a write and a reader of `/rpc' MUST offer a whole
+ * msize−IOHDRSZ (§5.6).  r->count is what the reply reported.
+ */
+int
+nineread(Nine *c, ulong fid, vlong off, void *a, long n, int ms, Ninerep *r)
+{
+	uchar *m;
+	Fcall t, f;
+
+	if(n < 0 || (ulong)n > c->msize - IOHDRSZ){
+		memset(r, 0, sizeof *r);
+		return nineout(r, Ninelocal, "ninep: a read of %ld bytes over"
+			" the negotiated msize %lud", n, c->msize);
+	}
+	memset(&t, 0, sizeof t);
+	t.type = Tread;
+	t.fid = fid;
+	t.offset = off;
+	t.count = n;
+	if(ninerpc(c, &t, fid, 1, ms, r, &f, &m) != Nineok)
+		return r->out;
+	if(f.count > (ulong)n){
+		free(m);
+		return nineout(r, Ninebotch, "ninep: an Rread of %lud bytes"
+			" for a Tread of %ld", f.count, n);
+	}
+	if(f.count > 0)
+		memmove(a, f.data, f.count);
+	r->count = f.count;
+	free(m);
+	return Nineok;
+}
+
+int
+ninewrite(Nine *c, ulong fid, vlong off, void *a, long n, int ms, Ninerep *r)
+{
+	uchar *m;
+	Fcall t, f;
+
+	if(n < 0 || (ulong)n > c->msize - IOHDRSZ){
+		memset(r, 0, sizeof *r);
+		return nineout(r, Ninelocal, "ninep: a write of %ld bytes over"
+			" the negotiated msize %lud", n, c->msize);
+	}
+	memset(&t, 0, sizeof t);
+	t.type = Twrite;
+	t.fid = fid;
+	t.offset = off;
+	t.count = n;
+	t.data = a;
+	if(ninerpc(c, &t, fid, 1, ms, r, &f, &m) != Nineok)
+		return r->out;
+	r->count = f.count;
+	free(m);
+	return Nineok;
+}
+
+int
+nineclunk(Nine *c, ulong fid, int ms, Ninerep *r)
+{
+	uchar *m;
+	Fcall t, f;
+
+	memset(&t, 0, sizeof t);
+	t.type = Tclunk;
+	t.fid = fid;
+	if(ninerpc(c, &t, fid, 1, ms, r, &f, &m) != Nineok)
+		return r->out;
+	free(m);
+	return Nineok;
+}
+
+int
+nineremove(Nine *c, ulong fid, int ms, Ninerep *r)
+{
+	uchar *m;
+	Fcall t, f;
+
+	memset(&t, 0, sizeof t);
+	t.type = Tremove;
+	t.fid = fid;
+	if(ninerpc(c, &t, fid, 1, ms, r, &f, &m) != Nineok)
+		return r->out;
+	free(m);
+	return Nineok;
+}
+
+/* the stat message into a, whose length lands in r->count */
+int
+ninestat(Nine *c, ulong fid, uchar *a, int n, int ms, Ninerep *r)
+{
+	uchar *m;
+	Fcall t, f;
+
+	memset(&t, 0, sizeof t);
+	t.type = Tstat;
+	t.fid = fid;
+	if(ninerpc(c, &t, fid, 1, ms, r, &f, &m) != Nineok)
+		return r->out;
+	if(n < 0 || f.nstat > (uint)n){
+		free(m);
+		return nineout(r, Ninelocal, "ninep: a stat of %ud bytes into"
+			" %d", f.nstat, n);
+	}
+	memmove(a, f.stat, f.nstat);
+	r->count = f.nstat;
+	free(m);
+	return Nineok;
+}
+
+/*
+ * §5.4.1's Tflush, for a tag the caller names.  A timed-out exchange
+ * flushes its own tag and needs nothing here (§14(49)); this is for a
+ * caller that wants to flush a tag of its own choosing, and 9P has the
+ * Rflush answered whether or not anything was outstanding under it.
+ */
+int
+nineflush(Nine *c, ushort oldtag, int ms, Ninerep *r)
+{
+	uchar *m;
+	Fcall t, f;
+
+	memset(&t, 0, sizeof t);
+	t.type = Tflush;
+	t.oldtag = oldtag;
+	if(ninerpc(c, &t, 0, 0, ms, r, &f, &m) != Nineok)
+		return r->out;
+	free(m);
+	return Nineok;
+}
