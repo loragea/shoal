@@ -588,7 +588,13 @@ recof(Srvctx *c, Hdr *h, Objinfo *oi, char *buf, int nbuf, char **err)
 	rerrstr(e, sizeof e);
 	if(srv26(e) == Enoobj)
 		return 0;
-	*err = srverrs(buf, nbuf, e);
+	/*
+	 * From the caller's buffer, and never from `e': srverrs answers a
+	 * §2.6 or an already-marked string with the pointer it was given,
+	 * and this frame is gone by the time the caller answers.  %r is
+	 * still the objstat's, nothing having run since.
+	 */
+	*err = srverr(buf, nbuf);
 	return -1;
 }
 

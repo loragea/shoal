@@ -1716,8 +1716,16 @@ objcreaterun(Req *r, Srvctx *c, Smap *m, char *buf, int nbuf)
 	if(objstat(c->store, qr->oid, qr->oidlen, &oi) < 0){
 		rerrstr(err, sizeof err);
 		if(srv26(err) != Enoobj){
+			/*
+			 * From the caller's buffer, not from `err': srverrs
+			 * answers a §2.6 or an already-marked string with the
+			 * pointer it was given, and this frame is gone before
+			 * the wrapper puts its snapshot and answers.  createdrop
+			 * carries %r across the give-back, so the read is the
+			 * objstat's.
+			 */
 			createdrop(f);
-			return srverrs(buf, nbuf, err);
+			return srverr(buf, nbuf);
 		}
 		ver = 1;
 	}else if(oi.state == Stomb)
