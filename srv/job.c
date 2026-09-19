@@ -1165,6 +1165,17 @@ scrubtickms(Srvctx *c)
  * for separately by the shutdown and before the jobs because it is one
  * of the two things that could still start one, and reading
  * srvstopping between ticks so as to be there to be waited for.
+ *
+ * A tick landing exactly as the shutdown begins still calls scrubgo:
+ * `left' reaching 0 leaves the wait before the flag is read, so the
+ * pass is asked for.  It is refused — jobadmit answers `shutting
+ * down' to anything offered once c->stopping is set, and it decides
+ * that under joblk, which is the lock the shutdown sets the flag
+ * under — so no pass starts, and the proc reads the flag at the top
+ * of the next wait and exits.  The cost is one refused start.
+ * reclaimtimer reaches the same place by the same route: its period
+ * expiring ends the for without consulting the flag either, so the
+ * two agree and there is nothing here to reorder.
  */
 static void
 scrubtimer(void *a)
