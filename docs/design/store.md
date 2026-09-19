@@ -3860,6 +3860,52 @@ program and under the libthread server (§7). This is a real
 constraint on the code layout rather than a preference, and it is
 expensive to undo once the engine has grown roots in a command.
 
+**The 9P client is in `lib/` too, and the same argument decides it a
+third time.** layer-a's monitor poll loop (§6.3) and its peer clients
+(§5.5, §5.6) each have to dial and speak 9P, and a T1 case for any of
+them has to run two instances and a monitor inside one program over
+pipes. So the client is `lib/ninep.c` behind `lib/shoal.h`'s opaque
+`Nine`, plain libc like the rest of the library: stock 9P2000 through
+`convS2M`/`convM2S` over a pair of fds, with tag management, a
+deadline on every exchange, layer-a §5.6's one-outstanding-per-fid
+rule (§14(60)) and nothing of shoal in it — no cluster map, no `op=`
+grammar, no retry and no reconnection. Those belong to the callers,
+and **nothing in this build dials it**: §14(18)'s item stands, so the
+only program that opens a connection today is `test/clienttest.c`.
+What is built is the engine each of those callers needs first.
+
+The callbacks are why it can be built before them. `connect`
+answers a pair of fds and is the network's `Dev` vtable (§0): a real
+dial answers the same fd twice, a T1 program answers one end of each
+of two pipes, and nothing in the library knows the difference.
+`spawn` is §7's, so the procs the client makes are ordinary procs of
+the program under plain libc and `proccreate`'s under the server. The
+rule it MUST follow — procs of the program's own flavour, and never
+the two flavours mixed on one connection — is normative and is
+§14(59)'s, with what libthread does to a bare-`rfork` proc's `QLock`
+as the reason.
+`hangup` is the other half of `connect`: what `connect` opened, only
+its owner can break, and breaking it is the only way to recall a proc
+parked in `read(2)` or `write(2)` when notes are ruled out (§14(59)).
+
+**The bounded wait.** layer-a §5.4 bounds a peer operation by
+`replms`, and a client parked for ever on a dead peer is that bound
+broken. Each call therefore carries a deadline in milliseconds. A
+**reader** proc demultiplexes replies by tag into per-request slots
+and a **timer** proc looks every few milliseconds for a slot whose
+deadline has passed; both act under one `QLock`, and the slot's state
+is what makes exactly one of them the waker — the waiter parks in
+`rsleep` on the slot's own `Rendez`, which releases the lock while it
+sleeps. There is no `alarm` and there are no notes, for §7's reason,
+and no `rendezvous`(2) either: libthread supplies its own, which
+rendezvous between threads, so the call would mean two different
+things in this library's two homes while `QLock` and `Rendez` mean
+one. The reader reads only while a request is on the wire, which is
+what lets an idle connection be closed without waiting for the peer to
+speak. §14(57) is what the client does with the negotiated `msize`,
+§14(58) what a timeout leaves behind, §14(59) how a dead connection
+is classified and when a closed one's memory goes.
+
 **A path is an sd(3) partition when the directory holding it is an
 sd unit's, and a plain file otherwise.** What is asked is whether
 that directory holds the unit's own `ctl` and `raw` files, not how
@@ -5094,7 +5140,11 @@ present in every build and inert without the flag; it is what drives
 the same named points on the real device. It is a command-line flag
 rather than a `/ctl` verb because layer-a §2.5 fixes the ctl grammar
 and requires an unknown verb to fail `unknown ctl`; a debug verb
-would be a wire change.
+would be a wire change. The points it names are the device's. The 9P
+client (§12) carries a set of its own that no flag reaches — one
+point, `writewiden`, named through `ninehook` and documented with it
+in `lib/shoal.h` — set in-process by the program that holds the
+connection, which is a T1 program.
 
 ## 14. Deviations from layer-a, and tensions with the platform
 
@@ -5105,7 +5155,7 @@ by the measurements or by the platform. Each entry states the
 tension, its resolution, and where the argument for it lives; nothing
 here repeats an argument made in a section above. Items 1–5, 8, 9,
 11, 12, 13, 14, 26 and 39 are amendments **made** to
-`docs/design/layer-a.md`; items 6, 7, 15, 17, 18–25, 27–38 and 40–56
+`docs/design/layer-a.md`; items 6, 7, 15, 17, 18–25, 27–38 and 40–60
 are recorded here and not made there; items 10 and 16 are
 **proposals** rather than amendments, because they touch the wire.
 
@@ -5113,7 +5163,8 @@ Items 18 to 48 are the object server's, and they describe what
 `srv/libshoalsrv.a` and `cmd/shoalsrv` **do today**. Items 49 to 56
 are the monitor's, and they describe what `mon/libshoalmon.a` and
 `cmd/shoalmon` do today. Several items in each group name a half that
-is not built; each says which.
+is not built; each says which. Items 57 to 60 are the 9P client's
+(§12), which nothing in this build dials with.
 
 1. **`cur` cannot usefully be durable (layer-a §5.2).** Layer-a
    required currency recorded "durably as `cur=<epoch>`" and, two
@@ -5319,13 +5370,16 @@ is not built; each says which.
     that are visible on the wire. `/repl` and `/rpc` are built, and
     what is built is the RECEIVING half of both: every operation of
     §5.5 and §5.6 is answered, and nothing is ever sent, because the
-    sender is the peer client this item is about. Items 41 to 48 are
+    sender is the peer client this item is about. Items 41 to 47 are
     what those two channels decide that layer-a leaves open.
     `/advert` is built: it renders this instance's own
     inventory in §7.2's line grammar, live and tomb, for a peer to
     read. Nothing sends it, because §7.2's sender — and its rate
     limit — is the peer client this item is about; what is built is
-    the readable half.
+    the readable half. The 9P client both of the missing clients
+    speak through is built and is in `lib/` (§12, items 57 to 60):
+    what is absent is the poll loop, the map refresh and the
+    operations, not the transport under them.
 
 19. **§6.4 F1's lease fence is inert while the map is static.** F1
     fences an instance that has not refreshed its map within
@@ -6929,6 +6983,239 @@ is not built; each says which.
       currently claim they cannot reach this one, which the
       `unreachable`/`reachable` verbs of §8.3 record; those are the
       unit after next's. The field is present because §8.1 names it.
+57. **The `msize` floor is the client's to report and somebody else's
+    to refuse (layer-a §5.5).** §5.5 has an instance negotiate at
+    least 8192 + `IOHDRSZ`, refuse to operate below that floor rather
+    than halve cluster throughput silently, and report what it
+    negotiated. The 9P client (§12) is not an instance: it is also
+    what a tool dials a monitor with, and what a T1 case dials a stub
+    with. *Not made; recorded here as this library's policy:*
+    `nineopen` proposes what it was given, `ninemsize` answers what
+    came back, and the floor is enforced by NOBODY here — the peer
+    client that dials a storage instance is what refuses a connection
+    below it, and `Ninemsizefloor` is in `lib/shoal.h` so that the
+    number is spelled once. What the client does refuse is what 9P
+    itself forbids: a version it did not offer, and an `msize` ABOVE
+    the proposal, which is a peer answering with something that was
+    never on the table, and a REPLY longer than the negotiated
+    `msize`. That last one is judged from the four-byte length header
+    before the rest of the message is read, rather than left to
+    `read9pmsg`(2): `read9pmsg` judges the length against the buffer
+    it was handed and answers an over-long message with the same `-1`
+    a broken transport gives, so the same violation would be
+    `Ninebotch` when the peer had lowered the `msize` and `Ninedead`
+    — "dial me again" — when it had not, which is the common case.
+    It is `Ninebotch` either way. The server's half of the same rule is
+    §14(20), which enforces the floor at `Tattach` — so a connection
+    below it negotiates, and is refused at the attach with a string
+    the client hands the caller verbatim.
+
+58. **What a timed-out exchange leaves behind (layer-a §5.4,
+    §5.4.1).** layer-a bounds every peer operation by `replms` and
+    says nothing about the tag of one that was not answered in time.
+    9P does: a tag may not be reused until the reply carrying it has
+    been read, or a `Tflush` naming it has been answered. *Not made;
+    recorded here as this library's policy:* a call whose deadline
+    passes answers `Ninetimeout` within one timer tick of it, and the
+    client sends a `Tflush` for that tag itself **without waiting for
+    the `Rflush`** — so the call costs the deadline, one tick and one
+    write, and no more. Until that `Rflush` arrives the tag is not
+    handed out again and the fid it named stays busy (§14(60)); a
+    reply that arrives for it meanwhile is read off the wire and
+    **discarded where it arrives**, which is what 9P has a client do
+    with the answer to a request it flushed and what §5.4.1 says of
+    the same exchange from the server's side. `nineheld` and
+    `ninelate` make those two states observable, since a caller has
+    no other way to see either. A peer that answers neither the
+    request nor the `Rflush` holds that one tag and that one fid for
+    the life of the connection: the client will not reuse a tag the
+    peer may still answer, and a caller that wants them back closes
+    the connection.
+
+    **That bound holds only because a stalled write kills the
+    connection.** `write(2)` on a peer that has stopped reading blocks
+    until the peer reads, which is layer-a §5.4's own dead-peer
+    scenario arriving on the sending side, and it blocks holding the
+    one write lock, so every other exchange on the connection piles up
+    behind it and the `Tflush` above, which is on the timeout path,
+    could never be written at all. A peer that will not ACCEPT a
+    message within the exchange's deadline therefore counts as dead:
+    there is nothing to flush, because nothing was sent, and nothing
+    to wait for. The writer marks the connection with the write's
+    deadline before entering `write(2)`; the timer, finding a write
+    outstanding past it, kills the connection `Ninedead` with a
+    string naming the stalled `T`-message and calls `Ninecfg.hangup`
+    (§14(59)) so that the blocked `write` returns, and the waiter
+    collects `Ninedead` rather than `Ninetimeout`. The `Tflush`'s own
+    write is bounded the same way, by a fixed 1000 ms rather than by
+    an exchange's deadline: it has no exchange of its own and nobody
+    waits for it, and the number has only to be far above a busy
+    peer's read of six bytes and far below the life of a connection.
+    With no `hangup` callback the connection still dies and the
+    waiters are still answered; what waits is the writer's own proc,
+    until the peer reads or the fds go.
+
+    **Either deadline covers the wait for the write lock as well as
+    the write.** A write's deadline is taken before the lock is asked
+    for — the exchange's when the call starts, the `Tflush`'s where
+    the `Tflush` is built — so the time a writer spends queued behind
+    another writer's message is charged to it, and what the timer
+    judges is the sum. That is the bound layer-a §5.4 asks for: what
+    it bounds is the operation the caller asked for, and a caller
+    queued for the lock is waiting on the peer just the same, since
+    what holds the lock is another write into the same peer. The
+    consequence is that a peer which was accepting messages
+    throughout can still have its connection killed `Ninedead`, if
+    the writer in front held the lock longer than this writer's
+    remaining deadline; the 1000 ms above is the figure that has to
+    absorb it, being fixed rather than the caller's. *Implementation
+    policy:* a client may instead start the clock where the write
+    does, at the price of leaving the queueing itself unbounded — and
+    the queue is exactly where a stalled write puts every other
+    exchange on the connection.
+
+    **That mark is owned, and the write lock is what owns it.** There
+    is one mark per connection, because there is one writer at a time
+    — but a connection has many writers over its life and they hand
+    the write lock from one to the next. A writer that cleared the
+    mark after letting the lock go would be clearing the mark of the
+    writer which overtook it, leaving that write with nothing
+    bounding it at all, so the bound above would hold for a
+    connection with one writer and go the moment two exchanges
+    overlapped. What prevents that is where the clear is: a mark is
+    settled inside the write lock's own hold, before the lock is
+    released, so the next writer has not reached the lock yet and has
+    no mark for this one to clear. The mark also carries the
+    generation of the write that set it, and the generation is tested
+    before the clear; with the clear where it is, no other writer can
+    have taken a generation in between, so that test cannot fail. It
+    is defence, against a clear that ever moves outside the lock,
+    which is what would let a writer clear a mark from further off
+    and the timer kill a connection over a deadline no outstanding
+    write has.
+
+59. **Four ways an exchange can end that are not an `Rerror`, and
+    when a closed connection's memory goes (layer-a §2.6, §3.7).**
+    §2.6's strings say what a RECEIVER refused; they have nothing to
+    say about a peer that never answered, a peer that hung up, a peer
+    that broke 9P, or a request that never reached the wire. §3.7's
+    rule — an internal error never begins with a §2.6 prefix — is
+    what those must not be confused with. *Not made; recorded here as
+    this library's policy:* the client answers an outcome code rather
+    than a string, and `Ninetimeout`, `Ninedead`, `Ninebotch`,
+    `Ninebusy` and `Ninelocal` are five distinct ones; an `Rerror` is
+    `Nineerr` and its string is handed over **verbatim**, with
+    nothing added, because a caller matches §2.6's spellings exactly.
+    Every local string carries the prefix `ninep: `, which shares no
+    prefix with §2.6's set or with the server's `shoalsrv: `
+    (§14(29)), so the marking is visible to a caller that relays one
+    rather than merely intended.
+
+    **A short `Rwalk` is one of those outcomes.** 9P answers a walk
+    that failed partway with an `Rwalk` carrying fewer qids than there
+    were names, and leaves `newfid` uncreated. That is not `Nineok`:
+    there is no `newfid` to clunk and no full walk to take
+    `Ninerep.qid` from, and a caller that read `qid` would get the
+    last qid WALKED rather than the one it asked for. Nor is it
+    `Nineerr`, which is §2.6's string verbatim and nothing was refused
+    in those words — nothing was sent back as an error at all. It is
+    `Ninelocal`, with a string naming how many of the names the walk
+    got; `Ninerep.nwqid` and `Ninerep.wqid` carry the partial result
+    for a caller that wants it. A protocol violation kills the
+    connection as transport death does, and stays distinguishable
+    from it: a peer that hangs up is one to dial again, and a peer
+    that answers on a tag nobody sent is not.
+
+    **The memory goes late, and the going is observable.**
+    `nineclose` answers every exchange in flight `Ninedead` and marks
+    the connection closed, and the memory, the fds and the two procs
+    go when the LAST of the caller, the reader, the timer and any
+    exchange still unwinding lets go. `Ninecfg.freed` is called as the
+    last act before the memory goes: §9's deferred free and §13's
+    `Storecfg.freed` hook again, for the same reason and with the same
+    discipline. It observes the end of a handle the caller HELD, so a
+    `nineopen` that answers nil never calls it, however far it got: an
+    allocation that failed, a `connect` that failed, a `spawn` that
+    failed, a peer whose `Rversion` broke 9P and a `Tversion` that
+    timed out are silent alike, because a caller cannot be told the
+    release of something it was never given. The rule about calls is
+    `storeclose`'s: one in flight when the close runs is safe, since
+    the exchange holds a reference of its own, and one STARTED after
+    it is undefined.
+
+    **Whose moment that is depends on `Ninecfg.hangup`.** A proc
+    parked in `read(2)` or `write(2)` cannot be recalled from inside
+    the library: the only mechanism is a note, and §7 rules notes out
+    for exactly the procs this library makes. The owner of the fds
+    can, because they are its fds, so the transport's owner supplies
+    a third callback beside `connect` and `spawn`, documented in
+    `lib/shoal.h`: break every blocked read and write on this
+    connection's fds, MAY be called more than once, and after it a
+    read or a write on them comes back rather than blocking. A network
+    connection takes `hangup` written to its ctl file. A pipe pair
+    takes the end the client reads closed and the end it writes
+    **drained, not closed**: `pipewrite` posts `sys: write on closed
+    pipe` to a proc blocked writing a pipe whose reader has gone
+    (`/sys/src/9/port/devpipe.c:310`, 9front), and that note kills the
+    proc — which on the write path is the caller's own — rather than
+    failing its write.
+    `nineclose` calls it, a `nineopen` that fails calls it, and the
+    timer calls it when a write has stalled past its deadline
+    (§14(58)). With one, a close reclaims everything within the time
+    the callback takes, whatever the peer is doing. Without one — it
+    is optional — a close of a connection whose reader is inside
+    `read(2)` reclaims nothing until the peer speaks or hangs up, and
+    a peer that does neither holds the memory, both fds and two procs
+    for the life of the program. The reader is sent into `read(2)`
+    only once a request is ON THE WIRE, never merely once a slot is
+    armed, so a request refused locally after its slot was taken
+    leaves the reader parked where it was and a close of an idle
+    connection reclaims everything at once; that much holds with no
+    callback at all.
+
+    **`spawn`'s own contract, and this part is normative.** The two
+    procs are made through §7's callback, and what the callback
+    answers is not free: `spawn` **MUST** make procs of the calling
+    program's own flavour — `proccreate` under libthread,
+    `rfork(RFPROC|RFMEM)` under plain libc — and a program **MUST
+    NOT** mix the two on one connection. libthread routes libc's
+    `qlock` and `rsleep` through a rendezvous of its own
+    (`/sys/src/libthread/main.c:28`, `_qlockinit(_threadrendezvous)`)
+    and resolves the current thread through a `privalloc`(2) slot
+    (`:27`), which `rfork(RFMEM)` shares between the procs that
+    inherit it, so a bare-`rfork` proc contending on a client
+    `QLock` inside a libthread program corrupts that state rather
+    than merely blocking oddly. That is the rule for any
+    implementation of this client that coordinates its procs with
+    libc's `QLock` and `Rendez`, and a caller keeps it whether or not
+    the procs are two — this client's being two, and being a reader
+    and a timer, is the implementation policy part. The rule is the
+    client's and not just the engine's (§7) because a connection is
+    shared by more procs than a store is.
+
+60. **One outstanding request per fid, widened from `/rpc` to every
+    fid (layer-a §5.6).** §5.6 makes it a rule of one channel: a
+    second `Twrite` to an `/rpc` fid before the response is read MUST
+    fail `bad ctl`. layer-a says nothing about two requests on any
+    other fid at once, and 9P permits them. *Not made; recorded here
+    as this library's policy:* the client refuses a second request on
+    ANY fid that already has one outstanding, answering `Ninebusy`
+    before anything is written, so the peer never sees it. Two
+    reasons. §5.6's rule cannot be kept by a caller that cannot see
+    the fid's state — an `/rpc` exchange is a `Twrite` and then a
+    `Tread`, two calls, and what must not interleave them is one of
+    several procs sharing a connection — so the only place it can be
+    enforced is here. And the rest of 9P has no use for the freedom:
+    a second `Tread` on a fid whose position the first is moving, or
+    a `Tclunk` beside a request naming the fid, is a caller bug in
+    every case this build has. A `Twalk` holds BOTH of the fids it
+    names for the exchange, the one it walks from and the `newfid` it
+    walks to, so that two concurrent walks cannot target one `newfid`
+    — the second is refused here rather than racing for a fid the
+    server would give to one of them. A fid a timed-out exchange
+    abandoned counts as busy until its `Rflush` (§14(58)), because the
+    peer may still be working on it. The refusal is local and is NOT
+    §2.6's `bad ctl`: nothing was sent, so no receiver refused anything.
 
 ## 15. Alternatives considered
 

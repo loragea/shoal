@@ -1,6 +1,7 @@
 #include <u.h>
 #include <libc.h>
 #include <libsec.h>
+#include <fcall.h>
 #include "shoal.h"
 
 /*

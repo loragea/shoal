@@ -1,7 +1,9 @@
 /*
  * libshoal — code shared by the shoal servers, commands and tests.
  *
- * Include after <u.h>, <libc.h> and <libsec.h>.
+ * Include after <u.h>, <libc.h>, <libsec.h> and <fcall.h> — the last
+ * for the GBIT/PBIT macros the on-disk structures are packed with and
+ * for the Qid, MAXWELEM and IOHDRSZ the 9P client at the end names.
  */
 
 /*
@@ -52,11 +54,11 @@ void	objcsum(uchar *p, uvlong len, ulong blksz, uchar csum[Csumlen]);
 char*	csumfmt(char *buf, uchar csum[Csumlen]);
 
 /*
- * The rest of this header is the local object store,
- * docs/design/store.md.  Anything that packs or unpacks an on-disk
- * integer must also include <fcall.h> before this file: that is where
- * 9front exports the GBIT/PBIT macros store.md §0 requires, and
- * nothing here redefines them.
+ * What follows is the local object store, docs/design/store.md,
+ * then the monitor's map slot store, the cluster map and the 9P
+ * client.  <fcall.h> is where 9front exports the GBIT/PBIT macros
+ * store.md §0 requires of anything that packs an on-disk integer, and
+ * the 9P types the client section names; nothing here redefines them.
  */
 
 /*
@@ -1886,3 +1888,213 @@ void	fencerefresh(Fence*, vlong now);
 void	fenceoperator(Fence*, int on);
 char*	fencename(int kind);
 int	maprefresh(Adopt*, Fence*, Cmap*, vlong now);
+
+/*
+ * A 9P client, docs/design/store.md §12.  Stock 9P2000 over a pair of
+ * fds, with no shoal semantics in it at all: the map, the `op='
+ * grammars of layer-a §5.5 and §5.6 and every retry policy belong to
+ * the callers this is the engine for.  `Nine' is opaque outside lib/,
+ * like Store and Mon and for the same 2c(1) reason.
+ *
+ * **It never dials.**  `connect' answers a pair of fds and is what a
+ * caller supplies instead — the network's equivalent of §0's device
+ * vtable, and what lets a T1 program run two instances and a monitor
+ * inside itself over pipes.  A real dial answers the same fd twice; a
+ * pipe pair answers two.  Reconnecting is the caller's, and what this
+ * library owes it is to tell a dead connection from a §2.6 refusal.
+ *
+ * **Procs.**  Two per connection — a reader and a timer — made
+ * through `spawn', exactly as the store engine makes its own (§7).
+ * The contract below is normative (§14(59)): `spawn' MUST create
+ * procs of the PROGRAM'S OWN flavour — proccreate under libthread,
+ * rfork(RFPROC|RFMEM) under plain libc — and a program MUST NOT mix
+ * the two on one connection.  The QLock
+ * and the Rendez below are libc's, but libthread routes both through
+ * a rendezvous of its own and resolves the current thread through a
+ * privalloc(2) slot, which rfork(RFMEM) SHARES between the procs that
+ * inherit it: a bare-rfork proc contending on this connection's QLock
+ * inside a libthread program corrupts that state rather than merely
+ * blocking oddly.  Nothing here includes <thread.h> either.
+ *
+ * **Hanging up.**  `hangup' breaks every blocked read and write on
+ * this connection's fds.  For a network connection the owner writes
+ * `hangup' to the conversation's ctl file.  For a pipe pair it closes
+ * the end this client READS and drains the end it WRITES rather than
+ * closing that one, because a pipe whose reader has gone posts `sys:
+ * write on closed pipe' to the proc blocked writing it, and a note
+ * kills that proc — the caller's own — instead of failing its write.
+ * `hangup' MAY be called more than once, and after it a read or a
+ * write on those fds comes back rather than blocking.  It is what
+ * lets this library recall a proc parked in read(2) or write(2),
+ * which plain libc cannot do by itself: nineclose calls it, a
+ * nineopen that fails calls it, and the timer calls it when a write
+ * has stalled past its deadline.  It is optional: with no `hangup', a close
+ * leaves a parked reader where it is until the peer speaks or hangs
+ * up, a stalled write stays parked until the peer reads, and the
+ * memory, the fds and the procs go only then (§14(59)).
+ *
+ * **Every exchange is bounded.**  Each call takes a deadline in
+ * milliseconds — layer-a §5.4's `replms' is what a peer client will
+ * pass — and answers Ninetimeout once it passes, within one timer
+ * tick of it.  The client then sends a Tflush of its own naming that
+ * tag and holds the tag, and the fid, until the Rflush; a reply that
+ * arrives late is discarded (§14(58)).  nineheld and ninelate are
+ * what a caller sees of that.
+ *
+ * A peer that will not ACCEPT the request inside that deadline is a
+ * different answer: nothing was sent, so there is no tag to flush and
+ * nothing to wait for, and the connection dies Ninedead with a string
+ * naming the stalled T-message.  Every call on it answers Ninedead
+ * from then on (§14(58)).
+ *
+ * **One outstanding request per fid** (layer-a §5.6, §14(60)): a
+ * second request on a fid that has one outstanding is refused
+ * Ninebusy before anything is written.  A Twalk holds BOTH of the
+ * fids it names, the one it walks from and the newfid it walks to,
+ * so two walks cannot target one newfid at once.
+ *
+ * **msize.**  nineopen proposes Ninecfg.msize, and ninemsize reports
+ * what was negotiated.  layer-a §5.5's floor is NOT enforced here:
+ * refusing to operate below it is the instance's policy and the
+ * report is this library's (§14(57)).  A peer that answers above what
+ * was proposed, or with a version this client did not offer, is
+ * refused as a protocol violation.
+ *
+ * **Errors.**  A §2.6 string arrives verbatim in Ninerep.err under
+ * Nineerr, with nothing added to it, since a caller matches §2.6's
+ * spellings exactly.  Every other outcome is local to this library
+ * and its string carries the prefix `ninep: ', which shares no prefix
+ * with §2.6's set or with the server's `shoalsrv: ' (§14(59)).  The
+ * same string is left in the error string, so %r says it too.
+ *
+ * **Closing.**  nineclose answers every exchange in flight Ninedead
+ * and stops both procs.  A call already in flight when it runs is
+ * safe; a call STARTED after it is undefined, exactly as after
+ * storeclose.  nineclose MAY be called once and once only, and a
+ * `hangup' callback MUST NOT re-enter this library: either drops the
+ * caller's reference a second time, which frees the connection under
+ * whoever still holds it.  The memory and the fds go when the last
+ * of the caller, the two procs and the exchanges unwinding lets go —
+ * `freed' is the observation of that moment, as §13's hook is for
+ * the engine (§14(59)), and `hangup' is what makes that moment the
+ * close's own rather than the peer's.  `freed' belongs to a handle
+ * the caller HELD: a nineopen that answers nil never calls it,
+ * however far it got before failing, and the one call there ever is
+ * comes from the close of a connection nineopen handed back.
+ */
+typedef struct Nine Nine;
+typedef struct Ninecfg Ninecfg;
+typedef struct Ninerep Ninerep;
+
+#pragma incomplete Nine
+
+/* what happened to one exchange */
+enum
+{
+	Nineok		= 0,	/* the reply the request asked for */
+	Nineerr,		/* an Rerror: err is §2.6's string, verbatim */
+	Ninetimeout,		/* the deadline passed; a Tflush went out */
+	Ninedead,		/* the connection is gone */
+	Ninebotch,		/* the peer broke 9P; the connection is gone */
+	Ninebusy,		/* this fid already has a request outstanding */
+	Ninelocal,		/* refused here: no tag, no memory, too large */
+};
+
+enum
+{
+	Ninemsizedflt	= 65536 + IOHDRSZ,	/* layer-a §5.5's SHOULD */
+	Ninemsizefloor	= 8192 + IOHDRSZ,	/* ... and its MUST, for a
+						 * caller that enforces it */
+	Ninetickmsdflt	= 5,			/* the timer's look */
+	Ninereqdflt	= 32,			/* requests outstanding at once */
+	Ninereqmax	= 4096,
+	Nineopenmsdflt	= 10000,		/* the Tversion's own deadline */
+};
+
+struct Ninecfg
+{
+	int	(*connect)(void *arg, int *infd, int *outfd);
+	void	*connectarg;
+	int	(*spawn)(void (*)(void*), void*);
+	void	(*hangup)(void *arg);	/* break the fds; nil leaves them */
+	void	*hanguparg;
+	ulong	msize;		/* proposed; 0 takes Ninemsizedflt */
+	ulong	tickms;		/* 0 takes Ninetickmsdflt */
+	int	nreq;		/* 0 takes Ninereqdflt */
+	int	openms;		/* the Tversion's deadline; 0 takes the default */
+	void	(*freed)(void*);	/* §13's free observation; see above */
+	void	*freedarg;
+};
+
+/*
+ * One exchange's answer.  `qid' is the Rattach, Ropen or Rcreate qid,
+ * and the last qid of a full Rwalk; `count' is an Rread's or Rwrite's
+ * byte count and an Rstat's message length; `tag' is the tag the
+ * exchange used, which is what nineflush names.
+ *
+ * A walk that got only some of its names is Ninelocal and NOT Nineok
+ * — 9P leaves newfid uncreated, so there is nothing to clunk and no
+ * full walk to take a qid from — but `nwqid' and `wqid' carry the
+ * partial result for a caller that wants it, and `qid' is untouched.
+ */
+struct Ninerep
+{
+	int	out;
+	char	err[ERRMAX];
+	Qid	qid;
+	Qid	wqid[MAXWELEM];
+	int	nwqid;
+	long	count;
+	ulong	iounit;
+	ushort	tag;
+};
+
+Nine*	nineopen(Ninecfg*);
+void	nineclose(Nine*);
+ulong	ninemsize(Nine*);
+int	nineheld(Nine*);	/* tags this connection cannot hand out */
+uvlong	ninelate(Nine*);	/* replies discarded after a timeout */
+
+/*
+ * This client's own fault-injection points, inert unless a T1 case
+ * sets one.  They are reachable in-process only: store.md §13's `-X'
+ * flag names the points of the device under the store, which is a
+ * different set in a different program, and a client point is set by
+ * the program that holds the `Nine', which is a T1 program.  Nothing
+ * on the wire reaches one either — this side of a connection sends
+ * requests and nothing else.  There is one:
+ *
+ *	writewiden	a writer parks `n' milliseconds between its
+ *			write(2) returning and the settling of the mark
+ *			that bounds it, holding the write lock while it
+ *			does.  The mark is handed from one writer to the
+ *			next through that window, and it is the only
+ *			place two writers can be ordered through it from
+ *			outside, so a case about a write stalled behind
+ *			another writer's is a case that arms this.
+ */
+void	ninehook(Nine*, char *name, uvlong n);
+
+/*
+ * Every one of these answers the outcome, which is also in r->out, and
+ * `ms' is the deadline in milliseconds.  Topen is spelled with the fid
+ * in its name because this library's own open is the connection's.
+ * Neither nineread nor ninewrite chunks: a count the negotiated msize
+ * will not hold is refused Ninelocal rather than shortened, since
+ * which of layer-a §2.4's short forms is wanted is the caller's.
+ */
+int	nineattach(Nine*, ulong fid, ulong afid, char *uname, char *aname,
+		int ms, Ninerep*);
+int	ninewalk(Nine*, ulong fid, ulong newfid, char **name, int nname,
+		int ms, Ninerep*);
+int	nineopenfid(Nine*, ulong fid, int mode, int ms, Ninerep*);
+int	ninecreate(Nine*, ulong fid, char *name, ulong perm, int mode,
+		int ms, Ninerep*);
+int	nineread(Nine*, ulong fid, vlong off, void *a, long n, int ms,
+		Ninerep*);
+int	ninewrite(Nine*, ulong fid, vlong off, void *a, long n, int ms,
+		Ninerep*);
+int	nineclunk(Nine*, ulong fid, int ms, Ninerep*);
+int	nineremove(Nine*, ulong fid, int ms, Ninerep*);
+int	ninestat(Nine*, ulong fid, uchar *a, int n, int ms, Ninerep*);
+int	nineflush(Nine*, ushort oldtag, int ms, Ninerep*);
