@@ -1887,8 +1887,15 @@ srvmetatext(Srvctx *c, Sfid *f, Text *t)
 	 */
 	m = srvmapget(c);
 	if((n = mapplace(m->map, id, p, nelem(p))) < 0){
+		/*
+		 * %r is read BEFORE the put, as ctldrop and rpcdropop read
+		 * theirs: the put takes and drops a lock, and nothing may
+		 * stand between a failing call and the rerrstr that reads
+		 * what it left.
+		 */
+		srverr(buf, sizeof buf);
 		srvmapput(c, m);
-		return srverr(buf, sizeof buf);
+		return buf;
 	}
 	/*
 	 * One physical line, which is what §2.4's "one attr=value line per
