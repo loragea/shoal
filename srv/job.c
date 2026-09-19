@@ -90,9 +90,16 @@ enum
 	 * the same place from the other end: a pass costs a walk of the
 	 * whole index at `scrubdays' of pacing, so an instance restarted
 	 * often would spend its life in the first tenth of one.
+	 *
+	 * The period itself is not here but below, as a macro: an enum
+	 * constant is an int, and a period in milliseconds outgrows one
+	 * at 24 days — 14 already spends 56% of the range.  A default
+	 * raised past that would wrap to a negative, which `return
+	 * Scrubperiodms' then sign-extends into a period of some hundred
+	 * million years.  The `-d' path is not exposed to it, casting to
+	 * uvlong before it multiplies; this one has to say so too.
 	 */
 	Scrubdaysdflt	= 14,
-	Scrubperiodms	= Scrubdaysdflt*86400*1000,
 	Scrubtickms	= 500,
 
 	/*
@@ -145,6 +152,15 @@ enum
 	/* what qjob runs on the object's queue */
 	Jscrub		= 0,
 };
+
+/*
+ * The default period in milliseconds, which is Scrubdaysdflt of days
+ * (see the enum above for why it is not in it): a macro rather than an
+ * enum constant, and multiplied by an unsigned long long rather than
+ * by two ints, so that the width of the result follows the number of
+ * days and not the other way about.
+ */
+#define Scrubperiodms	(Scrubdaysdflt*86400000ULL)
 
 /*
  * One unit of a pass's work, run on the object's own queue.
