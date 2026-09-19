@@ -3389,12 +3389,24 @@ tscrubticks(void)
 	}else
 		fail("/jobs is empty with a slow pass running");
 
-	/* `stop' ends that pass and turns no schedule off */
+	/*
+	 * `stop' ends that pass and turns no schedule off.  The period
+	 * goes back to `scrubdays' across the stop, because what says the
+	 * pass ended is jobrunning(), and that reads "/jobs is empty" and
+	 * not "this pass is over": a tick landing in the window where the
+	 * stopped pass has unlinked would fill /jobs with a pass of its
+	 * own, and the stop would read as never having taken.  The window
+	 * is a fraction of a tick and the poll below samples it, so the
+	 * tick is kept out of it rather than raced with.  The half after
+	 * shortens the period again, which is what that half is about.
+	 */
+	srvscrubms(ctx, 0);
 	if(clwrite(&cl, Fctl, 0, "scrub stop", &r) != Rwrite)
 		fail("scrub stop: %s", clerr(&r));
 	for(i = 0; i < 400 && jobrunning(&cl); i++)
 		sleep(20);
 	istrue("a pass stops when it is told to", !jobrunning(&cl));
+	srvscrubms(ctx, 30);
 	for(i = 0; i < 200 && !jobrunning(&cl); i++)
 		sleep(20);
 	if(slurpfile(&cl, Ffile, "jobs", buf, sizeof buf) > 0)
